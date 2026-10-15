@@ -1259,8 +1259,9 @@ pub(crate) fn lower_computed_member_registration(
                         let generator = ctx.classes.get(class_name).is_some_and(|c| {
                             c.computed_members.iter().any(|m| {
                                 m.function.name == *method_name
-                                    && crate::codegen::helpers::body_needs_method_owner(
+                                    && crate::codegen::helpers::body_needs_explicit_method_owner(
                                         &m.function.body,
+                                        owner.is_some(),
                                     )
                             })
                         });
