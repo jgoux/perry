@@ -285,6 +285,7 @@ fn is_zero_width_directive(directive: &str) -> bool {
             | ".loc"
             | ".no_dead_strip"
             | ".private_extern"
+            | ".alt_entry"
             | ".addrsig"
             | ".addrsig_sym"
             | ".end"
