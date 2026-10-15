@@ -6,6 +6,7 @@ struct Image {
     gc: GcHeader,
     string: StringHeader,
     bytes: [u8; 8],
+    hash: u64,
 }
 #[used]
 #[cfg_attr(target_vendor = "apple", link_section = "__TEXT,__perry_strings")]
@@ -19,7 +20,7 @@ static IMAGE: Image = Image {
         obj_type: crate::gc::GC_TYPE_STRING,
         gc_flags: 0x15,
         _reserved: 0x494d,
-        size: 36,
+        size: 48,
     },
     string: StringHeader {
         utf16_len: 7,
@@ -29,6 +30,7 @@ static IMAGE: Image = Image {
         flags: 4,
     },
     bytes: *b"literal\0",
+    hash: 0,
 };
 
 #[test]
@@ -81,7 +83,7 @@ fn tracked_classifier_rejects_null_forged_and_image_edge_addresses() {
             obj_type: crate::gc::GC_TYPE_STRING,
             gc_flags: 0x15,
             _reserved: 0x494d,
-            size: 36,
+            size: 48,
         },
         string: StringHeader {
             utf16_len: 7,
@@ -91,6 +93,7 @@ fn tracked_classifier_rejects_null_forged_and_image_edge_addresses() {
             flags: 4,
         },
         bytes: *b"literal\0",
+        hash: 0,
     };
     assert!(unsafe { try_read_tracked_gc_header(&fake.string as *const _ as usize) }.is_none());
 }
