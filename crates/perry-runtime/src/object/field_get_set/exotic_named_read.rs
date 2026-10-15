@@ -17,7 +17,8 @@ pub(super) enum NamedReadKind {
 /// Reuse the live-object classification the class-constructor arm already
 /// performs. GC_TYPE_OBJECT rules out typed arrays, Date and Temporal even
 /// when its shape is unmarked; only the ordinary shape kinds also rule out
-/// URLSearchParams. Unknown/headerless receivers keep the original probes.
+/// URLSearchParams (apart from the URLSearchParams layout itself).
+/// Unknown/headerless receivers keep the original probes.
 #[inline]
 pub(super) fn named_read_receiver_kind(obj: *const ObjectHeader) -> NamedReadKind {
     use super::super::shapes::ShapeObjectKind;
@@ -42,7 +43,16 @@ pub(super) fn named_read_receiver_kind(obj: *const ObjectHeader) -> NamedReadKin
                 };
                 match kind {
                     Some(ShapeObjectKind::Class) if bits >> 48 == 0 => NamedReadKind::Class,
-                    Some(ShapeObjectKind::Ordinary | ShapeObjectKind::OrdinaryNumericProof) => {
+                    // A native URLSearchParams is layout-born, so it is plain
+                    // ordinary like any record, yet it must still reach the
+                    // dynamic method probe for a type-erased receiver.
+                    Some(ShapeObjectKind::Ordinary | ShapeObjectKind::OrdinaryNumericProof)
+                        if (*(addr as *const ObjectHeader)).shape_word()
+                            != std::ptr::addr_of!(
+                                super::super::runtime_layouts::URL_SEARCH_PARAMS.layout_id
+                            )
+                            .read() =>
+                    {
                         NamedReadKind::Ordinary
                     }
                     _ => NamedReadKind::Object,
