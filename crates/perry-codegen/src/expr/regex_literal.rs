@@ -7,7 +7,7 @@
 //! birth is the runtime's ordinary RegExp birth (`regex/instance.rs`); the
 //! site carries no birth sequence and no birth state of its own.
 use super::FnCtx;
-use crate::types::I64;
+use crate::types::{DOUBLE, I64};
 
 /// The descriptor keeps operand loads on the shared cold miss, so every
 /// evaluation emits only the descriptor address and the shared call.
@@ -33,7 +33,22 @@ pub(crate) fn lower_regexp_literal(ctx: &mut FnCtx<'_>, pattern: &str, flags: &s
     let pattern_global = format!("@{}", ctx.strings.entry(pattern_idx).handle_global);
     let flags_global = format!("@{}", ctx.strings.entry(flags_idx).handle_global);
     let site = emit_regexp_site(ctx, &pattern_global, &flags_global);
+    // A program with agents keeps its string handle globals thread-local, so
+    // the descriptor's static address of one would name the TLS descriptor
+    // (not the executing agent's slot) and the cold miss would read garbage as
+    // the pattern/flags ("Invalid flags supplied to RegExp constructor").
+    // Such a program loads the executing agent's own handles at the site.
+    let agent_strings = ctx.program_has_worker || ctx.program_has_thread_agents;
     let blk = ctx.block();
     let site_key = blk.ptrtoint(&site, I64);
+    if agent_strings {
+        let pattern = blk.load(DOUBLE, &pattern_global);
+        let flags = blk.load(DOUBLE, &flags_global);
+        return blk.call(
+            I64,
+            "js_regexp_literal_loaded",
+            &[(I64, &site_key), (DOUBLE, &pattern), (DOUBLE, &flags)],
+        );
+    }
     blk.call(I64, "js_regexp_literal", &[(I64, &site_key)])
 }

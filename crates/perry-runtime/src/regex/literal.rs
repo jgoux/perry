@@ -28,6 +28,29 @@ pub extern "C" fn js_regexp_literal(site: i64) -> *mut RegExpHeader {
     literal_cold(site, word)
 }
 
+/// [`js_regexp_literal`] for a program whose string handles are per agent
+/// (thread-local): the descriptor cannot name them statically, so the site
+/// passes the executing agent's own pattern and flags strings.
+#[no_mangle]
+pub extern "C" fn js_regexp_literal_loaded(
+    site: i64,
+    pattern: f64,
+    flags: f64,
+) -> *mut RegExpHeader {
+    let site = site as *mut LiteralSite;
+    let word = unsafe { std::ptr::addr_of_mut!((*site).data) };
+    if crate::agent::current_agent() == crate::agent::PRIMARY_AGENT && unsafe { word.read() } != 0 {
+        return super::instance::new(|| unsafe {
+            (word.read() & crate::value::POINTER_MASK) as *const RegExpData
+        });
+    }
+    from_parts(
+        crate::value::js_nanbox_get_pointer(pattern) as *const StringHeader,
+        crate::value::js_nanbox_get_pointer(flags) as *const StringHeader,
+        word as i64,
+    )
+}
+
 #[cold]
 #[inline(never)]
 fn literal_cold(site: *mut LiteralSite, word: *mut u64) -> *mut RegExpHeader {
