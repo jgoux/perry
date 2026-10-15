@@ -300,7 +300,19 @@ const NON_COLLECTING: &[&str] = &[
 /// genuinely exceeds it still keeps today's IR and can still carry a stale
 /// register: the cap trades a compile-time cliff for a correctness risk, and
 /// that residual risk is why the number is generous rather than tight.
-const MAX_BLOCK_LOAD_PRODUCT: usize = 8_000_000;
+///
+/// # The bound was 8M and was too tight for a real `require` closure
+///
+/// A CommonJS wrapper's `require` closure is one function with a lazy arm per
+/// spec. Measured on Supabase Storage's dependency graph, the largest is 28187
+/// blocks x 570 walking groups = 16.1M (3958 groups before the walking-only
+/// count), and two more are 14.8M and 9.6M. Declining one of them left the
+/// captured-module cell address derived at entry stale across every nested
+/// `require` that collected, and the wrapper threw reading `.cache` from a
+/// from-space copy. The walk is cheap per block (those functions finish in tens
+/// of milliseconds), so the bound is now 64M: still a real opt-out for a
+/// pathological function, with margin over the largest function measured.
+const MAX_BLOCK_LOAD_PRODUCT: usize = 64_000_000;
 
 /// How long a derivation may get before the pass declines to re-materialise it.
 ///
@@ -630,7 +642,36 @@ pub(crate) fn apply_to_function(func: &mut LlFunction) -> usize {
             .push(i);
     }
 
-    if blocks.len().saturating_mul(groups.len()) > MAX_BLOCK_LOAD_PRODUCT {
+    // Which instructions read each register, in (block, index) order. Built
+    // here, ahead of the cap, because the cap is measured against the groups
+    // that actually NEED a reachability walk (see `MAX_BLOCK_LOAD_PRODUCT`).
+    let mut use_at: HashMap<&str, Vec<(usize, usize)>> = HashMap::new();
+    for (b, fb) in facts.iter().enumerate() {
+        for (i, f) in fb.iter().enumerate() {
+            for u in &f.uses {
+                use_at.entry(u.as_str()).or_default().push((b, i));
+            }
+        }
+    }
+    // A group whose every use sits in the root load's own builder block needs
+    // no walk: its answer is a range query over that one block. Only a group
+    // read from ANOTHER block pays the O(blocks) reachability pass. String
+    // handle loads are the bulk of the groups in a large module-scope or
+    // `require` function (one per string literal, each read inside the block
+    // that loaded it) and none of them walks.
+    let walking_groups = groups
+        .iter()
+        .filter(|(key, members)| {
+            let lb = (key.0).0;
+            members.iter().any(|&m| {
+                use_at
+                    .get(values[m].reg.as_str())
+                    .is_some_and(|sites| sites.iter().any(|&(ub, _)| ub != lb))
+            })
+        })
+        .count();
+
+    if blocks.len().saturating_mul(walking_groups) > MAX_BLOCK_LOAD_PRODUCT {
         return 0;
     }
 
@@ -708,14 +749,10 @@ pub(crate) fn apply_to_function(func: &mut LlFunction) -> usize {
         })
         .collect();
     let mut store_at: HashMap<&str, Vec<(usize, usize)>> = HashMap::new();
-    let mut use_at: HashMap<&str, Vec<(usize, usize)>> = HashMap::new();
     for (b, fb) in facts.iter().enumerate() {
         for (i, f) in fb.iter().enumerate() {
             if let Some(slot) = f.stores_to.as_deref() {
                 store_at.entry(slot).or_default().push((b, i));
-            }
-            for u in &f.uses {
-                use_at.entry(u.as_str()).or_default().push((b, i));
             }
         }
     }
@@ -747,50 +784,6 @@ pub(crate) fn apply_to_function(func: &mut LlFunction) -> usize {
             .iter()
             .map(|&m| (values[m].reg.as_str(), m))
             .collect();
-        // Forward reachability from the root load, never re-entering its own
-        // block: a back edge re-executes the load, so the value on the far side
-        // is a different dynamic instance and not this one.
-        //
-        // `collect_in[b]` / `store_in[b]`: can a collecting call / a store to
-        // `slot` have run on some path from the load to the TOP of block `b`?
-        let mut collect_in = vec![false; facts.len()];
-        let mut store_in = vec![false; facts.len()];
-        let mut seen = vec![false; facts.len()];
-        let mut queue: VecDeque<usize> = VecDeque::new();
-
-        // Tail of the load's own block, from just after the load.
-        let tail_end = facts[lb].len();
-        let c = any_collect(&collect_at, lb, li + 1, tail_end);
-        let s = any_in_block(stores, lb, li + 1, tail_end);
-        for &succ in &succs[lb] {
-            if succ == lb {
-                continue;
-            }
-            if !seen[succ] || (c && !collect_in[succ]) || (s && !store_in[succ]) {
-                collect_in[succ] |= c;
-                store_in[succ] |= s;
-                seen[succ] = true;
-                queue.push_back(succ);
-            }
-        }
-        while let Some(b) = queue.pop_front() {
-            let end = facts[b].len();
-            let oc = collect_in[b] || any_collect(&collect_at, b, 0, end);
-            let os = store_in[b] || any_in_block(stores, b, 0, end);
-            for &succ in &succs[b] {
-                if succ == lb {
-                    continue;
-                }
-                let grew = !seen[succ] || (oc && !collect_in[succ]) || (os && !store_in[succ]);
-                if grew {
-                    collect_in[succ] |= oc;
-                    store_in[succ] |= os;
-                    seen[succ] = true;
-                    queue.push_back(succ);
-                }
-            }
-        }
-
         // Every instruction that reads a member, in (block, index) order —
         // the order a whole-function scan would reach them in.
         let mut sites: Vec<(usize, usize)> = members
@@ -801,6 +794,63 @@ pub(crate) fn apply_to_function(func: &mut LlFunction) -> usize {
             .collect();
         sites.sort_unstable();
         sites.dedup();
+        // A group read only inside the root load's own block needs no walk (and
+        // is not counted by the cap): `seen` stays empty, which is exactly the
+        // answer the walk would give for every use in `lb`.
+        let needs_walk = sites.iter().any(|&(ub, _)| ub != lb);
+
+        // Forward reachability from the root load, never re-entering its own
+        // block: a back edge re-executes the load, so the value on the far side
+        // is a different dynamic instance and not this one.
+        //
+        // `collect_in[b]` / `store_in[b]`: can a collecting call / a store to
+        // `slot` have run on some path from the load to the TOP of block `b`?
+        let (mut collect_in, mut store_in, mut seen) = if needs_walk {
+            (
+                vec![false; facts.len()],
+                vec![false; facts.len()],
+                vec![false; facts.len()],
+            )
+        } else {
+            (Vec::new(), Vec::new(), Vec::new())
+        };
+        let mut queue: VecDeque<usize> = VecDeque::new();
+
+        if needs_walk {
+            // Tail of the load's own block, from just after the load.
+            let tail_end = facts[lb].len();
+            let c = any_collect(&collect_at, lb, li + 1, tail_end);
+            let s = any_in_block(stores, lb, li + 1, tail_end);
+            for &succ in &succs[lb] {
+                if succ == lb {
+                    continue;
+                }
+                if !seen[succ] || (c && !collect_in[succ]) || (s && !store_in[succ]) {
+                    collect_in[succ] |= c;
+                    store_in[succ] |= s;
+                    seen[succ] = true;
+                    queue.push_back(succ);
+                }
+            }
+            while let Some(b) = queue.pop_front() {
+                let end = facts[b].len();
+                let oc = collect_in[b] || any_collect(&collect_at, b, 0, end);
+                let os = store_in[b] || any_in_block(stores, b, 0, end);
+                for &succ in &succs[b] {
+                    if succ == lb {
+                        continue;
+                    }
+                    let grew = !seen[succ] || (oc && !collect_in[succ]) || (os && !store_in[succ]);
+                    if grew {
+                        collect_in[succ] |= oc;
+                        store_in[succ] |= os;
+                        seen[succ] = true;
+                        queue.push_back(succ);
+                    }
+                }
+            }
+        }
+
         for (ub, ui) in sites {
             // Only blocks the load can reach without re-entering its own block,
             // plus the load's own block below the load.

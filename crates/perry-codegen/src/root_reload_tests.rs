@@ -1175,3 +1175,78 @@ fn the_cap_counts_root_loads_not_derived_values() {
          function and silently leaves all of them in place"
     );
 }
+
+/// The cap must count only the groups that need a reachability walk.
+///
+/// A string-handle load read solely inside the builder block that loaded it
+/// answers from a range query over that block; it never walks. In a large
+/// CommonJS `require` function (one lazy arm per spec, several string literals
+/// per arm) those loads outnumber the real root loads ~4:1, so counting every
+/// group declined the whole function above `MAX_BLOCK_LOAD_PRODUCT`. A declined
+/// function keeps every stale register, and here the stale one is the capture
+/// cell address derived from the closure's captured `module` object once, at
+/// entry, and read again after each nested `require` that can collect: the
+/// read landed in a from-space copy and the CJS wrapper threw
+/// "Cannot convert undefined or null to object" (Supabase Storage's `semver`).
+///
+/// Each of the BLOCKS blocks loads its own string handle, holds it across a
+/// collecting call, and consumes it in that block. The final block also reads
+/// a value derived from the entry's root load across a call, which is the
+/// cross-block use that must be reloaded.
+#[test]
+fn the_cap_does_not_count_groups_that_never_walk() {
+    // Counting every group, the product is BLOCKS * (BLOCKS + 1) = 67.3M, over the
+    // 64M cap; counting only walking groups it is BLOCKS * 1.
+    const BLOCKS: usize = 8200;
+
+    let mut f = LlFunction::new("big", DOUBLE, vec![(DOUBLE, "%arg".into())]);
+    let mut labels = Vec::with_capacity(BLOCKS + 1);
+    labels.push(f.create_block("entry").label.clone());
+    for i in 0..BLOCKS {
+        labels.push(f.create_block(&format!("b{i}")).label.clone());
+    }
+
+    let derived;
+    {
+        let b = f.block_mut(0).unwrap();
+        let slot = b.alloca(DOUBLE);
+        b.store(DOUBLE, "%arg", &slot);
+        b.call_void(
+            "js_shadow_slot_bind",
+            &[(crate::types::I32, "0"), (PTR, &slot)],
+        );
+        let boxed = b.load(DOUBLE, &slot);
+        let bits = b.bitcast_double_to_i64(&boxed);
+        derived = b.and(I64, &bits, "281474976710655");
+        b.br(&labels[1]);
+    }
+
+    for i in 0..BLOCKS {
+        let next = labels.get(i + 2).cloned();
+        let b = f.block_mut(i + 1).unwrap();
+        let handle = b.load(DOUBLE, &format!("@m_.str.{i}.handle"));
+        b.call(DOUBLE, "js_object_alloc", &[]);
+        b.call(
+            DOUBLE,
+            "js_object_assign_one",
+            &[(DOUBLE, &handle), (DOUBLE, "0.0")],
+        );
+        match next {
+            Some(n) => b.br(&n),
+            None => {
+                b.call_void(
+                    "js_object_set_field_by_name",
+                    &[(I64, &derived), (DOUBLE, "0.0")],
+                );
+                b.ret(DOUBLE, "0.0")
+            }
+        }
+    }
+
+    assert_eq!(
+        apply_to_function(&mut f),
+        BLOCKS + 1,
+        "every per-block handle use and the one cross-block derived use must \
+         be reloaded; a declined function keeps all of them stale"
+    );
+}
