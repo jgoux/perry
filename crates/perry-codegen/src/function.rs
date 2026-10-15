@@ -1008,8 +1008,24 @@ impl LlFunction {
             .collect::<Vec<_>>()
             .join(", ");
 
-        let linkage = if self.linkage.is_empty() || force_external {
+        // `force_external` promotes only what is local to the unit
+        // (`internal`/`private`). A `linkonce_odr` definition is already
+        // visible and is emitted by EVERY unit that uses it (the shared
+        // `perry_birth_*` / `perry_array_index_normalize_i32` helpers), so it
+        // must stay a coalescing definition: dropping the keyword made each
+        // unit's copy a strong external and the link failed with duplicate
+        // symbols once two units used the same helper. `weak_odr` rather than
+        // `linkonce_odr` for the same reason the globals use it
+        // (`promote_external_global_for_units`): LLVM may not discard it when
+        // the owning unit's own references optimize away.
+        let linkage = if self.linkage.is_empty() {
             String::new()
+        } else if force_external {
+            match self.linkage.as_str() {
+                "linkonce_odr" => "weak_odr ".to_string(),
+                "internal" | "private" => String::new(),
+                other => format!("{other} "),
+            }
         } else {
             format!("{} ", self.linkage)
         };
@@ -1620,6 +1636,18 @@ mod define_header_tests {
             external,
             "force_external must remove the linkage keyword and change nothing else"
         );
+    }
+
+    /// A shared `linkonce_odr` helper defined by several units must keep
+    /// coalescing under `force_external` (it used to become a strong external
+    /// and collide at link time).
+    #[test]
+    fn force_external_keeps_linkonce_odr_coalescing() {
+        let mut f = probe();
+        f.linkage = "linkonce_odr".to_string();
+        assert!(f.define_header(false).starts_with("define linkonce_odr "));
+        let external = f.define_header(true);
+        assert!(external.starts_with("define weak_odr "), "{external}");
     }
 }
 
