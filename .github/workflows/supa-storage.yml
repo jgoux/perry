@@ -165,6 +165,9 @@ jobs:
         run: |
           export PATH="$LLVM_SYS_221_PREFIX/bin:$PATH" PERRY_EXTRA_LINK_ARGS=-fuse-ld=lld PERRY_FORCE_LINK_RESPONSE_FILE=1
           .github/supa/probes.sh
+      - name: Uncaught-throw diagnosis
+        if: always()
+        run: .github/supa/eh-diag.sh 2>&1 | tee supa-out/probes/eh-uncaught/diag.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -420,18 +423,10 @@ jobs:
           set +e
           "$OUT/probe-native" 2>&1 | tee "$OUT/probe-run.txt" | tail -n 80
           echo "probe exit=${PIPESTATUS[0]}"
-          for seed in 1 7 42; do
-            echo "== GC stress seed=$seed" | tee -a "$OUT/probe-run-stress.txt"
-            PERRY_GC_SCHEDULE_SEED=$seed PERRY_GC_SCHEDULE_RATE=1 PERRY_GC_PROTECT_FROMSPACE=1 PERRY_GC_MOVING_LOOP_POLLS=1 \
-              timeout 300 "$OUT/probe-native" 2>&1 | tee -a "$OUT/probe-run-stress.txt" | tail -n 40
-            echo "stress exit=${PIPESTATUS[0]}"
-          done
 
       - name: Native smoke
         id: native
         if: ${{ !inputs.probe }}
-        env:
-          PERRY_GC_TRACE: '1'
         run: |
           export PGPASSWORD=postgres
           psql -h 127.0.0.1 -U postgres -c 'create database ref_native'
