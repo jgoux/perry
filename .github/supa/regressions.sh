@@ -15,7 +15,7 @@ perry_tests=(
   --test url_search_params_type_erased_methods
   --test worker_program_regex_literal
 )
-hir_tests=(--test cjs_factory_frame_label --test enum_as_value_lowering)
+hir_tests=(--test cjs_factory_frame_label --test enum_as_value_lowering --test undici_namespace_agent_construction)
 perry=(cargo test --locked --profile perry-dev -p perry --no-default-features --features compile-cli "${perry_tests[@]}")
 rest=(cargo test --locked --profile perry-dev -p perry-hir -p perry-runtime -p perry-codegen --lib "${hir_tests[@]}")
 

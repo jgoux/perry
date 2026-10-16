@@ -1,6 +1,6 @@
 // What cdn-cache-manager.js needs at module init: undici's Agent and the
 // global Headers/URL constructors.
-const undici = require('undici');
+var undici = require('undici');
 console.log('typeof undici.Agent', typeof undici.Agent);
 console.log('typeof Headers', typeof Headers);
 console.log('typeof URL', typeof URL);

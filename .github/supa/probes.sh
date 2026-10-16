@@ -25,7 +25,11 @@ for n in "${names[@]}"; do
   cat "$d/init_array.txt"
   (cd "$d" && PERRY_EH_TRACE=1 timeout 60 ./"$n.bin" > run.log 2>&1); st=$?
   head -c 4000 "$d/run.log"; echo
-  if [ $st -eq 0 ]; then echo "probe $n: PASS"; else echo "probe $n: FAIL (exit $st)"; rc=1; fi
+  # A first-line `// expect-exit: N` marks a probe that must end uncaught with
+  # status N; a FATAL from the runtime's exception transport always fails.
+  want=$(sed -n '1s|^// expect-exit: \([0-9][0-9]*\)$|\1|p' "$here/probes/$n.js"); want=${want:-0}
+  if grep -q 'FATAL' "$d/run.log"; then echo "probe $n: FAIL (runtime FATAL)"; rc=1
+  elif [ $st -eq "$want" ]; then echo "probe $n: PASS"; else echo "probe $n: FAIL (exit $st, wanted $want)"; rc=1; fi
   echo "::endgroup::"
 done
 exit $rc
