@@ -145,9 +145,14 @@ fn is_aliasable_native_class(module: &str, method: &str) -> bool {
 /// #10454: native classes whose explicit-`this` construction
 /// (`Base.call(this, …)`, `super(…)`) must run the constructor through the
 /// http dispatcher up front instead of the ordinary call of the bound
-/// export. `https` has no distinct `ServerResponse` in Node.
+/// export. `https` has no distinct `ServerResponse` in Node. `Agent` joins
+/// them: `class HttpAgent extends http.Agent` (agentkeepalive, proxy agents)
+/// reaches `super(options)` with the bound export as its parent, and the
+/// ordinary call built a handle that `new` then returned in place of the
+/// subclass instance, so the subclass lost its own prototype and fields.
 fn is_construct_before_call_native_class(module: &str, method: &str) -> bool {
-    module == "http" && method == "ServerResponse"
+    (module == "http" && method == "ServerResponse")
+        || (matches!(module, "http" | "https") && method == "Agent")
 }
 
 /// Alias `this_arg` to `result` using one traced record on the receiver, when
