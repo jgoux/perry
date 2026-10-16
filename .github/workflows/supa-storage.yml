@@ -11,6 +11,9 @@
 #                     the sources that shape generated objects only. Link-side
 #                     changes keep it, so they cost a relink, not 35 min of codegen.
 #   storage-built-*   built Storage checkout (node_modules + dist), keyed by SHA.
+#   perry-wasip1-*    wasm32-wasip1 runtime archive for `perry compile --target
+#                     wasip1`, keyed by the runtime crates only.
+#   wasi-tools-*      wasi-sdk, wasmtime and wasm-tools for the wasi-linux job.
 name: supa-storage
 run-name: supa-storage / ${{ github.sha }}
 
@@ -49,6 +52,10 @@ on:
         default: ''
       probes:
         description: Compile and run the tiny programs in .github/supa/probes (exceptions, new Function)
+        type: boolean
+        default: false
+      wasi:
+        description: Run the wasi-linux job (wasip1 probes under wasmtime); it always runs on supa/wasip1 pushes
         type: boolean
         default: false
       simulate:
@@ -98,7 +105,7 @@ jobs:
         run: .github/supa/simulate.sh "${{ inputs.simulate }}"
       - name: Cache key
         id: key
-        run: echo "key=perry-dist-${{ runner.arch }}-${{ hashFiles('crates/**', 'Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/**', '!crates/*/tests/**', '!**/*.md') }}" >> "$GITHUB_OUTPUT"
+        run: echo "key=perry-dist-${{ runner.arch }}-wasi-${{ hashFiles('crates/**', 'Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/**', '!crates/*/tests/**', '!**/*.md') }}" >> "$GITHUB_OUTPUT"
       - name: Already built?
         id: have
         uses: actions/cache/restore@v4
@@ -114,7 +121,9 @@ jobs:
           start=$(date +%s)
           # Both ends are serial LTO links, so build them side by side; the
           # second graph gets its own target dir (cargo locks a shared one).
-          cargo build --locked --release -p perry --bin perry --no-default-features --features compile-cli &
+          # target-wasi adds the wasm32 backend for `--target wasi|wasip1`; it
+          # changes nothing for the native targets.
+          cargo build --locked --release -p perry --bin perry --no-default-features --features compile-cli,target-wasi &
           compiler=$!
           CARGO_TARGET_DIR="$PWD/target-libs" cargo build --locked --release -p perry-runtime-static -p perry-stdlib-static -p perry-ext-http -p perry-ext-net &
           libs=$!
@@ -142,6 +151,135 @@ jobs:
         run: |
           echo "### build-perry" >> "$GITHUB_STEP_SUMMARY"
           echo "- reused \`${{ steps.key.outputs.key }}\`" >> "$GITHUB_STEP_SUMMARY"
+
+  # Perry's wasm32-wasip1 target: compile the probes in .github/supa/wasi-probes
+  # to preview1 core modules, require that they import only what the supa-wasm
+  # host links, and compare their output with node under wasmtime.
+  wasi-linux:
+    if: ${{ github.ref_name == 'supa/wasip1' || (github.event_name == 'workflow_dispatch' && inputs.wasi) }}
+    needs: build-perry
+    runs-on: blacksmith-16vcpu-ubuntu-2404-arm
+    timeout-minutes: 90
+    env:
+      OUT: ${{ github.workspace }}/supa-out
+      WASI_TOOLS: /home/runner/wasi-tools
+      WASI_SDK_VERSION: "34"
+      WASMTIME_VERSION: 49.0.2
+      WASM_TOOLS_VERSION: 1.261.0
+      # exnref exception handling is what wasi-sdk's setjmp/longjmp lowering emits.
+      WASMTIME_FLAGS: -W exceptions=y
+      # The wasm runtime archive, not the native one the other jobs use.
+      PERRY_RUNTIME_DIR: ${{ github.workspace }}/target/wasm32-wasip1/release
+    steps:
+      - uses: actions/checkout@v4
+      - name: Perry build
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/perry-dist
+          key: ${{ needs.build-perry.outputs.key }}
+          fail-on-cache-miss: true
+      - run: mkdir -p target/release && cp perry-dist/perry target/release/perry && target/release/perry --version
+      - name: Rust toolchain with the wasm32-wasip1 target
+        run: |
+          rustup toolchain install nightly-2026-10-04 --profile minimal --component rustfmt --component clippy --target wasm32-wasip1
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-
+      - uses: actions/setup-node@v4 # the reference runs
+        with:
+          node-version: 24
+      - name: Tools cache
+        id: tools
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.WASI_TOOLS }}
+          key: wasi-tools-${{ runner.arch }}-sdk${{ env.WASI_SDK_VERSION }}-wasmtime${{ env.WASMTIME_VERSION }}-wasmtools${{ env.WASM_TOOLS_VERSION }}
+      - name: Install wasi-sdk, wasmtime and wasm-tools
+        if: steps.tools.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$WASI_TOOLS" && cd "$WASI_TOOLS"
+          curl -fsSL "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_SDK_VERSION}/wasi-sdk-${WASI_SDK_VERSION}.0-arm64-linux.tar.gz" | tar xz
+          curl -fsSL "https://github.com/bytecodealliance/wasmtime/releases/download/v${WASMTIME_VERSION}/wasmtime-v${WASMTIME_VERSION}-aarch64-linux.tar.xz" | tar xJ
+          curl -fsSL "https://github.com/bytecodealliance/wasm-tools/releases/download/v${WASM_TOOLS_VERSION}/wasm-tools-${WASM_TOOLS_VERSION}-aarch64-linux.tar.gz" | tar xz
+          ls
+      - name: Tool environment
+        run: |
+          {
+            echo "WASI_SDK_PATH=$WASI_TOOLS/wasi-sdk-${WASI_SDK_VERSION}.0-arm64-linux"
+            echo "CC_wasm32_wasip1=$WASI_TOOLS/wasi-sdk-${WASI_SDK_VERSION}.0-arm64-linux/bin/clang"
+            echo "AR_wasm32_wasip1=$WASI_TOOLS/wasi-sdk-${WASI_SDK_VERSION}.0-arm64-linux/bin/llvm-ar"
+            echo "CFLAGS_wasm32_wasip1=--sysroot=$WASI_TOOLS/wasi-sdk-${WASI_SDK_VERSION}.0-arm64-linux/share/wasi-sysroot"
+          } >> "$GITHUB_ENV"
+          echo "$WASI_TOOLS/wasmtime-v${WASMTIME_VERSION}-aarch64-linux" >> "$GITHUB_PATH"
+          echo "$WASI_TOOLS/wasm-tools-${WASM_TOOLS_VERSION}-aarch64-linux" >> "$GITHUB_PATH"
+          command -v /usr/bin/time >/dev/null || sudo apt-get install -y -qq time
+      - name: Tool versions
+        run: |
+          "$WASI_SDK_PATH/bin/clang" --version | head -n 1
+          wasmtime --version
+          wasm-tools --version
+          node --version
+      - name: Runtime cache
+        id: runtime
+        uses: actions/cache@v4
+        with:
+          path: target/wasm32-wasip1/release/libperry_runtime.a
+          key: perry-wasip1-runtime-${{ runner.arch }}-${{ hashFiles('crates/perry-runtime/**', 'crates/perry-runtime-static/**', 'crates/perry-ext-net/**', 'crates/perry-ffi/**', 'crates/perry-native-registration/**', 'crates/perry-abi/**', 'crates/perry-parser/**', 'crates/perry-diagnostics/**', 'crates/perry-dispatch/**', 'Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/**', 'scripts/wasi_build_runtime.*') }}
+      - name: Build the wasm32-wasip1 runtime
+        if: steps.runtime.outputs.cache-hit != 'true'
+        run: |
+          start=$(date +%s)
+          scripts/wasi_build_runtime.sh wasm32-wasip1
+          {
+            echo "### wasi-linux runtime"
+            echo "- build: $(( $(date +%s) - start )) s"
+            echo '```'; sccache --show-stats | head -n 12; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Runtime archive
+        run: ls -l "$PERRY_RUNTIME_DIR"/libperry_runtime.a
+      - name: Probes
+        run: .github/supa/wasi-probes.sh
+      - name: Hello module checks
+        if: always()
+        run: |
+          hello="$OUT/wasi-probes/hello/hello.wasm"
+          [ -f "$hello" ] || { echo "no hello.wasm"; exit 1; }
+          {
+            echo "### hello.wasm"
+            echo '```'
+            python3 -I .github/supa/wasi-imports.py "$hello"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          # Standard (exnref) exception handling only: the default feature set
+          # of wasm-tools has no legacy `try` support.
+          wasm-tools validate "$hello"
+          wasm-tools print "$hello" > "$OUT/hello.wat"
+          # The .init_array constructors (layouts, atoms, image ranges) must run
+          # from the command entry point.
+          grep -A12 '(func \$_start' "$OUT/hello.wat" | grep -q 'call \$__wasm_call_ctors' \
+            || { echo "::error::_start does not call __wasm_call_ctors"; exit 1; }
+          echo "_start calls __wasm_call_ctors"
+          echo "try_table sites: $(grep -c 'try_table' "$OUT/hello.wat" || true)"
+          echo "legacy try sites: $(grep -cE '^\s*try( |$)' "$OUT/hello.wat" || true)"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wasi-probes
+          path: |
+            supa-out/wasi-probes/*/*.log
+            supa-out/wasi-probes/*/*.out
+            supa-out/wasi-probes/*/*.err
+            supa-out/wasi-probes/*/*.txt
+            supa-out/wasi-probes/*/*.diff
+            supa-out/wasi-probes/hello/hello.wasm
+            supa-out/hello.wat
+          if-no-files-found: ignore
 
   # Tiny programs that isolate runtime behaviour on Linux arm without Storage.
   probes-linux:
