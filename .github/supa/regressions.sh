@@ -13,6 +13,7 @@ perry_tests=(
   --test codegen_units_shared_helper_linkage
   --test image_string_literal_native_args
   --test layout_family_alias_stack_map
+  --test tagged_template_sites_outside_entry_dir
   --test url_search_params_type_erased_methods
   --test worker_program_regex_literal
 )
