@@ -57,7 +57,7 @@ pub(super) fn default_output_path(
         PathBuf::from(format!("lib{}.so", stem))
     } else if is_windows_target(target) {
         PathBuf::from(format!("{}.exe", stem))
-    } else if target == Some("wasi") {
+    } else if matches!(target, Some("wasi" | "wasip1")) {
         PathBuf::from(format!("{}.wasm", stem))
     } else {
         PathBuf::from(stem)

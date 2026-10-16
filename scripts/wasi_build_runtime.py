@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Build the WASI runtime archive on any host with wasi-sdk configured."""
+"""Build the WASI runtime archive on any host with wasi-sdk configured.
+
+Usage: wasi_build_runtime.py [wasm32-wasip2 | wasm32-wasip1]
+
+wasm32-wasip2 (default) feeds `perry compile --target wasi`; wasm32-wasip1
+feeds `--target wasip1`. The wasip1 toolchain variables are CC_wasm32_wasip1,
+AR_wasm32_wasip1 and CFLAGS_wasm32_wasip1.
+"""
 
 import json
 import os
@@ -11,7 +18,10 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def main() -> int:
-    if not os.environ.get("CC_wasm32_wasip2"):
+    target = sys.argv[1] if len(sys.argv) > 1 else "wasm32-wasip2"
+    if target not in ("wasm32-wasip2", "wasm32-wasip1"):
+        sys.exit(f"Unsupported target {target}")
+    if not os.environ.get(f"CC_{target.replace('-', '_')}"):
         sys.exit("Configure wasi-sdk first (scripts/wasi_toolchain.ps1 or wasi_toolchain.sh)")
     metadata = json.loads(subprocess.check_output(
         ["cargo", "metadata", "--format-version", "1", "--no-deps", "--locked"], cwd=ROOT))
@@ -24,7 +34,7 @@ def main() -> int:
         sys.exit("Stale WASI feature exclusions; update wasi_check.sh and this script")
     features = ",".join(f"perry-runtime/{f}" for f in defaults if f not in excluded)
     command = ["cargo", "build", "--locked", "--release", "-p", "perry-runtime-static",
-               "--target", "wasm32-wasip2", "--no-default-features", "--features", features,
+               "--target", target, "--no-default-features", "--features", features,
                "--message-format=json-render-diagnostics"]
     # Cargo may legitimately reuse a fresh archive. Observe the target
     # artifact message instead of requiring an mtime change on every build.
@@ -40,7 +50,7 @@ def main() -> int:
                     and message["target"]["name"] in required):
                 for filename in message.get("filenames", []):
                     archive = Path(filename)
-                    if ("wasm32-wasip2" in archive.parts and archive.suffix == ".a"
+                    if (target in archive.parts and archive.suffix == ".a"
                             and archive.is_file()):
                         print(f"WASI archive: {archive}", flush=True)
                         live.add(message["target"]["name"])
@@ -48,7 +58,7 @@ def main() -> int:
     if status:
         return status
     if live != required:
-        sys.exit(f"Cargo reported no wasm32-wasip2 archives for {sorted(required - live)}")
+        sys.exit(f"Cargo reported no {target} archives for {sorted(required - live)}")
     return 0
 
 

@@ -221,6 +221,8 @@ pub(super) fn rust_target_triple(target: Option<&str>) -> Option<&'static str> {
         Some("macos") => Some("aarch64-apple-darwin"),
         // Standalone WASI (#11375): the runtime archive is built for this triple.
         Some("wasi") => Some("wasm32-wasip2"),
+        // WASI preview1 core module: the runtime archive is built for this triple.
+        Some("wasip1") => Some("wasm32-wasip1"),
         _ => None,
     }
 }

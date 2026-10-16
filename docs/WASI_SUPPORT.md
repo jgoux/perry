@@ -82,6 +82,20 @@ branch reports the same issues, with no new inventory issue paths. The
 `ephemeron.rs` pin affected by this change was separately reviewed and updated;
 no scanner exemption was added for the WASI transport.
 
+## WASI preview1 core modules (`--target wasip1`)
+
+`--target wasip1` runs the same wasm32 lowering and link, but for a preview1
+core module: objects are emitted for `wasm32-unknown-wasip1`, the link uses
+wasi-sdk's `--target=wasm32-wasip1` and the module has no `cabi_realloc` export
+or component adapter. It imports only `wasi_snapshot_preview1`. Build its
+runtime archive with `scripts/wasi_build_runtime.sh wasm32-wasip1` (toolchain
+variables `CC_wasm32_wasip1`, `AR_wasm32_wasip1`, `CFLAGS_wasm32_wasip1`) and
+point `PERRY_RUNTIME_DIR` at `target/wasm32-wasip1/release`. Exceptions use
+standard exnref exception handling, so run modules with
+`wasmtime run -W exceptions=y app.wasm`. `.github/supa/wasi-probes.sh` compiles
+and compares a probe set with node; `.github/supa/wasi-imports.py` rejects
+imports outside the supa-wasm host subset.
+
 ## Reproducing on Windows
 
 Configure the repository's pinned Rust and LLVM 22 toolchain first. Python

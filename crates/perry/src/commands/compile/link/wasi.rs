@@ -2,6 +2,10 @@
 //! runtime built for `wasm32-wasip2`, linked by wasi-sdk into a WASI 0.2
 //! component that runs under any WASI host (`wasmtime run app.wasm`).
 //!
+//! `--target wasip1` is the same pipeline for a WASI preview1 *core module*
+//! (runtime built for `wasm32-wasip1`): it imports `wasi_snapshot_preview1`
+//! and carries no component-model adapter, so it has no `cabi_realloc`.
+//!
 //! Deliberately separate from the native link path: no auto-optimize runtime
 //! rebuild, no stdlib, no link cache. Only compiled with the off-by-default
 //! `target-wasi` feature.
@@ -10,6 +14,32 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{anyhow, bail, Context, Result};
+
+/// Which WASI generation a link targets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Flavour {
+    /// `--target wasi`: WASI 0.2 component.
+    P2,
+    /// `--target wasip1`: preview1 core module.
+    P1,
+}
+
+impl Flavour {
+    pub(crate) fn from_target(target: &str) -> Option<Self> {
+        match target {
+            "wasi" => Some(Self::P2),
+            "wasip1" => Some(Self::P1),
+            _ => None,
+        }
+    }
+
+    fn triple(self) -> &'static str {
+        match self {
+            Self::P2 => "wasm32-wasip2",
+            Self::P1 => "wasm32-wasip1",
+        }
+    }
+}
 
 /// Linear-memory stack size. Perry's shadow stack and deep recursion need
 /// more than wasi-libc's 64 KiB default; placing the stack first also keeps
@@ -39,21 +69,24 @@ fn wasi_sdk() -> Result<PathBuf> {
 
 /// The clang/wasm-ld arguments for one link, split out for testing.
 pub(super) fn link_args(
+    flavour: Flavour,
     sdk: &Path,
     objects: &[PathBuf],
     runtime: &Path,
     output: &Path,
 ) -> Vec<String> {
     let mut args = vec![
-        "--target=wasm32-wasip2".to_string(),
+        format!("--target={}", flavour.triple()),
         format!("--sysroot={}", sdk.join("share/wasi-sysroot").display()),
     ];
     args.extend(objects.iter().map(|o| o.display().to_string()));
     args.push(runtime.display().to_string());
     args.push("-lsetjmp".to_string());
-    args.extend([
+    if flavour == Flavour::P2 {
         // The component adapter allocates through the module's allocator.
-        "-Wl,--export=cabi_realloc".to_string(),
+        args.push("-Wl,--export=cabi_realloc".to_string());
+    }
+    args.extend([
         "-Wl,--stack-first".to_string(),
         format!("-Wl,-z,stack-size={STACK_SIZE}"),
         // wasm-ld only warns on a call whose type differs from its callee's
@@ -66,15 +99,16 @@ pub(super) fn link_args(
     args
 }
 
-/// Link `objects` into the WASI component at `output`.
+/// Link `objects` into the WASI component (or preview1 module) at `output`.
 pub(crate) fn link_wasi(
+    flavour: Flavour,
     objects: &[PathBuf],
     runtime: &Path,
     output: &Path,
     verbose: u8,
 ) -> Result<()> {
     let sdk = wasi_sdk()?;
-    let args = link_args(&sdk, objects, runtime, output);
+    let args = link_args(flavour, &sdk, objects, runtime, output);
     let clang = sdk_clang(&sdk);
     if verbose > 0 {
         eprintln!("  wasi link: {} {}", clang.display(), args.join(" "));
@@ -104,6 +138,7 @@ mod tests {
     #[test]
     fn links_a_wasip2_component_and_refuses_signature_mismatches() {
         let args = link_args(
+            Flavour::P2,
             Path::new("/sdk"),
             &[PathBuf::from("a.o"), PathBuf::from("b.o")],
             Path::new("/rt/libperry_runtime.a"),
@@ -126,5 +161,21 @@ mod tests {
             assert!(args.iter().any(|a| a == flag), "{flag} missing: {args:?}");
         }
         assert_eq!(args[args.len() - 2..], ["-o", "app.wasm"]);
+    }
+
+    #[test]
+    fn wasip1_links_a_core_module_without_the_component_allocator() {
+        let args = link_args(
+            Flavour::P1,
+            Path::new("/sdk"),
+            &[PathBuf::from("a.o")],
+            Path::new("/rt/libperry_runtime.a"),
+            Path::new("app.wasm"),
+        );
+        assert_eq!(args[0], "--target=wasm32-wasip1");
+        assert!(!args.iter().any(|a| a.contains("cabi_realloc")), "{args:?}");
+        for flag in ["-lsetjmp", "-Wl,--stack-first", "-Wl,--fatal-warnings"] {
+            assert!(args.iter().any(|a| a == flag), "{flag} missing: {args:?}");
+        }
     }
 }

@@ -7,6 +7,9 @@
 #   eval "$(./scripts/wasi_toolchain.sh .cache/wasi)"
 #   ./scripts/wasi_build_runtime.sh
 #
+# `./scripts/wasi_build_runtime.sh wasm32-wasip1` builds the archive that
+# `--target wasip1` links instead (CC_wasm32_wasip1 and friends).
+#
 # Needs wasi-sdk's C compiler for the runtime's C sources (CC_wasm32_wasip2
 # and friends, as printed by wasi_toolchain.sh). Liveness: requires Cargo to
 # report a WASI static-archive artifact, including
@@ -14,4 +17,4 @@
 
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-exec python3 "$ROOT/scripts/wasi_build_runtime.py"
+exec python3 "$ROOT/scripts/wasi_build_runtime.py" "$@"
