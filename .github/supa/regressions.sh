@@ -13,6 +13,7 @@ perry_tests=(
   --test codegen_units_shared_helper_linkage
   --test http_agent_subclass_keeps_its_own_surface
   --test image_string_literal_native_args
+  --test incoming_message_pipe
   --test layout_family_alias_stack_map
   --test pipeline_into_fs_write_stream
   --test tagged_template_sites_outside_entry_dir
