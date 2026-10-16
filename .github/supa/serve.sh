@@ -22,6 +22,7 @@ export DATABASE_URL="postgresql://postgres:postgres@127.0.0.1:${PG_PORT:-5432}/$
 export STORAGE_FILE_BACKEND_PATH="${RUNNER_TEMP:-/tmp}/data-$label"
 export SERVER_PORT=$port SERVER_ADMIN_PORT=$((port + 1))
 rm -rf "$STORAGE_FILE_BACKEND_PATH"; mkdir -p "$STORAGE_FILE_BACKEND_PATH"
+export NODE_ENV=production
 ulimit -c unlimited || true
 "$@" > "$logdir/$label.log" 2>&1 &
 pid=$!

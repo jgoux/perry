@@ -114,8 +114,6 @@ jobs:
           cd "$STORAGE_DIR"
           "$GITHUB_WORKSPACE/.github/supa/serve.sh" start node ref_node 5601 "$OUT" -- node dist/start/server-minimal.js
           "$GITHUB_WORKSPACE/.github/supa/smoke.sh" 5601 "$OUT/node-transcript.txt"
-        env:
-          NODE_ENV: production
       - name: Stop node reference
         if: always()
         run: .github/supa/serve.sh stop node "$OUT"
