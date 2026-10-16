@@ -170,9 +170,6 @@ jobs:
         run: |
           export PATH="$LLVM_SYS_221_PREFIX/bin:$PATH" PERRY_EXTRA_LINK_ARGS=-fuse-ld=lld PERRY_FORCE_LINK_RESPONSE_FILE=1
           .github/supa/probes.sh $PROBE_NAMES
-      - name: Uncaught-throw diagnosis
-        if: ${{ always() && inputs.probe_names == '' }}
-        run: .github/supa/eh-diag.sh 2>&1 | tee supa-out/probes/eh-uncaught/diag.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
