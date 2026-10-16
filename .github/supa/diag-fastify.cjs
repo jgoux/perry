@@ -14,7 +14,7 @@ const patch = (file, pairs) => {
 }
 patch('route.js', [
   ["  if (request[kRouteContext].preParsing !== null) {",
-   "  if (request[kRouteContext].preParsing === undefined) console.error('DIAG preParsing undefined url=' + request.url + ' keys=' + Object.keys(request[kRouteContext]).join(',') + ' onRequest=' + String(request[kRouteContext].onRequest)\n  if (request[kRouteContext].preParsing !== null) {"],
+   "  if (request[kRouteContext].preParsing === undefined) console.error('DIAG preParsing undefined url=' + request.url + ' keys=' + Object.keys(request[kRouteContext]).join(',') + ' onRequest=' + String(request[kRouteContext].onRequest))\n  if (request[kRouteContext].preParsing !== null) {"],
   ["            context[hook] = toSet.length ? toSet : null\n          }\n\n          // Optimization",
    "            context[hook] = toSet.length ? toSet : null\n            if (hook === 'preParsing') console.error('DIAG route preReady ' + String(opts.url) + ' preParsing=' + String(context.preParsing) + ' keys=' + Object.keys(context).length)\n          }\n\n          // Optimization"],
 ])
