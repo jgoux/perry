@@ -459,7 +459,7 @@ pub(super) unsafe fn call_registers(
         if native_args_tag(info) == 0 {
             macro_rules! call {
                 ($ty:ident $(, $arg:expr)*) => {{
-                    let body: crate::codegen_abi::$ty<crate::closure::ClosureHeader> = std::mem::transmute(code);
+                    let body: crate::codegen_abi::$ty<crate::closure::ClosureHeader> = std::mem::transmute(code as usize);
                     body(closure, this $(, $arg)*)
                 }};
             }
@@ -557,7 +557,7 @@ unsafe fn invoke_body(
     let this = crate::closure::JsThis::from_f64(recv);
     if native_args_tag(info) != 0 {
         let body: crate::codegen_abi::JsNativeArgsBody<crate::closure::ClosureHeader> =
-            std::mem::transmute(code);
+            std::mem::transmute(code as usize);
         return Some(body(closure, this, args, argc));
     }
     let arg = |i| {
@@ -569,7 +569,7 @@ unsafe fn invoke_body(
     };
     macro_rules! call {
             ($ty:ident $(, $i:expr)*) => {{
-                let body: crate::codegen_abi::$ty<crate::closure::ClosureHeader> = std::mem::transmute(code);
+                let body: crate::codegen_abi::$ty<crate::closure::ClosureHeader> = std::mem::transmute(code as usize);
                 body(closure, this $(, arg($i))*)
             }};
         }

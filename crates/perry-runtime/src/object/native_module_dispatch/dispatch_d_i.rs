@@ -39,7 +39,7 @@ pub(crate) unsafe fn nm_dispatch_dgram(ctx: &NmCtx, module_name: &str, method_na
         typed_kind
     );
     match (module_name, method_name) {
-        #[cfg(feature = "mod-dgram")]
+        #[cfg(all(feature = "mod-dgram", not(target_os = "wasi")))]
         ("dgram", "createSocket") | ("dgram", "Socket") => {
             crate::dgram::js_dgram_create_socket(pack_args())
         }

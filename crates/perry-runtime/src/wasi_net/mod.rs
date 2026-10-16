@@ -18,8 +18,18 @@ pub mod abi;
 pub(crate) mod errors;
 #[path = "../turnloop_net/sink.rs"]
 mod sink;
+pub mod transport;
 pub use errors::NodeError;
-pub use sink::{register_sink, sink_installed, NetCompletion, MAX_SUBSYSTEMS};
+pub use sink::{
+    register_link_sink, register_sink, sink_installed, NetCompletion, SinkFn, MAX_LINK_ROUTES,
+    MAX_SUBSYSTEMS,
+};
+pub use transport::{TransportCore, TransportPayload, TRANSPORT_CORE_WORDS};
+// The completion kinds, for an in-tree subsystem (as `turnloop_net` exports).
+pub use sink::{
+    NET_ACCEPT, NET_CLOSED, NET_CONNECT, NET_DATA, NET_EOF, NET_ERROR, NET_FLAG_HANDLE_PARTS,
+    NET_FLAG_LINK, NET_FLAG_PLAINTEXT, NET_FLAG_STALE, NET_SHUTDOWN, NET_TIMER, NET_WROTE,
+};
 type NetResult<T> = Result<T, NodeError>;
 
 extern "C" {
@@ -61,6 +71,8 @@ struct Handle {
     connecting: bool,
     connected_event: bool,
     reading: bool,
+    /// `read_once`: stop after one buffer until the caller rearms.
+    read_once: bool,
     nodelay: bool,
     referenced: bool,
     writes: VecDeque<Write>,
@@ -77,6 +89,7 @@ impl Handle {
             connecting: false,
             connected_event: false,
             reading: false,
+            read_once: false,
             nodelay: false,
             referenced: true,
             writes: VecDeque::new(),
@@ -245,6 +258,16 @@ pub fn accept_start(id: i64) -> NetResult<()> {
 pub fn read_start(id: i64) -> NetResult<()> {
     with_handle(id, "read", |h| {
         h.reading = true;
+        h.read_once = false;
+        Ok(())
+    })
+}
+/// Read one buffer; the caller rearms after consuming it, so downstream
+/// backpressure leaves the socket unread without closing it.
+pub fn read_once(id: i64) -> NetResult<()> {
+    with_handle(id, "read", |h| {
+        h.reading = true;
+        h.read_once = true;
         Ok(())
     })
 }
@@ -559,6 +582,10 @@ extern "C" fn pump() -> i32 {
                         NetCompletion::data(id, &bytes),
                         bytes,
                     ));
+                    if h.read_once {
+                        h.reading = false;
+                        break;
+                    }
                 }
             }
         }

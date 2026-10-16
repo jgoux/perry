@@ -887,13 +887,7 @@ pub unsafe extern "C" fn js_perry_net_link_adopt_stream(
     err: *mut PerryNetError,
 ) -> i32 {
     if socket < 0 {
-        return finish(
-            Err(super::map_error(
-                turnloop::Error::new(turnloop::ErrorKind::InvalidInput),
-                "adopt",
-            )),
-            err,
-        );
+        return finish(Err(adopt_refused(AdoptRefusal::InvalidInput)), err);
     }
     #[cfg(unix)]
     {
@@ -918,13 +912,36 @@ pub unsafe extern "C" fn js_perry_net_link_adopt_stream(
     #[cfg(not(any(unix, windows)))]
     {
         let _ = (core, link);
-        finish(
-            Err(super::map_error(
-                turnloop::Error::new(turnloop::ErrorKind::Unsupported),
-                "adopt",
-            )),
-            err,
+        finish(Err(adopt_refused(AdoptRefusal::Unsupported)), err)
+    }
+}
+
+/// Why a link adoption was refused before it reached the transport.
+enum AdoptRefusal {
+    InvalidInput,
+    #[cfg_attr(any(unix, windows), allow(dead_code))]
+    Unsupported,
+}
+
+/// The error for a refused link adoption. The WASI guest has no turnloop, so
+/// it names the same two outcomes through the plain error constructors.
+fn adopt_refused(refusal: AdoptRefusal) -> NodeError {
+    #[cfg(not(target_os = "wasi"))]
+    {
+        super::map_error(
+            turnloop::Error::new(match refusal {
+                AdoptRefusal::InvalidInput => turnloop::ErrorKind::InvalidInput,
+                AdoptRefusal::Unsupported => turnloop::ErrorKind::Unsupported,
+            }),
+            "adopt",
         )
+    }
+    #[cfg(target_os = "wasi")]
+    {
+        match refusal {
+            AdoptRefusal::InvalidInput => super::errors::invalid_input("adopt"),
+            AdoptRefusal::Unsupported => super::errors::unsupported("adopt"),
+        }
     }
 }
 

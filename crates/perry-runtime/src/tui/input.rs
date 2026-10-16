@@ -140,6 +140,10 @@ mod termios_impl {
 /// the render-loop entry.
 pub fn enable_raw_mode() {
     let _ = termios_impl::enable();
+    // Threads never run on wasi: no reader thread, so no terminal input.
+    if cfg!(target_os = "wasi") {
+        return;
+    }
     READING.store(true, Ordering::Release);
     if READER_STARTED
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)

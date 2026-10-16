@@ -75,9 +75,9 @@ pub(crate) enum StreamEvent {
 /// may run JS, allocate, collect and submit new work.
 pub(crate) fn deliver(owner: Owner, id: u64, event: StreamEvent) {
     match owner {
-        #[cfg(feature = "mod-dgram")]
+        #[cfg(all(feature = "mod-dgram", not(target_os = "wasi")))]
         Owner::Dgram { socket } => crate::dgram_reactor::on_completion(socket, event),
-        #[cfg(not(feature = "mod-dgram"))]
+        #[cfg(not(all(feature = "mod-dgram", not(target_os = "wasi"))))]
         Owner::Dgram { .. } => {
             let _ = event;
         }

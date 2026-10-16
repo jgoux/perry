@@ -1333,12 +1333,12 @@ fn print_stats(id: AgentId, stats: LoopStats) {
     print_extra_stats();
 }
 
-#[cfg(feature = "mod-dgram")]
+#[cfg(all(feature = "mod-dgram", not(target_os = "wasi")))]
 fn dgram_sockets_on_turnloop() -> u64 {
     crate::dgram_reactor::turnloop_sockets()
 }
 
-#[cfg(not(feature = "mod-dgram"))]
+#[cfg(not(all(feature = "mod-dgram", not(target_os = "wasi"))))]
 fn dgram_sockets_on_turnloop() -> u64 {
     0
 }

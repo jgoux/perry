@@ -217,8 +217,9 @@ pub(super) fn invalid_input(syscall: &'static str) -> NodeError {
     }
 }
 
-/// Only a target with no socket adoption reaches this.
-#[cfg(not(any(unix, windows, target_os = "wasi")))]
+/// Only a target with no socket adoption reaches this, and the WASI guest's
+/// link transport until it has a driver.
+#[cfg(not(any(unix, windows)))]
 pub(super) fn unsupported(syscall: &'static str) -> NodeError {
     NodeError {
         code: "ENOTSUP",

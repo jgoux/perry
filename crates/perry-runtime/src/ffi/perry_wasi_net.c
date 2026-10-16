@@ -1,10 +1,17 @@
 /* wasi-sdk's libc implements WASIp2 name lookup. Rust std's resolver on
- * this target is still unsupported; keep libc layouts on the C side. */
+ * this target is still unsupported; keep libc layouts on the C side.
+ *
+ * The wasm32-wasip1 sysroot has no BSD sockets (no netdb.h, no socket,
+ * connect, bind, listen or getaddrinfo), so the real transport is WASIp2 only.
+ * On p1 every entry point reports ENOSYS with the same signatures; a later
+ * slice routes p1 networking through `sock_accept` and a host import. */
+#include <errno.h>
+#include <string.h>
+
+#if defined(__wasip2__)
 #include <netdb.h>
 #include <netinet/in.h>
-#include <string.h>
 #include <arpa/inet.h>
-#include <errno.h>
 #include <fcntl.h>
 #include <netinet/tcp.h>
 #include <poll.h>
@@ -129,3 +136,33 @@ int perry_wasi_socket_address(int fd, int peer, char *text, unsigned cap, unsign
     } else return -EAFNOSUPPORT;
     return inet_ntop(storage.ss_family, ip, text, cap) ? 0 : -errno;
 }
+
+#else /* !__wasip2__ */
+
+int perry_wasi_resolve(const char *hostname, int family, void *ctx,
+                      void (*push)(void *, int, const unsigned char *)) {
+    (void)hostname; (void)family; (void)ctx; (void)push;
+    return ENOSYS;
+}
+int perry_wasi_socket_nonblock(int fd) { (void)fd; return -ENOSYS; }
+int perry_wasi_tcp_open(const char *host, unsigned short port, int listening,
+                        int backlog, int reuse_port, int nodelay, int *pending) {
+    (void)host; (void)port; (void)listening; (void)backlog; (void)reuse_port;
+    (void)nodelay; if (pending) *pending = 0;
+    return -ENOSYS;
+}
+int perry_wasi_socket_connect_ready(int fd) { (void)fd; return -ENOSYS; }
+int perry_wasi_socket_accept(int fd, int nodelay) { (void)fd; (void)nodelay; return -ENOSYS; }
+int perry_wasi_socket_read(int fd, unsigned char *bytes, unsigned len) {
+    (void)fd; (void)bytes; (void)len; return -ENOSYS;
+}
+int perry_wasi_socket_write(int fd, const unsigned char *bytes, unsigned len) {
+    (void)fd; (void)bytes; (void)len; return -ENOSYS;
+}
+int perry_wasi_socket_shutdown(int fd) { (void)fd; return -ENOSYS; }
+int perry_wasi_socket_close(int fd) { (void)fd; return -ENOSYS; }
+int perry_wasi_socket_address(int fd, int peer, char *text, unsigned cap, unsigned short *port) {
+    (void)fd; (void)peer; (void)text; (void)cap; (void)port; return -ENOSYS;
+}
+
+#endif /* __wasip2__ */

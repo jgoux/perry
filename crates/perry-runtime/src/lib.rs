@@ -120,9 +120,9 @@ pub mod color_parse;
 #[cfg(feature = "contract-checks")]
 pub(crate) mod contracts;
 pub mod date;
-#[cfg(feature = "mod-dgram")]
+#[cfg(all(feature = "mod-dgram", not(target_os = "wasi")))]
 pub mod dgram;
-#[cfg(feature = "mod-dgram")]
+#[cfg(all(feature = "mod-dgram", not(target_os = "wasi")))]
 pub mod dgram_reactor;
 pub mod disposable;
 pub mod dns;
@@ -268,6 +268,9 @@ pub mod turnloop_proc;
 // (`turnloop_pool/mod.rs`). Same target gate as P1 and P2 — the driver itself
 // is a native-only dependency, and the pool it wraps is turnloop's.
 #[cfg(not(target_arch = "wasm32"))]
+pub mod turnloop_pool;
+#[cfg(target_arch = "wasm32")]
+#[path = "turnloop_pool_wasm.rs"]
 pub mod turnloop_pool;
 // turnloop P10: run a host job on the loop of the agent this thread acts for
 // (`turnloop_post/mod.rs`). Same target gate as P1, P2 and P4. This is what a
@@ -869,7 +872,7 @@ pub(crate) mod stdlib_pump {
         // #4911: deliver queued UDP datagrams as `'message'` events. Lives in
         // perry-runtime so node:dgram works without perry-stdlib linked.
         // Zero-cost (one relaxed load) when no sockets are bound.
-        #[cfg(feature = "mod-dgram")]
+        #[cfg(all(feature = "mod-dgram", not(target_os = "wasi")))]
         crate::dgram_reactor::pump();
         crate::process::js_process_ipc_drain();
         let f = STDLIB_PUMP_FN.load(Ordering::Acquire);
@@ -936,7 +939,7 @@ pub(crate) mod stdlib_pump {
             return 1;
         }
         // #4911: a bound + `ref`'d node:dgram socket keeps the loop alive.
-        #[cfg(feature = "mod-dgram")]
+        #[cfg(all(feature = "mod-dgram", not(target_os = "wasi")))]
         if crate::dgram_reactor::has_active() {
             return 1;
         }
