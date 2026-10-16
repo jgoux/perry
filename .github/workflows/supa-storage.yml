@@ -142,11 +142,18 @@ jobs:
         # objects, so runtime-only changes keep hitting the cache.
         run: echo "id=$(echo '${{ hashFiles('crates/perry-codegen/**', 'crates/perry-hir/**', 'crates/perry-transform/**', 'crates/perry-types/**', 'crates/perry/src/**') }}' | cut -c1-16)" >> "$GITHUB_OUTPUT"
       - name: Restore the object cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ${{ env.STORAGE_DIR }}/node_modules/.cache/perry
-          key: perry-obj-${{ runner.arch }}-${{ steps.objid.outputs.id }}-${{ steps.storage.outputs.sha }}
-          restore-keys: perry-obj-${{ runner.arch }}-${{ steps.objid.outputs.id }}-
+          key: perry-obj-${{ runner.arch }}-${{ steps.objid.outputs.id }}-${{ steps.storage.outputs.sha }}-${{ github.run_id }}
+          restore-keys: |
+            perry-obj-${{ runner.arch }}-${{ steps.objid.outputs.id }}-${{ steps.storage.outputs.sha }}-
+            perry-obj-${{ runner.arch }}-${{ steps.objid.outputs.id }}-
+
+      - name: Install lld
+        # GNU ld cannot place range-extension stubs for a ~200 MB aarch64 image
+        # (R_AARCH64_CALL26 truncation); lld inserts thunks as needed.
+        run: sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq lld-22
 
       - name: Compile Storage natively
         id: compile
@@ -157,6 +164,8 @@ jobs:
           export PERRY_NO_AUTO_OPTIMIZE=1 PERRY_FORCE_LINK_RESPONSE_FILE=1 PERRY_KEEP_SYMBOLS=1
           export PERRY_CODEGEN_UNIT_JOBS=2 PERRY_MODULE_JOBS=2
           export PATH="$LLVM_SYS_221_PREFIX/bin:$PATH"
+          export PERRY_EXTRA_LINK_ARGS="-fuse-ld=lld"
+          command -v ld.lld
           set +e
           /usr/bin/time -v -o "$OUT/compile.time" \
             "$GITHUB_WORKSPACE/target/release/perry" compile dist/start/server-minimal.js -o "$OUT/storage-native" \
@@ -164,6 +173,14 @@ jobs:
           rc=$?
           echo "compile exit=$rc" ; tail -n 25 "$OUT/compile.log"
           exit $rc
+
+      - name: Save the object cache
+        # Compiling takes ~35 min; keep the objects even when the link fails.
+        if: always() && steps.compile.conclusion != 'skipped'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.STORAGE_DIR }}/node_modules/.cache/perry
+          key: perry-obj-${{ runner.arch }}-${{ steps.objid.outputs.id }}-${{ steps.storage.outputs.sha }}-${{ github.run_id }}
 
       - name: Native smoke
         id: native
