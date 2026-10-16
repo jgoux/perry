@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Regression tests added on this branch. `build` compiles every test binary in
+# Regression tests added on this branch, built with the perry-dev profile (no LTO,
+# 16 codegen units; the release profile compiles the big crates serially). `build` compiles every test binary in
 # two cargo invocations (the perry crate needs its own feature set), `run`
 # executes them. Both take the same selection so cargo reuses the build.
 set -euo pipefail
@@ -15,8 +16,8 @@ perry_tests=(
   --test worker_program_regex_literal
 )
 hir_tests=(--test cjs_factory_frame_label --test enum_as_value_lowering)
-perry=(cargo test --locked --release -p perry --no-default-features --features compile-cli "${perry_tests[@]}")
-rest=(cargo test --locked --release -p perry-hir -p perry-runtime -p perry-codegen --lib "${hir_tests[@]}")
+perry=(cargo test --locked --profile perry-dev -p perry --no-default-features --features compile-cli "${perry_tests[@]}")
+rest=(cargo test --locked --profile perry-dev -p perry-hir -p perry-runtime -p perry-codegen --lib "${hir_tests[@]}")
 
 case "${1:?build|run}" in
   build)
