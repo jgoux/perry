@@ -14,6 +14,7 @@ perry_tests=(
   --test http_agent_subclass_keeps_its_own_surface
   --test image_string_literal_native_args
   --test layout_family_alias_stack_map
+  --test pipeline_into_fs_write_stream
   --test tagged_template_sites_outside_entry_dir
   --test trace_throw_reports_origin
   --test url_search_params_type_erased_methods
