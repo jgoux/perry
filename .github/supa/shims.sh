@@ -20,4 +20,7 @@ p=$root/node_modules/pg-format/lib/index.js
 shim "$p"
 sed "s#require(__dirname + '/reserved.js')#require('./reserved.js')#" "$p.orig" > "$p"
 grep -q "require('./reserved.js')" "$p" || { echo "pg-format shim did not apply" >&2; exit 1; }
+# find-my-way builds four functions with `new Function`; swap in equivalent closures.
+node "$(dirname "$0")/patch-find-my-way.cjs" "$root"
+
 echo "shims applied under $root/node_modules"
