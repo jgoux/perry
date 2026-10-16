@@ -13,7 +13,7 @@ on:
         description: Branch of jgoux/storage to compile
         default: supa/aot-friendly
       regressions:
-        description: Run the macOS regression job
+        description: Run the regression tests added on this branch
         type: boolean
         default: true
       storage:
@@ -234,9 +234,9 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-  regressions-macos:
+  regressions-linux:
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.regressions }}
-    runs-on: macos-15
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 240
     env:
       PERRY_WORKSPACE_ROOT: ${{ github.workspace }}
@@ -244,17 +244,20 @@ jobs:
       PERRY_SRC: ${{ github.workspace }}
       PERRY_RUNTIME_DIR: ${{ github.workspace }}/target/release
       PERRY_BUILD_COMMIT: supa-storage-fork
-      CARGO_PROFILE_RELEASE_DEBUG: "0"
     steps:
       - uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift 2>/dev/null || true
+          df -h /
       - name: Install Rust toolchain
         run: rustup toolchain install nightly-2026-10-04 --profile minimal --component rustfmt --component clippy
       - uses: ./.github/actions/setup-llvm22
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ${{ runner.os }}-${{ runner.arch }}-supa-regressions
-          cache-on-failure: true
-          save-if: "true"
+          shared-key: ${{ runner.os }}-${{ runner.arch }}-supa-storage
+          save-if: "false"
       - name: Runtime libraries for the integration tests
         run: cargo build --locked --release -p perry-runtime-static -p perry-stdlib-static -p perry-ext-http -p perry-ext-net
       - name: Compiler integration regressions
@@ -275,6 +278,7 @@ jobs:
             a_module_body_frame_renders_its_own_location tracked_classifier_rejects_null_forged_and_image_edge_addresses
       - name: Codegen unit regressions
         # Exact names: other perry-codegen lib tests abort on this baseline.
+        # The hot-TLS test builds IR for an explicit Apple triple, so it runs on Linux.
         run: |
           cargo test --locked --release -p perry-codegen --lib -- \
             the_cap_does_not_count_groups_that_never_walk \
