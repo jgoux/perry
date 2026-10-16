@@ -16,7 +16,7 @@ perry_tests=(
 )
 hir_tests=(--test cjs_factory_frame_label --test enum_as_value_lowering)
 perry=(cargo test --locked --release -p perry --no-default-features --features compile-cli "${perry_tests[@]}")
-rest=(cargo test --locked --release -p perry-hir "${hir_tests[@]}" -p perry-runtime --lib -p perry-codegen --lib)
+rest=(cargo test --locked --release -p perry-hir -p perry-runtime -p perry-codegen --lib "${hir_tests[@]}")
 
 case "${1:?build|run}" in
   build)

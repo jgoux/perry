@@ -39,11 +39,15 @@ on:
         type: boolean
         default: false
       module_jobs:
-        description: PERRY_MODULE_JOBS (4 vCPU / 16 GB runner; peak RSS was 7.6 GB at 2x2)
-        default: "3"
+        description: PERRY_MODULE_JOBS (32 vCPU / 94 GB runner; peak RSS was 8.6 GB at 3x2)
+        default: "8"
       codegen_jobs:
         description: PERRY_CODEGEN_UNIT_JOBS
-        default: "2"
+        default: "4"
+      probes:
+        description: Compile and run the tiny programs in .github/supa/probes (exceptions, new Function)
+        type: boolean
+        default: false
       simulate:
         description: Measurement aid, touch one source file to exercise cache invalidation without a commit
         type: choice
@@ -76,14 +80,11 @@ env:
   PERRY_SRC: ${{ github.workspace }}
   PERRY_RUNTIME_DIR: ${{ github.workspace }}/target/release
   PERRY_BUILD_COMMIT: supa-storage-fork
-  # Temporary: the objects cached before the object id was narrowed. Drop this
-  # line with the next change that really alters generated code.
-  OBJID_PIN: 170b4e1d3a2ab504
 
 jobs:
   # Compiler and runtime archives, built once per source hash.
   build-perry:
-    runs-on: ubuntu-24.04-arm
+    runs-on: blacksmith-32vcpu-ubuntu-2404-arm
     timeout-minutes: 120
     outputs:
       key: ${{ steps.key.outputs.key }}
@@ -133,11 +134,41 @@ jobs:
           echo "### build-perry" >> "$GITHUB_STEP_SUMMARY"
           echo "- reused \`${{ steps.key.outputs.key }}\`" >> "$GITHUB_STEP_SUMMARY"
 
+  # Tiny programs that isolate runtime behaviour on Linux arm without Storage.
+  probes-linux:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.probes }}
+    needs: build-perry
+    runs-on: blacksmith-16vcpu-ubuntu-2404-arm
+    timeout-minutes: 90
+    env:
+      OUT: ${{ github.workspace }}/supa-out
+    steps:
+      - uses: actions/checkout@v4
+      - name: Perry build
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/perry-dist
+          key: ${{ needs.build-perry.outputs.key }}
+          fail-on-cache-miss: true
+      - run: mkdir -p target/release && cp perry-dist/* target/release/
+      - uses: ./.github/actions/supa-rust-env
+      - name: Probes
+        run: |
+          export PATH="$LLVM_SYS_221_PREFIX/bin:$PATH" PERRY_EXTRA_LINK_ARGS=-fuse-ld=lld PERRY_FORCE_LINK_RESPONSE_FILE=1
+          .github/supa/probes.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: probes
+          path: supa-out/probes/*/*.log
+          if-no-files-found: ignore
+
+
   # Builds Storage once per SHA and records the node reference transcript.
   # Runs next to build-perry.
   storage-prep:
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.storage }}
-    runs-on: ubuntu-24.04-arm
+    runs-on: blacksmith-4vcpu-ubuntu-2404-arm
     timeout-minutes: 60
     env:
       OUT: ${{ github.workspace }}/supa-out
@@ -218,6 +249,20 @@ jobs:
       - name: Stop node reference
         if: always()
         run: .github/supa/serve.sh stop node "$OUT"
+      # The shims must not change what Storage does under node.
+      - name: Node smoke with the shims applied
+        run: |
+          export PGPASSWORD=postgres
+          psql -h 127.0.0.1 -U postgres -c 'create database ref_shim'
+          cd "$STORAGE_DIR"
+          "$GITHUB_WORKSPACE/.github/supa/shims.sh" .
+          "$GITHUB_WORKSPACE/.github/supa/serve.sh" start nodeshim ref_shim 5611 "$OUT" -- node dist/start/server-minimal.js
+          "$GITHUB_WORKSPACE/.github/supa/smoke.sh" 5611 "$OUT/node-shim-transcript.txt"
+          diff "$OUT/node-transcript.txt" "$OUT/node-shim-transcript.txt"
+          echo "- node smoke with shims: identical to the reference" >> "$GITHUB_STEP_SUMMARY"
+      - name: Stop shimmed node
+        if: always()
+        run: .github/supa/serve.sh stop nodeshim "$OUT"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -230,13 +275,13 @@ jobs:
   storage-linux:
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.storage }}
     needs: [build-perry, storage-prep]
-    runs-on: ubuntu-24.04-arm
+    runs-on: blacksmith-32vcpu-ubuntu-2404-arm
     timeout-minutes: 300
     env:
       OUT: ${{ github.workspace }}/supa-out
       PG_PORT: "5432"
-      PERRY_MODULE_JOBS: ${{ inputs.module_jobs || '3' }}
-      PERRY_CODEGEN_UNIT_JOBS: ${{ inputs.codegen_jobs || '2' }}
+      PERRY_MODULE_JOBS: ${{ inputs.module_jobs || '8' }}
+      PERRY_CODEGEN_UNIT_JOBS: ${{ inputs.codegen_jobs || '4' }}
     services:
       postgres:
         image: postgres:17
@@ -296,8 +341,7 @@ jobs:
         # Only sources that shape generated objects. Link, strip-dedup, library
         # search and tests are excluded so fixes there reuse every object.
         run: |
-          id="$OBJID_PIN"
-          [ -n "$id" ] || id=$(echo '${{ hashFiles('crates/perry-codegen/**', 'crates/perry-hir/**', 'crates/perry-transform/**', 'crates/perry-types/**', 'crates/perry-parser/**', 'crates/perry-diagnostics/**', 'crates/perry-api-manifest/**', 'crates/perry-dispatch/**', 'crates/perry-abi/**', 'crates/perry-ui-model/**', 'crates/perry/src/**', '!crates/*/tests/**', '!crates/**/*_tests.rs', '!crates/**/tests.rs', '!crates/perry/src/commands/compile/link/**', '!crates/perry/src/commands/compile/optimized_libs/**', '!crates/perry/src/commands/compile/optimized_libs.rs', '!crates/perry/src/commands/compile/strip_dedup/**', '!crates/perry/src/commands/compile/strip_dedup.rs', '!crates/perry/src/commands/compile/library_search/**', '!crates/perry/src/commands/compile/library_search.rs', '!crates/perry/src/commands/compile/post_link.rs', '!crates/perry/src/commands/compile/compressed_libs.rs', '!crates/perry/src/commands/compile/size_report.rs', '!crates/perry/src/commands/compile/bundle_*.rs') }}' | cut -c1-16)
+          id=$(echo '${{ hashFiles('crates/perry-codegen/**', 'crates/perry-hir/**', 'crates/perry-transform/**', 'crates/perry-types/**', 'crates/perry-parser/**', 'crates/perry-diagnostics/**', 'crates/perry-api-manifest/**', 'crates/perry-dispatch/**', 'crates/perry-abi/**', 'crates/perry-ui-model/**', 'crates/perry/src/**', '!crates/*/tests/**', '!crates/**/*_tests.rs', '!crates/**/tests.rs', '!crates/perry/src/commands/compile/link/**', '!crates/perry/src/commands/compile/optimized_libs/**', '!crates/perry/src/commands/compile/optimized_libs.rs', '!crates/perry/src/commands/compile/strip_dedup/**', '!crates/perry/src/commands/compile/strip_dedup.rs', '!crates/perry/src/commands/compile/library_search/**', '!crates/perry/src/commands/compile/library_search.rs', '!crates/perry/src/commands/compile/post_link.rs', '!crates/perry/src/commands/compile/compressed_libs.rs', '!crates/perry/src/commands/compile/size_report.rs', '!crates/perry/src/commands/compile/bundle_*.rs') }}' | cut -c1-16)
           echo "id=$id" >> "$GITHUB_OUTPUT"
       - name: Restore the object cache
         id: objects
@@ -455,7 +499,7 @@ jobs:
   regressions-linux:
     if: ${{ !inputs.skip_regressions }}
     needs: build-perry
-    runs-on: ubuntu-24.04-arm
+    runs-on: blacksmith-16vcpu-ubuntu-2404-arm
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
