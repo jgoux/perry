@@ -1,9 +1,10 @@
-// The same routes as fastify-readme.js, but with the npm package next to the
-// program (as Storage has it), so Perry compiles fastify, find-my-way, ajv and
-// fast-json-stringify from node_modules. Those reach the `new Function` source
-// evaluator, which needs the startup stubs to have run. Unpatched package.
+// The same routes as fastify-readme.js through a CommonJS require (the form of
+// Storage's tsc output). Perry compiles fastify, find-my-way, ajv and
+// fast-json-stringify from the unpatched npm package; those build functions
+// from runtime strings, which needs the source evaluator the startup stubs
+// install.
 // compare-node
-// npm: fastify@5.11.2
+// npm: fastify@5.11.2 find-my-way@9.7.0 ajv@8.18.0 fast-json-stringify@7.0.1
 // bundle-npm
 const fastify = require('fastify');
 const http = require('node:http');

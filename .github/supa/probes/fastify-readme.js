@@ -1,10 +1,12 @@
-// The README "Get started" Fastify example, compiled the way the README says:
-// no node_modules next to the program, so `import fastify from 'fastify'` is
-// Perry's built-in Fastify. The routes after the README one are the shapes
+// The README "Get started" Fastify example (README.md), with its ESM import,
+// compiled the way the README says: fastify is a dependency, installed next to
+// the program at build time (Perry compiles it from node_modules; the binary
+// needs none at run time). The routes after the README one are the shapes
 // Storage uses (params, response schema, body schema). The expected output is
-// recorded by running the same file under node with the npm package.
+// recorded by running the same file under node.
 // compare-node
-// npm: fastify@5.11.2
+// npm: fastify@5.11.2 find-my-way@9.7.0 ajv@8.18.0 fast-json-stringify@7.0.1
+// bundle-npm
 import fastify from 'fastify';
 import http from 'node:http';
 
