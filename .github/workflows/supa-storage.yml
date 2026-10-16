@@ -68,7 +68,11 @@ jobs:
           mkdir -p "$OUT"
 
       - name: Storage environment
-        run: .github/supa/env.sh >> "$GITHUB_ENV"
+        run: |
+          .github/supa/env.sh > "$RUNNER_TEMP/storage.env"
+          grep -E '^(AUTH_JWT_SECRET|PGRST_JWT_SECRET|SERVICE_KEY|ANON_KEY)=' "$RUNNER_TEMP/storage.env" \
+            | cut -d= -f2- | while read -r v; do echo "::add-mask::$v"; done
+          cat "$RUNNER_TEMP/storage.env" >> "$GITHUB_ENV"
 
       - uses: actions/setup-node@v4
         with:

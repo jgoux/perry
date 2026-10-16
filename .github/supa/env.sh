@@ -13,7 +13,6 @@ sign() {
 }
 service_key=$(sign '{"role":"service_role","iss":"supabase-test","iat":1700000000,"exp":4102444800}')
 anon_key=$(sign '{"role":"anon","iss":"supabase-test","iat":1700000000,"exp":4102444800}')
-for v in "$secret" "$service_key" "$anon_key"; do echo "::add-mask::$v"; done
 cat <<EOT
 AUTH_JWT_SECRET=$secret
 PGRST_JWT_SECRET=$secret
