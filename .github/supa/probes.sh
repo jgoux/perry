@@ -57,11 +57,18 @@ for n in "${names[@]}"; do
   # A first-line `// expect-exit: N` marks a probe that must end uncaught with
   # status N; a FATAL from the runtime's exception transport always fails.
   want=$(sed -n '1s|^// expect-exit: \([0-9][0-9]*\)$|\1|p' "$here/probes/$n.js"); want=${want:-0}
-  if grep -q 'FATAL' "$d/run.log"; then echo "probe $n: FAIL (runtime FATAL)"; rc=1
-  elif [ $st -ne "$want" ]; then echo "probe $n: FAIL (exit $st, wanted $want)"; rc=1
+  pf=0
+  if grep -q 'FATAL' "$d/run.log"; then echo "probe $n: FAIL (runtime FATAL)"; rc=1; pf=1
+  elif [ $st -ne "$want" ]; then echo "probe $n: FAIL (exit $st, wanted $want)"; rc=1; pf=1
   elif $cmp_node && ! diff -u "$d/node.log" "$d/run.log" > "$d/node.diff"; then
-    echo "probe $n: FAIL (output differs from node: - node, + perry)"; cat "$d/node.diff"; rc=1
+    echo "probe $n: FAIL (output differs from node: - node, + perry)"; cat "$d/node.diff"; rc=1; pf=1
   else echo "probe $n: PASS"; fi
+  # A failing probe is rerun with the throw trace (separate file: the trace
+  # goes to stderr and must not enter the comparison with node above).
+  if [ "$pf" -eq 1 ]; then
+    (cd "$d" && PERRY_TRACE_THROW=1 timeout 60 ./"$n.bin" > run-trace.log 2>&1) || true
+    echo "--- $n with PERRY_TRACE_THROW=1 (last 60 lines) ---"; tail -n 60 "$d/run-trace.log"
+  fi
   echo "::endgroup::"
 done
 exit $rc

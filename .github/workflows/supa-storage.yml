@@ -275,6 +275,13 @@ jobs:
       - name: Stop shimmed node
         if: always()
         run: .github/supa/serve.sh stop nodeshim "$OUT"
+      - name: Node server log tail
+        if: failure()
+        run: |
+          for l in node nodeshim; do
+            [ -f "$OUT/$l.log" ] && { echo "::group::$l.log (last 80 lines)"; tail -n 80 "$OUT/$l.log"; echo "::endgroup::"; }
+          done
+          true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -421,7 +428,7 @@ jobs:
         if: ${{ inputs.probe }}
         run: |
           set +e
-          "$OUT/probe-native" 2>&1 | tee "$OUT/probe-run.txt" | tail -n 80
+          PERRY_TRACE_THROW=1 "$OUT/probe-native" 2>&1 | tee "$OUT/probe-run.txt" | tail -n 80
           echo "probe exit=${PIPESTATUS[0]}"
 
       - name: Native smoke
@@ -432,6 +439,7 @@ jobs:
           psql -h 127.0.0.1 -U postgres -c 'create database ref_native'
           sudo sysctl -w kernel.core_pattern="$OUT/core.%p" || true
           cd "$STORAGE_DIR"
+          export PERRY_TRACE_THROW=1
           "$GITHUB_WORKSPACE/.github/supa/serve.sh" start native ref_native 5611 "$OUT" -- "$OUT/storage-native"
           pid=$(cat "$OUT/native.pid")
           sleep 5
@@ -440,6 +448,11 @@ jobs:
       - name: Stop native
         if: ${{ always() && !inputs.probe }}
         run: .github/supa/serve.sh stop native "$OUT"
+      - name: Native server log tail
+        if: ${{ failure() && !inputs.probe }}
+        run: |
+          [ -f "$OUT/native.log" ] && { echo "::group::native.log (last 80 lines)"; tail -n 80 "$OUT/native.log"; echo "::endgroup::"; }
+          true
 
       - uses: actions/download-artifact@v4
         if: ${{ !inputs.probe }}
