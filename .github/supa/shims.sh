@@ -8,13 +8,6 @@ shim() { # <file> <content-or-empty> ; keep the original beside it
   [ -f "$1.orig" ] || cp "$1" "$1.orig"
 }
 
-# agentkeepalive subclasses http.Agent, which Perry cannot do; alias the plain node agents.
-d=$root/node_modules/agentkeepalive/lib
-shim "$d/agent.js"
-shim "$d/https_agent.js"
-printf "'use strict';\nmodule.exports = require('http').Agent;\n" > "$d/agent.js"
-printf "'use strict';\nmodule.exports = require('https').Agent;\n" > "$d/https_agent.js"
-
 # pg-format: require(__dirname + '/reserved.js') is a computed require, which Perry does not bundle.
 p=$root/node_modules/pg-format/lib/index.js
 shim "$p"
