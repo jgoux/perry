@@ -723,7 +723,12 @@ pub(crate) fn render_frames(blob: &[u8]) -> Option<String> {
                 out.push_str(&format!("{pc:#x}"));
                 out.push(']');
             }
-            out.push_str(" (<anonymous>)");
+            // A module's top-level frame is registered with its own location
+            // (`Object.<anonymous> (<path>)`, node's spelling); the name
+            // already carries the position, so do not append an unknown one.
+            if !name.starts_with("Object.<anonymous> (") {
+                out.push_str(" (<anonymous>)");
+            }
             rendered += 1;
         }
         if rendered == 0 {
@@ -946,6 +951,31 @@ mod tests {
                 "    at bundleWitness9979 [{far_ip:#x}] (<anonymous>)"
             )),
             "the rendered stack must preserve a suspicious frame's address"
+        );
+    }
+
+    /// A module body is registered as `Object.<anonymous> (<path>)`: the frame
+    /// must print that location verbatim. Appending `(<anonymous>)` gave
+    /// fastify-plugin's stack parser a line without a file name, and it threw
+    /// `Cannot convert undefined or null to object` at startup.
+    #[test]
+    fn a_module_body_frame_renders_its_own_location() {
+        const MODULE_START: usize = 0x0000_7d00_0000_0000;
+        const MODULE_LABEL: &[u8] = b"Object.<anonymous> (/app/node_modules/plugin/index.js)";
+        unsafe {
+            crate::builtins::js_register_function_name_static(
+                MODULE_START as *const u8,
+                MODULE_LABEL.as_ptr(),
+                MODULE_LABEL.len() as u32,
+            );
+        }
+        *index_slot().lock().expect("code-symbol index lock") = None;
+
+        let mut blob = [0u8; MAX_CAPTURED_FRAMES * PC_CHARS];
+        let len = encode_pcs(&[MODULE_START + 32], &mut blob);
+        assert_eq!(
+            render_frames(&blob[..len]).as_deref(),
+            Some("    at Object.<anonymous> (/app/node_modules/plugin/index.js)"),
         );
     }
 
