@@ -13,6 +13,8 @@ names=("$@")
 rc=0
 for n in "${names[@]}"; do
   d="$work/$n"; rm -rf "$d"; mkdir -p "$d"; cp "$here/probes/$n.js" "$d/$n.js"
+  # A <name>.fixture directory holds files (e.g. node_modules) the probe needs.
+  if [ -d "$here/probes/$n.fixture" ]; then cp -R "$here/probes/$n.fixture/." "$d/"; fi
   echo "::group::probe $n"
   s=$(date +%s)
   if ! (cd "$d" && "$perry" compile "$n.js" -o "$n.bin" > compile.log 2>&1); then
