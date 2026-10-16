@@ -1,0 +1,7 @@
+{
+  "name": "esm-pkg",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "./lib/index.js",
+  "exports": { ".": { "import": "./lib/index.js", "require": "./lib/index.js" } }
+}
