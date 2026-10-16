@@ -980,6 +980,10 @@ const COMPILE_ENV_EXCLUSIONS: &[(&str, &str)] = &[
         "Read by the generated program runtime, never consulted by compiler lowering.",
     ),
     (
+        "PERRY_TRACE_THROW",
+        "Read by the generated program runtime, never consulted by compiler lowering.",
+    ),
+    (
         "PERRY_TRACE_OBJECT_ARRAY_WRITE_GUARD",
         "Read by the generated program runtime, never consulted by compiler lowering.",
     ),
