@@ -40,7 +40,7 @@ jobs:
     timeout-minutes: 300
     env:
       OUT: ${{ github.workspace }}/supa-out
-      STORAGE_DIR: ${{ runner.temp }}/storage
+      STORAGE_DIR: /home/runner/storage
       PERRY_WORKSPACE_ROOT: ${{ github.workspace }}
       PERRY_BUILD_WORKSPACE_ROOT: ${{ github.workspace }}
       PERRY_SRC: ${{ github.workspace }}
