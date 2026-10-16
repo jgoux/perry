@@ -630,7 +630,7 @@ unsafe fn array_fast_admits(recv: f64) -> bool {
         return true;
     }
     let addr = (bits & POINTER_MASK) as usize;
-    if !crate::value::addr_class::is_above_handle_band(addr) || addr >= 1 << 47 {
+    if !crate::value::addr_class::is_above_handle_band(addr) || addr as u64 >= 1u64 << 47 {
         return false;
     }
     let header = (addr - crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
