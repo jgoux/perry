@@ -8,6 +8,7 @@ cd "$(dirname "$0")/../.."
 
 perry_tests=(
   --test cjs_class_method_sees_later_const
+  --test cjs_require_esm_package_namespace
   --test class_computed_member_before_super_method
   --test codegen_units_shared_helper_linkage
   --test image_string_literal_native_args
