@@ -289,9 +289,24 @@ unsafe fn colour_masks(rec: &ShapeRecord) -> ([u64; 2], [u64; 2]) {
 fn positional_layout(rec: &ShapeRecord) -> bool {
     let kind = rec.object_kind();
     kind.is_ordinary_layout()
+        && !native_method_layout(rec)
         && (kind != super::ShapeObjectKind::NativeNamespace
             || super::complete_layout_generation(rec.semantic_generation))
         && rec.proto_id != super::PROTO_ID_PER_OBJECT
+}
+
+/// Is `rec` the declared layout of a native `URLSearchParams`? It is plain
+/// ordinary with the default prototype identity, yet its methods and `size`
+/// are not properties of its list or of `%Object.prototype%`: a native
+/// fallback answers them (`exotic_named_read::search_params_read`). Walking
+/// to `%Object.prototype%` would prove them absent, so the probe
+/// declines the record and the slow read reaches that fallback.
+fn native_method_layout(rec: &ShapeRecord) -> bool {
+    // SAFETY: a plain read of a registered descriptor's layout word.
+    let id = unsafe {
+        std::ptr::addr_of!(crate::object::runtime_layouts::URL_SEARCH_PARAMS.layout_id).read()
+    };
+    super::shape_record_by_id(id).is_some_and(|r| std::ptr::eq(r.0.as_ptr(), rec))
 }
 
 /// Is `text` an array index (`0`, `1`, ...)? Element properties
