@@ -105,6 +105,9 @@ pub struct LlModule {
     /// shared with every function's register counter; emitted by
     /// [`Self::emit_fn_infos`] once every function exists.
     fn_infos: Rc<RefCell<crate::fn_info::FnInfoState>>,
+    /// The compilation's runtime call-effect table, installed on every
+    /// function this module defines. `None` outside a compilation (tests).
+    gc_effects: Option<Arc<crate::gc_call_effects::GcEffects>>,
     /// Whether this module's own thread-locals use the local-exec model
     /// ([`Self::use_local_exec_tls`]). Module state: the output kind of the
     /// compile that built this module decides it, never a process global.
@@ -169,6 +172,7 @@ impl LlModule {
             fp_flags,
             preserve_none_fns: Rc::new(RefCell::new(HashSet::new())),
             fn_infos: Rc::new(RefCell::new(crate::fn_info::FnInfoState::default())),
+            gc_effects: None,
             local_exec_tls: false,
         }
     }
@@ -268,6 +272,20 @@ impl LlModule {
         self.preserve_none_fns.borrow_mut().extend(fns);
     }
 
+    /// Install the compilation's call-effect table (`CompileOptions::
+    /// gc_effects`). Must precede every function definition so each function's
+    /// counter reads it from its first block.
+    pub(crate) fn set_gc_effects(&mut self, effects: Arc<crate::gc_call_effects::GcEffects>) {
+        self.gc_effects = Some(effects);
+    }
+
+    /// The call-effect table this module is compiled under.
+    pub(crate) fn gc_effects(&self) -> Arc<crate::gc_call_effects::GcEffects> {
+        self.gc_effects
+            .clone()
+            .unwrap_or_else(crate::gc_call_effects::GcEffects::committed_fallback)
+    }
+
     /// Append a raw metadata definition line (e.g. `!1 = distinct !{!1}`).
     /// Emitted after `!0 = !{}` in the module IR.
     pub fn add_metadata_line(&mut self, line: String) {
@@ -365,6 +383,7 @@ impl LlModule {
         // so its call sites and its own define header agree on the convention.
         func.set_preserve_none_fns(Rc::clone(&self.preserve_none_fns));
         func.set_fn_infos(Rc::clone(&self.fn_infos));
+        func.set_gc_effects(self.gc_effects());
         func.set_null_guard_global(&self.null_guard_global());
         self.functions.push(func);
         self.functions.last_mut().unwrap()
@@ -378,6 +397,7 @@ impl LlModule {
         }
         func.set_preserve_none_fns(Rc::clone(&self.preserve_none_fns));
         func.set_fn_infos(Rc::clone(&self.fn_infos));
+        func.set_gc_effects(self.gc_effects());
         func.set_null_guard_global(&self.null_guard_global());
         self.functions.push(func);
     }
@@ -392,6 +412,7 @@ impl LlModule {
             .expect("defined body");
         func.set_preserve_none_fns(Rc::clone(&self.preserve_none_fns));
         func.set_fn_infos(Rc::clone(&self.fn_infos));
+        func.set_gc_effects(self.gc_effects());
         func.set_null_guard_global(&self.null_guard_global());
         self.functions[i] = func;
     }
@@ -920,7 +941,7 @@ impl LlModule {
 
         let funcs = self.deduped_function_refs();
         let gc_leaf_callees = if crate::codegen::helpers::native_stack_roots_enabled() {
-            crate::gc_call_effects::transitive_leaf_functions(&funcs)
+            crate::gc_call_effects::transitive_leaf_functions(&self.gc_effects(), &funcs)
         } else {
             HashSet::new()
         };
@@ -1057,7 +1078,7 @@ impl LlModule {
         if n <= 1 || funcs.len() <= 1 {
             let gc_leaf_callees =
                 Arc::new(if crate::codegen::helpers::native_stack_roots_enabled() {
-                    crate::gc_call_effects::transitive_leaf_functions(&funcs)
+                    crate::gc_call_effects::transitive_leaf_functions(&self.gc_effects(), &funcs)
                 } else {
                     HashSet::new()
                 });
@@ -1124,7 +1145,7 @@ impl LlModule {
         let gc_leaf_callees = {
             let refs: Vec<&LlFunction> = funcs.iter().map(|f| f.borrow()).collect();
             Arc::new(if crate::codegen::helpers::native_stack_roots_enabled() {
-                crate::gc_call_effects::transitive_leaf_functions(&refs)
+                crate::gc_call_effects::transitive_leaf_functions(&self.gc_effects(), &refs)
             } else {
                 HashSet::new()
             })
@@ -1317,7 +1338,7 @@ impl LlModule {
         // associative targets (LNK1227). Give each global one owner and use
         // external declarations in other consumers. Mach-O retains the
         // replicated policy required by `-dead_strip`.
-        let global_owners: Vec<usize> = (0..all_globals.len())
+        let mut global_owners: Vec<usize> = (0..all_globals.len())
             .map(|gi| {
                 bucket_needs
                     .iter()
@@ -1325,6 +1346,26 @@ impl LlModule {
                     .unwrap_or(0)
             })
             .collect();
+        let replicate_globals = self.target_triple.contains("apple");
+        // An alias must name a DEFINITION in its own object ("Alias must
+        // point to a definition"), so with one owner per global it is owned
+        // by its aliasee's owner. Owning it by its own first reference put a
+        // layout id alias (`@perry_array_layout_*_id`, which nothing loads,
+        // so unit 0 kept it) beside a mere declaration of its descriptor,
+        // defined in the unit that attaches the layout; three Next.js
+        // bundles failed to compile that way. Other units that name the
+        // alias declare it like any global (`external_decl_for_global`).
+        // Under replication every unit emitting the alias also emits the
+        // aliasee (the reference closure above), so Mach-O needs nothing.
+        if !replicate_globals {
+            for gi in 0..all_globals.len() {
+                if let Some(aliasee) = alias_target(all_globals[gi]) {
+                    if let Some(&ai) = global_index.get(aliasee) {
+                        global_owners[gi] = global_owners[ai];
+                    }
+                }
+            }
+        }
         // #10152: otherwise-unreferenced globals are retained in unit 0, but
         // their initializers were absent from the function-rooted closure
         // above. An orphaned string dispatch descriptor can still name bytes
@@ -1345,7 +1386,6 @@ impl LlModule {
                 }
             }
         }
-        let replicate_globals = self.target_triple.contains("apple");
         // #9610: how many units end up DEFINING each global. Under the
         // replicated (Mach-O) policy that is one unit per referencing bucket;
         // the owner fallback keeps unreferenced globals at one. Only the

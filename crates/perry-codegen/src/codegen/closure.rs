@@ -678,10 +678,27 @@ pub(super) fn compile_closure(
     let locals: HashMap<u32, String> = {
         let blk = lf.block_mut(0).unwrap();
         let mut map = HashMap::new();
+        // Closed World 5d: a parameter the typed body's entry check proved
+        // Number holds a plain double for the whole body
+        // (`typed_locals::number_proof_params`), so its slot is not bound as
+        // a root, exactly like a Number-by-construction body local. The
+        // body-local drop (`drop_number_local_root_slots`, which also removes
+        // this id from the map) runs only after these binds. A bound slot
+        // would make every read of the parameter a root reload whose word
+        // then flows into unrooted Number storage (a typed local copied from
+        // it) and across later safepoints. The map entry itself stays until
+        // that drop so `capture_root_base` below keeps the original count.
+        let number_params: HashSet<u32> = typed_body
+            .map(|plan| crate::collectors::typed_locals::number_proof_params(&plan.proofs).collect())
+            .unwrap_or_default();
         for p in params {
             let arg_name = format!("%arg{}", p.id);
             let slot = super::arguments::store_param_slot(blk, p, &closure_boxed_vars, &arg_name);
-            if let Some(slot_idx) = shadow_slot_map.get(&p.id).copied() {
+            if let Some(slot_idx) = shadow_slot_map
+                .get(&p.id)
+                .copied()
+                .filter(|_| !number_params.contains(&p.id))
+            {
                 blk.call_void(
                     "js_shadow_slot_bind",
                     &[(I32, &slot_idx.to_string()), (PTR, &slot)],
@@ -895,6 +912,18 @@ pub(super) fn compile_closure(
                 .extend(callback_shapes.clone());
         }
     }
+    // Closed World 5d: the most fixed type of every body local, by
+    // construction under this body's entry proofs (none for a generic
+    // body). Number locals join the by-construction set before any root
+    // slot is dropped for it.
+    let typed_locals = crate::collectors::typed_locals::apply(
+        body,
+        &typed_body.map(|p| p.proofs.clone()).unwrap_or_default(),
+        cross_module.capture_type_proofs.get(&func_id),
+        &closure_boxed_vars,
+        module_globals,
+        &mut native_facts.representation.number_by_construction_locals,
+    );
     super::helpers::drop_number_local_root_slots(
         &mut shadow_slot_map,
         native_facts.number_by_construction_locals(),
@@ -1074,6 +1103,7 @@ pub(super) fn compile_closure(
         local_types,
         // A typed body's entry check (the public dispatcher) proved these.
         proven_local_types: typed_body.map(|p| p.proofs.clone()).unwrap_or_default(),
+        typed_locals,
         guarded_discriminant_aliases: std::collections::HashMap::new(),
         module_global_proven_types: &cross_module.module_global_proven_types,
         module_global_transfers: &cross_module.module_global_transfers,
@@ -1098,6 +1128,7 @@ pub(super) fn compile_closure(
         wpfacts: typed_body
             .map(|p| p.receiver_facts(&cross_module.wpfacts))
             .unwrap_or_else(|| cross_module.wpfacts.clone()),
+        program_layouts: cross_module.program_layouts.clone(),
         wpfacts_sites: 0,
         wpfacts_tested: Vec::new(),
         wpfacts_this: if captures_this {
@@ -1355,7 +1386,6 @@ pub(super) fn compile_closure(
         was_unrolled: false,
         ic_site_counter: ic_base,
         ic_globals: Vec::new(),
-        property_get_ic_override: None,
         typed_parse_rodata: Vec::new(),
         buffer_data_slots: HashMap::new(),
         native_arena_owner_aliases: HashMap::new(),

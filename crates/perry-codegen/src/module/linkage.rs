@@ -232,6 +232,26 @@ pub(crate) fn make_unique_owner_global(line: &str) -> String {
     }
 }
 
+/// The aliasee symbol (`@name`) of an alias definition
+/// (`@a = [linkage] ... alias TY, <constant naming @aliasee>`), or `None`
+/// when `line` is not an alias.
+pub(crate) fn alias_target(line: &str) -> Option<&str> {
+    let (_, rhs) = line.split_once(" = ")?;
+    let rest = &rhs[rhs.find("alias ")?..];
+    if !rhs[..rhs.len() - rest.len()]
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '_' | '(' | ')'))
+    {
+        return None;
+    }
+    let at = rest.find('@')?;
+    let tail = &rest[at..];
+    let end = tail[1..]
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '$' | '-')))
+        .map_or(tail.len(), |i| i + 1);
+    Some(&tail[..end])
+}
+
 pub(crate) fn external_decl_for_global(line: &str) -> Option<String> {
     if line.contains(" = external ") {
         return Some(line.to_string());
@@ -252,6 +272,17 @@ pub(crate) fn external_decl_for_global(line: &str) -> Option<String> {
     // `unnamed_addr` describes the definition only; the declaration drops it.
     let (_, rhs) = take_keyword(rhs, &["unnamed_addr", "local_unnamed_addr"]);
     let (initialized, rhs) = take_keyword(rhs, &["externally_initialized"]);
+    // An alias is declared, in a unit that does not define it, as an
+    // external global of its value type: object files see only a symbol.
+    if let Some(rest) = rhs.strip_prefix("alias ") {
+        let ty = rest.split_once(',')?.0.trim();
+        let prefix: String = [preemption, visibility, tls]
+            .iter()
+            .filter(|keyword| !keyword.is_empty())
+            .map(|keyword| format!("{keyword} "))
+            .collect();
+        return Some(format!("{name} = external {prefix}global {ty}"));
+    }
     let (kind, rest) = if let Some(rest) = rhs.strip_prefix("constant ") {
         ("constant", rest)
     } else if let Some(rest) = rhs.strip_prefix("global ") {
@@ -314,13 +345,13 @@ const COLD_HELPERS: &[&str] = &[
     // register saves and code layout focused on the inline continuation.
     // `cold` is only a profitability hint: both calls remain fully
     // memory-clobbering and the cache miss remains GC-capable/throwing.
-    "js_object_get_field_ic_miss_packed",
-    "js_object_get_field_ic_slow",
-    "js_object_get_field_ic_nonptr",
+    "js_object_get_field_slow",
+    "js_object_get_field_nonptr",
+    "js_object_get_field_value",
+    "js_global_get_field_slow",
     "js_write_barrier_root_nanbox",
     // S2 (`expr/ic_fast_split.rs`): the collecting continuations behind
     // a declined GC-leaf hit. Still throwing, still GC-capable.
-    "js_object_get_field_ic_fast_miss",
     // The prologue stack check's overflow arm (`expr/stack_guard.rs`).
     // `-> !` in the runtime, but declared without `noreturn` here: the
     // clone-call check rejoins its call after it.
@@ -366,14 +397,14 @@ const READONLY_HELPERS: &[&str] = &[
 
 /// Group `#4`: nounwind, willreturn.
 const NOUNWIND_HELPERS: &[&str] = &[
-    // First-read D3 (`object/field_get_set/ic_miss/read_confirm.rs`): a
-    // generic read site's miss front. Loads, compares and at most one
-    // store (D3b re-aims the site's compact word); no allocation, lock,
-    // throw, call or unbounded loop (the ways and the second-chance scan
-    // are bounded). NOT readonly: it writes the site word. Also a proven
-    // `Leaf` in the generated call-effects table, so the call is
-    // `"gc-leaf-function"`.
-    "js_object_get_field_ic_front",
+    // Object model step 5 (`object/layout_probe.rs`): the unknown-receiver
+    // probe. Loads and compares, one bounded probe of a key index; its only
+    // store derives a record's probe word (one malloc on a record's first
+    // probe). No throw, lock, collection or user code.
+    "perry_probe_get",
+    "perry_probe_get_value",
+    "perry_probe_get_binding",
+    "perry_probe_get_keyed",
     // NOUNWIND+WILLRETURN only (#4, repsel Phase 4a.0) — each verified
     // (`typed_feedback.rs` / `array/header.rs`): no `js_throw` (longjmp)
     // anywhere in the body, every loop bounded by the 16M length/capacity
@@ -402,7 +433,6 @@ const NOUNWIND_HELPERS: &[&str] = &[
     // continuation instead — and no loop outside the audited guards'
     // bounded ones. Being nounwind is also what keeps them a plain `call`
     // inside a `try`, so the leaf marking never depends on the invoke arm.
-    "js_object_get_field_ic_fast",
     "js_property_rmw_fast",
     // `js_put_value_set_packed_fast`: `throws=no` since the generated table
     // cuts `StateOwner::drop` as thread teardown (seeds.txt, `teardown`).

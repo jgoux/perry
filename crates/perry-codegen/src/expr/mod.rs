@@ -81,6 +81,17 @@ use crate::types::{DOUBLE, F32, I1, I16, I32, I64, I8, PTR};
 // (`perry_abi::AGENT_PTR_SLOTS`).
 #[allow(dead_code)]
 pub(crate) mod agent_ptr;
+pub(crate) mod layout_read;
+
+/// `PERRY_SITE_STATS=1`: one stderr line `PERRY_SITE <kind>` per lowered
+/// named-read site, for the step-5 site census (case 1 / case 2 / probe).
+pub(crate) fn note_site(kind: &str) {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    if *ON.get_or_init(|| std::env::var("PERRY_SITE_STATS").as_deref() == Ok("1")) {
+        eprintln!("PERRY_SITE {kind}");
+    }
+}
 pub(crate) mod array_length;
 mod array_literal;
 pub(crate) mod array_proto_guard;
@@ -106,7 +117,6 @@ pub(crate) mod collection_receiver;
 mod conforming_layout_note_tests;
 mod helpers;
 mod i32_fast_path;
-mod in_presence_ic;
 mod index;
 pub(crate) mod nanbox_inline;
 mod native_memory;
@@ -329,20 +339,6 @@ pub(crate) struct InlineCtorReturn {
     pub is_derived: bool,
 }
 
-/// One statement-region-owned property IC shared by equivalent reads.
-///
-/// The owner emits a speculative, side-effect-free cache probe before the
-/// original statements, then leaves the original generic property reads in
-/// place as the semantic fallback. Those reads must prime the *same* cache or
-/// the speculative probe would remain cold forever. Sharing is safe only for
-/// the exact `(base local, static property name)` pair recorded here.
-#[derive(Clone)]
-pub(crate) struct PropertyGetIcOverride {
-    pub base_local_id: u32,
-    pub property: String,
-    pub cache_name: String,
-}
-
 /// Per-function codegen context. Held briefly during lowering, never stored.
 /// #8122: where an inline-`new` site gets its `<2 x i64>` header image from.
 #[derive(Clone, Debug)]
@@ -357,6 +353,9 @@ pub enum HeaderImageSource {
 pub(crate) struct FnCtx<'a> {
     /// wpfacts slice 2: this module's elision facts (`expr/wpfacts_access.rs`).
     pub wpfacts: std::sync::Arc<crate::codegen::ElisionFacts>,
+    /// Object model step 5 (case 2c): the program's key colouring
+    /// (`layout_families`, `expr/layout_read.rs`).
+    pub program_layouts: std::sync::Arc<crate::layout_families::ProgramLayouts>,
     /// `this` slots whose value is the `this` of a HIR function: (slot,
     /// function id). A `this` read is answered only while the top of
     /// `this_stack` is one of these slots (an inlined constructor pushes its
@@ -400,6 +399,10 @@ pub(crate) struct FnCtx<'a> {
     /// initializer. Unlike `local_types`, this map never receives a declared
     /// annotation or a type inferred from one.
     pub proven_local_types: std::collections::HashMap<u32, HirType>,
+    /// Closed World 5d (`collectors/typed_locals.rs`): body locals whose
+    /// every executable write produces this type by construction and whose
+    /// every read follows a write. Holds at every read, reassigned or not.
+    pub typed_locals: std::collections::HashMap<u32, HirType>,
     /// Immutable CSE/local aliases of a property read from another local,
     /// recorded as `alias_id -> (owner_id, property)`. Guarded discriminant
     /// narrowing uses this only after proving the owner at runtime; the alias
@@ -1695,11 +1698,6 @@ pub(crate) struct FnCtx<'a> {
     /// site's first priming miss (#9708) — for each entry.
     pub ic_globals: Vec<String>,
 
-    /// Region-scoped cache selected by a guarded statement fusion. Generic
-    /// property reads matching the exact base local and key reuse it instead
-    /// of allocating independent per-expression caches.
-    pub property_get_ic_override: Option<PropertyGetIcOverride>,
-
     /// Issue #179 typed-parse: raw rodata globals emitted by
     /// `JsonParseTyped` codegen. Each entry is the full LLVM IR line
     /// `@<name> = private unnamed_addr constant [N x i8] c"..."` to
@@ -2797,13 +2795,6 @@ mod inline_cache_name_tests {
 }
 
 impl<'a> FnCtx<'a> {
-    /// May some compiled class of the program declare a getter named `name`?
-    /// Where this is false a read site emits no class-getter arm.
-    pub(crate) fn program_may_declare_getter(&self, name: &str) -> bool {
-        self.program_class_accessor_names
-            .is_none_or(|names| names.may_get(name))
-    }
-
     /// May some compiled class of the program declare a setter named `name`?
     /// Where this is false a store site emits no class-setter arm.
     pub(crate) fn program_may_declare_setter(&self, name: &str) -> bool {
@@ -2853,9 +2844,11 @@ impl<'a> FnCtx<'a> {
     /// both provenance-checked and write-stable.
     pub(crate) fn stable_local_type_proof(&self, id: &u32) -> Option<&HirType> {
         if self.reassigned_locals.contains(id) {
-            None
+            self.typed_locals.get(id)
         } else {
-            self.proven_local_types.get(id)
+            self.proven_local_types
+                .get(id)
+                .or_else(|| self.typed_locals.get(id))
         }
     }
 

@@ -118,6 +118,19 @@ pub fn pristine(family: BuiltinProto) -> bool {
     }
 }
 
+/// `family`'s intrinsic prototype itself has not been written since the realm
+/// sealed it: its own shadow bit, one load. Unlike [`pristine`] this does not
+/// cover `%Object.prototype%`, so it proves only keys that prototype defines
+/// itself (a write to it, including a delete, sets the bit).
+#[inline(always)]
+pub fn prototype_unwritten(family: BuiltinProto) -> bool {
+    // SAFETY: as in `pristine`.
+    unsafe {
+        (*crate::agent_ptrs::intrinsic_proto(family as usize)).parent_class_id
+            < super::layout_desc::UNSHADOWED_WORD_END
+    }
+}
+
 /// `Pristine` for a borrowed call (`Array.prototype.m.call(x, …)`), which
 /// also reads `Function.prototype.call`.
 #[inline(always)]
@@ -160,6 +173,16 @@ pub(crate) fn note_array_custom_proto() {
 /// `obj` is a live `ObjectHeader` (a GC_TYPE_OBJECT), or null.
 #[inline(never)]
 pub(crate) unsafe fn seal_object(obj: *mut ObjectHeader, family: BuiltinProto) {
+    seal_object_family(obj, family as usize);
+}
+
+/// [`seal_object`] for any intrinsic family: a prototype family, a builtin
+/// namespace (`builtin_namespace`), or the realm global.
+///
+/// # Safety
+/// `obj` is a live `ObjectHeader` (a GC_TYPE_OBJECT), or null.
+#[inline(never)]
+pub(crate) unsafe fn seal_object_family(obj: *mut ObjectHeader, family: usize) {
     if obj.is_null() {
         return;
     }
@@ -172,7 +195,8 @@ pub(crate) unsafe fn seal_object(obj: *mut ObjectHeader, family: BuiltinProto) {
     }
     // GC_STORE_AUDIT(POINTER_FREE): scalar flag bits, never a reference.
     (*meta).flags |= super::meta_flags::OBJECT_META_FLAG_SEALED_INTRINSIC
-        | ((family as u64) << super::meta_flags::OBJECT_META_SEALED_FAMILY_SHIFT);
+        | (((family as u64) & super::meta_flags::OBJECT_META_SEALED_FAMILY_MASK)
+            << super::meta_flags::OBJECT_META_SEALED_FAMILY_SHIFT);
 }
 
 /// Seal one family's intrinsic the moment its builder completes it, before
@@ -239,6 +263,7 @@ pub(crate) fn seal_realm(global: *mut ObjectHeader) {
                 _ => {}
             }
         }
+        super::builtin_namespace::seal_namespaces(global);
     });
 }
 
@@ -299,15 +324,36 @@ pub(crate) unsafe fn note_write(obj: *const ObjectHeader, site: &'static str) {
     }
     let flags = (*meta).flags;
     if flags & super::meta_flags::OBJECT_META_FLAG_SEALED_INTRINSIC != 0 {
-        note_family_write(sealed_family(flags), site);
+        note_sealed_write(obj, flags, None, site);
     }
 }
 
-/// The family a sealed prototype's meta flags record (see
+/// The family a sealed intrinsic's meta flags record (see
 /// `OBJECT_META_FLAG_SEALED_INTRINSIC`).
 #[inline(always)]
 fn sealed_family(flags: u64) -> usize {
-    ((flags >> super::meta_flags::OBJECT_META_SEALED_FAMILY_SHIFT) & 0xF) as usize
+    ((flags >> super::meta_flags::OBJECT_META_SEALED_FAMILY_SHIFT)
+        & super::meta_flags::OBJECT_META_SEALED_FAMILY_MASK) as usize
+}
+
+/// A write reached a sealed intrinsic: a prototype family's own bit, or a
+/// namespace holder or the realm global (`builtin_namespace`). `field` is
+/// the inline or spill slot a value store is about to write, when known.
+#[cold]
+#[inline(never)]
+#[optimize(size)]
+unsafe fn note_sealed_write(
+    obj: *const ObjectHeader,
+    flags: u64,
+    field: Option<usize>,
+    site: &'static str,
+) {
+    let family = sealed_family(flags);
+    if family < FAMILIES {
+        note_family_write(family, site);
+    } else {
+        super::builtin_namespace::note_write(obj as *mut ObjectHeader, family, field, site);
+    }
 }
 
 /// The value-store hook (slot and spill stores): [`note_write`] for a sealed
@@ -344,7 +390,7 @@ unsafe fn note_prototype_value_store(
 ) {
     let flags = (*meta).flags;
     if flags & super::meta_flags::OBJECT_META_FLAG_SEALED_INTRINSIC != 0 {
-        note_family_write(sealed_family(flags), site);
+        note_sealed_write(obj, flags, Some(field_index), site);
     }
     // A method body replaced in place publishes no layout (§3.6).
     super::shadow::note_prototype_slot_store(obj as *mut ObjectHeader, field_index, spill);
@@ -379,14 +425,16 @@ pub(crate) fn note_array_prototype_write(arr: usize, site: &'static str) {
     if arr == 0 {
         return;
     }
-    let proto = crate::array::array_prototype_addr_if_resolved();
-    if proto == 0 {
-        return;
-    }
-    // A grown array leaves a forwarding alias; compare the live head.
-    let live = crate::array::clean_arr_ptr(arr as *const crate::array::ArrayHeader) as usize;
-    if proto == arr || proto == live {
-        note_family_write(BuiltinProto::Array as usize, site);
+    // `seal_realm` materialised `%Array.prototype%`'s named bag and sealed
+    // it, so the bag's meta record names the family; an ordinary array's bag
+    // (or none) is not sealed. The realm's memoized prototype address is not
+    // consulted: it may be unresolved when the realm was reached another way.
+    // SAFETY: `clean_arr_ptr` returns the live head of a grown array.
+    unsafe {
+        let live = crate::array::clean_arr_ptr(arr as *const crate::array::ArrayHeader);
+        if !live.is_null() {
+            note_write(crate::array::array_property_bag(live), site);
+        }
     }
 }
 
@@ -404,7 +452,10 @@ fn note_family_write(family: usize, site: &'static str) {
         // SAFETY: a live intrinsic of this agent, or the static stand-in
         // (never written: nothing writes an intrinsic before sealing).
         unsafe {
-            if std::ptr::eq(p.cast::<u64>(), crate::agent_ptrs::PERRY_PRISTINE_PROTO.as_ptr()) {
+            if std::ptr::eq(
+                p.cast::<u64>(),
+                crate::agent_ptrs::PERRY_PRISTINE_PROTO.as_ptr(),
+            ) {
                 return false;
             }
             let fresh = !super::layout_desc::word_is_shadowed((*p).parent_class_id);
@@ -476,12 +527,16 @@ fn receiver_fact(recv: f64) -> Option<(BuiltinProto, bool)> {
         return Some((BuiltinProto::BigInt, false));
     }
     let mut header = crate::value::addr_class::pointer_value_header(bits)?;
-    if matches!(header.obj_type, crate::gc::GC_TYPE_ARRAY | crate::gc::GC_TYPE_LAZY_ARRAY)
-        && header.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
+    if matches!(
+        header.obj_type,
+        crate::gc::GC_TYPE_ARRAY | crate::gc::GC_TYPE_LAZY_ARRAY
+    ) && header.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
     {
         let addr = (bits & crate::value::POINTER_MASK) as usize;
         let array = crate::array::clean_arr_ptr(addr as *const crate::array::ArrayHeader);
-        if array.is_null() { return None; }
+        if array.is_null() {
+            return None;
+        }
         // SAFETY: clean_arr_ptr returns a live GC-headed array.
         header = unsafe { crate::value::addr_class::honest_header(array as usize) };
     }
@@ -493,7 +548,10 @@ fn receiver_fact(recv: f64) -> Option<(BuiltinProto, bool)> {
         crate::gc::GC_TYPE_CLOSURE => BuiltinProto::Function,
         _ => return None,
     };
-    Some((family, family == BuiltinProto::Array && header._reserved & crate::gc::GC_ARRAY_CUSTOM_PROTO != 0))
+    Some((
+        family,
+        family == BuiltinProto::Array && header._reserved & crate::gc::GC_ARRAY_CUSTOM_PROTO != 0,
+    ))
 }
 
 /// The family whose prototype a by-name builtin dispatch on `recv` reads.
@@ -513,7 +571,7 @@ pub(crate) fn receiver_pristine(recv: f64) -> bool {
 }
 
 /// Is `value` one of the runtime's own builtin method closures?
-fn is_builtin_method(value: f64) -> bool {
+pub(crate) fn is_builtin_method(value: f64) -> bool {
     let bits = value.to_bits();
     if bits & !crate::value::POINTER_MASK != crate::value::POINTER_TAG {
         return false;

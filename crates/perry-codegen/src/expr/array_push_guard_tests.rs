@@ -43,6 +43,8 @@ fn ir_opts() -> CompileOptions {
         static_shape_ids: Vec::new(),
         program_class_shape_ids: Default::default(),
         program_facts: Default::default(),
+        program_layouts: Default::default(),
+        gc_effects: Default::default(),
         target: None,
         is_entry_module: true,
         non_entry_module_prefixes: Vec::new(),
@@ -760,9 +762,8 @@ fn class_field_push_checks_method_before_shared_argument_and_calls_builtin() {
         .find("call double @js_process_memory_usage(")
         .expect("allocating argument");
     assert!(
-        slow.contains("@js_object_get_field_ic")
-            && slow[..arg].contains("phi double")
-            && slow[..arg].contains("pget.recv_merge"),
+        (slow.contains("@perry_probe_get") || slow.contains("@js_object_get_field_"))
+            && slow[..arg].contains("phi double"),
         "the argument block must receive the method read's merged value before evaluating the \
          argument:\n{slow}"
     );

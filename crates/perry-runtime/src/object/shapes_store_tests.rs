@@ -49,6 +49,7 @@ fn kind_codes_round_trip() {
         ShapeObjectKind::FunctionBoundApply,
         ShapeObjectKind::FunctionBound,
         ShapeObjectKind::OrdinaryNativeAlias,
+        ShapeObjectKind::CallableOrdinary,
     ] {
         assert_eq!(kind as u8, kind.code() as u8, "kind cache decoding ordinal");
         assert!(kind.code() as u32 <= RECORD_KIND_MAX_CODE);
@@ -60,7 +61,11 @@ fn kind_codes_round_trip() {
             r.set_tracked_births(births);
             assert_eq!(r.tracked_births(), births.min(15));
             assert_eq!(r.object_kind(), kind, "birth count overlaps kind");
-            assert_eq!(r.summary(), 0x1F, "birth count overlaps summary");
+            assert_eq!(
+                r.summary(),
+                crate::object::key_attrs::SUMMARY_KEY_BITS,
+                "birth count overlaps summary"
+            );
         }
         for other in [ShapeObjectKind::Ordinary, ShapeObjectKind::OrdinaryUnmarked] {
             if other != kind {
@@ -310,11 +315,18 @@ fn lifted_descriptor_mirrors_the_record_and_names_its_address() {
 /// The [[Prototype]] itself is NOT in the record: it is one word per prototype
 /// identity (`shapes_prototype`). 64 -> 72 borrows that stable cell address
 /// to remove identity decoding and directory indexing from a prototype hop.
+/// 80 -> 120 is object model step 5 (OBJECT_MODEL §3.7): the record owns the
+/// unknown-receiver probe's key index word (`probe`, offset 80) and the
+/// colour read/store masks of case 2c (`colour_mask` 88, `colour_store_mask`
+/// 104), facts of the immutable key list computed at mint, not side tables.
 #[test]
 fn the_record_geometry_is_bounded_and_facts_key_is_o1() {
-    assert_eq!(std::mem::size_of::<ShapeRecord>(), 80, "record grew");
+    assert_eq!(std::mem::size_of::<ShapeRecord>(), 120, "record grew");
     assert_eq!(std::mem::align_of::<ShapeRecord>(), 8, "record realigned");
     assert_eq!(std::mem::offset_of!(ShapeRecord, element_kind), 72);
+    assert_eq!(std::mem::offset_of!(ShapeRecord, probe), 80);
+    assert_eq!(std::mem::offset_of!(ShapeRecord, colour_mask), 88);
+    assert_eq!(std::mem::offset_of!(ShapeRecord, colour_store_mask), 104);
 
     // `facts_key` folds the keys ADDRESS; it must never dereference it.
     // A wild, unmapped address must be folded, not read. If the probe
@@ -391,7 +403,9 @@ fn special_body_identity_uses_record_owned_extension() {
     assert_eq!(special.special_constfn_mask(), 1);
     assert_eq!(special.constfn_infos(), &a);
     assert_eq!(special.position_bound_raw(), old.position_bound_raw());
-    assert_eq!(std::mem::size_of::<ShapeRecord>(), 80);
+    // The ConstFn facts live in the record-owned extension: the record keeps
+    // its geometry (see `the_record_geometry_is_bounded_and_facts_key_is_o1`).
+    assert_eq!(std::mem::size_of::<ShapeRecord>(), 120);
     assert!(special.facts_match_proto_with_special(
         0x40,
         1,
@@ -835,7 +849,7 @@ fn weak_collection_header_brand_preserves_map_precedence() {
         Some(crate::weakref::CLASS_ID_WEAKMAP)
     );
     record.note_descendant_width(u32::MAX);
-    assert_eq!(record.descendant_width(), 127);
+    assert_eq!(record.descendant_width(), 64);
     assert_eq!(
         record.weak_collection_brand(),
         Some(crate::weakref::CLASS_ID_WEAKMAP)

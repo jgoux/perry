@@ -47,6 +47,7 @@ mod ptr_shape_callbacks;
 mod ptr_shape_elements;
 mod ptr_shape_report;
 mod ptr_shape_returns;
+mod read_before_write;
 mod receiver_regions;
 #[cfg(test)]
 mod receiver_regions_tests;
@@ -64,6 +65,7 @@ pub(crate) mod spec_abi_sites;
 mod straight_line_stores;
 pub(crate) mod suffix_strings;
 mod this_as_value;
+pub(crate) mod typed_locals;
 mod uppercase_strings;
 
 // Public re-exports for the visible API.
@@ -137,9 +139,10 @@ pub(crate) use receiver_regions::{
     ReceiverArrayValidationKind, ReceiverDescriptorTable, RegionEnder,
 };
 pub(crate) use refs::{
-    collect_let_ids, collect_ref_ids_in_expr, collect_ref_ids_in_stmts, is_clamp_call,
+    collect_free_ref_ids_in_stmts, collect_let_ids, collect_ref_ids_in_expr,
+    collect_ref_ids_in_stmts, is_clamp_call,
 };
-pub(crate) use safepoint_sites::count_safepoint_sites;
+pub(crate) use safepoint_sites::{count_body_nodes, count_safepoint_sites};
 pub(crate) use scalar_method_dispatch::{
     collect_module_dispatch_facts, for_each_expr_in_stmts, mark_unstable_scalar_method_receivers,
     ModuleDispatchFacts,

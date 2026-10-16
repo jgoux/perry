@@ -24,6 +24,13 @@ pub const UNSHADOWED_WORD_END: u32 = 0xB000_0000;
 /// `array::ArrayHeader` size: element 0 follows it.
 pub const ARRAY_HEADER_SIZE: usize = 16;
 
+/// `PerryLayoutKey.attrs` bit (the runtime's key entry byte, `ENTRY_OPTIONAL`):
+/// the key is a layout's optional or late member. Its slot may hold the hole
+/// marker, and while it does the key is absent (OBJECT_MODEL_2026-10-13.md
+/// §3.2). A descriptor emits it only for such keys; the layout then carries
+/// the "may have holes" summary bit and every other layout keeps its cost.
+pub const LAYOUT_KEY_OPTIONAL: u8 = 0x80;
+
 /// `StaticAtom.kind` (OBJECT_MODEL_2026-10-13.md §6a): a string key.
 pub const ATOM_KIND_STRING: u8 = 0;
 /// `StaticAtom.kind`: a well-known symbol; `string` is null and `index` is
@@ -70,7 +77,7 @@ pub const fn well_known_symbol_atom_hash(number: u32) -> u64 {
 }
 
 /// `agent_ptrs::PERRY_AGENT_PTRS`: the number of per-agent pointer slots.
-pub const AGENT_PTR_SLOTS: usize = 4 + BUILTIN_PROTO_FAMILIES;
+pub const AGENT_PTR_SLOTS: usize = 4 + INTRINSIC_FAMILIES;
 /// Slots `AGENT_PTR_INTRINSIC_PROTO + k`: this agent's intrinsic prototype of
 /// builtin family `k` (`object::builtin_proto::BuiltinProto`; for Array the
 /// sealed named-property bag), whose layout word's shadow bit
@@ -79,6 +86,32 @@ pub const AGENT_PTR_SLOTS: usize = 4 + BUILTIN_PROTO_FAMILIES;
 pub const AGENT_PTR_INTRINSIC_PROTO: usize = 4;
 /// Number of builtin prototype families.
 pub const BUILTIN_PROTO_FAMILIES: usize = 16;
+/// The builtin namespace objects whose direct member calls lowering binds to
+/// intrinsics (`Math.max(..)`, `Object.keys(..)`, `console.log(..)`). Namespace
+/// `i` is intrinsic family `BUILTIN_PROTO_FAMILIES + i`: its agent slot
+/// (`AGENT_PTR_INTRINSIC_PROTO + BUILTIN_PROTO_FAMILIES + i`) names the object
+/// that holds the namespace's own members (a constructor's property bag), and
+/// that object's shadow bit (`UNSHADOWED_WORD_END`) is `Pristine(namespace)`:
+/// clear while every member still holds its builtin and `globalThis[name]`
+/// still names the namespace.
+pub const BUILTIN_NAMESPACES: [&str; 15] = [
+    "console", "Math", "JSON", "Reflect", "Object", "Number", "String", "Array", "Promise",
+    "Date", "Symbol", "BigInt", "Atomics", "Intl", "Boolean",
+];
+/// Builtin prototype families plus builtin namespaces: the intrinsic slots.
+pub const INTRINSIC_FAMILIES: usize = BUILTIN_PROTO_FAMILIES + BUILTIN_NAMESPACES.len();
+
+/// The intrinsic family of builtin namespace `name`, if it is one.
+pub fn builtin_namespace_family(name: &str) -> Option<usize> {
+    let mut i = 0;
+    while i < BUILTIN_NAMESPACES.len() {
+        if BUILTIN_NAMESPACES[i].as_bytes() == name.as_bytes() {
+            return Some(BUILTIN_PROTO_FAMILIES + i);
+        }
+        i += 1;
+    }
+    None
+}
 /// Slot 0: the address of this agent's ordinary shape-directory mirror
 /// (`shapes_store::AGENT_SHAPE_DIR[0]`), which a generic read site passes to its
 /// GC-leaf miss front (`js_object_get_field_ic_front`) so the front reads no
@@ -92,6 +125,24 @@ pub const AGENT_PTR_SHAPE_DIR: usize = 0;
 /// that form: the front adds the floor back inside its load displacements,
 /// and the site passes the value its test already holds.
 pub const RECEIVER_HANDLE_FLOOR: usize = 0x20_0000;
+
+/// Object model step 5 (case 2c): the size of one ordinary-band shape record
+/// (`perry-runtime` `object/shapes_store.rs` `ShapeRecord`). Record `id` of
+/// an agent is at `flat_base + (id - SHAPE_ID_BASE) * SHAPE_RECORD_SIZE`,
+/// `flat_base` and the committed id bound at `SHAPE_DIR_FLAT_BASE` and
+/// `SHAPE_DIR_FLAT_BASE + 8` of the agent's shape directory
+/// (`AGENT_PTR_SHAPE_DIR`).
+pub const SHAPE_RECORD_SIZE: usize = 120;
+/// Offset of a record's two-word coloured-key mask (read: the key is inline
+/// data at its colour slot).
+pub const SHAPE_RECORD_COLOUR_MASK: usize = 88;
+/// Offset of a record's two-word coloured-key store mask (the key is also a
+/// plain writable `Any`-lane slot of a store-admitted, non-frozen layout).
+pub const SHAPE_RECORD_COLOUR_STORE_MASK: usize = 104;
+/// Offset of the flat record base in the agent's shape directory.
+pub const SHAPE_DIR_FLAT_BASE: usize = 24;
+/// The layout word's shadow bit (`perry-runtime` `layout_desc.rs`).
+pub const LAYOUT_SHADOW_BIT: u32 = 1 << 30;
 /// Slot 2: this agent's stack limit (#10812) — not a pointer to anything, the
 /// lowest frame address a compiled prologue accepts before it throws
 /// `RangeError: Maximum call stack size exceeded`. Null means unchecked.
@@ -154,6 +205,24 @@ pub const SYMBOL_HEADER_MAGIC: u32 = 0x5359_4D42;
 pub const GC_FLAG_FORWARDED: u8 = 0x80;
 /// `gc::GC_HEADER_SIZE`.
 pub const GC_HEADER_SIZE: usize = 8;
+
+/// Creation-time [[Call]] on OBJECT and PROXY only. This bit has no other
+/// meaning; closures are callable by their type byte.
+pub const GC_OBJECT_CALLABLE: u16 = 0x0020;
+pub const GC_TYPE_PROXY: u8 = 37;
+pub const GC_TYPE_SYMBOL: u8 = 32;
+pub const GC_TYPE_STRING: u8 = 3;
+
+/// Classify the first four GC-header bytes, loaded as a native-endian u32.
+/// No shape or target read is needed after the creation-time publication.
+#[inline(always)]
+pub const fn gc_header_word_is_callable(word: u32) -> bool {
+    let bytes = word.to_ne_bytes();
+    let kind = bytes[0];
+    let facts = u16::from_ne_bytes([bytes[2], bytes[3]]);
+    kind == GC_TYPE_CLOSURE
+        || ((kind == GC_TYPE_OBJECT || kind == GC_TYPE_PROXY) && facts & GC_OBJECT_CALLABLE != 0)
+}
 
 /// The JS BODY calling convention. Every native body a function object runs —
 /// a compiled closure body, a value wrapper, a native builtin installed as a

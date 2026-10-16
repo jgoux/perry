@@ -158,6 +158,9 @@ jobs:
           fail-on-cache-miss: true
       - run: mkdir -p target/release && cp perry-dist/* target/release/
       - uses: ./.github/actions/supa-rust-env
+      - uses: actions/setup-node@v4 # reference runs and npm installs for the fastify probes
+        with:
+          node-version: 24
       - name: Probes
         run: |
           export PATH="$LLVM_SYS_221_PREFIX/bin:$PATH" PERRY_EXTRA_LINK_ARGS=-fuse-ld=lld PERRY_FORCE_LINK_RESPONSE_FILE=1

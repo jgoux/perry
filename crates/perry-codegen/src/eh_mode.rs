@@ -74,7 +74,7 @@ fn flush_left_label(line: &str) -> Option<&str> {
 /// region? True only when the callee provably cannot unwind.
 ///
 /// A runtime symbol answers from the generated table's `throws` column
-/// (`gc_call_effects::runtime_throws`, one solve over the linked archives; a
+/// (`GcEffects::runtime_throws`, one solve over the linked archives; a
 /// symbol no table proves, such as user code, counts as throwing). That column
 /// is the only source of truth for runtime calls: there is no hand list of
 /// names behind it. The EH bookkeeping helpers (`js_eh_pad_enter`, `js_catch_enter`,
@@ -91,10 +91,8 @@ fn flush_left_label(line: &str) -> Option<&str> {
 ///   function un-lowered; on shadow-frame targets they are stack bookkeeping
 ///   that cannot unwind. They are absent from the Linux table because the
 ///   runtime no longer exports them there.
-pub(crate) fn nothrow_callee(name: &str) -> bool {
-    name.starts_with("llvm.")
-        || name.starts_with("js_shadow_")
-        || !crate::gc_call_effects::runtime_throws(name)
+pub(crate) fn nothrow_callee(effects: &crate::gc_call_effects::GcEffects, name: &str) -> bool {
+    name.starts_with("llvm.") || name.starts_with("js_shadow_") || !effects.runtime_throws(name)
 }
 
 #[cfg(test)]
@@ -104,20 +102,25 @@ mod tests {
     #[test]
     fn cold_property_miss_is_still_throwing() {
         for name in [
-            "js_object_get_field_ic_miss_packed",
-            // T1: the generic-get tower's two slow exits carry the same `cold`
-            // placement hint — and the same ability to throw, now including
-            // the nullish-receiver TypeError the emitted arm used to raise
-            // inline. A `cold` helper that lost its invoke edge would silently
-            // swallow every `Cannot read properties of undefined`.
-            "js_object_get_field_ic_slow",
-            "js_object_get_field_ic_nonptr",
+            // The named read's entries behind the probe carry the `cold`
+            // placement hint and the ability to throw (the nullish-receiver
+            // TypeError, a getter). A `cold` helper that lost its invoke edge
+            // would silently swallow every `Cannot read properties of
+            // undefined`.
+            "js_object_get_field_slow",
+            "js_object_get_field_nonptr",
+            "js_object_get_field_value",
         ] {
             assert_eq!(crate::module::helper_decl_attrs(name), " cold", "{name}");
-            assert!(!nothrow_callee(name), "{name}");
+            assert!(
+                !nothrow_callee(crate::gc_call_effects::committed_for_tests(), name),
+                "{name}"
+            );
         }
-        assert!(!nothrow_callee("js_object_get_field_ic_miss"));
-        assert!(!nothrow_callee("unknown_runtime_helper"));
+        assert!(!nothrow_callee(
+            crate::gc_call_effects::committed_for_tests(),
+            "unknown_runtime_helper"
+        ));
     }
 
     #[test]
@@ -128,9 +131,15 @@ mod tests {
             "js_string_compare",
             "js_array_numeric_value_to_raw_f64",
         ] {
-            assert!(nothrow_callee(name), "{name}");
+            assert!(
+                nothrow_callee(crate::gc_call_effects::committed_for_tests(), name),
+                "{name}"
+            );
         }
-        assert!(!nothrow_callee("js_string_compare_value"));
+        assert!(!nothrow_callee(
+            crate::gc_call_effects::committed_for_tests(),
+            "js_string_compare_value"
+        ));
     }
 
     #[test]
@@ -152,10 +161,16 @@ mod tests {
             "js_shadow_frame_enter",
             "llvm.memcpy.p0.p0.i64",
         ] {
-            assert!(nothrow_callee(name), "{name}");
+            assert!(
+                nothrow_callee(crate::gc_call_effects::committed_for_tests(), name),
+                "{name}"
+            );
         }
         for name in ["js_throw", "js_closure_call0", "js_to_primitive"] {
-            assert!(!nothrow_callee(name), "{name}");
+            assert!(
+                !nothrow_callee(crate::gc_call_effects::committed_for_tests(), name),
+                "{name}"
+            );
         }
     }
 

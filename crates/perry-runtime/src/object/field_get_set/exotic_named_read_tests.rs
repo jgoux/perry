@@ -103,3 +103,53 @@ fn exotic_named_reads_keep_native_properties() {
         "unmarked URLSearchParams must still reach its shape probe"
     );
 }
+
+/// The unknown-receiver probe (`layout_probe`) runs before the slow read and
+/// proves a key absent by walking to `%Object.prototype%`. A native
+/// URLSearchParams answers its methods and `size` natively, so the probe must
+/// decline it (`TAG_HOLE`), while an ordinary object's proven miss stays a
+/// fast `undefined`.
+#[test]
+fn unknown_receiver_probe_declines_url_search_params_but_not_ordinary_objects() {
+    crate::gc::initialize_runtime_fixture();
+    // The probe's absence proof needs `%Object.prototype%` resolved.
+    crate::object::builtin_prototype_value("Object");
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let params = scope.root_nanbox_f64(crate::value::js_nanbox_pointer(
+        crate::url::js_url_search_params_new_empty() as i64,
+    ));
+    let plain = scope.root_nanbox_f64(crate::value::js_nanbox_pointer(
+        crate::object::object_alloc_plain(0) as i64,
+    ));
+    let own = scope.root_raw_const_ptr(key(b"own"));
+    js_object_set_field_by_name(ptr(&plain), own.get_raw_const_ptr(), 21.0);
+    let probe = |receiver: &crate::gc::RuntimeHandle<'_>, name: &[u8]| {
+        let hash = crate::object::key_bytes_hash(name.as_ptr(), name.len());
+        let atom = crate::string::js_string_pool_atom(name.as_ptr(), name.len() as u32, hash, 0);
+        unsafe {
+            crate::object::layout_probe::perry_probe_get(
+                crate::object::shapes::ordinary_dir_addr(),
+                (ptr(receiver) as usize).wrapping_sub(perry_abi::RECEIVER_HANDLE_FLOOR) as i64,
+                crate::value::STRING_TAG | atom as u64,
+                crate::string::property_atom_hash(atom),
+            )
+        }
+        .to_bits()
+    };
+    for name in [&b"get"[..], b"append", b"size"] {
+        assert_eq!(
+            probe(&params, name),
+            crate::value::TAG_HOLE,
+            "the probe must leave URLSearchParams.{} to the slow read",
+            String::from_utf8_lossy(name)
+        );
+    }
+    // The slow read it falls to must reach the native fallback too.
+    assert_eq!(read(&params, b"size").to_number(), 0.0);
+    assert!(read(&params, b"get").is_pointer());
+    assert_eq!(
+        probe(&plain, b"probeGateMissing"),
+        crate::value::TAG_UNDEFINED,
+        "an ordinary object's proven miss stays on the probe's fast path"
+    );
+}

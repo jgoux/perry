@@ -206,10 +206,11 @@ const NON_COLLECTING: &[&str] = &[
     "js_write_barrier_root_nanbox",
     "perry_transition_cache_base",
     "js_transition_ic_note_hit",
-    // S2 GC-leaf IC hits; proven `Leaf` by the generated call-effects table.
-    "js_object_get_field_ic_fast",
-    // First-read D3: a generic read's miss front, proven `Leaf` likewise.
-    "js_object_get_field_ic_front",
+    // Object model step 5: the unknown-receiver probe, proven `Leaf`.
+    "perry_probe_get",
+    "perry_probe_get_value",
+    "perry_probe_get_binding",
+    "perry_probe_get_keyed",
     "js_put_value_set_packed_fast",
     "js_transition_ic_spill_append",
     "js_write_barrier_slot",
@@ -377,7 +378,7 @@ fn literal_capture_idx(args: &[(LlvmType, String)]) -> Option<&str> {
     (!idx.is_empty() && !idx.starts_with('%')).then_some(idx.as_str())
 }
 
-fn is_collecting(callee: &str) -> bool {
+fn is_collecting(gc: &crate::gc_call_effects::GcEffects, callee: &str) -> bool {
     if callee.starts_with("llvm.") {
         return false;
     }
@@ -386,8 +387,7 @@ fn is_collecting(callee: &str) -> bool {
     // table does not prove `Leaf` (e.g. `js_array_length`'s Proxy arm,
     // #11522, or a GcRootRegistryGuard flush, #11523) stays collecting.
     !(NON_COLLECTING.contains(&callee)
-        && crate::gc_call_effects::classify_direct_callee(callee)
-            == crate::gc_call_effects::GcCallEffect::CannotCollect)
+        && gc.classify_direct_callee(callee) == crate::gc_call_effects::GcCallEffect::CannotCollect)
 }
 
 /// Is `name` (no `@`) a string-literal handle global — `<mod>_.str.<N>.handle`?
@@ -496,6 +496,7 @@ struct Reloadable {
 }
 
 pub(crate) fn apply_to_function(func: &mut LlFunction) -> usize {
+    let gc = func.gc_effects();
     // NOT an early return on an empty bind set. A function with no shadow slot
     // can still load a string-handle global, and #7664's `main` cases are
     // exactly that; returning here is how the whole `strhandle` population
@@ -515,7 +516,7 @@ pub(crate) fn apply_to_function(func: &mut LlFunction) -> usize {
 
     let facts: Vec<Vec<Facts>> = blocks
         .iter()
-        .map(|b| b.insts().iter().map(|i| facts_of(i, &slots)).collect())
+        .map(|b| b.insts().iter().map(|i| facts_of(&gc, i, &slots)).collect())
         .collect();
 
     let label_index: HashMap<&str, usize> = blocks
@@ -1052,7 +1053,11 @@ fn set_inst_result(inst: &mut LlInst, fresh: &str) {
     }
 }
 
-fn facts_of(inst: &LlInst, slots: &HashSet<String>) -> Facts {
+fn facts_of(
+    gc: &crate::gc_call_effects::GcEffects,
+    inst: &LlInst,
+    slots: &HashSet<String>,
+) -> Facts {
     let mut uses = Vec::new();
     let mut result = None;
     let mut load_of = None;
@@ -1075,7 +1080,7 @@ fn facts_of(inst: &LlInst, slots: &HashSet<String>) -> Facts {
     };
 
     match inst {
-        LlInst::Raw(text) => return raw_facts(text, slots),
+        LlInst::Raw(text) => return raw_facts(gc, text, slots),
         LlInst::Bin { dst, op, a, b, .. } => {
             result = reg(dst);
             use_op(&mut uses, a);
@@ -1128,7 +1133,7 @@ fn facts_of(inst: &LlInst, slots: &HashSet<String>) -> Facts {
             for (_, v) in args {
                 use_op(&mut uses, v);
             }
-            collecting = !gc_leaf && is_collecting(callee);
+            collecting = !gc_leaf && is_collecting(gc, callee);
             // #7725: the two capture-bits halves. GET extends a derivation like a transparent
             // bit op (see CAPTURE_GET_CALLEE); SET's side effect on the capture slot has to
             // invalidate that derivation the way a store does, via the shared `stores_to`
@@ -1200,7 +1205,7 @@ fn facts_of(inst: &LlInst, slots: &HashSet<String>) -> Facts {
 /// the rendered line. Everything here is one-sided towards doing nothing: an
 /// operand form this does not recognise contributes no rewrite, and a call it
 /// cannot name is treated as collecting.
-fn raw_facts(text: &str, slots: &HashSet<String>) -> Facts {
+fn raw_facts(gc: &crate::gc_call_effects::GcEffects, text: &str, slots: &HashSet<String>) -> Facts {
     let mut uses = Vec::new();
     let mut result = None;
     let mut load_of = None;
@@ -1321,7 +1326,7 @@ fn raw_facts(text: &str, slots: &HashSet<String>) -> Facts {
                         stores_to = Some(capture_slot_key(&idx));
                     }
                 }
-                is_collecting(&name)
+                is_collecting(gc, &name)
             }
             // An indirect call, or inline asm. `asm sideeffect ""` emits
             // nothing; anything else through a function pointer is user code.

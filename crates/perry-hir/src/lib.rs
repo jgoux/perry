@@ -55,10 +55,10 @@ pub use egress::{audit_module_egress, EgressRefusalReason, EgressViolation};
 pub use enums::fix_imported_enums;
 pub use eval_classifier::{
     check_unimplemented_api, classify as classify_eval_surface, has_deferred_dynamic_code_sites,
-    location_string, note_dynamic_function_reachable, record_deferred_aot_site,
-    set_eval_strict_mode, set_unimplemented_strict_mode, take_deferred_eval_sites,
-    DeferredEvalSite, EvalBucket, EvalClassification, EvalDecision, EvalSurface,
-    UnimplementedDecision, UNIMPLEMENTED_API_KIND,
+    interpreted_source_sites, location_string, note_dynamic_function_reachable,
+    record_deferred_aot_site, set_eval_strict_mode, set_unimplemented_strict_mode,
+    take_deferred_eval_sites, DeferredEvalSite, EvalBucket, EvalClassification, EvalDecision,
+    EvalSurface, UnimplementedDecision, UNIMPLEMENTED_API_KIND,
 };
 pub use ir::*;
 pub use js_transform::{
@@ -73,11 +73,14 @@ pub use lower::{
 };
 pub use monomorph::{monomorphize_module, monomorphize_modules};
 pub use native_profile::exported_native_pod_abi;
+pub use patched_builtins::proto_census::{scan_module as scan_proto_census, ProtoCensus};
 pub use patched_builtins::{
     clear_patched_builtins, patched_prototype_methods, scan_module as scan_patched_builtins,
     set_patched_builtins, PatchedBuiltins,
 };
-pub use patched_builtins::proto_census::{scan_module as scan_proto_census, ProtoCensus};
 pub use type_alias_resolve::{resolve_type_aliases_in_module, AliasDef, AliasTable};
 
 mod iterator_record;
+
+pub mod dynamic_code;
+pub mod static_dynamic_code;

@@ -158,6 +158,10 @@ impl PageGenerationCache {
 // that — an 8.6% regression on the same row (0/7 pairs). Keep the scan short.
 const PAGE_GENERATION_CACHE_WAYS: usize = 4;
 
+mod local;
+pub(crate) use local::page_generations_hot_addr;
+use local::with_page_generations;
+
 mod compact;
 use compact::{page_count, PageObjects};
 mod storage;
@@ -252,7 +256,7 @@ pub(crate) struct OldArenaSourceBlockSelection {
 // exists; everything else in this file was simply never migrated.
 thread_local! {
     static PAGE_GENERATIONS: RefCell<PageGenerationMap> =
-        RefCell::new(crate::fast_hash::new_ptr_hash_map());
+        const { RefCell::new(crate::fast_hash::new_ptr_hash_map()) };
 
     static PAGE_GENERATION_CACHE: UnsafeCell<PageGenerationCacheSet> =
         const { UnsafeCell::new(PageGenerationCacheSet::empty()) };
@@ -260,15 +264,15 @@ thread_local! {
 
 crate::perry_thread_local! {
     static OLD_GEN_PAGE_OBJECTS: RefCell<OldGenPageObjectMap> =
-        RefCell::new(OldGenPageObjectMap::default());
+        const { RefCell::new(OldGenPageObjectMap::new()) };
 
     static OLD_GEN_PAGE_META: RefCell<OldGenPageMetaMap> =
-        RefCell::new(OldGenPageMetaMap::default());
+        const { RefCell::new(OldGenPageMetaMap::new()) };
 
     /// Promoted-block pages whose object list is DESCRIBED rather than stored —
     /// see [`register_promoted_page_run`].
     static OLD_GEN_PAGE_PROMOTED_RUNS: RefCell<crate::fast_hash::PtrHashMap<usize, PromotedPageRun>> =
-        RefCell::new(crate::fast_hash::new_ptr_hash_map());
+        const { RefCell::new(crate::fast_hash::new_ptr_hash_map()) };
 
     /// Monotone-within-a-window latch so the common case — a program that never
     /// promotes a block in place — pays one `Cell` read per reader instead of a
@@ -297,11 +301,6 @@ thread_local! {
 /// Address of this thread's `PAGE_GENERATION_CACHE`.
 pub(crate) fn page_generation_cache_hot_addr() -> *mut u8 {
     PAGE_GENERATION_CACHE.with(|c| c.get() as *mut u8)
-}
-
-/// Address of this thread's `PAGE_GENERATIONS`.
-pub(crate) fn page_generations_hot_addr() -> *mut u8 {
-    PAGE_GENERATIONS.with(|p| p as *const _ as *mut u8)
 }
 
 /// [`PAGE_GENERATION_CACHE`] without a TLS resolution — see `crate::tls_hot`.
@@ -453,7 +452,7 @@ pub(crate) fn register_block_space_with_object_starts(
     };
     let first_key = generation_class_key_for_addr(base);
     let last_key = generation_class_key_for_addr(end - 1);
-    PAGE_GENERATIONS.with(|pages| {
+    with_page_generations(|pages| {
         let mut pages = pages.borrow_mut();
         for key in first_key..=last_key {
             match pages.entry(key) {
@@ -540,7 +539,7 @@ fn retag_block_space_inner(
     let end = base + size;
     let first_key = generation_class_key_for_addr(base);
     let last_key = generation_class_key_for_addr(end - 1);
-    PAGE_GENERATIONS.with(|pages| {
+    with_page_generations(|pages| {
         let mut pages = pages.borrow_mut();
         for key in first_key..=last_key {
             let Some(slot) = pages.get_mut(&key) else {
@@ -842,7 +841,7 @@ pub(crate) fn unregister_block_generation(base: usize, size: usize) {
     let first_key = generation_class_key_for_addr(base);
     let last_key = generation_class_key_for_addr(end - 1);
     let mut removed_old_block = false;
-    PAGE_GENERATIONS.with(|pages| {
+    with_page_generations(|pages| {
         let mut pages = pages.borrow_mut();
         for key in first_key..=last_key {
             let mut remove_page = false;
@@ -2021,7 +2020,7 @@ pub(crate) fn old_page_meta_for_tests(page: usize) -> Option<OldPageMeta> {
 pub(crate) fn page_meta_census() -> Vec<crate::gc::census::SideTableRow> {
     use crate::gc::census::hash_table_bytes;
     let mut rows = Vec::new();
-    PAGE_GENERATIONS.with(|m| {
+    with_page_generations(|m| {
         let m = m.borrow();
         rows.push((
             "arena.page_generations",

@@ -131,6 +131,7 @@ js_array_fill_f64_iota_len_extend	Reenters	yes
 js_array_fill_generic	Reenters	yes
 js_array_fill_range	Reenters	yes
 js_array_fill_range_strided_tagged	Reenters	yes
+js_array_fill_values	Leaf	no
 js_array_filter	Reenters	yes
 js_array_find	Reenters	yes
 js_array_findIndex	Reenters	yes
@@ -590,6 +591,9 @@ js_buffer_write_uint8	Reenters	yes
 js_buffer_write_uint_be	Reenters	yes
 js_buffer_write_uint_le	Reenters	yes
 js_build_class_keys_array	Reenters	yes
+js_builtin_namespace_contract_check	Reenters	yes
+js_builtin_namespace_member	Reenters	yes
+js_builtin_namespace_value	Reenters	yes
 js_builtin_proto_contract_check	Leaf	no
 js_builtin_proto_generic_call	Reenters	yes
 js_builtin_proto_generic_call0	Reenters	yes
@@ -1127,7 +1131,6 @@ js_domain_remove	Reenters	yes
 js_domain_run	Reenters	yes
 js_drain_queued_microtasks	Reenters	yes
 js_dyn_index_get	Reenters	yes
-js_dyn_index_get_site	Reenters	yes
 js_dyn_index_set	Reenters	yes
 js_dyn_index_set_strict	Reenters	yes
 js_dynamic_add	Reenters	yes
@@ -1190,6 +1193,7 @@ js_ethers_get_address	Reenters	yes
 js_ethers_parse_ether	Reenters	yes
 js_ethers_parse_units	Reenters	yes
 js_ethers_wallet_create_random	Reenters	yes
+js_eval_in_scope	Reenters	yes
 js_evalerror_new	AllocOnly	no
 js_event_emitter_async_resource_call	ThrowOnly	yes
 js_event_emitter_async_resource_object_new	Reenters	yes
@@ -1447,7 +1451,7 @@ js_gc_collect	Reenters	no
 js_gc_enter_unsafe_zone	Leaf	no
 js_gc_exit_unsafe_zone	Leaf	no
 js_gc_forget_object_layout	Leaf	no
-js_gc_init	Reenters	no
+js_gc_init	Reenters	yes
 js_gc_loop_safepoint	Reenters	no
 js_gc_memory_pressure	Reenters	no
 js_gc_module_collect	Reenters	no
@@ -1492,7 +1496,7 @@ js_get_string_pointer_unified	AllocOnly	no
 js_getenv	AllocOnly	no
 js_getenv_value	AllocOnly	no
 js_global_assign_existing_or_throw	Reenters	yes
-js_global_get_field_ic_slow	Reenters	yes
+js_global_get_field_slow	Reenters	yes
 js_global_get_optional	Reenters	yes
 js_global_get_or_throw_unresolved	Reenters	yes
 js_global_or_console_property_by_name	Reenters	yes
@@ -1571,7 +1575,6 @@ js_immediate_has_pending	Leaf	no
 js_import_meta_resolve	Reenters	yes
 js_import_meta_resolve_value	Reenters	yes
 js_in_operator	Reenters	yes
-js_in_operator_presence_ic	Reenters	yes
 js_inline_arena_slow_alloc	AllocOnly	no
 js_inline_arena_state	Leaf	no
 js_install_global_value_surfaces	Leaf	no
@@ -2218,23 +2221,16 @@ js_object_freeze	Reenters	yes
 js_object_from_entries	Reenters	yes
 js_object_get_class_id	Leaf	no
 js_object_get_field	Leaf	no
-js_object_get_field_by_key_site	Reenters	yes
 js_object_get_field_by_name	Reenters	yes
 js_object_get_field_by_name_boxed	Reenters	yes
 js_object_get_field_by_name_f64	Reenters	yes
 js_object_get_field_by_property_id_f64	Reenters	yes
 js_object_get_field_f64	Leaf	no
-js_object_get_field_ic	Reenters	yes
-js_object_get_field_ic_fast	Leaf	no
-js_object_get_field_ic_fast_miss	Reenters	yes
-js_object_get_field_ic_front	Leaf	no
-js_object_get_field_ic_miss	Reenters	yes
-js_object_get_field_ic_miss_packed	Reenters	yes
-js_object_get_field_ic_nonptr	Reenters	yes
-js_object_get_field_ic_overflow_load	Reenters	yes
-js_object_get_field_ic_slow	Reenters	yes
+js_object_get_field_nonptr	Reenters	yes
+js_object_get_field_slow	Reenters	yes
+js_object_get_field_value	Reenters	yes
 js_object_get_index_polymorphic	Reenters	yes
-js_object_get_own_field_ic_front	Leaf	no
+js_object_get_keyed_slow	Reenters	yes
 js_object_get_own_field_or_undef	Reenters	yes
 js_object_get_own_field_or_undef_learn	Reenters	yes
 js_object_get_own_property_descriptor	Reenters	yes
@@ -2244,8 +2240,6 @@ js_object_get_own_property_symbols	Reenters	yes
 js_object_get_property_key	Reenters	yes
 js_object_get_prototype_of	Reenters	yes
 js_object_get_symbol_property	Reenters	yes
-js_object_get_symbol_property_ic_miss	Reenters	yes
-js_object_get_symbol_then_field_ic_miss	Reenters	yes
 js_object_group_by	Reenters	yes
 js_object_has_own	Reenters	yes
 js_object_has_own_symbol	Reenters	yes
@@ -2922,7 +2916,6 @@ js_regexp_test	Reenters	yes
 js_regexp_to_string	Reenters	yes
 js_region_guard_pack	Reenters	no
 js_region_guard_prime	Reenters	no
-js_region_holder_read	Leaf	no
 js_region_loop_pack	Leaf	no
 js_region_loop_prime	Leaf	no
 js_register_agent_aux_pump	Leaf	no
@@ -4341,6 +4334,10 @@ perry_plugin_unregister_route	AllocOnly	no
 perry_plugin_unregister_service	Reenters	yes
 perry_plugin_unregister_tool	AllocOnly	no
 perry_poll	Reenters	yes
+perry_probe_get	Leaf	no
+perry_probe_get_binding	Leaf	no
+perry_probe_get_keyed	Leaf	no
+perry_probe_get_value	Leaf	no
 perry_register_static_plugin	Leaf	no
 perry_resolve_static_plugin	Leaf	no
 perry_runtime_image_result	Reenters	yes
