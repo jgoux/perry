@@ -602,3 +602,24 @@ pub(crate) fn typed_parse_codegen_supports(ty: &Type) -> bool {
 
     matches!(elem, Type::Object(obj) if !obj.properties.is_empty())
 }
+
+/// Fields of an enum's runtime object: the forward members plus, for every
+/// numeric member, TypeScript's reverse entry (`Color[2] === "Blue"`).
+/// String-valued members get no reverse entry, matching tsc.
+pub(crate) fn enum_runtime_object_fields(
+    members: &[(String, crate::ir::EnumValue)],
+) -> Vec<(String, Expr)> {
+    let mut fields: Vec<(String, Expr)> = Vec::new();
+    for (name, value) in members {
+        match value {
+            crate::ir::EnumValue::Number(n) => {
+                fields.push((name.clone(), Expr::Number(*n as f64)));
+                fields.push((n.to_string(), Expr::String(name.clone())));
+            }
+            crate::ir::EnumValue::String(s) => {
+                fields.push((name.clone(), Expr::String(s.clone())));
+            }
+        }
+    }
+    fields
+}

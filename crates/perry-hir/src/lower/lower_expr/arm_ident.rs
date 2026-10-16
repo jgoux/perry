@@ -204,6 +204,16 @@ pub(crate) fn lower_ident_expr(ctx: &mut LoweringContext, ident: &ast::Ident) ->
         // emit a ClassRef by name — codegen resolves it from the
         // class registry, which has every pending class by then.
         Ok(class_binding_read(ctx, &name))
+    } else if let Some(members) = ctx.lookup_enum(&name).map(|(_, m)| m.to_vec()) {
+        // A TypeScript enum used as a VALUE (`Object.values(E)`,
+        // `Object.keys(E)`, `const e = E`, `fn(E)`). Enums are folded away at
+        // compile time (`E.A` -> `Expr::EnumMember`) and no binding named `E`
+        // exists at runtime, so the bare identifier fell through to the
+        // unresolved-global lookup and threw `ReferenceError: E is not
+        // defined`. Materialize the runtime object (forward members plus the
+        // numeric reverse mapping), exactly as the computed-access form
+        // `E[expr]` does.
+        Ok(Expr::Object(super::helpers::enum_runtime_object_fields(&members)))
     } else if name == "undefined" {
         // Global undefined identifier
         Ok(Expr::Undefined)

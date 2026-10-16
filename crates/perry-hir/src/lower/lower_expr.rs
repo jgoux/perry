@@ -43,7 +43,8 @@ pub(crate) use assignment::lower_expr_assignment;
 #[cfg(test)]
 pub(crate) use helpers::test_only::ForceGlobalScriptThisForTest;
 pub(crate) use helpers::{
-    anonymous_class_has_static_name_member, expr_uses_stack_heavy_chain_lowering,
+    anonymous_class_has_static_name_member, enum_runtime_object_fields,
+    expr_uses_stack_heavy_chain_lowering,
     global_script_this_enabled, is_fetch_global_value_name, is_known_global_identifier_name,
     lower_expr_with_json_parse_type_hint, native_module_binding_value, opt_call_func_nullish_guard,
     opt_call_receiver_repeatable, relower_trace, strict_global_assign_existing_or_throw,
