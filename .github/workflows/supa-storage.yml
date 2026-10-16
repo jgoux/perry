@@ -109,10 +109,16 @@ jobs:
         if: steps.have.outputs.cache-hit != 'true'
         run: |
           start=$(date +%s)
-          cargo build --locked --release -p perry --bin perry --no-default-features --features compile-cli
-          cargo build --locked --release -p perry-runtime-static -p perry-stdlib-static -p perry-ext-http -p perry-ext-net
+          # Both ends are serial LTO links, so build them side by side; the
+          # second graph gets its own target dir (cargo locks a shared one).
+          cargo build --locked --release -p perry --bin perry --no-default-features --features compile-cli &
+          compiler=$!
+          CARGO_TARGET_DIR="$PWD/target-libs" cargo build --locked --release -p perry-runtime-static -p perry-stdlib-static -p perry-ext-http -p perry-ext-net &
+          libs=$!
+          rc=0; wait "$compiler" || rc=1; wait "$libs" || rc=1
+          [ "$rc" = 0 ]
           mkdir perry-dist
-          cp target/release/perry target/release/lib*.a perry-dist/
+          cp target/release/perry target-libs/release/lib*.a perry-dist/
           ls -l perry-dist; du -sh perry-dist
           {
             echo "### build-perry"

@@ -37,7 +37,7 @@ norm 'del(.Id)'
 step "GET /object/smoke/hello.bin" 200 "$base/object/smoke/hello.bin" -H "${auth[0]}" || exit 1
 got_sum=$(sha256sum "$work/body" | cut -d' ' -f1)
 if [ "$got_sum" = "$want_sum" ]; then
-  echo "download bytes identical (sha256 $want_sum)" >> "$out"
+  echo "download bytes identical" >> "$out"
 else
   echo "FAIL download bytes differ: want $want_sum got $got_sum" | tee -a "$out" >&2
   exit 1
