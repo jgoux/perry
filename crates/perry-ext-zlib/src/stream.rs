@@ -24,6 +24,13 @@ extern "C" {
 }
 mod allocation;
 mod driver;
+// zlib-ng (a C build needing cmake) is the native inflate engine; wasm32 has no
+// C toolchain story for it, so the same `Context` interface is backed by
+// flate2's pure-Rust inflater there.
+#[cfg(not(target_family = "wasm"))]
+mod inflate_context;
+#[cfg(target_family = "wasm")]
+#[path = "stream/inflate_context_wasm.rs"]
 mod inflate_context;
 pub(crate) use driver::decode_bytes;
 mod one_shot_callback;

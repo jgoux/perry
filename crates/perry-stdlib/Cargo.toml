@@ -343,8 +343,9 @@ rustls-pemfile = { workspace = true, optional = true }
 rusqlite = { version = "0.39", features = ["bundled", "column_decltype", "limits", "session"], optional = true }
 
 # Crypto
-# CPU-dispatched fixed SHA-384/512 contexts, without an EVP allocation.
-openssl-sys = { version = "0.9", optional = true, features = ["vendored"] }
+# SHA-384/512 contexts come from OpenSSL's CPU-dispatched fixed contexts
+# (`openssl-sys`, declared in the non-wasi target table below) or, on wasm32
+# WASI where OpenSSL cannot build, from `sha2` (`crypto/wide_digest.rs`).
 sha2 = { version = "0.11", optional = true }
 sha1 = { version = "0.11", optional = true }
 sha3 = { version = "0.12", optional = true }
@@ -422,6 +423,9 @@ perry-uuid = { workspace = true, optional = true }
 # Unix path uses tcsetattr/cfmakeraw; Windows uses SetConsoleMode via
 # the windows-sys crate (#406). iOS/Android stdlibs are stubbed
 # entirely (no terminal surface on those platforms).
+[target.'cfg(not(target_os = "wasi"))'.dependencies]
+openssl-sys = { version = "0.9", optional = true, features = ["vendored"] }
+
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
