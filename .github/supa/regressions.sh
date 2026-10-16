@@ -11,6 +11,7 @@ perry_tests=(
   --test cjs_require_esm_package_namespace
   --test class_computed_member_before_super_method
   --test codegen_units_shared_helper_linkage
+  --test http_agent_subclass_keeps_its_own_surface
   --test image_string_literal_native_args
   --test layout_family_alias_stack_map
   --test tagged_template_sites_outside_entry_dir

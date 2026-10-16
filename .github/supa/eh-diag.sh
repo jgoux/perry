@@ -11,7 +11,7 @@ echo "== walker off =="; PERRY_EH_WALKER=off PERRY_EH_TRACE=1 ./eh-uncaught.bin 
 echo "== walker diff =="; PERRY_EH_WALKER=diff PERRY_EH_TRACE=1 ./eh-uncaught.bin 2>&1 | head -20
 echo "== bindings =="; LD_DEBUG=bindings ./eh-uncaught.bin 2>&1 | grep -i 'unwind' | head
 sudo apt-get install -y gdb >/dev/null 2>&1 || true
-cat > gdbpy <<'G'
+cat > gdbpy.py <<'G'
 import gdb
 gdb.execute('set pagination off')
 gdb.execute('break _Unwind_RaiseException')
@@ -40,4 +40,4 @@ gdb.execute('info registers x0 x1 x19 x20 x30 sp')
 gdb.execute('x/6i $pc-12')
 gdb.execute('bt 6')
 G
-echo "== gdb =="; gdb -batch -x gdbpy ./eh-uncaught.bin 2>&1 | tail -60
+echo "== gdb =="; gdb -batch -x gdbpy.py ./eh-uncaught.bin 2>&1 | tail -60
