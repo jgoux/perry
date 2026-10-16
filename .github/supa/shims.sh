@@ -23,4 +23,7 @@ grep -q "require('./reserved.js')" "$p" || { echo "pg-format shim did not apply"
 # find-my-way builds four functions with `new Function`; swap in equivalent closures.
 node "$(dirname "$0")/patch-find-my-way.cjs" "$root"
 
+# Temporary: log which fastify route context lacks preParsing.
+node "$(dirname "$0")/diag-fastify.cjs" "$root"
+
 echo "shims applied under $root/node_modules"
