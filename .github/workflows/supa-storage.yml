@@ -417,6 +417,12 @@ jobs:
           set +e
           "$OUT/probe-native" 2>&1 | tee "$OUT/probe-run.txt" | tail -n 80
           echo "probe exit=${PIPESTATUS[0]}"
+          for seed in 1 7 42; do
+            echo "== GC stress seed=$seed" | tee -a "$OUT/probe-run-stress.txt"
+            PERRY_GC_SCHEDULE_SEED=$seed PERRY_GC_SCHEDULE_RATE=1 PERRY_GC_PROTECT_FROMSPACE=1 PERRY_GC_MOVING_LOOP_POLLS=1 \
+              timeout 300 "$OUT/probe-native" 2>&1 | tee -a "$OUT/probe-run-stress.txt" | tail -n 40
+            echo "stress exit=${PIPESTATUS[0]}"
+          done
 
       - name: Native smoke
         id: native
