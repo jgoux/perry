@@ -16,7 +16,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::collect_modules_helpers::{
-    file_loader_import_sources, imported_file_asset_name, looks_like_generated_module,
+    collection_module_name, file_loader_import_sources, imported_file_asset_name,
+    looks_like_generated_module,
 };
 use crate::commands::progress::{ProgressSnapshot, VerboseProgress};
 use crate::OutputFormat;
@@ -542,12 +543,7 @@ fn collect_module_one(
 
     // Use a relative path from project root for unique module names
     // This ensures files like "routes/auth.ts" and "middleware/auth.ts" have different names
-    let module_name = canonical
-        .strip_prefix(&ctx.project_root)
-        .ok()
-        .and_then(|p| p.to_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| filename.to_string());
+    let module_name = collection_module_name(&canonical, &ctx.project_root);
 
     // Parse via the optional in-memory cache (only populated by `perry dev`).
     // On a cache hit, we reuse the AST from the previous rebuild — the single
