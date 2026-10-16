@@ -19,6 +19,10 @@ for n in "${names[@]}"; do
     echo "probe $n: COMPILE FAILED"; tail -20 "$d/compile.log"; rc=1; echo "::endgroup::"; continue
   fi
   echo "compile: $(( $(date +%s) - s )) s"
+  # Startup registration must be reachable from .init_array (not legacy .ctors).
+  { echo "== .init_array =="; objdump -s -j .init_array "$d/$n.bin" 2>&1 | tail -n +4
+    echo "== .ctors =="; objdump -h "$d/$n.bin" 2>&1 | grep -E '\.ctors|\.init_array' ; } > "$d/init_array.txt" 2>&1
+  cat "$d/init_array.txt"
   (cd "$d" && PERRY_EH_TRACE=1 timeout 60 ./"$n.bin" > run.log 2>&1); st=$?
   head -c 4000 "$d/run.log"; echo
   if [ $st -eq 0 ]; then echo "probe $n: PASS"; else echo "probe $n: FAIL (exit $st)"; rc=1; fi

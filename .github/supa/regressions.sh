@@ -38,6 +38,8 @@ case "${1:?build|run}" in
       the_hot_cache_read_is_marked_gc_leaf_in_bodies_without_root_slots
       the_module_body_frame_is_labelled_with_the_module_path
       bare_enum_identifier_materializes_the_enum_object
+      elf_startup_registration_lands_in_init_array
+      non_elf_startup_registration_keeps_global_ctors
     )
     out=$(mktemp)
     RUST_TEST_THREADS=1 "${rest[@]}" -- "${names[@]}" 2>&1 | tee "$out"
