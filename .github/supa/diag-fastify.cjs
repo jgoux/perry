@@ -22,4 +22,14 @@ patch('four-oh-four.js', [
   ["        context[hook] = toSet.length ? toSet : null\n      }\n      context.errorHandler",
    "        context[hook] = toSet.length ? toSet : null\n        if (hook === 'preParsing') console.error('DIAG 404 preReady preParsing=' + String(context.preParsing))\n      }\n      context.errorHandler"],
 ])
+
+{
+  const p = `${root}/node_modules/ajv/dist/compile/index.js`
+  if (!fs.existsSync(p + '.diag.orig')) fs.copyFileSync(p, p + '.diag.orig')
+  let s = fs.readFileSync(p + '.diag.orig', 'utf8')
+  const from = '        if (sourceCode)\n            this.logger.error("Error compiling schema, function code:", sourceCode);'
+  if (!s.includes(from)) throw new Error('diag patch anchor missing in ajv compile/index.js')
+  s = s.replace(from, from + '\n        console.error("DIAG ajv compile error: " + String(e && e.message) + " | schema=" + JSON.stringify(sch.schema).slice(0, 300) + " | stack=" + String(e && e.stack) + " | here=" + new Error("here").stack);')
+  fs.writeFileSync(p, s)
+}
 console.log('diag-fastify applied')
