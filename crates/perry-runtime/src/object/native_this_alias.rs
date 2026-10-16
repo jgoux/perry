@@ -427,7 +427,62 @@ unsafe fn construct_native_http_class_with_this(
         result.get_nanbox_f64(),
         method == "ServerResponse",
     );
+    if method == "Agent" {
+        install_agent_options(&scope, this_root.get_nanbox_f64(), args.first().copied());
+    }
     result.get_nanbox_f64()
+}
+
+/// Node's `Agent` constructor stores `this.options` (a copy of the
+/// constructor options with `noDelay` defaulting to true and `path` forced to
+/// null) and subclasses read it: agentkeepalive's `HttpsAgent` reads
+/// `this.options.maxCachedSessions`, and its timeouts live there. The native
+/// handle has no such record, so give the subclass instance its own.
+unsafe fn install_agent_options(
+    scope: &crate::gc::RuntimeHandleScope,
+    this_val: f64,
+    options: Option<f64>,
+) {
+    use crate::object::{js_object_alloc, js_object_set_field_by_name, ObjectHeader};
+    let this_root = scope.root_nanbox_f64(this_val);
+    let record = scope.root_raw_mut_ptr(js_object_alloc(0, 4));
+    let record_value = scope.root_nanbox_f64(f64::from_bits(
+        crate::value::POINTER_TAG
+            | (record.get_raw_mut_ptr::<ObjectHeader>() as u64 & crate::value::POINTER_MASK),
+    ));
+    if let Some(options) = options {
+        super::assign::js_object_assign_one(record_value.get_nanbox_f64(), options);
+    }
+    let set = |name: &[u8], value: f64| {
+        let key = scope.root_string_ptr(crate::string::js_string_from_bytes(
+            name.as_ptr(),
+            name.len() as u32,
+        ));
+        js_object_set_field_by_name(
+            (record_value.get_nanbox_f64().to_bits() & crate::value::POINTER_MASK)
+                as *mut ObjectHeader,
+            key.get_raw_const_ptr::<crate::string::StringHeader>(),
+            value,
+        );
+    };
+    let no_delay = crate::object::js_object_get_field_by_name_f64(
+        (record_value.get_nanbox_f64().to_bits() & crate::value::POINTER_MASK)
+            as *const ObjectHeader,
+        crate::string::js_string_from_bytes(b"noDelay".as_ptr(), 7)
+            as *const crate::string::StringHeader,
+    );
+    if no_delay.to_bits() == crate::value::TAG_UNDEFINED {
+        set(b"noDelay", f64::from_bits(crate::value::TAG_TRUE));
+    }
+    set(b"path", f64::from_bits(crate::value::TAG_NULL));
+    let this_obj = (this_root.get_nanbox_f64().to_bits() & crate::value::POINTER_MASK)
+        as *mut ObjectHeader;
+    let key = scope.root_string_ptr(crate::string::js_string_from_bytes(b"options".as_ptr(), 7));
+    js_object_set_field_by_name(
+        this_obj,
+        key.get_raw_const_ptr::<crate::string::StringHeader>(),
+        record_value.get_nanbox_f64(),
+    );
 }
 
 /// Shared implementation for the `js_http(s)_server_construct_with_this`
