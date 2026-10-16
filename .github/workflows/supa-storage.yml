@@ -1,6 +1,16 @@
 # CI for the supa/storage fork branch: builds Perry, compiles Supabase Storage
 # natively and runs a smoke flow against it. Not part of upstream; drop together
 # with .github/supa/ when the fixes land upstream.
+#
+# Caches, in the order they pay off:
+#   perry-dist-*      compiler + runtime archives, keyed by the hash of crates/**.
+#                     build-perry skips the build when it exists.
+#   sccache (GHA)     per-crate rustc outputs, so a changed crate does not drag
+#                     the unchanged ones into a rebuild.
+#   perry-obj-*       Storage object cache (node_modules/.cache/perry), keyed by
+#                     the sources that shape generated objects only. Link-side
+#                     changes keep it, so they cost a relink, not 35 min of codegen.
+#   storage-built-*   built Storage checkout (node_modules + dist), keyed by SHA.
 name: supa-storage
 run-name: supa-storage / ${{ github.sha }}
 
@@ -12,14 +22,33 @@ on:
       storage_ref:
         description: Branch of jgoux/storage to compile
         default: supa/aot-friendly
-      regressions:
-        description: Run the regression tests added on this branch
+      skip_regressions:
+        description: Skip the regression tests added on this branch
         type: boolean
-        default: true
+        default: false
       storage:
         description: Run the Linux Storage job
         type: boolean
         default: true
+      relink_only:
+        description: Fail unless the object cache is warm, so the run only relinks
+        type: boolean
+        default: false
+      probe:
+        description: Compile and run a small Storage subset (.github/supa/probe.js) instead of the server
+        type: boolean
+        default: false
+      module_jobs:
+        description: PERRY_MODULE_JOBS (4 vCPU / 16 GB runner; peak RSS was 7.6 GB at 2x2)
+        default: "3"
+      codegen_jobs:
+        description: PERRY_CODEGEN_UNIT_JOBS
+        default: "2"
+      simulate:
+        description: Measurement aid, touch one source file to exercise cache invalidation without a commit
+        type: choice
+        options: [none, link, runtime, codegen]
+        default: none
 
 concurrency:
   group: supa-storage-${{ github.ref }}
@@ -27,26 +56,93 @@ concurrency:
 
 permissions:
   contents: read
+  actions: write # prune superseded caches
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: sccache
+  # RUSTFLAGS would replace .cargo/config.toml's unwind flags, so lld goes in
+  # through the linker instead.
+  CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ github.workspace }}/.github/supa/cc-lld.sh
+  GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
   STORAGE_REPO: https://github.com/jgoux/storage
   STORAGE_REF: ${{ inputs.storage_ref || 'supa/aot-friendly' }}
+  STORAGE_DIR: /home/runner/storage
+  PERRY_WORKSPACE_ROOT: ${{ github.workspace }}
+  PERRY_BUILD_WORKSPACE_ROOT: ${{ github.workspace }}
+  PERRY_SRC: ${{ github.workspace }}
+  PERRY_RUNTIME_DIR: ${{ github.workspace }}/target/release
+  PERRY_BUILD_COMMIT: supa-storage-fork
+  # Temporary: the objects cached before the object id was narrowed. Drop this
+  # line with the next change that really alters generated code.
+  OBJID_PIN: 170b4e1d3a2ab504
 
 jobs:
-  storage-linux:
+  # Compiler and runtime archives, built once per source hash.
+  build-perry:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    outputs:
+      key: ${{ steps.key.outputs.key }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Simulated change
+        if: ${{ inputs.simulate && inputs.simulate != 'none' }}
+        run: .github/supa/simulate.sh "${{ inputs.simulate }}"
+      - name: Cache key
+        id: key
+        run: echo "key=perry-dist-${{ runner.arch }}-${{ hashFiles('crates/**', 'Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/**', '!crates/*/tests/**', '!**/*.md') }}" >> "$GITHUB_OUTPUT"
+      - name: Already built?
+        id: have
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/perry-dist
+          key: ${{ steps.key.outputs.key }}
+          lookup-only: true
+      - uses: ./.github/actions/supa-rust-env
+        if: steps.have.outputs.cache-hit != 'true'
+      - name: Build the Perry compiler and runtime libraries
+        if: steps.have.outputs.cache-hit != 'true'
+        run: |
+          start=$(date +%s)
+          cargo build --locked --release -p perry --bin perry --no-default-features --features compile-cli
+          cargo build --locked --release -p perry-runtime-static -p perry-stdlib-static -p perry-ext-http -p perry-ext-net
+          mkdir perry-dist
+          cp target/release/perry target/release/lib*.a perry-dist/
+          ls -l perry-dist; du -sh perry-dist
+          {
+            echo "### build-perry"
+            echo "- build: $(( $(date +%s) - start )) s"
+            echo '```'; sccache --show-stats; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Save the build
+        if: steps.have.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/perry-dist
+          key: ${{ steps.key.outputs.key }}
+      - name: Prune old builds
+        if: steps.have.outputs.cache-hit != 'true'
+        run: .github/supa/prune-caches.sh perry-dist- 2
+      - name: Summary
+        if: steps.have.outputs.cache-hit == 'true'
+        run: |
+          echo "### build-perry" >> "$GITHUB_STEP_SUMMARY"
+          echo "- reused \`${{ steps.key.outputs.key }}\`" >> "$GITHUB_STEP_SUMMARY"
+
+  # Builds Storage once per SHA and records the node reference transcript.
+  # Runs next to build-perry.
+  storage-prep:
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.storage }}
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 300
+    timeout-minutes: 60
     env:
       OUT: ${{ github.workspace }}/supa-out
-      STORAGE_DIR: /home/runner/storage
-      PERRY_WORKSPACE_ROOT: ${{ github.workspace }}
-      PERRY_BUILD_WORKSPACE_ROOT: ${{ github.workspace }}
-      PERRY_SRC: ${{ github.workspace }}
-      PERRY_RUNTIME_DIR: ${{ github.workspace }}/target/release
-      PERRY_BUILD_COMMIT: supa-storage-fork
-      PG_PORT: "5432"
+    outputs:
+      sha: ${{ steps.storage.outputs.sha }}
     services:
       postgres:
         image: postgres:17
@@ -58,55 +154,60 @@ jobs:
           --health-timeout 5s --health-retries 20
     steps:
       - uses: actions/checkout@v4
-
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
-            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift 2>/dev/null || true
-          df -h /
-          nproc; free -m
-          mkdir -p "$OUT"
-
       - name: Storage environment
         run: |
+          mkdir -p "$OUT"
           .github/supa/env.sh > "$RUNNER_TEMP/storage.env"
           grep -E '^(AUTH_JWT_SECRET|PGRST_JWT_SECRET|SERVICE_KEY|ANON_KEY)=' "$RUNNER_TEMP/storage.env" \
             | cut -d= -f2- | while read -r v; do echo "::add-mask::$v"; done
           cat "$RUNNER_TEMP/storage.env" >> "$GITHUB_ENV"
-
       - uses: actions/setup-node@v4
         with:
           node-version: 24
       - run: |
           npm install -g npm@11
           node --version; npm --version
-
-      - name: Check out Storage
+      - name: Resolve Storage
         id: storage
         run: |
-          git clone --depth 1 --branch "$STORAGE_REF" "$STORAGE_REPO" "$STORAGE_DIR"
-          echo "sha=$(git -C "$STORAGE_DIR" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          git -C "$STORAGE_DIR" log --oneline -1
-
+          sha=$(git ls-remote "$STORAGE_REPO" "refs/heads/$STORAGE_REF" | cut -f1)
+          [ -n "$sha" ] || { echo "::error::no branch $STORAGE_REF in $STORAGE_REPO"; exit 1; }
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - name: Restore the built Storage
+        id: built
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.STORAGE_DIR }}
+          key: storage-built-${{ runner.arch }}-${{ steps.storage.outputs.sha }}
       - uses: actions/cache@v4
+        if: steps.built.outputs.cache-hit != 'true'
         with:
           path: ~/.npm
           key: npm-${{ runner.arch }}-${{ steps.storage.outputs.sha }}
           restore-keys: npm-${{ runner.arch }}-
-
       - name: Build Storage
-        working-directory: ${{ env.STORAGE_DIR }}
+        if: steps.built.outputs.cache-hit != 'true'
         run: |
+          git clone --depth 1 --branch "$STORAGE_REF" "$STORAGE_REPO" "$STORAGE_DIR"
+          cd "$STORAGE_DIR"
+          [ "$(git rev-parse HEAD)" = "${{ steps.storage.outputs.sha }}" ] || echo "::warning::$STORAGE_REF moved while resolving"
+          git log --oneline -1
           npm ci
           npm run build
-          ls dist/start/server-minimal.js
-
+      - name: Save the built Storage
+        if: steps.built.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.STORAGE_DIR }}
+          key: storage-built-${{ runner.arch }}-${{ steps.storage.outputs.sha }}
+      - name: Prune old Storage builds
+        if: steps.built.outputs.cache-hit != 'true'
+        run: .github/supa/prune-caches.sh storage-built- 2
       - name: Tools for the smoke flow
         run: |
           command -v psql >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client; }
-          command -v /usr/bin/time >/dev/null || sudo apt-get install -y -qq time
           jq --version
-
+          ls "$STORAGE_DIR/dist/start/server-minimal.js"
       - name: Node reference smoke
         run: |
           export PGPASSWORD=postgres
@@ -117,43 +218,109 @@ jobs:
       - name: Stop node reference
         if: always()
         run: .github/supa/serve.sh stop node "$OUT"
-
-      - name: Install Rust toolchain
-        run: rustup toolchain install nightly-2026-10-04 --profile minimal --component rustfmt --component clippy
-      - uses: ./.github/actions/setup-llvm22
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          shared-key: ${{ runner.os }}-${{ runner.arch }}-supa-storage
-          cache-on-failure: true
-          save-if: "true"
+          name: node-reference
+          path: |
+            supa-out/*.log
+            supa-out/*.txt
+          if-no-files-found: ignore
 
-      - name: Build the Perry compiler and runtime libraries
+  storage-linux:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.storage }}
+    needs: [build-perry, storage-prep]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 300
+    env:
+      OUT: ${{ github.workspace }}/supa-out
+      PG_PORT: "5432"
+      PERRY_MODULE_JOBS: ${{ inputs.module_jobs || '3' }}
+      PERRY_CODEGEN_UNIT_JOBS: ${{ inputs.codegen_jobs || '2' }}
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s
+          --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Simulated change
+        if: ${{ inputs.simulate && inputs.simulate != 'none' }}
+        run: .github/supa/simulate.sh "${{ inputs.simulate }}"
+
+      - name: Storage environment
         run: |
-          date +%s > "$OUT/perry-build.start"
-          cargo build --locked --release -p perry --bin perry --no-default-features --features compile-cli
-          cargo build --locked --release -p perry-runtime-static -p perry-stdlib-static -p perry-ext-http -p perry-ext-net
-          date +%s > "$OUT/perry-build.end"
-          ls -l target/release/perry
-          df -h /
+          mkdir -p "$OUT"
+          .github/supa/env.sh > "$RUNNER_TEMP/storage.env"
+          grep -E '^(AUTH_JWT_SECRET|PGRST_JWT_SECRET|SERVICE_KEY|ANON_KEY)=' "$RUNNER_TEMP/storage.env" \
+            | cut -d= -f2- | while read -r v; do echo "::add-mask::$v"; done
+          cat "$RUNNER_TEMP/storage.env" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Built Storage
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.STORAGE_DIR }}
+          key: storage-built-${{ runner.arch }}-${{ needs.storage-prep.outputs.sha }}
+          fail-on-cache-miss: true
+      - name: Perry build
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/perry-dist
+          key: ${{ needs.build-perry.outputs.key }}
+          fail-on-cache-miss: true
+      - name: Put the Perry build where the compiler looks for it
+        run: |
+          mkdir -p target/release
+          cp perry-dist/* target/release/
+          ls -l target/release | head
+      - name: Tools for the smoke flow
+        run: |
+          command -v psql >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client; }
+          command -v /usr/bin/time >/dev/null || sudo apt-get install -y -qq time
+          jq --version
+
+      # Perry rebuilds the runtime + stdlib + wrappers together while compiling
+      # (target/perry-no-auto-stream-dispatch), so the compile step needs the
+      # same toolchain and sccache as the build job.
+      - uses: ./.github/actions/supa-rust-env
 
       - name: Object cache id
         id: objid
-        # Pins the object-cache build id to the sources that shape generated
-        # objects, so runtime-only changes keep hitting the cache.
-        run: echo "id=$(echo '${{ hashFiles('crates/perry-codegen/**', 'crates/perry-hir/**', 'crates/perry-transform/**', 'crates/perry-types/**', 'crates/perry/src/**') }}' | cut -c1-16)" >> "$GITHUB_OUTPUT"
+        # Only sources that shape generated objects. Link, strip-dedup, library
+        # search and tests are excluded so fixes there reuse every object.
+        run: |
+          id="$OBJID_PIN"
+          [ -n "$id" ] || id=$(echo '${{ hashFiles('crates/perry-codegen/**', 'crates/perry-hir/**', 'crates/perry-transform/**', 'crates/perry-types/**', 'crates/perry-parser/**', 'crates/perry-diagnostics/**', 'crates/perry-api-manifest/**', 'crates/perry-dispatch/**', 'crates/perry-abi/**', 'crates/perry-ui-model/**', 'crates/perry/src/**', '!crates/*/tests/**', '!crates/**/*_tests.rs', '!crates/**/tests.rs', '!crates/perry/src/commands/compile/link/**', '!crates/perry/src/commands/compile/optimized_libs/**', '!crates/perry/src/commands/compile/optimized_libs.rs', '!crates/perry/src/commands/compile/strip_dedup/**', '!crates/perry/src/commands/compile/strip_dedup.rs', '!crates/perry/src/commands/compile/library_search/**', '!crates/perry/src/commands/compile/library_search.rs', '!crates/perry/src/commands/compile/post_link.rs', '!crates/perry/src/commands/compile/compressed_libs.rs', '!crates/perry/src/commands/compile/size_report.rs', '!crates/perry/src/commands/compile/bundle_*.rs') }}' | cut -c1-16)
+          echo "id=$id" >> "$GITHUB_OUTPUT"
       - name: Restore the object cache
+        id: objects
         uses: actions/cache/restore@v4
         with:
           path: ${{ env.STORAGE_DIR }}/node_modules/.cache/perry
-          key: perry-obj-${{ runner.arch }}-${{ steps.objid.outputs.id }}-${{ steps.storage.outputs.sha }}-${{ github.run_id }}
+          key: perry-obj-${{ runner.arch }}-${{ steps.objid.outputs.id }}-${{ needs.storage-prep.outputs.sha }}-${{ github.run_id }}
           restore-keys: |
-            perry-obj-${{ runner.arch }}-${{ steps.objid.outputs.id }}-${{ steps.storage.outputs.sha }}-
+            perry-obj-${{ runner.arch }}-${{ steps.objid.outputs.id }}-${{ needs.storage-prep.outputs.sha }}-
             perry-obj-${{ runner.arch }}-${{ steps.objid.outputs.id }}-
-
-      - name: Install lld
-        # GNU ld cannot place range-extension stubs for a ~200 MB aarch64 image
-        # (R_AARCH64_CALL26 truncation); lld inserts thunks as needed.
-        run: sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq lld-22
+      - name: Object cache state
+        id: objstate
+        run: |
+          matched='${{ steps.objects.outputs.cache-matched-key }}'
+          exact='perry-obj-${{ runner.arch }}-${{ steps.objid.outputs.id }}-${{ needs.storage-prep.outputs.sha }}-'
+          case "$matched" in "$exact"*) echo "exact=true" >> "$GITHUB_OUTPUT" ;; *) echo "exact=false" >> "$GITHUB_OUTPUT" ;; esac
+          case "$matched" in "perry-obj-${{ runner.arch }}-${{ steps.objid.outputs.id }}-"*) warm=true ;; *) warm=false ;; esac
+          echo "object cache: matched='$matched' warm=$warm"
+          echo "- object cache: ${matched:-cold}" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ inputs.relink_only }}" = true ] && [ "$warm" != true ]; then
+            echo "::error::relink_only requested but no object cache exists for this object id"
+            exit 1
+          fi
 
       - name: Compile Storage natively
         id: compile
@@ -162,28 +329,48 @@ jobs:
           "$GITHUB_WORKSPACE/.github/supa/shims.sh" .
           export PERRY_OBJECT_CACHE_BUILD_ID=${{ steps.objid.outputs.id }}
           export PERRY_NO_AUTO_OPTIMIZE=1 PERRY_FORCE_LINK_RESPONSE_FILE=1 PERRY_KEEP_SYMBOLS=1
-          export PERRY_CODEGEN_UNIT_JOBS=2 PERRY_MODULE_JOBS=2
           export PATH="$LLVM_SYS_221_PREFIX/bin:$PATH"
           export PERRY_EXTRA_LINK_ARGS="-fuse-ld=lld"
           command -v ld.lld
+          entry=dist/start/server-minimal.js; out="$OUT/storage-native"
+          if [ "${{ inputs.probe }}" = true ]; then
+            cp "$GITHUB_WORKSPACE/.github/supa/probe.js" probe.js
+            entry=probe.js; out="$OUT/probe-native"
+          fi
+          echo "jobs: modules=$PERRY_MODULE_JOBS units=$PERRY_CODEGEN_UNIT_JOBS"
           set +e
+          # Timestamp every line so the log shows where the time goes
+          # (collect, codegen, no-auto library rebuild, link).
           /usr/bin/time -v -o "$OUT/compile.time" \
-            "$GITHUB_WORKSPACE/target/release/perry" compile dist/start/server-minimal.js -o "$OUT/storage-native" \
-            > "$OUT/compile.log" 2>&1
-          rc=$?
+            "$GITHUB_WORKSPACE/target/release/perry" compile "$entry" -o "$out" 2>&1 \
+            | while IFS= read -r l; do printf '%(%T)T %s\n' -1 "$l"; done > "$OUT/compile.log"
+          rc=${PIPESTATUS[0]}
           echo "compile exit=$rc" ; tail -n 25 "$OUT/compile.log"
+          if grep -q 'codegen: modules finished' "$OUT/compile.log"; then echo "codegen=true" >> "$GITHUB_OUTPUT"; else echo "codegen=false" >> "$GITHUB_OUTPUT"; fi
           exit $rc
 
       - name: Save the object cache
-        # Compiling takes ~35 min; keep the objects even when the link fails.
-        if: always() && steps.compile.conclusion != 'skipped'
+        # Compiling takes ~35 min cold; keep the objects even when the link
+        # fails, but only when this run generated some (or found none).
+        if: always() && steps.compile.conclusion != 'skipped' && !inputs.probe && (steps.compile.outputs.codegen == 'true' || steps.objstate.outputs.exact != 'true')
         uses: actions/cache/save@v4
         with:
           path: ${{ env.STORAGE_DIR }}/node_modules/.cache/perry
-          key: perry-obj-${{ runner.arch }}-${{ steps.objid.outputs.id }}-${{ steps.storage.outputs.sha }}-${{ github.run_id }}
+          key: perry-obj-${{ runner.arch }}-${{ steps.objid.outputs.id }}-${{ needs.storage-prep.outputs.sha }}-${{ github.run_id }}
+      - name: Prune old object caches
+        if: always() && steps.compile.conclusion != 'skipped' && !inputs.probe && (steps.compile.outputs.codegen == 'true' || steps.objstate.outputs.exact != 'true')
+        run: .github/supa/prune-caches.sh perry-obj- 2
+
+      - name: Probe run
+        if: ${{ inputs.probe }}
+        run: |
+          set +e
+          "$OUT/probe-native" 2>&1 | tee "$OUT/probe-run.txt" | tail -n 80
+          echo "probe exit=${PIPESTATUS[0]}"
 
       - name: Native smoke
         id: native
+        if: ${{ !inputs.probe }}
         run: |
           export PGPASSWORD=postgres
           psql -h 127.0.0.1 -U postgres -c 'create database ref_native'
@@ -195,11 +382,17 @@ jobs:
           grep -E 'VmRSS|VmHWM' "/proc/$pid/status" | tee "$OUT/native-idle-rss.txt"
           "$GITHUB_WORKSPACE/.github/supa/smoke.sh" 5611 "$OUT/native-transcript.txt"
       - name: Stop native
-        if: always()
+        if: ${{ always() && !inputs.probe }}
         run: .github/supa/serve.sh stop native "$OUT"
 
+      - uses: actions/download-artifact@v4
+        if: ${{ !inputs.probe }}
+        with:
+          name: node-reference
+          path: ${{ env.OUT }}/node
       - name: Compare with node
-        run: .github/supa/compare.sh "$OUT/node-transcript.txt" "$OUT/native-transcript.txt"
+        if: ${{ !inputs.probe }}
+        run: .github/supa/compare.sh "$OUT/node/node-transcript.txt" "$OUT/native-transcript.txt"
 
       - name: Diagnostics
         if: failure()
@@ -210,21 +403,31 @@ jobs:
         run: |
           {
             echo "### storage-linux"
-            echo "- perry: \`${GITHUB_SHA::8}\`, storage: \`${{ steps.storage.outputs.sha }}\` (\`$STORAGE_REF\`)"
-            if [ -f "$OUT/perry-build.end" ]; then
-              echo "- perry build (compiler + libs): $(( $(cat "$OUT/perry-build.end") - $(cat "$OUT/perry-build.start") )) s"
-            fi
+            echo "- perry: \`${GITHUB_SHA::8}\`, storage: \`${{ needs.storage-prep.outputs.sha }}\` (\`$STORAGE_REF\`), objects: \`${{ steps.objid.outputs.id }}\`"
+            echo "- jobs: modules=$PERRY_MODULE_JOBS units=$PERRY_CODEGEN_UNIT_JOBS"
             if [ -f "$OUT/compile.time" ]; then
               grep -E 'Elapsed|Maximum resident' "$OUT/compile.time" | sed 's/^\s*/- compile: /'
             fi
-            if [ -f "$OUT/storage-native" ]; then
-              echo "- binary: $(stat -c %s "$OUT/storage-native") bytes unstripped, $(strip -o /dev/stdout "$OUT/storage-native" 2>/dev/null | wc -c) bytes stripped"
+            if [ -f "$OUT/compile.log" ]; then
+              echo '- compile stages (first line of each):'
+              echo '```'
+              for p in 'Collecting modules' 'Generating code' 'no-auto libraries' 'Linking' 'Wrote executable'; do
+                grep -m1 -F "$p" "$OUT/compile.log" || true
+              done
+              grep 'codegen: modules finished' "$OUT/compile.log" | tail -n 1 || true
+              tail -n 1 "$OUT/compile.log"
+              echo '```'
             fi
+            for b in storage-native probe-native; do
+              [ -f "$OUT/$b" ] && echo "- $b: $(stat -c %s "$OUT/$b") bytes unstripped, $(strip -o /dev/stdout "$OUT/$b" 2>/dev/null | wc -c) bytes stripped"
+            done
             [ -f "$OUT/native-idle-rss.txt" ] && sed 's/^/- idle /' "$OUT/native-idle-rss.txt"
+            echo '```'; sccache --show-stats 2>/dev/null | head -n 12; echo '```'
             echo '```'
             [ -f "$OUT/native-transcript.txt" ] && cat "$OUT/native-transcript.txt"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+          true
 
       - name: Upload logs
         if: always()
@@ -250,52 +453,55 @@ jobs:
           retention-days: 7
 
   regressions-linux:
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.regressions }}
+    if: ${{ !inputs.skip_regressions }}
+    needs: build-perry
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 240
-    env:
-      PERRY_WORKSPACE_ROOT: ${{ github.workspace }}
-      PERRY_BUILD_WORKSPACE_ROOT: ${{ github.workspace }}
-      PERRY_SRC: ${{ github.workspace }}
-      PERRY_RUNTIME_DIR: ${{ github.workspace }}/target/release
-      PERRY_BUILD_COMMIT: supa-storage-fork
     steps:
       - uses: actions/checkout@v4
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
-            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift 2>/dev/null || true
-          df -h /
-      - name: Install Rust toolchain
-        run: rustup toolchain install nightly-2026-10-04 --profile minimal --component rustfmt --component clippy
-      - uses: ./.github/actions/setup-llvm22
-      - uses: Swatinem/rust-cache@v2
+      - name: Simulated change
+        if: ${{ inputs.simulate && inputs.simulate != 'none' }}
+        run: .github/supa/simulate.sh "${{ inputs.simulate }}"
+      - name: Already passed for this source?
+        id: done
+        # The marker is keyed by everything the tests depend on: the crates,
+        # the lockfile and the test list itself.
+        uses: actions/cache/restore@v4
         with:
-          shared-key: ${{ runner.os }}-${{ runner.arch }}-supa-storage
-          save-if: "false"
+          path: regressions-ok
+          key: regressions-ok-${{ runner.arch }}-${{ hashFiles('crates/**', 'Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/**', '.github/supa/regressions.sh') }}
+          lookup-only: true
+      - uses: ./.github/actions/supa-rust-env
+        if: steps.done.outputs.cache-hit != 'true'
       - name: Runtime libraries for the integration tests
-        run: cargo build --locked --release -p perry-runtime-static -p perry-stdlib-static -p perry-ext-http -p perry-ext-net
-      - name: Compiler integration regressions
+        if: steps.done.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/perry-dist
+          key: ${{ needs.build-perry.outputs.key }}
+          fail-on-cache-miss: true
+      - name: Build the test binaries
+        if: steps.done.outputs.cache-hit != 'true'
         run: |
-          cargo test --locked --release -p perry --no-default-features --features compile-cli \
-            --test cjs_class_method_sees_later_const \
-            --test class_computed_member_before_super_method \
-            --test codegen_units_shared_helper_linkage \
-            --test image_string_literal_native_args \
-            --test layout_family_alias_stack_map \
-            --test url_search_params_type_erased_methods \
-            --test worker_program_regex_literal
-      - name: HIR regressions
-        run: cargo test --locked --release -p perry-hir --test cjs_factory_frame_label --test enum_as_value_lowering
-      - name: Runtime unit regressions
-        run: |
-          RUST_TEST_THREADS=1 cargo test --locked --release -p perry-runtime --lib -- \
-            a_module_body_frame_renders_its_own_location tracked_classifier_rejects_null_forged_and_image_edge_addresses
-      - name: Codegen unit regressions
-        # Exact names: other perry-codegen lib tests abort on this baseline.
-        # The hot-TLS test builds IR for an explicit Apple triple, so it runs on Linux.
-        run: |
-          cargo test --locked --release -p perry-codegen --lib -- \
-            the_cap_does_not_count_groups_that_never_walk \
-            the_cap_counts_root_loads_not_derived_values \
-            the_hot_cache_read_is_marked_gc_leaf_in_bodies_without_root_slots
+          mkdir -p target/release && cp perry-dist/lib*.a target/release/
+          start=$(date +%s)
+          .github/supa/regressions.sh build
+          {
+            echo "### regressions-linux"
+            echo "- test build: $(( $(date +%s) - start )) s"
+            echo '```'; sccache --show-stats | head -n 12; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Run the regression tests
+        if: steps.done.outputs.cache-hit != 'true'
+        run: .github/supa/regressions.sh run
+      - name: Record the pass
+        if: steps.done.outputs.cache-hit != 'true'
+        run: mkdir -p regressions-ok && date -u > regressions-ok/passed
+      - uses: actions/cache/save@v4
+        if: steps.done.outputs.cache-hit != 'true'
+        with:
+          path: regressions-ok
+          key: regressions-ok-${{ runner.arch }}-${{ hashFiles('crates/**', 'Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/**', '.github/supa/regressions.sh') }}
+      - name: Summary
+        if: steps.done.outputs.cache-hit == 'true'
+        run: echo "regressions already passed for this source hash" >> "$GITHUB_STEP_SUMMARY"

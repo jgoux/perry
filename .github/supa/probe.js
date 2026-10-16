@@ -1,0 +1,55 @@
+try { require('pg-boss'); } catch (e) { console.log('pre FAIL pg-boss', e.message); }
+try { require('ajv'); } catch (e) { console.log('pre FAIL ajv', e.message); }
+try { require('pino'); } catch (e) { console.log('pre FAIL pino', e.message); }
+try { require('fast-xml-parser'); } catch (e) { console.log('pre FAIL fast-xml-parser', e.message); }
+try { const x = require('avvio'); console.log('OK avvio'); } catch (e) { console.log('FAIL avvio', String(e && e.message)); }
+try { const x = require('node:diagnostics_channel'); console.log('OK node:diagnostics_channel'); } catch (e) { console.log('FAIL node:diagnostics_channel', String(e && e.message)); }
+try { const x = require('light-my-request'); console.log('OK light-my-request'); } catch (e) { console.log('FAIL light-my-request', String(e && e.message)); }
+try { const x = require('find-my-way'); console.log('OK find-my-way'); } catch (e) { console.log('FAIL find-my-way', String(e && e.message)); }
+try { const x = require('@fastify/error'); console.log('OK @fastify/error'); } catch (e) { console.log('FAIL @fastify/error', String(e && e.message)); }
+try { const x = require('@fastify/fast-json-stringify-compiler'); console.log('OK @fastify/fast-json-stringify-compiler'); } catch (e) { console.log('FAIL @fastify/fast-json-stringify-compiler', String(e && e.message)); }
+try { const x = require('@fastify/ajv-compiler'); console.log('OK @fastify/ajv-compiler'); } catch (e) { console.log('FAIL @fastify/ajv-compiler', String(e && e.message)); }
+try { const x = require('@fastify/proxy-addr'); console.log('OK @fastify/proxy-addr'); } catch (e) { console.log('FAIL @fastify/proxy-addr', String(e && e.message)); }
+try { const x = require('abstract-logging'); console.log('OK abstract-logging'); } catch (e) { console.log('FAIL abstract-logging', String(e && e.message)); }
+try { const x = require('process-warning'); console.log('OK process-warning'); } catch (e) { console.log('FAIL process-warning', String(e && e.message)); }
+try { const x = require('rfdc'); console.log('OK rfdc'); } catch (e) { console.log('FAIL rfdc', String(e && e.message)); }
+try { const x = require('secure-json-parse'); console.log('OK secure-json-parse'); } catch (e) { console.log('FAIL secure-json-parse', String(e && e.message)); }
+try { const x = require('toad-cache'); console.log('OK toad-cache'); } catch (e) { console.log('FAIL toad-cache', String(e && e.message)); }
+try { const x = require('fast-json-stringify'); console.log('OK fast-json-stringify'); } catch (e) { console.log('FAIL fast-json-stringify', String(e && e.message)); }
+try { const x = require('semver'); console.log('OK semver'); } catch (e) { console.log('FAIL semver', String(e && e.message)); }
+try { const x = require('ipaddr.js'); console.log('OK ipaddr.js'); } catch (e) { console.log('FAIL ipaddr.js', String(e && e.message)); }
+try { const x = require('fast-uri'); console.log('OK fast-uri'); } catch (e) { console.log('FAIL fast-uri', String(e && e.message)); }
+try { const x = require('@fastify/merge-json-schemas'); console.log('OK @fastify/merge-json-schemas'); } catch (e) { console.log('FAIL @fastify/merge-json-schemas', String(e && e.message)); }
+try { const x = require('./node_modules/fastify/lib/config-validator.js'); console.log('OK ./node_modules/fastify/lib/config-validator.js'); } catch (e) { console.log('FAIL ./node_modules/fastify/lib/config-validator.js', String(e && e.message)); }
+try { const x = require('./node_modules/fastify/lib/content-type-parser.js'); console.log('OK ./node_modules/fastify/lib/content-type-parser.js'); } catch (e) { console.log('FAIL ./node_modules/fastify/lib/content-type-parser.js', String(e && e.message)); }
+try { const x = require('./node_modules/fastify/lib/content-type.js'); console.log('OK ./node_modules/fastify/lib/content-type.js'); } catch (e) { console.log('FAIL ./node_modules/fastify/lib/content-type.js', String(e && e.message)); }
+try { const x = require('./node_modules/fastify/lib/context.js'); console.log('OK ./node_modules/fastify/lib/context.js'); } catch (e) { console.log('FAIL ./node_modules/fastify/lib/context.js', String(e && e.message)); }
+try { const x = require('./node_modules/fastify/lib/decorate.js'); console.log('OK ./node_modules/fastify/lib/decorate.js'); } catch (e) { console.log('FAIL ./node_modules/fastify/lib/decorate.js', String(e && e.message)); }
+try { const x = require('./node_modules/fastify/lib/error-handler.js'); console.log('OK ./node_modules/fastify/lib/error-handler.js'); } catch (e) { console.log('FAIL ./node_modules/fastify/lib/error-handler.js', String(e && e.message)); }
+try { const x = require('./node_modules/fastify/lib/error-serializer.js'); console.log('OK ./node_modules/fastify/lib/error-serializer.js'); } catch (e) { console.log('FAIL ./node_modules/fastify/lib/error-serializer.js', String(e && e.message)); }
+try { const x = require('./node_modules/fastify/lib/error-status.js'); console.log('OK ./node_modules/fastify/lib/error-status.js'); } catch (e) { console.log('FAIL ./node_modules/fastify/lib/error-status.js', String(e && e.message)); }
+try { const x = require('./node_modules/fastify/lib/errors.js'); console.log('OK ./node_modules/fastify/lib/errors.js'); } catch (e) { console.log('FAIL ./node_modules/fastify/lib/errors.js', String(e && e.message)); }
+try { const x = require('./node_modules/fastify/lib/four-oh-four.js'); console.log('OK ./node_modules/fastify/lib/four-oh-four.js'); } catch (e) { console.log('FAIL ./node_modules/fastify/lib/four-oh-four.js', String(e && e.message)); }
+try { const x = require('./node_modules/fastify/lib/handle-request.js'); console.log('OK ./node_modules/fastify/lib/handle-request.js'); } catch (e) { console.log('FAIL ./node_modules/fastify/lib/handle-request.js', String(e && e.message)); }
+try { const x = require('./node_modules/fastify/lib/head-route.js'); console.log('OK ./node_modules/fastify/lib/head-route.js'); } catch (e) { console.log('FAIL ./node_modules/fastify/lib/head-route.js', String(e && e.message)); }
+try { const x = require('./node_modules/fastify/lib/hooks.js'); console.log('OK ./node_modules/fastify/lib/hooks.js'); } catch (e) { console.log('FAIL ./node_modules/fastify/lib/hooks.js', String(e && e.message)); }
+try { const x = require('./node_modules/fastify/lib/initial-config-validation.js'); console.log('OK ./node_modules/fastify/lib/initial-config-validation.js'); } catch (e) { console.log('FAIL ./node_modules/fastify/lib/initial-config-validation.js', String(e && e.message)); }
+try { const x = require('./node_modules/fastify/lib/log-controller.js'); console.log('OK ./node_modules/fastify/lib/log-controller.js'); } catch (e) { console.log('FAIL ./node_modules/fastify/lib/log-controller.js', String(e && e.message)); }
+try { const x = require('./node_modules/fastify/lib/logger-factory.js'); console.log('OK ./node_modules/fastify/lib/logger-factory.js'); } catch (e) { console.log('FAIL ./node_modules/fastify/lib/logger-factory.js', String(e && e.message)); }
+try { const x = require('./node_modules/fastify/lib/logger-pino.js'); console.log('OK ./node_modules/fastify/lib/logger-pino.js'); } catch (e) { console.log('FAIL ./node_modules/fastify/lib/logger-pino.js', String(e && e.message)); }
+try { const x = require('./node_modules/fastify/lib/noop-set.js'); console.log('OK ./node_modules/fastify/lib/noop-set.js'); } catch (e) { console.log('FAIL ./node_modules/fastify/lib/noop-set.js', String(e && e.message)); }
+try { const x = require('./node_modules/fastify/lib/plugin-override.js'); console.log('OK ./node_modules/fastify/lib/plugin-override.js'); } catch (e) { console.log('FAIL ./node_modules/fastify/lib/plugin-override.js', String(e && e.message)); }
+try { const x = require('./node_modules/fastify/lib/plugin-utils.js'); console.log('OK ./node_modules/fastify/lib/plugin-utils.js'); } catch (e) { console.log('FAIL ./node_modules/fastify/lib/plugin-utils.js', String(e && e.message)); }
+try { const x = require('./node_modules/fastify/lib/promise.js'); console.log('OK ./node_modules/fastify/lib/promise.js'); } catch (e) { console.log('FAIL ./node_modules/fastify/lib/promise.js', String(e && e.message)); }
+try { const x = require('./node_modules/fastify/lib/reply.js'); console.log('OK ./node_modules/fastify/lib/reply.js'); } catch (e) { console.log('FAIL ./node_modules/fastify/lib/reply.js', String(e && e.message)); }
+try { const x = require('./node_modules/fastify/lib/req-id-gen-factory.js'); console.log('OK ./node_modules/fastify/lib/req-id-gen-factory.js'); } catch (e) { console.log('FAIL ./node_modules/fastify/lib/req-id-gen-factory.js', String(e && e.message)); }
+try { const x = require('./node_modules/fastify/lib/request.js'); console.log('OK ./node_modules/fastify/lib/request.js'); } catch (e) { console.log('FAIL ./node_modules/fastify/lib/request.js', String(e && e.message)); }
+try { const x = require('./node_modules/fastify/lib/route.js'); console.log('OK ./node_modules/fastify/lib/route.js'); } catch (e) { console.log('FAIL ./node_modules/fastify/lib/route.js', String(e && e.message)); }
+try { const x = require('./node_modules/fastify/lib/schema-controller.js'); console.log('OK ./node_modules/fastify/lib/schema-controller.js'); } catch (e) { console.log('FAIL ./node_modules/fastify/lib/schema-controller.js', String(e && e.message)); }
+try { const x = require('./node_modules/fastify/lib/schemas.js'); console.log('OK ./node_modules/fastify/lib/schemas.js'); } catch (e) { console.log('FAIL ./node_modules/fastify/lib/schemas.js', String(e && e.message)); }
+try { const x = require('./node_modules/fastify/lib/server.js'); console.log('OK ./node_modules/fastify/lib/server.js'); } catch (e) { console.log('FAIL ./node_modules/fastify/lib/server.js', String(e && e.message)); }
+try { const x = require('./node_modules/fastify/lib/symbols.js'); console.log('OK ./node_modules/fastify/lib/symbols.js'); } catch (e) { console.log('FAIL ./node_modules/fastify/lib/symbols.js', String(e && e.message)); }
+try { const x = require('./node_modules/fastify/lib/validation.js'); console.log('OK ./node_modules/fastify/lib/validation.js'); } catch (e) { console.log('FAIL ./node_modules/fastify/lib/validation.js', String(e && e.message)); }
+try { const x = require('./node_modules/fastify/lib/warnings.js'); console.log('OK ./node_modules/fastify/lib/warnings.js'); } catch (e) { console.log('FAIL ./node_modules/fastify/lib/warnings.js', String(e && e.message)); }
+try { const x = require('./node_modules/fastify/lib/wrap-thenable.js'); console.log('OK ./node_modules/fastify/lib/wrap-thenable.js'); } catch (e) { console.log('FAIL ./node_modules/fastify/lib/wrap-thenable.js', String(e && e.message)); }
+try { const x = require('fastify'); console.log('OK fastify'); } catch (e) { console.log('FAIL fastify', String(e && e.message)); }
