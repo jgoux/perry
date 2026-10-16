@@ -16,7 +16,7 @@ run-name: supa-storage / ${{ github.sha }}
 
 on:
   push:
-    branches: [supa/storage]
+    branches: [supa/storage, supa/storage-ci]
   workflow_dispatch:
     inputs:
       storage_ref:
