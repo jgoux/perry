@@ -130,6 +130,11 @@ pub(crate) struct MixinFn {
 pub struct LoweringContext {
     /// Labels and source spans of the for-of loops currently being lowered.
     pub iterator_loop_labels: Vec<(u32, String)>,
+    /// Enclosing break/continue targets of the statement being lowered; see
+    /// `jump_targets.rs` (#12663).
+    pub(crate) jump_frames: Vec<super::jump_targets::JumpFrame>,
+    /// Counter for the synthetic labels of `jump_frames`.
+    pub(crate) next_jump_label: u32,
     /// Counter for generating unique local IDs
     pub(crate) next_local_id: LocalId,
     /// User-visible declaration spans keyed by the `LocalId` allocated during
@@ -637,6 +642,13 @@ pub struct LoweringContext {
     /// the frame was entered, so declarations inside the block/function can
     /// continue to lexically shadow the object environment.
     pub(crate) with_env_stack: Vec<WithEnvFrame>,
+    /// One entry per function body being lowered: its dynamic eval scope
+    /// object and the locals mark of its own bindings, or `(LocalId::MAX, _)`
+    /// when it has none (`lower::dynamic_eval`).
+    pub(crate) dynamic_eval_scopes: Vec<(LocalId, usize)>,
+    /// Set by arrow lowering for its block body: an arrow shares the
+    /// enclosing function's variable scope.
+    pub(crate) lowering_arrow_body: bool,
     pub(crate) var_hoisted_ids: HashSet<LocalId>,
     /// LocalIds of lexical let/const bindings that are forward-referenced
     /// (read before their declaration, directly or via a closure) in the

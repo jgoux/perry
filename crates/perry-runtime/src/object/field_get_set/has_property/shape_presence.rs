@@ -83,6 +83,11 @@ pub(crate) unsafe fn own_position(
             Some(slot)
         }
     });
+    // A layout that can have holes: an optional key whose slot holds the
+    // hole is absent (`key_view`), and the answer is this object's alone.
+    let holey = !table_owned && crate::object::key_view::summary_may_have_holes(shape.summary);
+    let position = position
+        .filter(|&p| !holey || !crate::object::key_view::position_is_hole(obj, view, p));
 
     if position.is_some() {
         if class_id != 0 && super::super::is_internal_runtime_key_bytes(name) {
@@ -102,85 +107,10 @@ pub(crate) unsafe fn own_position(
         return None;
     }
     let reusable = !table_owned
+        && !holey
         && shape.hole_count == 0
         && shapes::is_site_matchable_shape_id(shapes::object_shape_stamp(obj));
     Some((position, shape.proto_id, shape.object_kind, reusable))
-}
-
-pub(crate) struct PresenceProof {
-    pub(crate) present: bool,
-    pub(crate) holder: usize,
-    pub(crate) holder_shape: u32,
-    pub(crate) slot: Option<u32>,
-    pub(crate) hops: [(usize, u32); 3],
-    pub(crate) depth: usize,
-    pub(crate) reusable: bool,
-}
-
-/// The ordinary walk uses one prototype cell per hop. Its short proof can be
-/// published in the existing keyed holder record; longer/table_owned/class
-/// links still answer directly, without introducing invalidation state.
-#[inline(always)]
-pub(crate) unsafe fn presence_proof(receiver: f64, key: f64) -> Option<PresenceProof> {
-    let value = JSValue::from_bits(receiver.to_bits());
-    let key_value = JSValue::from_bits(key.to_bits());
-    if !value.is_pointer() || !key_value.is_any_string() {
-        return None;
-    }
-    let mut scratch = [0u8; crate::value::SHORT_STRING_MAX_LEN];
-    let name = crate::string::js_string_key_bytes(key_value, &mut scratch)?;
-    let recv = value.as_pointer::<ObjectHeader>();
-    let mut obj = recv as *const ObjectHeader;
-    let mut proof = PresenceProof {
-        present: false,
-        holder: 0,
-        holder_shape: 0,
-        slot: None,
-        hops: [(0, 0); 3],
-        depth: 0,
-        reusable: true,
-    };
-    for depth in 0..32 {
-        let (position, pid, _kind, reusable) = own_position(obj, name)?;
-        proof.reusable &= reusable && depth <= 4;
-        if obj != recv {
-            proof.holder = obj as usize;
-            proof.holder_shape = shapes::object_shape_stamp(obj);
-            proof.depth = depth;
-        }
-        if position.is_some() {
-            proof.present = true;
-            proof.slot = position;
-            return Some(proof);
-        }
-        if pid == shapes::PROTO_ID_NULL
-            || obj as usize == crate::array::object_prototype_addr_if_resolved()
-        {
-            return Some(proof);
-        }
-        if depth > 0 && depth <= 3 {
-            proof.hops[depth - 1] = (obj as usize, shapes::object_shape_stamp(obj));
-        }
-        let next = if pid == shapes::PROTO_ID_DEFAULT {
-            crate::array::object_prototype_addr_if_resolved() as *const ObjectHeader
-        } else {
-            // CLASS identity cells may change while the receiver keeps its
-            // shape. Consume their live word on each walk; do not memoize it.
-            proof.reusable &= !(shapes::PROTO_ID_CLASS..shapes::PROTO_ID_MIXED).contains(&pid);
-            let word =
-                shapes::shape_record_by_id(shapes::object_shape_stamp(obj))?.prototype_word();
-            let prototype = JSValue::from_bits(word);
-            if !prototype.is_pointer() {
-                return None;
-            }
-            prototype.as_pointer::<ObjectHeader>() as *const ObjectHeader
-        };
-        if next.is_null() || next == obj || next == recv {
-            return None;
-        }
-        obj = next;
-    }
-    None
 }
 
 #[inline(never)]

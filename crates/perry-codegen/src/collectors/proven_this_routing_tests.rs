@@ -41,6 +41,8 @@ fn ir_opts(is_entry: bool) -> CompileOptions {
         static_shape_ids: Vec::new(),
         program_class_shape_ids: Default::default(),
         program_facts: Default::default(),
+        program_layouts: Default::default(),
+        gc_effects: Default::default(),
         target: None,
         is_entry_module: is_entry,
         non_entry_module_prefixes: Vec::new(),
@@ -1648,7 +1650,10 @@ fn tower_receiver_word_is_a_native_scalar() {
         .to_string();
     let compare = caller
         .lines()
-        .find(|line| line.trim_start().starts_with(&format!("{class_id} = trunc i64 ")))
+        .find(|line| {
+            line.trim_start()
+                .starts_with(&format!("{class_id} = trunc i64 "))
+        })
         .unwrap_or_else(|| panic!("no receiver-word class id:\n{caller}"));
     let word = compare
         .split("trunc i64 ")

@@ -1594,18 +1594,14 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                         "object[index]",
                         TypedFeedbackContract::object_get_by_name(),
                     );
-                    let slot = keyed_slot(ctx);
-                    Ok(ctx.block().call(
-                        DOUBLE,
-                        "js_object_get_field_by_key_site",
-                        &[
-                            (crate::types::PTR, &slot),
-                            (I64, &site_id),
-                            (I64, &obj_handle),
-                            (DOUBLE, key_box),
-                            (DOUBLE, obj_box),
-                        ],
-                    ))
+                    let _ = obj_handle;
+                    // Object model step 5 (§3.7 case 3): the receiver's own
+                    // layout and its chain answer the key's atom
+                    // (`perry_probe_get_keyed`, a GC leaf); only a decline
+                    // takes the complete keyed read.
+                    Ok(symbol_ic::emit_keyed_probe(ctx, obj_box, key_box, |ctx| {
+                        symbol_ic::keyed_slow(ctx, obj_box, key_box, &site_id, false)
+                    }))
                 });
             }
             // Last-resort fallback with runtime tag checks on the index.
@@ -1710,18 +1706,11 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 );
                 // #10753: the by-key entry answers from shapes before it
                 // takes the by-value read (see the dynamic-string arm above).
-                let slot = keyed_slot(ctx);
-                let v_str = ctx.block().call(
-                    DOUBLE,
-                    "js_object_get_field_by_key_site",
-                    &[
-                        (crate::types::PTR, &slot),
-                        (I64, &site_id),
-                        (I64, &str_obj_handle),
-                        (DOUBLE, &idx_box),
-                        (DOUBLE, &obj_box),
-                    ],
-                );
+                let _ = str_obj_handle;
+                // The probe first (§3.7 case 3), as the dynamic-string arm.
+                let v_str = symbol_ic::emit_keyed_probe(ctx, &obj_box, &idx_box, |ctx| {
+                    symbol_ic::keyed_slow(ctx, &obj_box, &idx_box, &site_id, false)
+                });
                 let str_end_lbl = ctx.block().label.clone();
                 ctx.block().br(&merge_lbl);
                 // Numeric key → polymorphic dispatch.
@@ -1798,13 +1787,4 @@ pub(crate) fn lower_record_next(
     value_slot: &str,
 ) -> Result<(String, String)> {
     guarded_array::lower_record_next(ctx, array, index, protocol, record, index_slot, value_slot)
-}
-
-/// A keyed read owns one lazy PIC slot, just like a named read.
-pub(super) fn keyed_slot(ctx: &mut FnCtx<'_>) -> String {
-    let site = ctx.ic_site_counter;
-    ctx.ic_site_counter += 1;
-    let name = crate::expr::inline_cache_global_name(ctx, site);
-    ctx.ic_globals.push(name.clone());
-    format!("@{name}")
 }

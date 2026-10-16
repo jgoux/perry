@@ -383,6 +383,25 @@ fn compute_object_cache_key_with_env(
             section_hash(&opts.program_facts.contract_section)
         ),
     );
+    h.field(
+        "dynamic_code_reach",
+        &format!("{:?}", opts.program_facts.dynamic_code_reach),
+    );
+    // Object model case 2c: the program's families and key colouring decide
+    // every module's descriptors and coloured read sites.
+    h.field(
+        "program_layouts",
+        &format!(
+            "{:016x}:{}:{}",
+            opts.program_layouts.digest,
+            opts.program_layouts.families.len(),
+            opts.program_layouts.mask_words
+        ),
+    );
+    // The runtime call-effect table decides which calls become statepoints,
+    // leaf-marked calls and plain calls rather than invokes: a module
+    // compiled under another table is a different object.
+    h.field("gc_effects", &format!("{:016x}", opts.gc_effects.digest()));
     // #11394: a module's method calls lower differently when ANY module in the
     // program writes that method name onto a builtin prototype.
     h.field(

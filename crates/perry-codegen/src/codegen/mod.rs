@@ -562,6 +562,7 @@ fn compile_module_impl(
 
     let mut llmod = LlModule::new_with_fp_flags(&triple, fp_flags);
     llmod.program_has_worker = opts.program_has_worker;
+    llmod.set_gc_effects(std::sync::Arc::clone(&opts.gc_effects));
     runtime_decls::declare_phase1(&mut llmod);
 
     // Derive a per-module symbol prefix from the HIR module name:
@@ -2802,6 +2803,8 @@ fn compile_module_impl(
             .collect();
     let mut cross_module = CrossModuleCtx {
         wpfacts: opts.program_facts.elision.clone(),
+        capture_type_proofs: Default::default(),
+        program_layouts: Arc::clone(&opts.program_layouts),
         program_has_worker: opts.program_has_worker,
         program_has_thread_agents: thread_agents,
         class_hierarchy: class_hierarchy::ClassHierarchy::default(),
@@ -3187,6 +3190,8 @@ fn compile_module_impl(
     cross_module.scope_map =
         crate::scope_env::ScopeMap::build(hir, &module_boxed_vars, &module_globals);
     cross_module.string_accumulator_locals = crate::collectors::string_accumulator_locals(hir);
+    cross_module.capture_type_proofs =
+        crate::collectors::typed_locals::capture_proofs(hir, &module_boxed_vars, &module_globals);
     // #6369: the *receiver-type oracle* for closure bodies — every module-wide
     // `Stmt::Let` type, with NO representation-driven filtering. `FnCtx.
     // local_types` is what `static_type_of` / `is_array_expr` /
@@ -3565,6 +3570,18 @@ fn compile_module_impl(
             {
                 reject(
                     typed_abi::TypedCloneRejectionReason::SpecTypedCloneOverlap,
+                    &mut typed_clone_rejection_records,
+                );
+                continue;
+            }
+            // A specialized entry is a second full copy of the body. For a
+            // giant body (a generated straight-line driver, a 400-case
+            // switch) that doubles the dominant LLVM cost and its `.text`
+            // for entry-bound parameter facts that a body this size
+            // amortizes to nothing.
+            if spec_abi::spec_body_too_large(&f.body) {
+                reject(
+                    typed_abi::TypedCloneRejectionReason::SpecBodyTooLarge,
                     &mut typed_clone_rejection_records,
                 );
                 continue;

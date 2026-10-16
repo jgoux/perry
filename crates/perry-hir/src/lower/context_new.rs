@@ -44,6 +44,8 @@ impl LoweringContext {
         let tagged_template_site_salt = super::context::stable_module_salt(&module_identity);
         Self {
             iterator_loop_labels: Vec::new(),
+            jump_frames: Vec::new(),
+            next_jump_label: 0,
             next_local_id: 0,
             local_source_spans: HashMap::new(),
             classic_for_lexical_bindings: HashSet::new(),
@@ -143,6 +145,8 @@ impl LoweringContext {
             unresolved_ident_as_global: false,
             global_intrinsic_new_once: false,
             with_env_stack: Vec::new(),
+            dynamic_eval_scopes: Vec::new(),
+            lowering_arrow_body: false,
             var_hoisted_ids: HashSet::new(),
             tdz_forward_ids: HashSet::new(),
             module_lexical_ids: HashSet::new(),

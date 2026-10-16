@@ -171,6 +171,7 @@ pub(super) const COMPILE_ENV_VARS: &[&str] = &[
     "PERRY_TYPED_BODIES",
     "PERRY_TYPED_FEEDBACK",
     "PERRY_TYPED_FEEDBACK_TRACE",
+    "PERRY_TYPED_LOCALS",
     "PERRY_U8_INLINE_READ",
     "PERRY_VERIFY_NATIVE_REGIONS",
     "PERRY_VISIONOS_SYSROOT",
@@ -580,7 +581,7 @@ const COMPILE_ENV_EXCLUSIONS: &[(&str, &str)] = &[
     ),
     (
         "PERRY_GC_TENURING_SURVIVALS",
-        "Read by the generated program runtime, never consulted by compiler lowering.",
+        "Runtime-only diagnostic u8 pin; effective 0..=3, larger values saturate with one stderr warning.",
     ),
     (
         "PERRY_GLSLC",

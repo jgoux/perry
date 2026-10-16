@@ -44,6 +44,8 @@ mod perex_display;
 #[cfg(feature = "regex-engine")]
 pub(crate) mod perex_glob;
 #[cfg(feature = "regex-engine")]
+pub(crate) mod perex_lead;
+#[cfg(feature = "regex-engine")]
 pub(crate) mod perex_literal_bytes;
 #[cfg(feature = "regex-engine")]
 mod perex_literal_search;
@@ -183,7 +185,7 @@ crate::perry_thread_local! {
 pub fn regexp_data_of(value: f64) -> Option<*const RegExpData> {
     #[cfg(test)]
     REGEX_PTR_VALIDATION_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let slot = MATCHER_READ.with(|site| site.read(value))?;
+    let slot = MATCHER_READ.read(value)?;
     let slot = crate::value::JSValue::from_bits(slot.to_bits());
     slot.is_pointer().then(|| slot.as_pointer::<RegExpData>())
 }
@@ -191,10 +193,8 @@ pub fn regexp_data_of(value: f64) -> Option<*const RegExpData> {
 /// Raw-receiver ABI retained for the typed HIR calls until S5.
 pub type RegExpHeader = ObjectHeader;
 pub(crate) const REGEXP_MATCHER: &str = "[[RegExpMatcher]]";
-crate::perry_thread_local! {
-    static MATCHER_READ: crate::object::IntrinsicPrivateReadSite =
-        const { crate::object::IntrinsicPrivateReadSite::new(REGEXP_MATCHER) };
-}
+const MATCHER_READ: crate::object::IntrinsicPrivateReadSite =
+    crate::object::IntrinsicPrivateReadSite::new(REGEXP_MATCHER);
 
 /// The slot of the intrinsic private matcher in a shape's key list: the
 /// brand as a fact of that shape.
@@ -206,7 +206,7 @@ pub(crate) unsafe fn matcher_slot(
     keys: *const crate::array::ArrayHeader,
     count: u32,
 ) -> Option<u32> {
-    MATCHER_READ.with(|site| site.slot_in(keys, count))
+    MATCHER_READ.slot_in(keys, count)
 }
 
 /// Read an already branded receiver's immutable data before the next
@@ -322,7 +322,14 @@ pub struct RegExpData {
     pub dot_all: bool,
     pub unicode: bool,
     pub has_indices: bool,
+    /// Terms in `lead` (`perex_lead`): zero when the pattern's leading
+    /// units were not derived.
+    pub(crate) lead_len: u8,
     pub(crate) perex_program: *const u8,
+    /// The ASCII units every match begins with, one set per unit, derived
+    /// from the source when the cell is published (`perex_lead::derive`).
+    #[cfg(feature = "regex-engine")]
+    pub(crate) lead: [perex_lead::AsciiSet; perex_lead::LEAD_MAX],
 }
 
 impl RegExpData {
@@ -653,13 +660,9 @@ pub extern "C" fn js_regexp_to_string(re: *const RegExpHeader) -> *mut StringHea
 /// f64). Usually a number, but `re.lastIndex = obj` round-trips the object.
 #[cfg(feature = "regex-engine")]
 pub(crate) fn get_last_index(re: *const RegExpHeader) -> f64 {
-    LAST_INDEX_READ.with(|site| unsafe { site.read(re as *mut ObjectHeader, b"lastIndex") })
-}
-
-crate::perry_thread_local! {
-    #[cfg(feature = "regex-engine")]
-    static LAST_INDEX_READ: crate::object::field_get_set::runtime_read_site::RuntimeReadSite =
-        const { crate::object::field_get_set::runtime_read_site::RuntimeReadSite::new() };
+    unsafe {
+        crate::object::field_get_set::runtime_read_site::get(re as *mut ObjectHeader, b"lastIndex")
+    }
 }
 
 #[cfg(feature = "regex-engine")]

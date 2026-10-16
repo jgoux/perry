@@ -162,8 +162,10 @@ pub(crate) fn lower_unary_expr(ctx: &mut LoweringContext, unary: &ast::UnaryExpr
                 // implicit globals are runtime globalThis properties
                 // (#3575), so `g = 5; typeof g` must observe the live
                 // binding. Non-throwing lookup per the spec's
-                // GetValue-skips-on-typeof rule.
-                return Ok(Expr::TypeOf(Box::new(Expr::Call {
+                // GetValue-skips-on-typeof rule. A `with` object or a
+                // function's dynamic eval scope (`lower::dynamic_eval`) may
+                // bind the name first, so it is consulted before the global.
+                let global = Expr::Call {
                     callee: Box::new(Expr::ExternFuncRef {
                         name: "js_global_get_optional".to_string(),
                         param_types: vec![Type::Any],
@@ -172,7 +174,11 @@ pub(crate) fn lower_unary_expr(ctx: &mut LoweringContext, unary: &ast::UnaryExpr
                     args: vec![Expr::String(n.to_string())],
                     type_args: Vec::new(),
                     byte_offset: 0,
-                })));
+                };
+                let with_envs = ctx.active_with_envs_for_ident(n);
+                return Ok(Expr::TypeOf(Box::new(super::helpers::wrap_with_gets(
+                    n, global, with_envs,
+                ))));
             }
         }
         // #1395: `typeof process.memoryUsage.rss` is a nested member
@@ -232,7 +238,9 @@ pub(crate) fn lower_unary_expr(ctx: &mut LoweringContext, unary: &ast::UnaryExpr
                         && ctx.lookup_func(obj_name).is_none()
                         && is_known_namespace_static_function(obj_name, prop_name)
                     {
-                        return Ok(Expr::String("function".to_string()));
+                        if let Some(folded) = namespace_typeof_fold(obj_name, prop_name, None) {
+                            return Ok(folded);
+                        }
                     }
                     let is_process_object = ctx.lookup_local(obj_name).is_none()
                         && (obj_name == "process"
@@ -482,7 +490,13 @@ pub(crate) fn lower_unary_expr(ctx: &mut LoweringContext, unary: &ast::UnaryExpr
                                     inner_prop_name,
                                 )
                             {
-                                return Ok(Expr::String("function".to_string()));
+                                if let Some(folded) = namespace_typeof_fold(
+                                    inner_obj_name,
+                                    inner_prop_name,
+                                    Some(prop_name),
+                                ) {
+                                    return Ok(folded);
+                                }
                             }
                         }
                     }
@@ -692,4 +706,42 @@ pub(crate) fn lower_unary_expr(ctx: &mut LoweringContext, unary: &ast::UnaryExpr
         #[allow(unreachable_patterns)]
         _ => Err(anyhow!("Unsupported unary operator: {:?}", unary.op)),
     }
+}
+
+/// `typeof NS.m` (or `typeof NS.m.<then>`) for a namespace static the runtime
+/// implements: `"function"`, unless the member may have been replaced. A
+/// program write leaves the read to the ordinary path (`None`); one dynamic
+/// code may perform is guarded by `Pristine(NS)` (#12643), reading the live
+/// value only when the namespace's shadow bit is set.
+fn namespace_typeof_fold(ns: &str, member: &str, then: Option<&str>) -> Option<Expr> {
+    if !crate::patched_builtins::is_builtin_namespace(ns) {
+        return Some(Expr::String("function".to_string()));
+    }
+    if crate::patched_builtins::namespace_member_patched(ns, member) {
+        return None;
+    }
+    if !crate::patched_builtins::namespace_call_guarded() {
+        return Some(Expr::String("function".to_string()));
+    }
+    let mut live = Expr::PropertyGet {
+        byte_offset: 0,
+        object: Box::new(Expr::PropertyGet {
+            byte_offset: 0,
+            object: Box::new(Expr::GlobalThisExpr),
+            property: ns.to_string(),
+        }),
+        property: member.to_string(),
+    };
+    if let Some(then) = then {
+        live = Expr::PropertyGet {
+            byte_offset: 0,
+            object: Box::new(live),
+            property: then.to_string(),
+        };
+    }
+    Some(Expr::Conditional {
+        condition: Box::new(Expr::NamespacePatched(ns.to_string())),
+        then_expr: Box::new(Expr::TypeOf(Box::new(live))),
+        else_expr: Box::new(Expr::String("function".to_string())),
+    })
 }

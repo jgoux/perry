@@ -97,9 +97,9 @@ use crate::object::ObjectHeader;
 
 mod builtin_receiver;
 mod proto_constant;
-pub(crate) use builtin_receiver::shape_proof as builtin_shape_proof;
 pub use proto_constant::{
-    js_proto_constant_contract_check, js_proto_holder_contract_check, js_proto_shadow_contract_check,
+    js_proto_constant_contract_check, js_proto_holder_contract_check,
+    js_proto_shadow_contract_check,
 };
 pub(crate) mod chain_memo;
 mod function_receiver;
@@ -451,17 +451,12 @@ pub(crate) fn stats_report_enabled() -> bool {
                         refused.push_str(&format!(" refused.{}={n}", refusal_name(i)));
                     }
                 }
-                let (hd, ha, hr) = read_holder::read_holder_stats();
-                let (ap, ah) = read_holder::read_accessor_stats();
-                let (cp, ch) = read_holder::class_read_stats();
                 eprintln!(
-                    "[method-site] primes_own={a} primes_inherited={b} primes_builtin={} primes_function={} primes_constfn={} chain_memo_records={} misses={c} read_holder_primes={hd} read_absent_primes={ha} read_accessor_primes={ap} read_accessor_hits={ah} read_accessor_class_primes={} class_read_primes={cp} class_read_hits={ch} read_accessor_same_shape_relinks={} read_holder_refused={hr} unstable_referent_refusals={} unstable_young={} unstable_not_object={}{refused}",
+                    "[method-site] primes_own={a} primes_inherited={b} primes_builtin={} primes_function={} primes_constfn={} chain_memo_records={} misses={c} unstable_referent_refusals={} unstable_young={} unstable_not_object={}{refused}",
                     PRIMES_BUILTIN.load(Ordering::Relaxed),
                     method_site_function_primes(),
                     PRIMES_CONSTFN.load(Ordering::Relaxed),
                     chain_memo::chain_memo_records(),
-                    read_holder::read_accessor_class_primes(),
-                    read_holder::read_accessor_same_shape_relinks(),
                     memo_unstable_referent_refusals(),
                     UNSTABLE_YOUNG.load(Ordering::Relaxed),
                     UNSTABLE_NOT_OBJECT.load(Ordering::Relaxed),
@@ -1707,7 +1702,15 @@ unsafe fn ordinary_receiver(addr: usize) -> Option<*const ObjectHeader> {
         return None;
     }
     let obj = addr as *const ObjectHeader;
-    if !super::object_is_regular(obj)
+    // `object_is_regular` without its second header read: the record names
+    // the kind, and its summary says whether the layout can have holes, whose
+    // optional keys are own or absent per object (`key_view`): no site
+    // learns from such a receiver.
+    let Some(record) = super::shapes::shape_record_by_id((*obj).shape_word()) else {
+        return None;
+    };
+    if !record.object_kind().is_ordinary_layout()
+        || super::key_view::summary_may_have_holes(record.summary())
         || super::overflow::has_overflow(obj)
         || (*obj).class_id == super::native_module::NATIVE_MODULE_CLASS_ID
         || super::class_registry::is_class_object_ptr(obj.cast())

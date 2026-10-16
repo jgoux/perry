@@ -121,6 +121,7 @@ mod constfn_key_add;
 pub(crate) mod field_rep;
 pub(crate) mod field_rep_store;
 pub(crate) mod key_attrs;
+pub(crate) mod key_view;
 pub(crate) use census::object_tables_census;
 #[cfg(test)]
 mod bound_method_receiver_tests;
@@ -161,6 +162,7 @@ pub(crate) use global_this::{
     temporal_subclass_super as global_this_temporal_subclass_super,
 };
 pub mod builtin_proto;
+pub(crate) mod builtin_namespace;
 mod builtin_proto_entries;
 pub mod handle_expando;
 pub(crate) mod owned_state_bag;
@@ -264,9 +266,10 @@ pub(crate) mod shape_carriers;
 // other hooks are feature-only), so a stock non-test build never
 // reaches it and the linker drops it: the shipped runtime pays nothing.
 pub mod layout_desc;
-pub mod runtime_layouts;
+pub(crate) use shapes::layout_probe;
 #[cfg(test)]
 mod layout_desc_tests;
+pub mod runtime_layouts;
 pub(crate) mod shadow;
 #[cfg_attr(not(feature = "shape-mint-diag"), allow(dead_code))]
 pub(crate) mod shape_mint_census;
@@ -422,9 +425,7 @@ pub(crate) use this_binding::{
     static_this_arm_if_unarmed, static_this_disarm, SuperNewTargetScope,
 };
 #[cfg(test)]
-pub(crate) use this_binding::{
-    derived_super_scope_push_at, static_private_owner_depth,
-};
+pub(crate) use this_binding::{derived_super_scope_push_at, static_private_owner_depth};
 pub use this_binding::{
     js_new_target_enter, js_new_target_get, js_new_target_leave, js_new_target_set,
     js_static_this_arm_classref, js_static_this_arm_value, js_static_this_resolve,

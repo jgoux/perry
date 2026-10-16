@@ -488,7 +488,7 @@ pub(super) fn compile_method(
             .return_shape_method_class(&class.name, &method.name, method.id)
             .is_some(),
     );
-    let native_facts = crate::collectors::collect_native_region_fact_graph(
+    let mut native_facts = crate::collectors::collect_native_region_fact_graph(
         method_body,
         &[],
         &flat_const_ids,
@@ -503,6 +503,15 @@ pub(super) fn compile_method(
         &cross_module.module_dispatch,
         // #9363: a method body reads the same module-scope views.
         &cross_module.module_global_proven_types,
+    );
+    // Closed World 5d: the body's typed locals (no entry proofs here).
+    let typed_locals = crate::collectors::typed_locals::apply(
+        method_body,
+        &std::collections::HashMap::new(),
+        None,
+        &method_boxed_vars,
+        module_globals,
+        &mut native_facts.representation.number_by_construction_locals,
     );
     super::helpers::drop_number_local_root_slots(
         &mut shadow_slot_map,
@@ -580,6 +589,7 @@ pub(super) fn compile_method(
         locals,
         local_types,
         proven_local_types: guarded_param_proofs,
+        typed_locals,
         guarded_discriminant_aliases: std::collections::HashMap::new(),
         module_global_proven_types: &cross_module.module_global_proven_types,
         module_global_transfers: &cross_module.module_global_transfers,
@@ -603,6 +613,7 @@ pub(super) fn compile_method(
         classes,
         class_hierarchy: &cross_module.class_hierarchy,
         wpfacts: cross_module.wpfacts.clone(),
+        program_layouts: cross_module.program_layouts.clone(),
         wpfacts_sites: 0,
         wpfacts_tested: Vec::new(),
         wpfacts_this: vec![(this_slot.clone(), method.id)],
@@ -836,7 +847,6 @@ pub(super) fn compile_method(
         was_unrolled: method.was_unrolled,
         ic_site_counter: ic_base,
         ic_globals: Vec::new(),
-        property_get_ic_override: None,
         typed_parse_rodata: Vec::new(),
         buffer_data_slots: HashMap::new(),
         native_arena_owner_aliases: HashMap::new(),

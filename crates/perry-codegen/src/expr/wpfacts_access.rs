@@ -470,6 +470,11 @@ pub(crate) fn try_lower_get(
         return Ok(None);
     };
     let site = site_id(ctx, property);
+    crate::expr::note_site(if p.agrees() {
+        "case1-wpfacts"
+    } else {
+        "case2-wpfacts"
+    });
     let recv_box = lower_expr(ctx, object)?;
     if p.nullable {
         // The binding holds an object or null/undefined (F4). The one test
@@ -494,22 +499,20 @@ pub(crate) fn try_lower_get(
             property,
             super::TypedFeedbackContract::object_get_by_name(),
         );
-        let cache_name = super::property_get::generic_dispatch::allocate_property_cache(ctx);
-        let cache_slot_ref = format!("@{cache_name}");
         let key_idx = ctx.strings.intern(property);
         let key_handle_global = format!("@{}", ctx.strings.entry(key_idx).handle_global);
         let blk = ctx.block();
         let key_box = blk.load(DOUBLE, &key_handle_global);
         let key_bits = blk.bitcast_double_to_i64(&key_box);
         let key_handle = blk.and(I64, &key_bits, POINTER_MASK_I64);
+        // A non-object receiver: the complete read throws for nullish.
         let _ = blk.call(
             DOUBLE,
-            "js_object_get_field_ic",
+            "js_object_get_field_value",
             &[
                 (I64, &obj_bits),
                 (I64, &key_handle),
                 (I64, &feedback_site_id),
-                (PTR, &cache_slot_ref),
             ],
         );
         blk.unreachable();
