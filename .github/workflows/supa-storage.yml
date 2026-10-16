@@ -44,6 +44,9 @@ on:
       codegen_jobs:
         description: PERRY_CODEGEN_UNIT_JOBS
         default: "4"
+      probe_names:
+        description: Space-separated probe names to run (default all)
+        default: ''
       probes:
         description: Compile and run the tiny programs in .github/supa/probes (exceptions, new Function)
         type: boolean
@@ -162,11 +165,13 @@ jobs:
         with:
           node-version: 24
       - name: Probes
+        env:
+          PROBE_NAMES: ${{ inputs.probe_names }}
         run: |
           export PATH="$LLVM_SYS_221_PREFIX/bin:$PATH" PERRY_EXTRA_LINK_ARGS=-fuse-ld=lld PERRY_FORCE_LINK_RESPONSE_FILE=1
-          .github/supa/probes.sh
+          .github/supa/probes.sh $PROBE_NAMES
       - name: Uncaught-throw diagnosis
-        if: always()
+        if: ${{ always() && inputs.probe_names == '' }}
         run: .github/supa/eh-diag.sh 2>&1 | tee supa-out/probes/eh-uncaught/diag.log
       - uses: actions/upload-artifact@v4
         if: always()
