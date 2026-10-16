@@ -121,6 +121,8 @@ mod constfn_key_add;
 pub(crate) mod field_rep;
 pub(crate) mod field_rep_store;
 pub(crate) mod key_attrs;
+#[cfg(target_family = "wasm")]
+pub(crate) mod static_registry;
 pub(crate) mod key_view;
 pub(crate) use census::object_tables_census;
 #[cfg(test)]

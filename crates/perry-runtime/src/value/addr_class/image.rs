@@ -27,8 +27,24 @@ static IMAGE_START: [u64; 1] = [0];
 #[link_section = ".perrystr$z"]
 static IMAGE_END: [u64; 1] = [0];
 
+/// The `(start, end)` of the image region that may hold a string at `addr`.
+/// One section on every target but wasm32, which has no section bounds and
+/// registers each string's own range from a constructor instead.
+#[cfg(target_family = "wasm")]
 #[inline]
-fn bounds() -> (usize, usize) {
+fn bounds(addr: usize) -> (usize, usize) {
+    crate::object::static_registry::image_range(addr).unwrap_or((0, 0))
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[inline]
+fn bounds(_addr: usize) -> (usize, usize) {
+    section_bounds()
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[inline]
+fn section_bounds() -> (usize, usize) {
     // A real reference: whatever links this function links the sentinel too.
     std::hint::black_box(std::ptr::addr_of!(IMAGE_SECTION_SENTINEL));
     #[cfg(target_vendor = "apple")]
@@ -66,10 +82,6 @@ fn bounds() -> (usize, usize) {
             std::ptr::addr_of!(__stop_perry_strings) as usize,
         )
     }
-    #[cfg(target_family = "wasm")]
-    {
-        (0, 0)
-    }
 }
 
 /// The `GcHeader.size` of an image string whose header, string header and
@@ -88,7 +100,7 @@ const fn image_size(body: usize) -> usize {
 #[inline(never)]
 pub(super) unsafe fn header(addr: usize) -> Option<std::ptr::NonNull<GcHeader>> {
     use crate::string::StringHeader;
-    let (start, end) = bounds();
+    let (start, end) = bounds(addr.wrapping_sub(GC_HEADER_SIZE));
     let header_addr = addr.checked_sub(GC_HEADER_SIZE)?;
     let data = addr.checked_add(std::mem::size_of::<StringHeader>())?;
     if header_addr < start || data >= end || addr % 8 != 0 {

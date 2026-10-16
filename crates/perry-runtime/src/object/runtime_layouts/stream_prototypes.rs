@@ -7,7 +7,7 @@ macro_rules! atom {
         #[cfg_attr(target_vendor = "apple", link_section = "__TEXT,__perry_strings")]
         #[cfg_attr(target_os = "windows", link_section = ".perrystr$m")]
         #[cfg_attr(
-            not(any(target_vendor = "apple", target_os = "windows")),
+            not(any(target_vendor = "apple", target_os = "windows", target_family = "wasm")),
             link_section = "perry_strings"
         )]
         #[export_name = $image_export]
@@ -16,7 +16,7 @@ macro_rules! atom {
         #[cfg_attr(target_vendor = "apple", link_section = "__DATA,__perry_atoms")]
         #[cfg_attr(target_os = "windows", link_section = ".perryatm$m")]
         #[cfg_attr(
-            not(any(target_vendor = "apple", target_os = "windows")),
+            not(any(target_vendor = "apple", target_os = "windows", target_family = "wasm")),
             link_section = "perry_atoms"
         )]
         #[export_name = $atom_export]
@@ -27,6 +27,14 @@ macro_rules! atom {
             _pad: [0; 3],
             index: 0,
         };
+        #[cfg(target_family = "wasm")]
+        crate::object::static_registry::wasm_ctor!({
+            crate::object::static_registry::register_image(
+                std::ptr::addr_of!($string) as usize,
+                std::mem::size_of_val(&$string),
+            );
+            crate::object::static_registry::register_atom(std::ptr::addr_of!($atom));
+        });
     };
 }
 atom!(
@@ -646,7 +654,7 @@ static READABLE_STATE_PROTO_INDEX: [u32; 32] = [
 #[cfg_attr(target_vendor = "apple", link_section = "__DATA,__perry_layouts")]
 #[cfg_attr(target_os = "windows", link_section = ".perrylay$m")]
 #[cfg_attr(
-    not(any(target_vendor = "apple", target_os = "windows")),
+    not(any(target_vendor = "apple", target_os = "windows", target_family = "wasm")),
     link_section = "perry_layouts"
 )]
 pub(crate) static mut READABLE_STATE_PROTO: PerryLayoutDesc = PerryLayoutDesc {
@@ -799,7 +807,7 @@ static WRITABLE_STATE_PROTO_INDEX: [u32; 32] = [
 #[cfg_attr(target_vendor = "apple", link_section = "__DATA,__perry_layouts")]
 #[cfg_attr(target_os = "windows", link_section = ".perrylay$m")]
 #[cfg_attr(
-    not(any(target_vendor = "apple", target_os = "windows")),
+    not(any(target_vendor = "apple", target_os = "windows", target_family = "wasm")),
     link_section = "perry_layouts"
 )]
 pub(crate) static mut WRITABLE_STATE_PROTO: PerryLayoutDesc = PerryLayoutDesc {
@@ -990,7 +998,7 @@ static DUPLEX_PROTO_INDEX: [u32; 64] = [
 #[cfg_attr(target_vendor = "apple", link_section = "__DATA,__perry_layouts")]
 #[cfg_attr(target_os = "windows", link_section = ".perrylay$m")]
 #[cfg_attr(
-    not(any(target_vendor = "apple", target_os = "windows")),
+    not(any(target_vendor = "apple", target_os = "windows", target_family = "wasm")),
     link_section = "perry_layouts"
 )]
 pub(crate) static mut DUPLEX_PROTO: PerryLayoutDesc = PerryLayoutDesc {
@@ -1026,7 +1034,7 @@ static TRANSFORM_PROTO_INDEX: [u32; 4] = [u32::MAX, u32::MAX, 1, 0];
 #[cfg_attr(target_vendor = "apple", link_section = "__DATA,__perry_layouts")]
 #[cfg_attr(target_os = "windows", link_section = ".perrylay$m")]
 #[cfg_attr(
-    not(any(target_vendor = "apple", target_os = "windows")),
+    not(any(target_vendor = "apple", target_os = "windows", target_family = "wasm")),
     link_section = "perry_layouts"
 )]
 pub(crate) static mut TRANSFORM_PROTO: PerryLayoutDesc = PerryLayoutDesc {
@@ -1054,7 +1062,7 @@ static PASSTHROUGH_PROTO_INDEX: [u32; 2] = [u32::MAX, 0];
 #[cfg_attr(target_vendor = "apple", link_section = "__DATA,__perry_layouts")]
 #[cfg_attr(target_os = "windows", link_section = ".perrylay$m")]
 #[cfg_attr(
-    not(any(target_vendor = "apple", target_os = "windows")),
+    not(any(target_vendor = "apple", target_os = "windows", target_family = "wasm")),
     link_section = "perry_layouts"
 )]
 pub(crate) static mut PASSTHROUGH_PROTO: PerryLayoutDesc = PerryLayoutDesc {
@@ -1207,7 +1215,7 @@ static LEGACY_STREAM_PROTO_INDEX: [u32; 32] = [
 #[cfg_attr(target_vendor = "apple", link_section = "__DATA,__perry_layouts")]
 #[cfg_attr(target_os = "windows", link_section = ".perrylay$m")]
 #[cfg_attr(
-    not(any(target_vendor = "apple", target_os = "windows")),
+    not(any(target_vendor = "apple", target_os = "windows", target_family = "wasm")),
     link_section = "perry_layouts"
 )]
 pub(crate) static mut LEGACY_STREAM_PROTO: PerryLayoutDesc = PerryLayoutDesc {
@@ -1410,7 +1418,7 @@ static EVENT_EMITTER_PROTO_INDEX: [u32; 64] = [
 #[cfg_attr(target_vendor = "apple", link_section = "__DATA,__perry_layouts")]
 #[cfg_attr(target_os = "windows", link_section = ".perrylay$m")]
 #[cfg_attr(
-    not(any(target_vendor = "apple", target_os = "windows")),
+    not(any(target_vendor = "apple", target_os = "windows", target_family = "wasm")),
     link_section = "perry_layouts"
 )]
 pub(crate) static mut EVENT_EMITTER_PROTO: PerryLayoutDesc = PerryLayoutDesc {
@@ -1487,7 +1495,7 @@ static EE_ASYNC_RESOURCE_PROTO_INDEX: [u32; 16] = [
 #[cfg_attr(target_vendor = "apple", link_section = "__DATA,__perry_layouts")]
 #[cfg_attr(target_os = "windows", link_section = ".perrylay$m")]
 #[cfg_attr(
-    not(any(target_vendor = "apple", target_os = "windows")),
+    not(any(target_vendor = "apple", target_os = "windows", target_family = "wasm")),
     link_section = "perry_layouts"
 )]
 pub(crate) static mut EE_ASYNC_RESOURCE_PROTO: PerryLayoutDesc = PerryLayoutDesc {
@@ -1504,3 +1512,20 @@ pub(crate) static mut EE_ASYNC_RESOURCE_PROTO: PerryLayoutDesc = PerryLayoutDesc
     index_mask: 15,
     index: EE_ASYNC_RESOURCE_PROTO_INDEX.as_ptr(),
 };
+
+// wasm32 registers the fixed statics above from one `.init_array` constructor
+// (`static_registry`); other targets find them by section.
+#[cfg(target_family = "wasm")]
+crate::object::static_registry::wasm_ctor!({
+    use crate::object::static_registry::*;
+    unsafe {
+        register_layout(std::ptr::addr_of_mut!(READABLE_STATE_PROTO));
+        register_layout(std::ptr::addr_of_mut!(WRITABLE_STATE_PROTO));
+        register_layout(std::ptr::addr_of_mut!(DUPLEX_PROTO));
+        register_layout(std::ptr::addr_of_mut!(TRANSFORM_PROTO));
+        register_layout(std::ptr::addr_of_mut!(PASSTHROUGH_PROTO));
+        register_layout(std::ptr::addr_of_mut!(LEGACY_STREAM_PROTO));
+        register_layout(std::ptr::addr_of_mut!(EVENT_EMITTER_PROTO));
+        register_layout(std::ptr::addr_of_mut!(EE_ASYNC_RESOURCE_PROTO));
+    }
+});

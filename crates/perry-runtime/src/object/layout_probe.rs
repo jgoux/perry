@@ -36,7 +36,9 @@
 //! absent. Everything else (an accessor, an exotic or per-object receiver, a
 //! chain that ends without the key, a builtin prototype that misses) is
 //! `TAG_HOLE`, and the site takes its complete slow operation.
-use super::shapes_store::{ShapeRecord, FLAT_BASE_OFFSET};
+use super::shapes_store::{
+    ShapeRecord, FLAT_BASE_OFFSET, FLAT_IDS_OFFSET, PROTO_CELL_OFFSET, WORD_DIR_OFFSET,
+};
 use crate::object::ObjectHeader;
 use crate::value::TAG_HOLE;
 
@@ -510,7 +512,7 @@ unsafe fn bucket_matches(
 #[inline(always)]
 unsafe fn record_of(dir: *const u8, word: u32) -> *mut ShapeRecord {
     let base = *(dir.add(FLAT_BASE_OFFSET) as *const *mut ShapeRecord);
-    let ids = *(dir.add(FLAT_BASE_OFFSET + 8) as *const usize);
+    let ids = *(dir.add(FLAT_IDS_OFFSET) as *const usize);
     let rel =
         (word & !crate::object::overflow::SHADOW_BIT).wrapping_sub(super::SHAPE_ID_BASE) as usize;
     if rel >= ids {
@@ -948,7 +950,7 @@ enum Next {
 /// (`BandDir.proto_cell`): `None` before it is resolved.
 #[inline]
 unsafe fn object_prototype(dir: *const u8) -> Option<*const ObjectHeader> {
-    let cell = *(dir.add(FLAT_BASE_OFFSET + 16) as *const *const usize);
+    let cell = *(dir.add(PROTO_CELL_OFFSET) as *const *const usize);
     if cell.is_null() {
         return None;
     }
@@ -1003,7 +1005,7 @@ unsafe fn prototype_of_in(
             };
         }
         if (super::PROTO_ID_CLASS..super::PROTO_ID_MIXED).contains(&pid) {
-            let word_dir = *(dir.add(FLAT_BASE_OFFSET + 24) as *const *const u8);
+            let word_dir = *(dir.add(WORD_DIR_OFFSET) as *const *const u8);
             if word_dir.is_null() {
                 return Next::Unknown;
             }
@@ -1165,7 +1167,7 @@ unsafe fn inherited_get<const ABSENT: bool>(
                 return chain_absent::<ABSENT>();
             }
             let word = if (super::PROTO_ID_CLASS..super::PROTO_ID_MIXED).contains(&pid) {
-                let word_dir = *(dir.add(FLAT_BASE_OFFSET + 24) as *const *const u8);
+                let word_dir = *(dir.add(WORD_DIR_OFFSET) as *const *const u8);
                 if word_dir.is_null() {
                     return hole();
                 }

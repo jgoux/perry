@@ -1122,12 +1122,27 @@ pub(crate) struct BandDir {
     pub(crate) word_dir: std::cell::Cell<*const u8>,
 }
 
-/// `BandDir.flat_base`'s offset; `flat_ids` follows at +8.
-pub(crate) const FLAT_BASE_OFFSET: usize = crate::codegen_abi::SHAPE_DIR_FLAT_BASE;
-const _: () = assert!(std::mem::offset_of!(BandDir, flat_base) == FLAT_BASE_OFFSET);
-const _: () = assert!(std::mem::offset_of!(BandDir, flat_ids) == FLAT_BASE_OFFSET + 8);
-const _: () = assert!(std::mem::offset_of!(BandDir, proto_cell) == FLAT_BASE_OFFSET + 16);
-const _: () = assert!(std::mem::offset_of!(BandDir, word_dir) == FLAT_BASE_OFFSET + 24);
+/// Offsets of the `BandDir` words the probe reads through the directory
+/// address. LP64 offsets are the codegen ABI (`SHAPE_DIR_FLAT_BASE`, read by
+/// `perry-codegen` `layout_read.rs`); ILP32 targets (wasm32) lay the same
+/// fields out at 4-byte pointer width and no codegen reads them.
+pub(crate) const FLAT_BASE_OFFSET: usize = std::mem::offset_of!(BandDir, flat_base);
+pub(crate) const FLAT_IDS_OFFSET: usize = std::mem::offset_of!(BandDir, flat_ids);
+pub(crate) const PROTO_CELL_OFFSET: usize = std::mem::offset_of!(BandDir, proto_cell);
+pub(crate) const WORD_DIR_OFFSET: usize = std::mem::offset_of!(BandDir, word_dir);
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert!(FLAT_BASE_OFFSET == crate::codegen_abi::SHAPE_DIR_FLAT_BASE);
+    assert!(FLAT_IDS_OFFSET == FLAT_BASE_OFFSET + 8);
+    assert!(PROTO_CELL_OFFSET == FLAT_BASE_OFFSET + 16);
+    assert!(WORD_DIR_OFFSET == FLAT_BASE_OFFSET + 24);
+};
+#[cfg(target_pointer_width = "32")]
+const _: () = {
+    assert!(FLAT_IDS_OFFSET == FLAT_BASE_OFFSET + 4);
+    assert!(PROTO_CELL_OFFSET == FLAT_BASE_OFFSET + 8);
+    assert!(WORD_DIR_OFFSET == FLAT_BASE_OFFSET + 12);
+};
 
 impl BandDir {
     const fn empty(band: usize) -> BandDir {

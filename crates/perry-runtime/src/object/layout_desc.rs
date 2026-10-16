@@ -172,16 +172,16 @@ const _: () = assert!(LAYOUT_BASE == crate::codegen_abi::SHAPE_ID_BASE + (1 << 1
 /// `PerryLayoutDesc.proto` builtin tags (values below
 /// [`LAYOUT_PROTO_TAG_END`]; anything else is a `*const PerryProtoFamily`,
 /// the singleton prototype of an `Object.create(P)` family, step 1).
-pub const LAYOUT_PROTO_OBJECT: usize = 0;
-pub const LAYOUT_PROTO_NULL: usize = 1;
-pub const LAYOUT_PROTO_URL: usize = 2;
-pub const LAYOUT_PROTO_READABLE_STATE: usize = 3;
-pub const LAYOUT_PROTO_WRITABLE_STATE: usize = 4;
-pub const LAYOUT_PROTO_TIMEOUT: usize = 5;
-pub const LAYOUT_PROTO_IMMEDIATE: usize = 6;
+pub const LAYOUT_PROTO_OBJECT: u64 = 0;
+pub const LAYOUT_PROTO_NULL: u64 = 1;
+pub const LAYOUT_PROTO_URL: u64 = 2;
+pub const LAYOUT_PROTO_READABLE_STATE: u64 = 3;
+pub const LAYOUT_PROTO_WRITABLE_STATE: u64 = 4;
+pub const LAYOUT_PROTO_TIMEOUT: u64 = 5;
+pub const LAYOUT_PROTO_IMMEDIATE: u64 = 6;
 /// `PerryLayoutDesc.proto` values at or above this are a
 /// `*const PerryProtoFamily`.
-pub const LAYOUT_PROTO_TAG_END: usize = 4096;
+pub const LAYOUT_PROTO_TAG_END: u64 = 4096;
 
 /// Object model step 1 (§3.2, §3.6): the prototype of an `Object.create(P)`
 /// family whose `P` is a module's singleton literal (a top-level `const`
@@ -268,7 +268,9 @@ pub struct PerryLayoutDesc {
     /// register it) and as 0 for static data no object carries.
     pub layout_id: u32,
     pub rep: u64,
-    pub proto: usize,
+    /// Fixed 64-bit like the codegen's `i64` (`DESC_TY`): an address on
+    /// LP64, widened by `as` on ILP32 targets.
+    pub proto: u64,
     pub keys: *const PerryLayoutKey,
     pub key_count: u32,
     /// Index capacity - 1 (a power of two minus one).
@@ -277,14 +279,31 @@ pub struct PerryLayoutDesc {
     pub index: *const u32,
 }
 
-const _: () = assert!(std::mem::size_of::<PerryLayoutDesc>() == 56);
+// Offsets are pointer-width aware: codegen's `DESC_TY` / `KEY_TY` / `ATOM_TY`
+// spell pointers as `ptr`, which LLVM lays out at the target's width.
+#[cfg(target_pointer_width = "64")]
+mod layout_asserts {
+    use super::*;
+    const _: () = assert!(std::mem::size_of::<PerryLayoutDesc>() == 56);
+    const _: () = assert!(std::mem::offset_of!(PerryLayoutDesc, keys) == 32);
+    const _: () = assert!(std::mem::offset_of!(PerryLayoutDesc, index) == 48);
+    const _: () = assert!(std::mem::size_of::<PerryLayoutKey>() == 16);
+    const _: () = assert!(std::mem::size_of::<StaticAtom>() == 24);
+    const _: () = assert!(std::mem::offset_of!(StaticAtom, kind) == 16);
+    const _: () = assert!(std::mem::offset_of!(StaticAtom, index) == 20);
+}
+#[cfg(target_pointer_width = "32")]
+mod layout_asserts {
+    use super::*;
+    const _: () = assert!(std::mem::size_of::<PerryLayoutDesc>() == 48);
+    const _: () = assert!(std::mem::offset_of!(PerryLayoutDesc, keys) == 32);
+    const _: () = assert!(std::mem::offset_of!(PerryLayoutDesc, index) == 44);
+    const _: () = assert!(std::mem::size_of::<PerryLayoutKey>() == 12);
+    const _: () = assert!(std::mem::size_of::<StaticAtom>() == 24);
+    const _: () = assert!(std::mem::offset_of!(StaticAtom, kind) == 12);
+    const _: () = assert!(std::mem::offset_of!(StaticAtom, index) == 16);
+}
 const _: () = assert!(std::mem::offset_of!(PerryLayoutDesc, layout_id) == 12);
-const _: () = assert!(std::mem::offset_of!(PerryLayoutDesc, keys) == 32);
-const _: () = assert!(std::mem::offset_of!(PerryLayoutDesc, index) == 48);
-const _: () = assert!(std::mem::size_of::<PerryLayoutKey>() == 16);
-const _: () = assert!(std::mem::size_of::<StaticAtom>() == 24);
-const _: () = assert!(std::mem::offset_of!(StaticAtom, kind) == 16);
-const _: () = assert!(std::mem::offset_of!(StaticAtom, index) == 20);
 
 /// `PerryLayoutDesc.layout_id` as emitted for a layout some object carries:
 /// [`register_static_layouts`] replaces it with the registered id. Every other
@@ -394,6 +413,7 @@ static ATOM_START: [u64; 1] = [0];
 static ATOM_END: [u64; 1] = [0];
 
 /// (start, end) of the layout section.
+#[cfg(not(target_family = "wasm"))]
 fn layout_bounds() -> (usize, usize) {
     std::hint::black_box(std::ptr::addr_of!(LAYOUT_SECTION_SENTINEL) as usize);
     #[cfg(target_vendor = "apple")]
@@ -427,13 +447,10 @@ fn layout_bounds() -> (usize, usize) {
             std::ptr::addr_of!(__stop_perry_layouts) as usize,
         )
     }
-    #[cfg(target_family = "wasm")]
-    {
-        (0, 0)
-    }
 }
 
 /// (start, end) of the atom section.
+#[cfg(not(target_family = "wasm"))]
 fn atom_bounds() -> (usize, usize) {
     std::hint::black_box(std::ptr::addr_of!(ATOM_SECTION_SENTINEL) as usize);
     #[cfg(target_vendor = "apple")]
@@ -467,19 +484,38 @@ fn atom_bounds() -> (usize, usize) {
             std::ptr::addr_of!(__stop_perry_atoms) as usize,
         )
     }
-    #[cfg(target_family = "wasm")]
-    {
-        (0, 0)
-    }
 }
 
 /// Every record of a section, in section order (the linker may pad between
 /// input sections; records are 8-aligned and a zero word never starts one).
+#[cfg(not(target_family = "wasm"))]
 fn records<T>(bounds: (usize, usize)) -> impl Iterator<Item = *mut T> {
     let (start, end) = bounds;
     let size = std::mem::size_of::<T>();
     let count = if end > start { (end - start) / size } else { 0 };
     (0..count).map(move |i| (start + i * size) as *mut T)
+}
+
+// wasm32 cannot place pointer-bearing statics in custom sections or enumerate
+// a section with start/stop symbols, so each runtime-declared descriptor and
+// atom registers itself from an `.init_array` constructor instead (see
+// `static_registry`). Registration order is the link order of the
+// constructors, identical for every agent of one process.
+#[cfg(not(target_family = "wasm"))]
+fn layout_records() -> impl Iterator<Item = *mut PerryLayoutDesc> {
+    records::<PerryLayoutDesc>(layout_bounds())
+}
+#[cfg(not(target_family = "wasm"))]
+fn atom_records() -> impl Iterator<Item = *mut StaticAtom> {
+    records::<StaticAtom>(atom_bounds())
+}
+#[cfg(target_family = "wasm")]
+fn layout_records() -> impl Iterator<Item = *mut PerryLayoutDesc> {
+    super::static_registry::layouts().into_iter()
+}
+#[cfg(target_family = "wasm")]
+fn atom_records() -> impl Iterator<Item = *mut StaticAtom> {
+    super::static_registry::atoms().into_iter()
 }
 
 /// The bytes of an atom's image string.
@@ -501,7 +537,7 @@ unsafe fn atom_bytes<'a>(atom: *const StaticAtom) -> Option<&'a [u8]> {
 pub(crate) fn coloured_atoms() -> Vec<(&'static [u8], u64, u32, u32)> {
     let mut out = Vec::new();
     unsafe {
-        for atom in records::<StaticAtom>(atom_bounds()) {
+        for atom in atom_records() {
             if (*atom)._pad[0] != 1 {
                 continue;
             }
@@ -531,7 +567,7 @@ pub(crate) unsafe fn well_known_atom_symbol(
 /// agent from `js_shape_run_static_seed`, after the hash-band literal seeds.
 pub(crate) fn seed_static_atoms() {
     unsafe {
-        for atom in records::<StaticAtom>(atom_bounds()) {
+        for atom in atom_records() {
             if let Some(bytes) = atom_bytes(atom) {
                 crate::string::seed_static_atom(bytes, (*atom).hash, (*atom).string);
             }
@@ -543,7 +579,7 @@ pub(crate) fn seed_static_atoms() {
 pub(crate) fn register_static_layouts() {
     unsafe {
         let mut index = 0u32;
-        for desc in records::<PerryLayoutDesc>(layout_bounds()) {
+        for desc in layout_records() {
             if (*desc).family == SENTINEL_FAMILY || (*desc).keys.is_null() && (*desc).key_count != 0
             {
                 continue;
