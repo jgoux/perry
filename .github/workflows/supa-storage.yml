@@ -421,6 +421,8 @@ jobs:
       - name: Native smoke
         id: native
         if: ${{ !inputs.probe }}
+        env:
+          PERRY_GC_TRACE: '1'
         run: |
           export PGPASSWORD=postgres
           psql -h 127.0.0.1 -U postgres -c 'create database ref_native'

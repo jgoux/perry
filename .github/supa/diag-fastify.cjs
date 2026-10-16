@@ -29,7 +29,7 @@ patch('four-oh-four.js', [
   let s = fs.readFileSync(p + '.diag.orig', 'utf8')
   const from = '        if (sourceCode)\n            this.logger.error("Error compiling schema, function code:", sourceCode);'
   if (!s.includes(from)) throw new Error('diag patch anchor missing in ajv compile/index.js')
-  s = s.replace(from, from + '\n        console.error("DIAG ajv compile error: " + String(e && e.message) + " | schema=" + JSON.stringify(sch.schema).slice(0, 300) + " | stack=" + String(e && e.stack) + " | here=" + new Error("here").stack);')
+  s = s.replace(from, from + '\n        Error.stackTraceLimit = 80; console.error("DIAG ajv compile error: " + String(e && e.message) + " | schema=" + JSON.stringify(sch.schema).slice(0, 300) + " | opts=" + Object.keys(this.opts).map(k => k + ":" + (typeof this.opts[k] == "object" || typeof this.opts[k] == "function" ? typeof this.opts[k] : String(this.opts[k]))).join(",") + " | here=" + new Error("here").stack);')
   fs.writeFileSync(p, s)
 }
 console.log('diag-fastify applied')
