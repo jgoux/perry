@@ -70,6 +70,7 @@ Conventions in this file:
 | P46 | TBD | fix(hir): construct the global when a program class shares a name with a globalThis alias | hir (`lower/expr_new.rs`, `lower/context.rs`, destructuring) | all | wasi probe `headers-global-alias.js` | not tried | PR-AC |
 | P47 | TBD | fix(runtime): start reading when a readable that is not flowing is piped | runtime (node:stream, `node_stream_readwrite.rs`) | all | wasi probe `stream-pipe-starts-read.js` | not tried | PR-AD |
 | P48 | TBD | fix(runtime): hand a live stream to the function stage of stream.pipeline | runtime (node:stream, `node_stream_pipeline.rs`) | all | wasi probe `stream-pipeline-live-source.js` | not tried | PR-AE |
+| P49 | TBD | fix(runtime): read an http request through Readable.toWeb with the request's own read() | runtime (node:stream web adapter, `node_stream_constructors/web_adapter.rs`) | all | wasi probe `http-request-to-web.js` | not tried | PR-AF |
 
 All 22 patches except P12's `.github` hunks, P05 and P06 cherry-pick cleanly.
 A stack of every patch except P05 and P06, with P12 limited to `crates/`, also applies cleanly in sequence on `1fd8ca2ae`.
@@ -109,6 +110,7 @@ Ordered by value and independence. Each PR carries its patches' tests.
 29. **PR-AC `new Alias()` constructs the global an alias holds, not a same-named program class** (P46). Prerequisite: none.
 30. **PR-AD `readable.pipe()` starts reading a stream that was not flowing** (P47). Prerequisite: none.
 31. **PR-AE `stream.pipeline(streams..., fn)` gives the function the live stream** (P48). Prerequisite: none.
+32. **PR-AF `Readable.toWeb(req)` yields the request body** (P49). Prerequisite: PR-AD, PR-AE for the probe's roundtrip and pipeline routes.
 
 Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616f5e` for P05, `79aae9aa7` for P06 and P15); drop them at the next upstream sync and take upstream's versions.
 
@@ -602,6 +604,15 @@ Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616
 - Test: wasi probe `.github/supa/wasi-probes/stream-pipeline-live-source.js` (a piped source, a timer write, a microtask write, a transform as first stage; each prints 0 before the fix and 1500 after, as node does); port to `crates/perry/tests` for upstream.
 - Not covered: the collected path still snapshots a first stream that already holds data, and chunk boundaries can differ from Node (Node's `read()` coalesces everything buffered; the probe sums lengths). The settling pump blocks the caller until the function's promise resolves.
 - Upstream: not cherry-picked. Depends on: none. PR-AE.
+
+### P49 TBD fix(runtime): read an http request through Readable.toWeb with the request's own read()
+- Area / platform: runtime node:stream / all targets; seen on wasm32-wasip1.
+- Problem: `Readable.toWeb(req)` for a server `IncomingMessage` produced a web stream that closed at once with no data. srvx's node adapter builds a fetch `Request` body this way, so Storage handlers (TUS resumable uploads) saw an empty body.
+- Root cause: the web adapter's pull step read the node stream through the node:stream hidden buffer (`read_stream_with_size_arg`). A server request is a bare native handle with no such state, so the read returned null and the adapter closed the web stream. The handle exposes its own `read()` (the whole body on the first call, then null) and `destroy()`.
+- Fix: `node_to_web_readable_pull` calls the handle's `read()` when the source is a bare handle (`is_bare_handle_value`: HANDLE_TAG, not a stream-id band) and closes the controller when it returns null; `node_to_web_readable_cancel` destroys the handle through `destroy_foreign_readable`. File: `perry-runtime/src/node_stream_constructors/web_adapter.rs`.
+- Test: wasi probe `.github/supa/wasi-probes/http-request-to-web.js` (server probe: a 300 kB POST read with the web reader, through `fromWeb(toWeb(req)).pipe(PassThrough)`, and through that plus `pipeline(proxy, transform, async fn)`; before the fixes P47-P49 the routes answer 0 or hang, after they match node); port to `crates/perry/tests` for upstream. Runs under supa-host with `--listen 127.0.0.1:18323`.
+- Not covered: the CommonJS spelling `const { Readable } = require('node:stream'); Readable.toWeb(x)` goes through the method-value fallback, which returns a plain object rather than a ReadableStream; a `for await` over `Readable.fromWeb(...)` repeats the last chunk; `push(Uint8Array)` into a non-object-mode Readable yields a Uint8Array, not a Buffer.
+- Upstream: not cherry-picked. Depends on: PR-AD, PR-AE for the probe's roundtrip and pipeline routes. PR-AF.
 
 ## Not for upstream
 
