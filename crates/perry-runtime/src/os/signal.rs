@@ -6,8 +6,10 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicI32;
 #[cfg(unix)]
 use std::sync::atomic::AtomicU64;
+#[cfg(any(unix, windows, target_os = "wasi"))]
+use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(any(unix, windows))]
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::{LazyLock, Mutex};
 
 static SIGNAL_ASYNC_IDS: LazyLock<Mutex<HashMap<String, u64>>> =
@@ -816,7 +818,11 @@ pub(crate) fn is_process_signal_name(name: &str) -> bool {
     {
         win_slot_by_name(name).is_some()
     }
-    #[cfg(not(any(unix, windows)))]
+    #[cfg(target_os = "wasi")]
+    {
+        wasi_slot(name).is_some()
+    }
+    #[cfg(not(any(unix, windows, target_os = "wasi")))]
     {
         matches!(name, "SIGINT" | "SIGTERM")
     }
@@ -850,7 +856,16 @@ pub(crate) fn set_process_signal_listener_count(name: &str, count: usize) {
             ensure_win_console_ctrl_handler();
         }
     }
-    #[cfg(not(any(unix, windows)))]
+    #[cfg(target_os = "wasi")]
+    {
+        if let Some(slot) = wasi_slot(name) {
+            WASI_LISTENERS[slot].store(count, Ordering::Release);
+            if count == 0 {
+                WASI_PENDING[slot].store(0, Ordering::Release);
+            }
+        }
+    }
+    #[cfg(not(any(unix, windows, target_os = "wasi")))]
     {
         let _ = (name, count);
     }
@@ -909,7 +924,14 @@ pub(crate) fn has_active_process_signal_listeners() -> bool {
             slot.pending.load(Ordering::Acquire) > 0 && slot.listeners.load(Ordering::Acquire) > 0
         })
     }
-    #[cfg(not(any(unix, windows)))]
+    #[cfg(target_os = "wasi")]
+    {
+        (0..WASI_SIGNALS.len()).any(|slot| {
+            WASI_PENDING[slot].load(Ordering::Acquire) > 0
+                && WASI_LISTENERS[slot].load(Ordering::Acquire) > 0
+        })
+    }
+    #[cfg(not(any(unix, windows, target_os = "wasi")))]
     {
         false
     }
@@ -940,9 +962,57 @@ pub(crate) fn take_pending_process_signals() -> Vec<&'static str> {
         }
         signals
     }
-    #[cfg(not(any(unix, windows)))]
+    #[cfg(target_os = "wasi")]
+    {
+        crate::turnloop_net::drain_signals();
+        let mut signals = Vec::new();
+        for (slot, (_, name)) in WASI_SIGNALS.iter().enumerate() {
+            let count = WASI_PENDING[slot].swap(0, Ordering::AcqRel);
+            if count == 0 || WASI_LISTENERS[slot].load(Ordering::Acquire) == 0 {
+                continue;
+            }
+            signals.extend(std::iter::repeat_n(*name, count));
+        }
+        signals
+    }
+    #[cfg(not(any(unix, windows, target_os = "wasi")))]
     {
         Vec::new()
+    }
+}
+
+/// The signals a WASI guest can receive: the host writes one byte per signal
+/// (its number) to `SUPA_SIGNAL_FD`; `wasi_net` reads them.
+#[cfg(target_os = "wasi")]
+const WASI_SIGNALS: [(u8, &str); 5] = [
+    (1, "SIGHUP"),
+    (2, "SIGINT"),
+    (10, "SIGUSR1"),
+    (12, "SIGUSR2"),
+    (15, "SIGTERM"),
+];
+#[cfg(target_os = "wasi")]
+static WASI_PENDING: [AtomicUsize; 5] = [const { AtomicUsize::new(0) }; 5];
+#[cfg(target_os = "wasi")]
+static WASI_LISTENERS: [AtomicUsize; 5] = [const { AtomicUsize::new(0) }; 5];
+
+#[cfg(target_os = "wasi")]
+fn wasi_slot(name: &str) -> Option<usize> {
+    WASI_SIGNALS.iter().position(|(_, n)| *n == name)
+}
+
+/// A signal arrived from the host. A listener gets it on the next drain; with
+/// none, SIGHUP, SIGINT, SIGUSR2 and SIGTERM end the process with
+/// `128 + signal`, as Node's default action does. SIGUSR1 is ignored.
+#[cfg(target_os = "wasi")]
+pub(crate) fn wasi_deliver(number: u8) {
+    let Some(slot) = WASI_SIGNALS.iter().position(|(n, _)| *n == number) else {
+        return;
+    };
+    if WASI_LISTENERS[slot].load(Ordering::Acquire) > 0 {
+        WASI_PENDING[slot].fetch_add(1, Ordering::AcqRel);
+    } else if number != 10 {
+        std::process::exit(128 + number as i32);
     }
 }
 

@@ -817,6 +817,14 @@ pub extern "C" fn js_wait_for_event() {
         crate::gc::ParkVerdict::Resume => return,
         crate::gc::ParkVerdict::Park(remaining_ms) => remaining_ms,
     };
+    // A WASI guest has no helper threads: it parks in one `poll_oneoff` that also
+    // wakes on socket readiness and host signals, falling back to the sleeping
+    // condvar park when there is nothing to wait on.
+    #[cfg(target_os = "wasi")]
+    if crate::turnloop_net::park(Duration::from_millis(budget_ms)) {
+        spin_streak_reset();
+        return;
+    }
     // Threads without an agent loop use the original condvar park (#84).
     condvar_park(Duration::from_millis(budget_ms));
 }

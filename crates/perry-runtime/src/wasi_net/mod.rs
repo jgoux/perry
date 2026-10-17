@@ -1,6 +1,7 @@
-//! WASIp2 stream transport for the shared Perry net ABI.
+//! WASI stream transport for the shared Perry net ABI (p2 sockets, or on p1
+//! the host's listener fds plus the `supa_net` imports; see `perry_wasi_net.c`).
 //!
-//! wasi-sdk owns socket layouts and WASI imports. This module owns nonblocking
+//! The C shim owns socket layouts and WASI imports. This module owns nonblocking
 //! handles and native byte queues; the existing extension sink owns JS values.
 //! Completions are delivered after releasing every state borrow, so sinks can
 //! submit more work or close handles safely.
@@ -56,6 +57,9 @@ extern "C" {
         cap: u32,
         port: *mut u16,
     ) -> i32;
+    fn perry_wasi_poll(fds: *const i32, kinds: *const u8, n: u32, timeout_ns: u64) -> i32;
+    fn perry_wasi_signal_fd() -> i32;
+    fn perry_wasi_stream_read(fd: i32, bytes: *mut u8, len: u32) -> i32;
 }
 
 struct Write {
@@ -75,6 +79,8 @@ struct Handle {
     read_once: bool,
     nodelay: bool,
     referenced: bool,
+    /// Connected by host name: a failed lookup reads as `ENOTFOUND`.
+    by_name: bool,
     writes: VecDeque<Write>,
     shutdown: Option<u64>,
     write_closed: bool,
@@ -92,6 +98,7 @@ impl Handle {
             read_once: false,
             nodelay: false,
             referenced: true,
+            by_name: false,
             writes: VecDeque::new(),
             shutdown: None,
             write_closed: false,
@@ -183,11 +190,11 @@ pub fn tcp_listen(
         handle.listener = true;
         handle.nodelay = nodelay;
         state.handles.insert(id, handle);
-        // Same contract as the turnloop transport (callers report this as
-        // `server.address()`). The p1 host binds the requested address, so
-        // the requested address is returned; an ephemeral port 0 stays 0
-        // until the socket slice reads the bound port back from the host.
-        Ok(addr)
+        // Callers report this as `server.address()`. A p1 guest does not choose
+        // its socket: the host announces a listener's address in
+        // SUPA_LISTEN_ADDRS when it knows it, and otherwise the requested
+        // address stands (an ephemeral port 0 stays 0).
+        Ok(socket_address(fd, false).unwrap_or(addr))
     })
 }
 pub fn tcp_connect_host(
@@ -212,6 +219,7 @@ pub fn tcp_connect_host(
         let mut handle = Handle::new(fd, subsystem);
         handle.connecting = pending != 0;
         handle.connected_event = true;
+        handle.by_name = host.to_str().is_ok_and(|h| h.parse::<std::net::IpAddr>().is_err());
         state.handles.insert(id, handle);
         Ok(())
     })
@@ -370,31 +378,37 @@ pub fn timer_park(id: i64) -> NetResult<()> {
     });
     Ok(())
 }
+fn socket_address(fd: i32, peer: bool) -> Option<SocketAddr> {
+    let mut text = [0i8; 64];
+    let mut port = 0;
+    let result = unsafe {
+        perry_wasi_socket_address(fd, peer as i32, text.as_mut_ptr(), text.len() as u32, &mut port)
+    };
+    if result < 0 {
+        return None;
+    }
+    let ip = unsafe { CStr::from_ptr(text.as_ptr()) }
+        .to_str()
+        .ok()?
+        .parse()
+        .ok()?;
+    Some(SocketAddr::new(ip, port))
+}
 fn address(id: i64, peer: bool) -> Option<SocketAddr> {
-    STATE.with(|s| {
-        let s = s.borrow();
-        let h = s.handles.get(&id)?;
-        let mut text = [0i8; 64];
-        let mut port = 0;
-        let result = unsafe {
-            perry_wasi_socket_address(
-                h.fd,
-                peer as i32,
-                text.as_mut_ptr(),
-                text.len() as u32,
-                &mut port,
-            )
+    let fd = STATE.with(|s| s.borrow().handles.get(&id).map(|h| h.fd))?;
+    socket_address(fd, peer)
+}
+/// The host resolves a connect target itself and reports a failed lookup as
+/// `EHOSTUNREACH`; for a name that is libuv's `ENOTFOUND` (`-3008`).
+fn connect_error(os: i32, by_name: bool) -> NodeError {
+    if by_name && os == libc::EHOSTUNREACH {
+        return NodeError {
+            code: "ENOTFOUND",
+            errno: -3008,
+            syscall: "getaddrinfo",
         };
-        if result < 0 {
-            return None;
-        }
-        let ip = unsafe { CStr::from_ptr(text.as_ptr()) }
-            .to_str()
-            .ok()?
-            .parse()
-            .ok()?;
-        Some(SocketAddr::new(ip, port))
-    })
+    }
+    errors::from_os(os, "connect")
 }
 pub fn local_addr(id: i64) -> Option<SocketAddr> {
     address(id, false)
@@ -409,37 +423,97 @@ extern "C" fn has_active() -> i32 {
         i32::from(!s.events.is_empty() || s.handles.values().any(|h| h.referenced))
     })
 }
-/// Bound the legacy WASI event-loop park while sockets await readiness.
-/// This also preserves timer deadlines; idle programs without sockets sleep normally.
+/// How long the event loop may park, in ms: 0 when work is ready now, the
+/// nearest timer deadline, or -1 for no deadline. The park itself (`park`) wakes
+/// on socket readiness, so sockets need no polling interval.
 pub(crate) fn next_wake_ms() -> f64 {
     STATE.with(|s| {
         let s = s.borrow();
-        if !s.events.is_empty() {
+        if !s.events.is_empty()
+            || s.handles.values().any(|h| {
+                (!h.connecting && h.connected_event) || (h.shutdown.is_some() && h.writes.is_empty())
+            })
+        {
             return 0.0;
         }
-        let mut next = if s.handles.is_empty() {
-            f64::INFINITY
-        } else {
-            1.0
-        };
         let now = Instant::now();
-        for timer in s.timers.values() {
-            if let Some(d) = timer.deadline {
-                next = next.min(d.saturating_duration_since(now).as_secs_f64() * 1000.0);
-            }
-        }
-        if next.is_finite() {
-            next
-        } else {
-            -1.0
+        s.timers
+            .values()
+            .filter_map(|t| t.deadline)
+            .map(|d| d.saturating_duration_since(now).as_secs_f64() * 1000.0)
+            .fold(-1.0, |next: f64, d| if next < 0.0 || d < next { d } else { next })
+    })
+}
+
+thread_local! { static SIGNAL_FD: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) }; }
+/// The host's signal stream (`SUPA_SIGNAL_FD`), or -1.
+fn signal_fd() -> i32 {
+    SIGNAL_FD.with(|cell| match cell.get() {
+        Some(fd) => fd,
+        None => {
+            let fd = unsafe { perry_wasi_signal_fd() };
+            cell.set(Some(fd));
+            fd
         }
     })
+}
+/// Reads the signals the host queued (one byte each) and delivers them.
+pub(crate) fn drain_signals() {
+    let fd = signal_fd();
+    if fd < 0 {
+        return;
+    }
+    let mut bytes = [0u8; 32];
+    loop {
+        let n = unsafe { perry_wasi_stream_read(fd, bytes.as_mut_ptr(), bytes.len() as u32) };
+        if n <= 0 {
+            return;
+        }
+        for &signal in &bytes[..n as usize] {
+            crate::os::signal::wasi_deliver(signal);
+        }
+    }
+}
+
+/// Sleep for at most `budget` in one `poll_oneoff`: until a socket the loop
+/// waits on is ready, a signal arrives, or the budget (next timer) elapses.
+/// Returns false, having done nothing, when there is nothing to wait on.
+pub(crate) fn park(budget: Duration) -> bool {
+    let signal = signal_fd();
+    let mut fds = Vec::new();
+    let mut kinds = Vec::new();
+    STATE.with(|s| {
+        for h in s.borrow().handles.values() {
+            let mut kind = 0u8;
+            if h.connecting || !h.writes.is_empty() {
+                kind |= 2;
+            }
+            if h.reading || (h.listener && h.accepting) {
+                kind |= 1;
+            }
+            if kind != 0 {
+                fds.push(h.fd);
+                kinds.push(kind);
+            }
+        }
+    });
+    if signal >= 0 {
+        fds.push(signal);
+        kinds.push(1);
+    }
+    if fds.is_empty() {
+        return false;
+    }
+    let timeout = budget.as_nanos().min(u64::MAX as u128) as u64;
+    unsafe { perry_wasi_poll(fds.as_ptr(), kinds.as_ptr(), fds.len() as u32, timeout) };
+    true
 }
 fn completion(events: &mut VecDeque<Event>, subsystem: u8, c: NetCompletion) {
     events.push_back(Event::Completion(subsystem, c, Vec::new()));
 }
 
 extern "C" fn pump() -> i32 {
+    drain_signals();
     let mut events = STATE.with(|s| {
         let mut s = s.borrow_mut();
         let State {
@@ -463,7 +537,7 @@ extern "C" fn pump() -> i32 {
                             id,
                             0,
                             h.queued(),
-                            errors::from_os(-ready, "connect"),
+                            connect_error(-ready, h.by_name),
                             true,
                         ),
                     );
