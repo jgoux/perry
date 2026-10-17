@@ -157,14 +157,14 @@ js_array_push_u31_with_length	ptr	ptr,i32u,ptr
 js_array_record_abrupt	void	f64,f64,f64,i32u
 js_array_record_close	f64	f64,f64,f64,f64,f64
 js_array_record_close_absent	i32s	
-js_array_record_enter	i32s	f64,ptr,ptr
-js_array_record_enter_counted	i32s	f64,ptr,ptr
+js_array_record_enter	i32s	f64,ptr,i32u
+js_array_record_enter_counted	i32s	f64,ptr,i32u
 js_array_record_finish	f64	f64,f64,f64,i32u
 js_array_record_literal	f64	ptr,i32u
-js_array_record_literal_needs_iterator	i32s	ptr
+js_array_record_literal_needs_iterator	i32s	i32u
 js_array_record_needs_iterator	i32s	f64
 js_array_record_stack_dispatch	f64	ptr,i32u
-js_array_record_stack_enter	i32s	ptr,ptr,i32u
+js_array_record_stack_enter	i32s	ptr,i32u,i32u
 js_array_reduce	f64	ptr,ptr,i32s,f64
 js_array_reduce_right	f64	ptr,ptr,i32s,f64
 js_array_refresh_local_head	f64	f64
@@ -509,6 +509,9 @@ js_buffer_write_uint8	void	f64,f64,i32s
 js_buffer_write_uint_be	void	f64,f64,i32s,i32s
 js_buffer_write_uint_le	void	f64,f64,i32s,i32s
 js_build_class_keys_array	ptr	i32u,i32u,ptr,i32u,i64
+js_builtin_namespace_contract_check	void	i64,ptr,usize
+js_builtin_namespace_member	f64	f64,ptr,usize
+js_builtin_namespace_value	f64	i64
 js_builtin_proto_contract_check	void	i64
 js_builtin_proto_generic_call	f64	i32s,f64,i64,ptr,usize
 js_builtin_proto_generic_call0	f64	f64,i64
@@ -810,6 +813,7 @@ js_container_start	ptr	ptr
 js_container_stop	ptr	ptr,i32s
 js_count_queuing_strategy_new	f64	f64
 js_create_callback	f64	i64,i64,i64
+js_create_family_contract_check	void	ptr,f64
 js_create_namespace	f64	i32s,ptr,ptr,ptr,ptr
 js_create_native_module_namespace	f64	ptr,usize
 js_cron_timer_has_pending	i32s	
@@ -1090,7 +1094,6 @@ js_domain_remove	f64	i64,f64
 js_domain_run	f64	i64,f64,ptr
 js_drain_queued_microtasks	void	
 js_dyn_index_get	f64	f64,f64
-js_dyn_index_get_site	f64	ptr,f64,f64
 js_dyn_index_set	f64	f64,f64,f64
 js_dyn_index_set_strict	f64	f64,f64,f64,i32s
 js_dynamic_add	f64	f64,f64
@@ -1116,7 +1119,8 @@ js_dynamic_string_equals	i32s	f64,f64
 js_dynamic_string_or_number_add	f64	f64,f64
 js_dynamic_sub	f64	f64,f64
 js_dynamic_ushr	f64	f64,f64
-js_eh_try_push	void	
+js_eh_handle_height	i64	
+js_eh_pad_enter	void	ptr,i64
 js_encode_uri	i64	f64
 js_encode_uri_component	i64	f64
 js_encoding_tag_from_value	i32s	f64
@@ -1152,6 +1156,7 @@ js_ethers_get_address	ptr	ptr
 js_ethers_parse_ether	ptr	ptr
 js_ethers_parse_units	ptr	ptr,f64
 js_ethers_wallet_create_random	ptr	
+js_eval_in_scope	f64	f64,f64,f64,f64,f64,f64
 js_evalerror_new	ptr	ptr
 js_event_emitter_async_resource_call	f64	f64
 js_event_emitter_async_resource_object_new	f64	f64
@@ -1519,7 +1524,7 @@ js_get_string_pointer_unified	i64	f64
 js_getenv	ptr	ptr
 js_getenv_value	f64	ptr
 js_global_assign_existing_or_throw	f64	f64,f64
-js_global_get_field_ic_slow	f64	i64,ptr,ptr,ptr
+js_global_get_field_slow	f64	i64,ptr
 js_global_get_optional	f64	f64
 js_global_get_or_throw_unresolved	f64	f64
 js_global_or_console_property_by_name	f64	ptr
@@ -1684,7 +1689,6 @@ js_immediate_has_pending	i32s
 js_import_meta_resolve	f64	f64,f64,f64
 js_import_meta_resolve_value	f64	f64
 js_in_operator	f64	f64,f64
-js_in_operator_presence_ic	f64	f64,f64,ptr
 js_inline_arena_slow_alloc	ptr	ptr,usize,usize
 js_inline_arena_state	ptr	
 js_install_global_value_surfaces	void	
@@ -2155,7 +2159,9 @@ js_new_function_construct_apply	f64	f64,f64
 js_new_function_construct_site	f64	f64,ptr,usize,ptr
 js_new_function_construct_with_new_target	f64	f64,ptr,usize,f64
 js_new_instance	f64	i64,i64,i64,i64,i64
+js_new_target_enter	f64	f64
 js_new_target_get	f64	
+js_new_target_leave	void	
 js_new_target_set	f64	f64
 js_new_target_value	f64	
 js_nm_enable_install_all	void	
@@ -2521,6 +2527,7 @@ js_number_is_finite	f64	f64
 js_number_is_integer	f64	f64
 js_number_is_nan	f64	f64
 js_number_is_safe_integer	f64	f64
+js_number_mod	f64	f64,f64
 js_number_to_exponential	ptr	f64,f64
 js_number_to_fixed	ptr	f64,f64
 js_number_to_locale_string	ptr	f64
@@ -2570,23 +2577,16 @@ js_object_freeze	f64	f64
 js_object_from_entries	f64	f64
 js_object_get_class_id	i32u	ptr
 js_object_get_field	i64	ptr,i32u
-js_object_get_field_by_key_site	f64	ptr,i64,ptr,f64,f64
 js_object_get_field_by_name	i64	ptr,ptr
 js_object_get_field_by_name_boxed	f64	f64,ptr
 js_object_get_field_by_name_f64	f64	ptr,ptr
 js_object_get_field_by_property_id_f64	f64	ptr,i64
 js_object_get_field_f64	f64	ptr,i32u
-js_object_get_field_ic	f64	i64,ptr,i64,ptr
-js_object_get_field_ic_fast	f64	i64,ptr,i64,ptr
-js_object_get_field_ic_fast_miss	f64	i64,ptr,i64,ptr
-js_object_get_field_ic_front	f64	ptr,i64,i64,ptr,ptr
-js_object_get_field_ic_miss	f64	ptr,ptr,ptr
-js_object_get_field_ic_miss_packed	f64	ptr,ptr,ptr,ptr
-js_object_get_field_ic_nonptr	f64	i64,ptr,i64
-js_object_get_field_ic_overflow_load	f64	ptr,ptr,i32s,ptr
-js_object_get_field_ic_slow	f64	i64,ptr,ptr,ptr
+js_object_get_field_nonptr	f64	i64,ptr,i64
+js_object_get_field_slow	f64	i64,ptr
+js_object_get_field_value	f64	i64,ptr,i64
 js_object_get_index_polymorphic	f64	i64,f64
-js_object_get_own_field_ic_front	f64	ptr,i64,i64,ptr,ptr
+js_object_get_keyed_slow	f64	f64,f64,i64,i32u
 js_object_get_own_field_or_undef	f64	f64,ptr,usize
 js_object_get_own_field_or_undef_learn	f64	f64,ptr,usize,ptr
 js_object_get_own_property_descriptor	f64	f64,f64
@@ -2596,8 +2596,6 @@ js_object_get_own_property_symbols	i64	f64
 js_object_get_property_key	f64	f64,f64
 js_object_get_prototype_of	f64	f64
 js_object_get_symbol_property	f64	f64,f64
-js_object_get_symbol_property_ic_miss	f64	f64,f64,ptr
-js_object_get_symbol_then_field_ic_miss	f64	f64,f64,ptr,i64,ptr,ptr
 js_object_group_by	f64	f64,f64
 js_object_has_own	f64	f64,f64
 js_object_has_own_symbol	bool	f64,f64
@@ -3145,10 +3143,9 @@ js_promise_with_resolvers	ptr
 js_promise_with_resolvers_spec	f64	f64
 js_property_rmw	f64	f64,ptr,f64,i32s,ptr,ptr
 js_property_rmw_fast	f64	f64,f64,i32s,ptr
-js_proto_constant_contract_check	void	f64,i64,i32,i64
+js_proto_constant_contract_check	void	f64,i64,i32s,i64
 js_proto_holder_contract_check	void	f64,f64,i64
-js_proto_shadow_contract_check	void	i32,f64,i64
-perry_intrinsic_proto	ptr	i32
+js_proto_shadow_contract_check	void	i32s,f64,i64
 js_proxy_apply	f64	f64,f64,f64
 js_proxy_construct	f64	f64,f64,f64
 js_proxy_delete	f64	f64,f64
@@ -3282,12 +3279,12 @@ js_regexp_exec_get_index	f64
 js_regexp_get_flags	ptr	ptr
 js_regexp_get_source	ptr	ptr
 js_regexp_literal	ptr	i64
+js_regexp_literal_loaded	ptr	i64,f64,f64
 js_regexp_new	ptr	ptr,ptr
 js_regexp_test	i32s	ptr,ptr
 js_regexp_to_string	ptr	ptr
 js_region_guard_pack	i64	i32u,i32u,i64,i64,i64,i64,i64
 js_region_guard_prime	i64	ptr,i32u,i32u,i64,i64,i64,i64,i64
-js_region_holder_read	i32u	ptr,f64,ptr,i32u,ptr,i32u
 js_region_loop_pack	i64	i32u,i32u,i64,i64,i64,i64,i64,i32u,i32u
 js_region_loop_prime	i64	ptr,i32u,i32u,i64,i64,i64,i64,i64,i32u,i32u,i32u,i32u
 js_register_agent_aux_pump	void	ptr
@@ -3553,6 +3550,7 @@ js_setenv	void	ptr,f64
 js_shadow_frame_enter	ptr	i32u
 js_shadow_frame_pop	void	i64
 js_shadow_frame_push	i64	i32u
+js_shadow_frame_restore_to	void	i64
 js_shadow_slot_bind	void	i32u,ptr
 js_shadow_slot_get	i64	i32u
 js_shadow_slot_set	void	i32u,i64
@@ -3728,6 +3726,8 @@ js_string_pool_atom	ptr	ptr,i32u,i64,i32s
 js_string_position_to_index	i32s	f64
 js_string_print	void	ptr
 js_string_raw	ptr	f64,f64
+js_string_register_property_atom	void	ptr
+js_string_register_property_atoms	void	ptr,i32u
 js_string_repeat	ptr	ptr,f64
 js_string_replace_all_js	f64	f64,f64,f64
 js_string_replace_all_regex	ptr	ptr,ptr,ptr
@@ -3942,8 +3942,9 @@ js_transform_stream_writable	f64	f64
 js_transition_ic_note_hit	void	
 js_transition_ic_probe_report	void	
 js_transition_ic_spill_append	i32s	f64,i64,i32u,f64
+js_trap_call	i32s	ptr,ptr
 js_try_end	void	
-js_try_push	ptr	
+js_try_push	ptr	ptr
 js_tty_isatty	f64	f64
 js_tty_read_stream_new	f64	f64
 js_tty_read_stream_set_raw_mode	f64	ptr,i64,f64
@@ -4677,6 +4678,8 @@ node_api_create_syntax_error	i32s	ptr,ptr,ptr,ptr
 node_api_get_module_file_name	i32s	ptr,ptr
 node_api_symbol_for	i32s	ptr,ptr,usize,ptr
 node_api_throw_syntax_error	i32s	ptr,ptr,ptr
+perry_alloc_layout	ptr	ptr
+perry_alloc_runtime_record	ptr	ptr
 perry_app_group_init	void	ptr,i32s
 perry_app_group_suite_name	ptr	ptr
 perry_arkts_drain_toast	f64	
@@ -4688,7 +4691,12 @@ perry_arkts_set_content_view	void	f64,f64
 perry_arkts_set_text	void	f64,f64
 perry_arkts_set_visibility	void	f64,f64
 perry_arkts_show_toast	void	f64
+perry_array_attach_layout	f64	f64,ptr
+perry_array_element_kind	i32s	ptr
+perry_array_iteration_init	void	i32u
 perry_array_read_cold_shared	f64	f64,f64,i64
+perry_bind_family_prototype	void	ptr,f64
+perry_build_runtime_record	ptr	ptr,ptr
 perry_class_value_dir_cell	ptr	
 perry_cluster_compute_key_id	i32u	ptr,i32u,i32s,i32s
 perry_cluster_is_worker	i32s	
@@ -4696,6 +4704,7 @@ perry_cluster_worker_listening	void	ptr,i32u,i32s,i32s
 perry_cluster_worker_query_listen	i32s	ptr,i32u,i32s,i32s,i32s
 perry_cluster_worker_recv_fd	i32s	i32u
 perry_cluster_worker_sched_is_rr	i32s	
+perry_create_family	f64	ptr,f64
 perry_debug_trace_init	void	i64,ptr,i64
 perry_debug_trace_init_done	void	i64
 perry_eh_personality	i32s	i32s,i32s,i64,ptr,ptr
@@ -4770,9 +4779,11 @@ perry_i18n_set_currencies	void	ptr,i32u
 perry_i18n_set_locale_index	void	i32s
 perry_i18n_set_plural_locales	void	ptr,ptr,i32u
 perry_init_guard_check_and_set	i32s	i64
+perry_intrinsic_proto	ptr	i32u
 perry_ios_classes_registered	void	
 perry_ios_get_connected_scene	i64	
 perry_key_content_hash	i64	ptr
+perry_layout_index_probe	i32s	ptr,ptr
 perry_macos_bundle_chdir	void	
 perry_media_create_player	i64	i64
 perry_media_destroy	void	f64
@@ -4789,9 +4800,11 @@ perry_media_set_now_playing	void	f64,i64,i64,i64,i64
 perry_media_set_rate	void	f64,f64
 perry_media_set_volume	void	f64,f64
 perry_media_stop	void	f64
-perry_native_iterator_cleanup_before_trap	i32s	
 perry_next_wake_ms	f64	
 perry_object_header_abi_revision	i32u	
+perry_overflow_delete	bool	ptr,ptr
+perry_overflow_get	i64	ptr,ptr
+perry_overflow_set	void	ptr,ptr,i64,i8u
 perry_plugin_count	i64	
 perry_plugin_discover	f64	f64
 perry_plugin_emit	f64	i64,f64,f64
@@ -4820,8 +4833,13 @@ perry_plugin_unregister_route	f64	i64,f64
 perry_plugin_unregister_service	f64	i64,f64
 perry_plugin_unregister_tool	f64	i64,f64
 perry_poll	i32s	
+perry_probe_get	f64	ptr,i64,i64,i64
+perry_probe_get_binding	f64	ptr,i64,i64,i64
+perry_probe_get_keyed	f64	ptr,i64,i64
+perry_probe_get_value	f64	ptr,i64,i64,i64
 perry_register_static_plugin	void	ptr,f64
 perry_resolve_static_plugin	f64	ptr
+perry_runtime_image_result	i64	i64,f64,f64
 perry_runtime_widget_init	void	
 perry_safe_area_insets_make	f64	f64,f64,f64,f64
 perry_set_wake_callback	void	ptr,ptr
