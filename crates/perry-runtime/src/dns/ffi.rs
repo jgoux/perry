@@ -479,3 +479,45 @@ pub extern "C" fn js_dns_promises_lookup_service(args: i64) -> f64 {
         Err(error) => throw_error_value(error),
     }
 }
+
+/// Calls the DNS export `method` of `dns` (`promises == false`) or
+/// `dns/promises` (`promises == true`) with `args` (a packed `ArrayHeader`
+/// pointer, the same shape the static native table passes). Returns `None`
+/// when `method` is not a lookup/resolve/reverse export.
+///
+/// The static native table (`NODE_DNS_ROWS`) resolves these at compile time
+/// for ESM and literal `dns.*` calls. A namespace obtained at runtime (the
+/// synthetic CommonJS `require`) reaches them through the dynamic native
+/// module dispatch instead, which funnels here.
+pub(crate) fn dispatch_export(promises: bool, method: &str, args: i64) -> Option<f64> {
+    macro_rules! route {
+        ($($name:literal => $cb:ident, $pr:ident;)*) => {
+            match (promises, method) {
+                $(
+                    (false, $name) => Some($cb(args)),
+                    (true, $name) => Some($pr(args)),
+                )*
+                _ => None,
+            }
+        };
+    }
+    route! {
+        "lookup" => js_dns_lookup, js_dns_promises_lookup;
+        "lookupService" => js_dns_lookup_service, js_dns_promises_lookup_service;
+        "resolve" => js_dns_resolve, js_dns_promises_resolve;
+        "resolve4" => js_dns_resolve4, js_dns_promises_resolve4;
+        "resolve6" => js_dns_resolve6, js_dns_promises_resolve6;
+        "resolveAny" => js_dns_resolve_any, js_dns_promises_resolve_any;
+        "resolveCaa" => js_dns_resolve_caa, js_dns_promises_resolve_caa;
+        "resolveCname" => js_dns_resolve_cname, js_dns_promises_resolve_cname;
+        "resolveMx" => js_dns_resolve_mx, js_dns_promises_resolve_mx;
+        "resolveNaptr" => js_dns_resolve_naptr, js_dns_promises_resolve_naptr;
+        "resolveNs" => js_dns_resolve_ns, js_dns_promises_resolve_ns;
+        "resolvePtr" => js_dns_resolve_ptr, js_dns_promises_resolve_ptr;
+        "resolveSoa" => js_dns_resolve_soa, js_dns_promises_resolve_soa;
+        "resolveSrv" => js_dns_resolve_srv, js_dns_promises_resolve_srv;
+        "resolveTlsa" => js_dns_resolve_tlsa, js_dns_promises_resolve_tlsa;
+        "resolveTxt" => js_dns_resolve_txt, js_dns_promises_resolve_txt;
+        "reverse" => js_dns_reverse, js_dns_promises_reverse;
+    }
+}

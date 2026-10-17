@@ -146,9 +146,6 @@ unchanged; the runtime (`perry_wasi_net.c`, `wasi_net/mod.rs`) maps them as foll
   with `--allow-supa-net`, which a probe requests with `// network: yes`; such a
   module runs under plain wasmtime with `-W unknown-imports-trap` (the call is never
   made unless the program opens a socket).
-- **`dns` in CommonJS.** `require('node:dns')` in a CommonJS-wrapped program does not
-  install Perry's dns bindings and `dns.lookup` silently does nothing; use
-  `import * as dns from 'node:dns'`.
 - **CI.** wasmtime 47 removed the legacy p1 implementation that `-S tcplisten`
   needs, so the server probes run under wasmtime 46.0.3 (`WASMTIME_P1`); the other
   probes use 49. Probes that need a service (a Postgres for `pg`) are compiled and

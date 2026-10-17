@@ -79,8 +79,7 @@ for n in "${names[@]}"; do
 
   mkdir -p "$d/work"
   # The checkout's package.json says "type": "module"; node runs the probe as CommonJS,
-  # or as an ES module when it uses static imports (a CommonJS `require('node:dns')`
-  # does not reach Perry's dns bindings).
+  # or as an ES module when it uses static imports.
   ext=cjs; grep -q '^import ' "$src" && ext=mjs
   cp "$d/$n.js" "$d/$n.$ext"
   if [ -n "$port" ]; then

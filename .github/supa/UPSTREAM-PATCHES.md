@@ -66,6 +66,7 @@ Conventions in this file:
 | P42 | 743236204 | fix(gc): trace an array's named-property holder as a pointer | gc (layout) | wasm32 | wasi probe `array-named-props-gc.js` | not tried | PR-Y |
 | P43 | 4519a2f16 | fix(runtime): zero the DateCell padding on 32-bit targets | runtime (date) | wasm32 | wasi probe `date-cell-reuse.js` | not tried | PR-Z |
 | P44 | 540a34fc2 | fix(net): an application's end() after the protocol layer's close is a no-op | net (payload socket) | all (seen on wasm32) | wasi probe `http-early-reply.js` | not tried | PR-AA |
+| P45 | TBD | fix(dns): dispatch dns lookup and resolve exports reached through a CommonJS namespace | dns (`perry-runtime` native module dispatch) | all (seen on wasm32) | wasi probe `cjs-dns.js` | not tried | PR-AB |
 
 All 22 patches except P12's `.github` hunks, P05 and P06 cherry-pick cleanly.
 A stack of every patch except P05 and P06, with P12 limited to `crates/`, also applies cleanly in sequence on `1fd8ca2ae`.
@@ -101,6 +102,7 @@ Ordered by value and independence. Each PR carries its patches' tests.
 25. **PR-Y GC traces an array's named-property holder as a pointer** (P42). Prerequisite: none.
 26. **PR-Z A Date cell's padding is zeroed on 32-bit targets** (P43). Prerequisite: none.
 27. **PR-AA An application's `end()` after the HTTP layer's close is a no-op** (P44). Prerequisite: none.
+28. **PR-AB `dns.lookup`, `resolve*` and `reverse` work through a CommonJS `require`** (P45). Prerequisite: none.
 
 Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616f5e` for P05, `79aae9aa7` for P06 and P15); drop them at the next upstream sync and take upstream's versions.
 
@@ -558,6 +560,15 @@ Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616
 - Test: wasi probe `.github/supa/wasi-probes/http-early-reply.js` (a 401 before reading a 5 MB body, with Storage's half-close; the process exits 1 with the unhandled error before the fix, and answers the next request after it); port to `crates/perry/tests` for upstream.
 - Upstream: not cherry-picked. Depends on: none. PR-AA.
 - Not covered: the other order (the application's `end()` first, then the protocol layer's close) still gets the transport's duplicate-shutdown error, which the layers answer by destroying the connection without an `'error'`.
+
+### P45 TBD fix(dns): dispatch dns lookup and resolve exports reached through a CommonJS namespace
+- Area / platform: dns (`perry-runtime` `object/native_module_dispatch/dispatch_d_i.rs`, `dns/ffi.rs`) / all targets; observed on wasm32-wasip1.
+- Problem: in a CommonJS file `const dns = require('node:dns'); dns.lookup('localhost', cb)` never called `cb` and the program exited 0 silently; the same held for `lookupService`, `resolve*`, `reverse`, `require('node:dns/promises').lookup(...)` and a destructured `const { lookup } = require('dns')` (the promise forms returned undefined, so `.then` threw). The ESM form `import * as dns from 'node:dns'` worked. Fastify's `listen({ host })` calls `dns.lookup(host, { all: true }, cb)` through `require('node:dns')` and only starts listening inside the callback, so a hostname listen hung. `net.connect({ host: 'localhost' })` and pg by hostname were not affected (they resolve inside the runtime).
+- Root cause: Perry's CommonJS wrapper injects its own `require`, so `require('node:dns')` is a runtime call that returns a native-module namespace, not the static `NativeModuleRef` that `import * as dns` produces. Static `dns.lookup(...)` is bound at compile time through `NODE_DNS_ROWS` (`native_table/node_dns.rs`) to `js_dns_lookup` and friends. A member call on the runtime namespace instead goes through `nm_dispatch_dns`, which had arms only for `getServers`, `setServers` and the default result order; its `_ =>` arm returned undefined, so every other export was a silent no-op.
+- Fix: `dns::dispatch_export` (`dns/ffi.rs`) maps each lookup/lookupService/resolve*/reverse export, callback and `dns/promises` form, to the same `js_dns_*` FFI the static table uses; `nm_dispatch_dns` calls it with the packed arguments before falling through to undefined. Docs: the "`dns` in CommonJS" limitation is removed from `docs/WASI_SUPPORT.md` and `wasi-probes.sh`.
+- Test: wasi probe `.github/supa/wasi-probes/cjs-dns.js` (run as CommonJS: callback and promise lookup, `{ all: true }`, an IP literal, ENOTFOUND, `net.connect` by name; before the fix it prints only its first line and exits 0, after it matches node line for line); port to `crates/perry/tests` for upstream. It is compile-only in CI (needs a resolver) and runs locally under supa-host with `--listen 127.0.0.1:47123`.
+- Upstream: not cherry-picked. Depends on: none. PR-AB.
+- Not covered: instance methods of `new dns.Resolver()` reached through a CommonJS namespace were not re-tested.
 
 ## Not for upstream
 
