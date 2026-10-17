@@ -62,7 +62,8 @@ Conventions in this file:
 | P38 | f0a9e8a1d | fix(cjs): share one registry helper across a module's deferred requires | compile (cjs_wrap) | all (shrinks native output too) | Storage compile size (530 MB to 414 MB module) | not tried | PR-V |
 | P39 | 28fa69faf | fix(wasm32): pass a JS body's callee as a pointer in indirect calls | codegen (wasm32) | wasm32 | wasi probe `closure-call-in-loop.js` + unit | not tried | PR-U |
 | P40 | 3d45a1e6d | fix(runtime): register the standard descriptors for fs on WASI | runtime (fs) | wasm32 (WASI) | wasi probe `fs-stdio-fd.js` | not tried | PR-W |
-| P41 | (this commit) | fix(runtime): report readableEnded only once the end event was emitted | runtime (node:stream) | all | unit + wasi probe `stream-readable-ended.js` | not tried | PR-X |
+| P41 | 5a0100769 | fix(runtime): report readableEnded only once the end event was emitted | runtime (node:stream) | all | unit + wasi probe `stream-readable-ended.js` | not tried | PR-X |
+| P42 | 7f704b6bb | fix(gc): trace an array's named-property holder as a pointer | gc (layout) | wasm32 | wasi probe `array-named-props-gc.js` | not tried | PR-Y |
 
 All 22 patches except P12's `.github` hunks, P05 and P06 cherry-pick cleanly.
 A stack of every patch except P05 and P06, with P12 limited to `crates/`, also applies cleanly in sequence on `1fd8ca2ae`.
@@ -95,6 +96,7 @@ Ordered by value and independence. Each PR carries its patches' tests.
 22. **PR-V Deferred CJS requires share one registry helper** (P38). Smaller output on every target. Prerequisite: none.
 23. **PR-W `fs.write*` on stdio descriptors under WASI** (P40). Prerequisite: PR-R.
 24. **PR-X `readableEnded` means the end event was emitted** (P41). Prerequisite: none.
+25. **PR-Y GC traces an array's named-property holder as a pointer** (P42). Prerequisite: none.
 
 Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616f5e` for P05, `79aae9aa7` for P06 and P15); drop them at the next upstream sync and take upstream's versions.
 
@@ -519,7 +521,7 @@ Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616
 - Test: wasi probe `fs-stdio-fd.js`.
 - Upstream: not cherry-picked. Depends on: none. PR-W.
 
-### P41 (this commit) fix(runtime): report readableEnded only once the end event was emitted
+### P41 5a0100769 fix(runtime): report readableEnded only once the end event was emitted
 - Area / platform: runtime (node:stream) / all.
 - Problem: a `PassThrough` that was `end()`ed but not yet consumed reported `readableEnded === true` (node: `false`). Storage pipes a request into a proxy `PassThrough` and rejects the upload when `proxy.readableEnded` is true, so every small upload failed with "Request stream closed before upload could begin".
 - Root cause: the public `readableEnded` getter read `Slot::ReadableEnded`, which `mark_stream_ended` sets when EOF is pushed (node's `ended`). Node's `readableEnded` is `endEmitted`.
@@ -528,9 +530,17 @@ Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616
 - Upstream: not cherry-picked. Depends on: none. PR-X.
 - Not covered: a server `IncomingMessage` still reports `readableEnded` as `complete` and `closed` as undefined (perry-ext-http `handle_dispatch.rs`).
 
+### P42 7f704b6bb fix(gc): trace an array's named-property holder as a pointer
+- Area / platform: gc (`gc/layout_slot_visit.rs`) / wasm32.
+- Problem: Storage (ajv schema compilation, tagged templates) trapped nondeterministically with `out of bounds memory access` in `named_layout_holds_element_descriptors`; any program that keeps arrays with own named properties (tagged-template `strings.raw`, regexp `match` results, `arr.label = ...`) across a nursery collection could read a freed property holder.
+- Root cause: the array's `named` word is a raw machine pointer. The layout visitor gave it a `u64` slot descriptor (only objects and closures got the pointer-width one). On wasm32 the pointer is four bytes inside an eight-byte-aligned header, followed by four padding bytes, so the `u64` read folded whatever the padding held into the address; the edge was then neither marked nor rewritten, and the holder was reclaimed or left at its old address once the array was evacuated. Native targets read the full pointer word and were unaffected.
+- Fix: arrays use the pointer-width slot descriptor like objects and closures. File: `perry-runtime/src/gc/layout_slot_visit.rs`.
+- Test: wasi probe `.github/supa/wasi-probes/array-named-props-gc.js` (traps without the fix, with and without `PERRY_GC_FORCE_EVACUATE=1`); port to `crates/perry/tests` for upstream.
+- Upstream: not cherry-picked. Depends on: none. PR-Y.
+
 ## Not for upstream
 
-Every other fork-only non-merge commit is CI, probes, a temporary diagnostic, or a Storage shim. None edits files outside `.github/` (checked with `git show --name-only`). There are 44 such commits, 22 fix/feat commits are the patches above, and the fork has no `test:` commits.
+Every other fork-only non-merge commit is CI, probes, a temporary diagnostic, or a Storage shim. None edits files outside `.github/` (checked with `git show --name-only`). There are 44 such commits, 23 fix/feat commits are the patches above, and the fork has no `test:` commits.
 
 **Fork CI workflow, composite action and driver scripts** (`.github/workflows/supa-storage.yml`, `.github/actions/supa-rust-env`, `.github/supa/*.sh`; Blacksmith runner, sccache, lld, caches). Fork-specific infrastructure for supabase/perry.
 `e8ac78fea` `ece6015bb` `297306927` `18b63cef3` `512996ccb` `0c3401687` `9d2cbde15` `8a051e924` `53423af73` `942a6fe56` `5b1438709`
