@@ -50,6 +50,8 @@ fn protect_setjmp_locals(ir: &str) -> String {
                         line = line
                             .replace(" alwaysinline", "")
                             .replace(" {", " noinline {");
+                    } else if let Some(marked) = mark_call_noinline(&line) {
+                        line = marked;
                     } else if line
                         .split(',')
                         .any(|part| slots.iter().any(|slot| part.trim() == slot))
@@ -72,6 +74,36 @@ fn protect_setjmp_locals(ir: &str) -> String {
         }
     }
     out
+}
+
+/// Keep every call out of a returns-twice frame.
+///
+/// LLVM's wasm sjlj lowering turns each setjmp function into a dispatch loop and
+/// carries every SSA value that crosses a block boundary through phis, then
+/// spills all of them around every call. A callee inlined into the frame
+/// brings its own block-crossing temporaries along, so spill code grows with
+/// (calls x values), quadratically. A module body of a few hundred statements
+/// reached 17 MB for one function and Storage's module 530 MB, past the 7.6 MB
+/// function-size limit that wasmtime and wasm-tools enforce. Marking the call
+/// sites `noinline` keeps the frame's values to the few Perry creates itself.
+/// Intrinsics stay inlinable; they are not calls in the output.
+fn mark_call_noinline(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let is_call = ["call ", "tail call "]
+        .iter()
+        .any(|p| trimmed.starts_with(p))
+        || trimmed
+            .split_once(" = ")
+            .is_some_and(|(_, rest)| rest.starts_with("call ") || rest.starts_with("tail call "));
+    if !is_call || trimmed.contains("@llvm.") || trimmed.contains(" asm ") {
+        return None;
+    }
+    // Trailing instruction metadata (`, !tbaa !3`) must stay last.
+    let (body, metadata) = match line.find(", !") {
+        Some(at) => line.split_at(at),
+        None => (line, ""),
+    };
+    Some(format!("{body} noinline{metadata}"))
 }
 
 /// The emitted object without the NUL terminator inkwell's
@@ -131,6 +163,15 @@ mod tests {
         assert!(out.contains("store volatile i64 1, ptr %slot"));
         assert!(out.contains("load volatile i64, ptr %slot"));
         assert!(out.contains("load atomic i64, ptr @global monotonic"));
+    }
+    #[test]
+    fn sjlj_frames_do_not_inline_their_callees() {
+        let ir = "define void @f() optsize {\nentry:\n  %r = call i32 @setjmp(ptr %buf)\n  %a = call double @g(double 1.0)\n  call void @h(i32 2), !srcloc !4\n  %n = tail call i32 @llvm.ctpop.i32(i32 3)\n  ret void\n}\ndefine void @plain() {\n  call void @h(i32 2)\n  ret void\n}\n";
+        let out = super::protect_setjmp_locals(ir);
+        assert!(out.contains("%a = call double @g(double 1.0) noinline\n"), "{out}");
+        assert!(out.contains("call void @h(i32 2) noinline, !srcloc !4"), "{out}");
+        assert!(out.contains("@llvm.ctpop.i32(i32 3)\n"), "{out}");
+        assert!(out.contains("  call void @h(i32 2)\n  ret void\n}\n"), "{out}");
     }
     #[test]
     fn the_buffer_terminator_is_dropped_from_a_wasm_object() {
