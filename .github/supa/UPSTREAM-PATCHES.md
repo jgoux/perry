@@ -62,6 +62,7 @@ Conventions in this file:
 | P38 | f0a9e8a1d | fix(cjs): share one registry helper across a module's deferred requires | compile (cjs_wrap) | all (shrinks native output too) | Storage compile size (530 MB to 414 MB module) | not tried | PR-V |
 | P39 | 28fa69faf | fix(wasm32): pass a JS body's callee as a pointer in indirect calls | codegen (wasm32) | wasm32 | wasi probe `closure-call-in-loop.js` + unit | not tried | PR-U |
 | P40 | 3d45a1e6d | fix(runtime): register the standard descriptors for fs on WASI | runtime (fs) | wasm32 (WASI) | wasi probe `fs-stdio-fd.js` | not tried | PR-W |
+| P41 | (this commit) | fix(runtime): report readableEnded only once the end event was emitted | runtime (node:stream) | all | unit + wasi probe `stream-readable-ended.js` | not tried | PR-X |
 
 All 22 patches except P12's `.github` hunks, P05 and P06 cherry-pick cleanly.
 A stack of every patch except P05 and P06, with P12 limited to `crates/`, also applies cleanly in sequence on `1fd8ca2ae`.
@@ -93,6 +94,7 @@ Ordered by value and independence. Each PR carries its patches' tests.
 21. **PR-U wasm32 codegen lowering fixes** (P36, P37, P39). Indirect-call ABI, setjmp spill size and static-method declaration width. Prerequisite: PR-S. Re-check P37 first, see its section.
 22. **PR-V Deferred CJS requires share one registry helper** (P38). Smaller output on every target. Prerequisite: none.
 23. **PR-W `fs.write*` on stdio descriptors under WASI** (P40). Prerequisite: PR-R.
+24. **PR-X `readableEnded` means the end event was emitted** (P41). Prerequisite: none.
 
 Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616f5e` for P05, `79aae9aa7` for P06 and P15); drop them at the next upstream sync and take upstream's versions.
 
@@ -516,6 +518,15 @@ Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616
 - Fix: on WASI the registry wraps descriptors 0..=2 directly (no dup exists). File: `fs/mod.rs`.
 - Test: wasi probe `fs-stdio-fd.js`.
 - Upstream: not cherry-picked. Depends on: none. PR-W.
+
+### P41 (this commit) fix(runtime): report readableEnded only once the end event was emitted
+- Area / platform: runtime (node:stream) / all.
+- Problem: a `PassThrough` that was `end()`ed but not yet consumed reported `readableEnded === true` (node: `false`). Storage pipes a request into a proxy `PassThrough` and rejects the upload when `proxy.readableEnded` is true, so every small upload failed with "Request stream closed before upload could begin".
+- Root cause: the public `readableEnded` getter read `Slot::ReadableEnded`, which `mark_stream_ended` sets when EOF is pushed (node's `ended`). Node's `readableEnded` is `endEmitted`.
+- Fix: the prototype getter and `js_node_stream_method_readable_ended` read `Slot::EndEmitted`, and constructors initialise it to false. `Slot::ReadableEnded` keeps its internal meaning (EOF pushed). Files: `perry-runtime/src/node_stream.rs`, `node_stream/proto_methods.rs`, `node_stream_constructors.rs`.
+- Test: the unit test `readable_lifecycle_flags_reflect_ended_state` now expects `false` after `push(null)` (it asserted the old behaviour); probe `.github/supa/wasi-probes/stream-readable-ended.js` (port to `crates/perry/tests` for upstream).
+- Upstream: not cherry-picked. Depends on: none. PR-X.
+- Not covered: a server `IncomingMessage` still reports `readableEnded` as `complete` and `closed` as undefined (perry-ext-http `handle_dispatch.rs`).
 
 ## Not for upstream
 

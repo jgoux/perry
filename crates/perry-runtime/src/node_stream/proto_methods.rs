@@ -250,7 +250,7 @@ const READABLE_PROPERTIES: &[(&str, Word)] = &[
     ("readableObjectMode", Word::Slot(Slot::ReadableObjectMode)),
     ("readableFlowing", Word::Slot(Slot::ReadableFlowing)),
     ("readable", Word::Slot(Slot::Readable)),
-    ("readableEnded", Word::Slot(Slot::ReadableEnded)),
+    ("readableEnded", Word::Slot(Slot::EndEmitted)),
     ("readableDidRead", Word::Slot(Slot::Disturbed)),
     ("readableEncoding", Word::Slot(Slot::ReadableEncoding)),
 ];
