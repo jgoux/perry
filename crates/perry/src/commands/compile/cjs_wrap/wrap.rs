@@ -618,6 +618,7 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_addon_paths(
         "import {{ createRequire as __perry_cjs_create_require, isBuiltin as __perry_cjs_is_builtin }} from 'node:module';\n{imports}"
     );
 
+    let uses_deferred_helper = std::cell::Cell::new(false);
     // An UNRESOLVABLE adopted specifier (`require('@opentelemetry/api')`
     // with only Next's vendored copy on disk) leaves its hoisted import
     // binding as the boolean TRUE sentinel at runtime. Returning that from
@@ -678,20 +679,20 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_addon_paths(
                 resolved_target
                     .as_ref()
                     .map(|target| {
-                        let warnings = if cyclic_specs.contains(spec) {
-                            cyclic_missing_property_names(source, source_path, spec, target)
-                                .into_iter()
-                                .map(|property| {
-                                    // #10178: this scan only nominates possible
-                                    // misses. __export helpers and class statics
-                                    // can already be present on a replacement
-                                    // module.exports. Check the returned value
-                                    // without invoking the exported getter.
-                                    format!(
-                                        "if (childBefore && childBefore.loaded === false && required != null && (typeof required === 'object' || typeof required === 'function') && !('{property}' in required)) globalThis.process?.emitWarning?.(\"Accessing non-existent property '{property}' of module exports inside circular dependency\"); "
-                                    )
-                                })
-                                .collect::<String>()
+                        // A cyclic target reports the properties the cycle can
+                        // read before they exist (#10178), in the shared helper.
+                        let missing = if cyclic_specs.contains(spec) {
+                            let names =
+                                cyclic_missing_property_names(source, source_path, spec, target);
+                            if names.is_empty() {
+                                String::new()
+                            } else {
+                                format!(
+                                    ", {}",
+                                    serde_json::to_string(&names)
+                                        .expect("property names are JSON encodable")
+                                )
+                            }
                         } else {
                             String::new()
                         };
@@ -708,9 +709,23 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_addon_paths(
                         // miss-vs-`undefined`-export discriminator (a real
                         // module may export `undefined`), and on a genuine miss
                         // the import binding is the value this arm returned
-                        // before the target was deferred at all.
+                        // before the target was deferred at all. The binding is
+                        // read through a thunk because reading it can itself
+                        // initialize the target.
+                        //
+                        // The registry call, its `try`/`finally`, the cycle
+                        // warning and the child link live in one helper per
+                        // module instead of being repeated in every case.
+                        // `require` holds one case per specifier, and each
+                        // inlined copy carried a returns-twice frame on wasm32:
+                        // the sjlj lowering threads every value of every case
+                        // through one dispatch loop, so the function grew with
+                        // the square of the specifier count (17 MB for a 3 KB
+                        // barrel module) and passed the 7.6 MB function size
+                        // limit of wasmtime and wasm-tools.
+                        uses_deferred_helper.set(true);
                         format!(
-                            "const childBefore = require.cache[{path:?}]; globalThis.__perry_cjs_pending_parent = module; let required; try {{ required = __perry_require_path_module({path:?}); required = __perry_cjs_refresh_path({path:?}, required); }} finally {{ globalThis.__perry_cjs_pending_parent = undefined; }} if (required === undefined && !__perry_has_path_module({path:?})) required = {local}; {warnings}{link_child}const __perry_rec = require.cache[{path:?}]; if (__perry_rec !== undefined && __perry_rec.loaded === true) {local}__rec = __perry_rec; return required;",
+                            "const required = __perry_cjs_require_deferred({path:?}, () => {local}{missing}); const __perry_rec = require.cache[{path:?}]; if (__perry_rec !== undefined && __perry_rec.loaded === true) {local}__rec = __perry_rec; return required;",
                             path = target.to_string_lossy(),
                             local = local,
                         )
@@ -802,6 +817,42 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_addon_paths(
         .map(|(_, local)| format!("    let {local}__rec;"))
         .collect::<Vec<_>>()
         .join("\n");
+    // The first, registry-backed require of a deferred target (see the case
+    // above). `fallback` is a thunk: reading the import binding can initialize
+    // the target, so it is read only when the registry has no such module.
+    let deferred_helper = if uses_deferred_helper.get() {
+        r#"    function __perry_cjs_require_deferred(path, fallback, missing) {
+        const childBefore = require.cache[path];
+        globalThis.__perry_cjs_pending_parent = module;
+        let required;
+        try {
+            required = __perry_require_path_module(path);
+            required = __perry_cjs_refresh_path(path, required);
+        } finally {
+            globalThis.__perry_cjs_pending_parent = undefined;
+        }
+        if (required === undefined && !__perry_has_path_module(path)) required = fallback();
+        if (missing !== undefined && childBefore && childBefore.loaded === false && required != null && (typeof required === 'object' || typeof required === 'function')) {
+            // #10178: this scan only nominates possible misses. __export helpers
+            // and class statics can already be present on a replacement
+            // module.exports. Check the returned value without invoking the
+            // exported getter.
+            for (let i = 0; i < missing.length; i++) {
+                const property = missing[i];
+                if (!(property in required)) globalThis.process?.emitWarning?.("Accessing non-existent property '" + property + "' of module exports inside circular dependency");
+            }
+        }
+        const child = require.cache[path];
+        if (child) {
+            if (child.parent === undefined) child.parent = module;
+            if (module.children.indexOf(child) === -1) module.children.push(child);
+        }
+        return required;
+    }
+"#
+    } else {
+        ""
+    };
     // Heuristic: is any `require('<spec>')` call site lexically inside a
     // `try { … }` block? Reverse brace-depth scan from the call offset to
     // the nearest unmatched `{`, checking whether `try` precedes it.
@@ -1381,7 +1432,7 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_addon_paths(
         if (__perry_cjs_reload_require === undefined) __perry_cjs_reload_require = __perry_cjs_create_require({module_filename_literal});
         return __perry_cjs_reload_require(path);
     }}
-    function require(specifier) {{
+{deferred_helper}    function require(specifier) {{
         if (typeof specifier !== 'string') throw __perry_cjs_require_error('type', 'ERR_INVALID_ARG_TYPE', 'The "id" argument must be of type string.');
         if (specifier === '') throw __perry_cjs_require_error('type', 'ERR_INVALID_ARG_VALUE', 'The argument "id" must be a non-empty string.');
 {require_cases}

@@ -361,4 +361,51 @@ module.exports = { get };
              requires.\n{wrapped}"
         );
     }
+
+    /// Every deferred case calls one shared helper instead of inlining the
+    /// registry call and its `try`/`finally`.
+    ///
+    /// On wasm32 a `try` makes the enclosing function a returns-twice frame, and
+    /// LLVM's sjlj lowering threads the values of every case in that function
+    /// through one dispatch loop. `require` carries one case per specifier, so
+    /// inlining the `try` into each made it grow with the square of the
+    /// specifier count: a 3 KB barrel module with 16 requires produced a 17 MB
+    /// function, past the 7.6 MB function body limit of wasmtime. The shape is
+    /// invisible to behavioural tests, so pin it: the registry call appears the
+    /// same number of times however many specifiers are deferred.
+    #[test]
+    fn deferred_require_cases_share_one_registry_helper() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry_calls = Vec::new();
+        for count in [1usize, 4] {
+            let mut src = String::new();
+            for i in 0..count {
+                std::fs::write(
+                    dir.path().join(format!("dep{i}.js")),
+                    "module.exports = { v: 1 };\n",
+                )
+                .unwrap();
+                src.push_str(&format!(
+                    "function get{i}(flag) {{ if (flag) {{ return require(\"./dep{i}.js\").v; }} return 0; }}\n"
+                ));
+            }
+            src.push_str("module.exports = {};\n");
+            let wrapped = super::super::wrap::wrap_commonjs(&src, &dir.path().join("entry.js"));
+            assert_eq!(
+                wrapped.matches("function __perry_cjs_require_deferred(").count(),
+                1,
+                "{wrapped}"
+            );
+            assert_eq!(
+                wrapped.matches("__perry_cjs_require_deferred(\"").count(),
+                count,
+                "{wrapped}"
+            );
+            registry_calls.push(wrapped.matches("__perry_require_path_module(").count());
+        }
+        assert_eq!(
+            registry_calls[0], registry_calls[1],
+            "the registry call must not be repeated per deferred specifier"
+        );
+    }
 }
