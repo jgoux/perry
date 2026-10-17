@@ -346,6 +346,15 @@ jobs:
             supa-out/compile.time
             supa-out/imports.txt
           if-no-files-found: ignore
+      # The compiler and the wasm runtime archive, for compiling small repros in a Linux
+      # arm64 container on a dev machine (no LLVM 22 there).
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wasi-compiler
+          path: |
+            target/release/perry
+            target/wasm32-wasip1/release/libperry_runtime.a
+          retention-days: 3
       - uses: actions/upload-artifact@v4
         with:
           name: storage-wasi-module
