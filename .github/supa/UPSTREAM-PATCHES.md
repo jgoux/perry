@@ -66,7 +66,7 @@ Conventions in this file:
 | P42 | 743236204 | fix(gc): trace an array's named-property holder as a pointer | gc (layout) | wasm32 | wasi probe `array-named-props-gc.js` | not tried | PR-Y |
 | P43 | 4519a2f16 | fix(runtime): zero the DateCell padding on 32-bit targets | runtime (date) | wasm32 | wasi probe `date-cell-reuse.js` | not tried | PR-Z |
 | P44 | 540a34fc2 | fix(net): an application's end() after the protocol layer's close is a no-op | net (payload socket) | all (seen on wasm32) | wasi probe `http-early-reply.js` | not tried | PR-AA |
-| P45 | TBD | fix(dns): dispatch dns lookup and resolve exports reached through a CommonJS namespace | dns (`perry-runtime` native module dispatch) | all (seen on wasm32) | wasi probe `cjs-dns.js` | not tried | PR-AB |
+| P45 | d9ebda76d | fix(dns): dispatch dns lookup and resolve exports reached through a CommonJS namespace | dns (`perry-runtime` native module dispatch) | all (seen on wasm32) | wasi probe `cjs-dns.js` | not tried | PR-AB |
 
 All 22 patches except P12's `.github` hunks, P05 and P06 cherry-pick cleanly.
 A stack of every patch except P05 and P06, with P12 limited to `crates/`, also applies cleanly in sequence on `1fd8ca2ae`.
@@ -561,7 +561,7 @@ Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616
 - Upstream: not cherry-picked. Depends on: none. PR-AA.
 - Not covered: the other order (the application's `end()` first, then the protocol layer's close) still gets the transport's duplicate-shutdown error, which the layers answer by destroying the connection without an `'error'`.
 
-### P45 TBD fix(dns): dispatch dns lookup and resolve exports reached through a CommonJS namespace
+### P45 d9ebda76d fix(dns): dispatch dns lookup and resolve exports reached through a CommonJS namespace
 - Area / platform: dns (`perry-runtime` `object/native_module_dispatch/dispatch_d_i.rs`, `dns/ffi.rs`) / all targets; observed on wasm32-wasip1.
 - Problem: in a CommonJS file `const dns = require('node:dns'); dns.lookup('localhost', cb)` never called `cb` and the program exited 0 silently; the same held for `lookupService`, `resolve*`, `reverse`, `require('node:dns/promises').lookup(...)` and a destructured `const { lookup } = require('dns')` (the promise forms returned undefined, so `.then` threw). The ESM form `import * as dns from 'node:dns'` worked. Fastify's `listen({ host })` calls `dns.lookup(host, { all: true }, cb)` through `require('node:dns')` and only starts listening inside the callback, so a hostname listen hung. `net.connect({ host: 'localhost' })` and pg by hostname were not affected (they resolve inside the runtime).
 - Root cause: Perry's CommonJS wrapper injects its own `require`, so `require('node:dns')` is a runtime call that returns a native-module namespace, not the static `NativeModuleRef` that `import * as dns` produces. Static `dns.lookup(...)` is bound at compile time through `NODE_DNS_ROWS` (`native_table/node_dns.rs`) to `js_dns_lookup` and friends. A member call on the runtime namespace instead goes through `nm_dispatch_dns`, which had arms only for `getServers`, `setServers` and the default result order; its `_ =>` arm returned undefined, so every other export was a silent no-op.
