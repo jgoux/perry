@@ -73,7 +73,7 @@ runs:
         {
           echo "### wasm32-wasip1 runtime"
           echo "- build: $(( $(date +%s) - start )) s"
-          echo '```'; sccache --show-stats | head -n 12; echo '```'
+          echo '```'; sccache --show-stats | sed -n 1,12p; echo '```'
         } >> "$GITHUB_STEP_SUMMARY"
     - name: Runtime archive
       shell: bash

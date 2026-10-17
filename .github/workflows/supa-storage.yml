@@ -717,7 +717,7 @@ jobs:
               [ -f "$OUT/$b" ] && echo "- $b: $(stat -c %s "$OUT/$b") bytes unstripped, $(strip -o /dev/stdout "$OUT/$b" 2>/dev/null | wc -c) bytes stripped"
             done
             [ -f "$OUT/native-idle-rss.txt" ] && sed 's/^/- idle /' "$OUT/native-idle-rss.txt"
-            echo '```'; sccache --show-stats 2>/dev/null | head -n 12; echo '```'
+            echo '```'; sccache --show-stats 2>/dev/null | sed -n 1,12p; echo '```'
             echo '```'
             [ -f "$OUT/native-transcript.txt" ] && cat "$OUT/native-transcript.txt"
             echo '```'
@@ -784,7 +784,7 @@ jobs:
           {
             echo "### regressions-linux"
             echo "- test build: $(( $(date +%s) - start )) s"
-            echo '```'; sccache --show-stats | head -n 12; echo '```'
+            echo '```'; sccache --show-stats | sed -n 1,12p; echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Run the regression tests
         if: steps.done.outputs.cache-hit != 'true'
