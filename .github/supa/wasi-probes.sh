@@ -50,7 +50,9 @@ for n in "${names[@]}"; do
   fi
 
   mkdir -p "$d/work"
-  (cd "$d" && WORK_DIR="$d/work" timeout 120 node "$n.js" > node.out 2> node.err); echo $? > "$d/node.rc"
+  # The checkout's package.json says "type": "module"; node runs the probe as CommonJS.
+  cp "$d/$n.js" "$d/$n.cjs"
+  (cd "$d" && WORK_DIR="$d/work" timeout 120 node "$n.cjs" > node.out 2> node.err); echo $? > "$d/node.rc"
   (cd "$d" && /usr/bin/time -v -o time.txt timeout 300 "$wasmtime" run $flags --dir "$d/work::/work" "$n.wasm" > run.out 2> run.err); echo $? > "$d/run.rc"
   rss=$(awk -F': ' '/Maximum resident set size/ {printf "%d", $2 / 1024}' "$d/time.txt")
   echo "--- stdout (wasm) ---"; head -c 3000 "$d/run.out"
