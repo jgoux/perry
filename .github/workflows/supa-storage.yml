@@ -289,6 +289,12 @@ jobs:
             supa-out/wasi-probes/hello/hello.wasm
             supa-out/start.wat
           if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: perry-wasi-compiler
+          path: target/release/perry
+          if-no-files-found: ignore
       # Every compiled probe, for runs under the supa-wasm host (supa-host) on a dev machine.
       - uses: actions/upload-artifact@v4
         if: always()
