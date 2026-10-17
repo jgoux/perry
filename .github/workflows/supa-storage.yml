@@ -264,8 +264,9 @@ jobs:
           wasm-tools print "$hello" > "$OUT/hello.wat"
           # The .init_array constructors (layouts, atoms, image ranges) must run
           # from the command entry point.
-          grep -A12 '(func \$_start' "$OUT/hello.wat" | grep -q 'call \$__wasm_call_ctors' \
-            || { echo "::error::_start does not call __wasm_call_ctors"; exit 1; }
+          awk '/^  \(func \$_start /{p=1} p{print} p && /^  \)/{exit}' "$OUT/hello.wat" > "$OUT/start.wat"
+          grep -q 'call \$__wasm_call_ctors' "$OUT/start.wat" \
+            || { cat "$OUT/start.wat"; echo "::error::_start does not call __wasm_call_ctors"; exit 1; }
           echo "_start calls __wasm_call_ctors"
           echo "try_table sites: $(grep -c 'try_table' "$OUT/hello.wat" || true)"
           echo "legacy try sites: $(grep -cE '^\s*try( |$)' "$OUT/hello.wat" || true)"
@@ -280,7 +281,7 @@ jobs:
             supa-out/wasi-probes/*/*.txt
             supa-out/wasi-probes/*/*.diff
             supa-out/wasi-probes/hello/hello.wasm
-            supa-out/hello.wat
+            supa-out/start.wat
           if-no-files-found: ignore
 
   # Tiny programs that isolate runtime behaviour on Linux arm without Storage.
