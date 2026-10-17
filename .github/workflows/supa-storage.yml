@@ -33,6 +33,10 @@ on:
         description: Run the Linux Storage job
         type: boolean
         default: true
+      storage_wasi:
+        description: Run the storage-wasi job (Storage compiled to wasip1); it always runs on supa/wasip1 pushes. With storage=false and skip_regressions=true only it and its dependencies run
+        type: boolean
+        default: false
       relink_only:
         description: Fail unless the object cache is warm, so the run only relinks
         type: boolean
@@ -184,73 +188,10 @@ jobs:
           key: ${{ needs.build-perry.outputs.key }}
           fail-on-cache-miss: true
       - run: mkdir -p target/release && cp perry-dist/perry target/release/perry && target/release/perry --version
-      - name: Rust toolchain with the wasm32-wasip1 target
-        run: |
-          rustup toolchain install nightly-2026-10-04 --profile minimal --component rustfmt --component clippy --target wasm32-wasip1
-      - uses: mozilla-actions/sccache-action@v0.0.9
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: cargo-registry-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-registry-
+      - uses: ./.github/actions/supa-wasi-env
       - uses: actions/setup-node@v4 # the reference runs
         with:
           node-version: 24
-      - name: Tools cache
-        id: tools
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.WASI_TOOLS }}
-          key: wasi-tools-${{ runner.arch }}-sdk${{ env.WASI_SDK_VERSION }}-wasmtime${{ env.WASMTIME_VERSION }}-p1wasmtime${{ env.WASMTIME_P1_VERSION }}-wasmtools${{ env.WASM_TOOLS_VERSION }}
-      - name: Install wasi-sdk, wasmtime and wasm-tools
-        if: steps.tools.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p "$WASI_TOOLS" && cd "$WASI_TOOLS"
-          curl -fsSL "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_SDK_VERSION}/wasi-sdk-${WASI_SDK_VERSION}.0-arm64-linux.tar.gz" | tar xz
-          curl -fsSL "https://github.com/bytecodealliance/wasmtime/releases/download/v${WASMTIME_VERSION}/wasmtime-v${WASMTIME_VERSION}-aarch64-linux.tar.xz" | tar xJ
-          curl -fsSL "https://github.com/bytecodealliance/wasmtime/releases/download/v${WASMTIME_P1_VERSION}/wasmtime-v${WASMTIME_P1_VERSION}-aarch64-linux.tar.xz" | tar xJ
-          curl -fsSL "https://github.com/bytecodealliance/wasm-tools/releases/download/v${WASM_TOOLS_VERSION}/wasm-tools-${WASM_TOOLS_VERSION}-aarch64-linux.tar.gz" | tar xz
-          ls
-      - name: Tool environment
-        run: |
-          {
-            echo "WASI_SDK_PATH=$WASI_TOOLS/wasi-sdk-${WASI_SDK_VERSION}.0-arm64-linux"
-            echo "CC_wasm32_wasip1=$WASI_TOOLS/wasi-sdk-${WASI_SDK_VERSION}.0-arm64-linux/bin/clang"
-            echo "AR_wasm32_wasip1=$WASI_TOOLS/wasi-sdk-${WASI_SDK_VERSION}.0-arm64-linux/bin/llvm-ar"
-            echo "CFLAGS_wasm32_wasip1=--sysroot=$WASI_TOOLS/wasi-sdk-${WASI_SDK_VERSION}.0-arm64-linux/share/wasi-sysroot"
-          } >> "$GITHUB_ENV"
-          echo "$WASI_TOOLS/wasmtime-v${WASMTIME_VERSION}-aarch64-linux" >> "$GITHUB_PATH"
-          echo "WASMTIME_P1=$WASI_TOOLS/wasmtime-v${WASMTIME_P1_VERSION}-aarch64-linux/wasmtime" >> "$GITHUB_ENV"
-          echo "$WASI_TOOLS/wasm-tools-${WASM_TOOLS_VERSION}-aarch64-linux" >> "$GITHUB_PATH"
-          command -v /usr/bin/time >/dev/null || sudo apt-get install -y -qq time
-      - name: Tool versions
-        run: |
-          "$WASI_SDK_PATH/bin/clang" --version | head -n 1
-          wasmtime --version
-          "$WASMTIME_P1" --version
-          wasm-tools --version
-          node --version
-      - name: Runtime cache
-        id: runtime
-        uses: actions/cache@v4
-        with:
-          path: target/wasm32-wasip1/release/libperry_runtime.a
-          key: perry-wasip1-runtime-${{ runner.arch }}-${{ hashFiles('crates/perry-runtime/**', 'crates/perry-runtime-static/**', 'crates/perry-ext-net/**', 'crates/perry-ext-http/**', 'crates/perry-http-server/**', 'crates/perry-ext-undici/**', 'crates/perry-ext-zlib/**', 'crates/perry-ext-ws/**', 'crates/perry-stdlib/**', 'crates/perry-ffi/**', 'crates/perry-native-registration/**', 'crates/perry-abi/**', 'crates/perry-parser/**', 'crates/perry-diagnostics/**', 'crates/perry-dispatch/**', 'Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/**', 'scripts/wasi_build_runtime.*') }}
-      - name: Build the wasm32-wasip1 runtime
-        if: steps.runtime.outputs.cache-hit != 'true'
-        run: |
-          start=$(date +%s)
-          scripts/wasi_build_runtime.sh wasm32-wasip1
-          {
-            echo "### wasi-linux runtime"
-            echo "- build: $(( $(date +%s) - start )) s"
-            echo '```'; sccache --show-stats | head -n 12; echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-      - name: Runtime archive
-        run: ls -l "$PERRY_RUNTIME_DIR"/libperry_runtime.a
       - name: Probes
         run: .github/supa/wasi-probes.sh
       - name: Hello module checks
@@ -297,6 +238,122 @@ jobs:
           path: supa-out/wasi-probes/*/*.wasm
           if-no-files-found: ignore
 
+  # Storage's server-minimal entry compiled to a wasip1 core module for the supa-wasm
+  # host. CI only compiles and checks the module (the host's socket imports are not
+  # available to wasmtime); it runs under supa-host on a dev machine.
+  storage-wasi:
+    if: ${{ github.ref_name == 'supa/wasip1' || (github.event_name == 'workflow_dispatch' && inputs.storage_wasi) }}
+    needs: [build-perry, storage-prep]
+    runs-on: blacksmith-32vcpu-ubuntu-2404-arm
+    timeout-minutes: 240
+    env:
+      OUT: ${{ github.workspace }}/supa-out
+      WASI_TOOLS: /home/runner/wasi-tools
+      WASI_SDK_VERSION: "34"
+      WASMTIME_VERSION: 49.0.2
+      WASMTIME_P1_VERSION: 46.0.3
+      WASM_TOOLS_VERSION: 1.261.0
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: cc
+      PERRY_RUNTIME_DIR: ${{ github.workspace }}/target/wasm32-wasip1/release
+      PERRY_MODULE_JOBS: ${{ inputs.module_jobs || '8' }}
+      PERRY_CODEGEN_UNIT_JOBS: ${{ inputs.codegen_jobs || '4' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Perry build
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/perry-dist
+          key: ${{ needs.build-perry.outputs.key }}
+          fail-on-cache-miss: true
+      - run: mkdir -p target/release && cp perry-dist/perry target/release/perry && target/release/perry --version
+      - uses: ./.github/actions/supa-wasi-env
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Built Storage
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.STORAGE_DIR }}
+          key: storage-built-${{ runner.arch }}-${{ needs.storage-prep.outputs.sha }}
+          fail-on-cache-miss: true
+      - name: Object cache id
+        id: objid
+        # Same inputs as the native object cache: the wasm objects are generated by the
+        # same crates plus the wasm32 backend, which lives in perry-codegen.
+        run: |
+          id=$(echo '${{ hashFiles('crates/perry-codegen/**', 'crates/perry-hir/**', 'crates/perry-transform/**', 'crates/perry-types/**', 'crates/perry-parser/**', 'crates/perry-diagnostics/**', 'crates/perry-api-manifest/**', 'crates/perry-dispatch/**', 'crates/perry-abi/**', 'crates/perry-ui-model/**', 'crates/perry/src/**', '!crates/*/tests/**', '!crates/**/*_tests.rs', '!crates/**/tests.rs', '!crates/perry/src/commands/compile/link/**', '!crates/perry/src/commands/compile/optimized_libs/**', '!crates/perry/src/commands/compile/optimized_libs.rs', '!crates/perry/src/commands/compile/strip_dedup/**', '!crates/perry/src/commands/compile/strip_dedup.rs', '!crates/perry/src/commands/compile/library_search/**', '!crates/perry/src/commands/compile/library_search.rs', '!crates/perry/src/commands/compile/post_link.rs', '!crates/perry/src/commands/compile/compressed_libs.rs', '!crates/perry/src/commands/compile/size_report.rs', '!crates/perry/src/commands/compile/bundle_*.rs') }}' | cut -c1-16)
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+      - name: Restore the object cache
+        id: objects
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.STORAGE_DIR }}/node_modules/.cache/perry
+          key: perry-wobj-${{ runner.arch }}-${{ steps.objid.outputs.id }}-${{ needs.storage-prep.outputs.sha }}-${{ github.run_id }}
+          restore-keys: |
+            perry-wobj-${{ runner.arch }}-${{ steps.objid.outputs.id }}-${{ needs.storage-prep.outputs.sha }}-
+            perry-wobj-${{ runner.arch }}-${{ steps.objid.outputs.id }}-
+      - name: Compile Storage to wasip1
+        id: compile
+        working-directory: ${{ env.STORAGE_DIR }}
+        run: |
+          mkdir -p "$OUT"
+          "$GITHUB_WORKSPACE/.github/supa/shims.sh" .
+          export PERRY_OBJECT_CACHE_BUILD_ID=${{ steps.objid.outputs.id }}
+          export PERRY_NO_AUTO_OPTIMIZE=1 PERRY_KEEP_SYMBOLS=1
+          echo "jobs: modules=$PERRY_MODULE_JOBS units=$PERRY_CODEGEN_UNIT_JOBS"
+          set +e
+          /usr/bin/time -v -o "$OUT/compile.time" \
+            "$GITHUB_WORKSPACE/target/release/perry" compile --target wasip1 dist/start/server-minimal.js -o "$OUT/storage.wasm" 2>&1 \
+            | while IFS= read -r l; do printf '%(%T)T %s\n' -1 "$l"; done > "$OUT/compile.log"
+          rc=${PIPESTATUS[0]}
+          echo "compile exit=$rc"; tail -n 25 "$OUT/compile.log"
+          if grep -q 'codegen: modules finished' "$OUT/compile.log"; then echo "codegen=true" >> "$GITHUB_OUTPUT"; else echo "codegen=false" >> "$GITHUB_OUTPUT"; fi
+          exit $rc
+      - name: Save the object cache
+        if: always() && steps.compile.conclusion != 'skipped' && steps.compile.outputs.codegen == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.STORAGE_DIR }}/node_modules/.cache/perry
+          key: perry-wobj-${{ runner.arch }}-${{ steps.objid.outputs.id }}-${{ needs.storage-prep.outputs.sha }}-${{ github.run_id }}
+      - name: Prune old object caches
+        if: always() && steps.compile.conclusion != 'skipped' && steps.compile.outputs.codegen == 'true'
+        run: .github/supa/prune-caches.sh perry-wobj- 2
+      - name: Module checks
+        run: |
+          wasm=$OUT/storage.wasm
+          python3 -I .github/supa/wasi-imports.py --allow-supa-net "$wasm" | tee "$OUT/imports.txt"
+          wasm-tools validate "$wasm"
+          wasm-tools strip "$wasm" -o "$OUT/storage.stripped.wasm"
+          ls -l "$wasm" "$OUT/storage.stripped.wasm"
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "### storage-wasi"
+            echo "- perry: \`${GITHUB_SHA::8}\`, storage: \`${{ needs.storage-prep.outputs.sha }}\` (\`$STORAGE_REF\`), objects: \`${{ steps.objid.outputs.id }}\`"
+            echo "- jobs: modules=$PERRY_MODULE_JOBS units=$PERRY_CODEGEN_UNIT_JOBS"
+            [ -f "$OUT/compile.time" ] && grep -E 'Elapsed|Maximum resident' "$OUT/compile.time" | sed 's/^\s*/- compile: /'
+            [ -f "$OUT/storage.wasm" ] && echo "- module: $(stat -c %s "$OUT/storage.wasm") bytes, $(stat -c %s "$OUT/storage.stripped.wasm" 2>/dev/null || echo ?) bytes stripped"
+            echo '```'; [ -f "$OUT/compile.log" ] && grep -E 'Collecting modules|Generating code|Linking|Wrote|codegen: modules finished' "$OUT/compile.log" | tail -n 8; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: storage-wasi-logs
+          path: |
+            supa-out/compile.log
+            supa-out/compile.time
+            supa-out/imports.txt
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        with:
+          name: storage-wasi-module
+          path: |
+            supa-out/storage.wasm
+            supa-out/storage.stripped.wasm
+          retention-days: 14
+
   # Tiny programs that isolate runtime behaviour on Linux arm without Storage.
   probes-linux:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.probes }}
@@ -335,7 +392,7 @@ jobs:
   # Builds Storage once per SHA and records the node reference transcript.
   # Runs next to build-perry.
   storage-prep:
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.storage }}
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.storage || inputs.storage_wasi }}
     runs-on: blacksmith-4vcpu-ubuntu-2404-arm
     timeout-minutes: 60
     env:

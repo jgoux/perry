@@ -1,0 +1,80 @@
+# Toolchain for the wasip1 jobs of the supa-storage workflow: the nightly with the
+# wasm32-wasip1 target, sccache, wasi-sdk, wasmtime, wasm-tools and the wasm32-wasip1
+# runtime archive (built or restored from cache). Not part of upstream.
+# The calling job sets WASI_TOOLS, WASI_SDK_VERSION, WASMTIME_VERSION,
+# WASMTIME_P1_VERSION and WASM_TOOLS_VERSION in its env.
+name: supa-wasi-env
+description: wasm32-wasip1 toolchain, wasi tools and runtime archive for the supa-storage wasip1 jobs
+runs:
+  using: composite
+  steps:
+    - name: Rust toolchain with the wasm32-wasip1 target
+      shell: bash
+      run: |
+        rustup toolchain install nightly-2026-10-04 --profile minimal --component rustfmt --component clippy --target wasm32-wasip1
+    - uses: mozilla-actions/sccache-action@v0.0.9
+    - uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+        key: cargo-registry-${{ hashFiles('Cargo.lock') }}
+        restore-keys: cargo-registry-
+    - name: Tools cache
+      id: tools
+      uses: actions/cache@v4
+      with:
+        path: ${{ env.WASI_TOOLS }}
+        key: wasi-tools-${{ runner.arch }}-sdk${{ env.WASI_SDK_VERSION }}-wasmtime${{ env.WASMTIME_VERSION }}-p1wasmtime${{ env.WASMTIME_P1_VERSION }}-wasmtools${{ env.WASM_TOOLS_VERSION }}
+    - name: Install wasi-sdk, wasmtime and wasm-tools
+      if: steps.tools.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        mkdir -p "$WASI_TOOLS" && cd "$WASI_TOOLS"
+        curl -fsSL "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_SDK_VERSION}/wasi-sdk-${WASI_SDK_VERSION}.0-arm64-linux.tar.gz" | tar xz
+        curl -fsSL "https://github.com/bytecodealliance/wasmtime/releases/download/v${WASMTIME_VERSION}/wasmtime-v${WASMTIME_VERSION}-aarch64-linux.tar.xz" | tar xJ
+        curl -fsSL "https://github.com/bytecodealliance/wasmtime/releases/download/v${WASMTIME_P1_VERSION}/wasmtime-v${WASMTIME_P1_VERSION}-aarch64-linux.tar.xz" | tar xJ
+        curl -fsSL "https://github.com/bytecodealliance/wasm-tools/releases/download/v${WASM_TOOLS_VERSION}/wasm-tools-${WASM_TOOLS_VERSION}-aarch64-linux.tar.gz" | tar xz
+        ls
+    - name: Tool environment
+      shell: bash
+      run: |
+        {
+          echo "WASI_SDK_PATH=$WASI_TOOLS/wasi-sdk-${WASI_SDK_VERSION}.0-arm64-linux"
+          echo "CC_wasm32_wasip1=$WASI_TOOLS/wasi-sdk-${WASI_SDK_VERSION}.0-arm64-linux/bin/clang"
+          echo "AR_wasm32_wasip1=$WASI_TOOLS/wasi-sdk-${WASI_SDK_VERSION}.0-arm64-linux/bin/llvm-ar"
+          echo "CFLAGS_wasm32_wasip1=--sysroot=$WASI_TOOLS/wasi-sdk-${WASI_SDK_VERSION}.0-arm64-linux/share/wasi-sysroot"
+        } >> "$GITHUB_ENV"
+        echo "$WASI_TOOLS/wasmtime-v${WASMTIME_VERSION}-aarch64-linux" >> "$GITHUB_PATH"
+        echo "WASMTIME_P1=$WASI_TOOLS/wasmtime-v${WASMTIME_P1_VERSION}-aarch64-linux/wasmtime" >> "$GITHUB_ENV"
+        echo "$WASI_TOOLS/wasm-tools-${WASM_TOOLS_VERSION}-aarch64-linux" >> "$GITHUB_PATH"
+        command -v /usr/bin/time >/dev/null || sudo apt-get install -y -qq time
+    - name: Tool versions
+      shell: bash
+      run: |
+        export PATH="$WASI_TOOLS/wasmtime-v${WASMTIME_VERSION}-aarch64-linux:$WASI_TOOLS/wasm-tools-${WASM_TOOLS_VERSION}-aarch64-linux:$PATH"
+        "$WASI_TOOLS/wasi-sdk-${WASI_SDK_VERSION}.0-arm64-linux/bin/clang" --version | head -n 1
+        wasmtime --version
+        "$WASI_TOOLS/wasmtime-v${WASMTIME_P1_VERSION}-aarch64-linux/wasmtime" --version
+        wasm-tools --version
+    - name: Runtime cache
+      id: runtime
+      uses: actions/cache@v4
+      with:
+        path: target/wasm32-wasip1/release/libperry_runtime.a
+        key: perry-wasip1-runtime-${{ runner.arch }}-${{ hashFiles('crates/perry-runtime/**', 'crates/perry-runtime-static/**', 'crates/perry-ext-net/**', 'crates/perry-ext-http/**', 'crates/perry-http-server/**', 'crates/perry-ext-undici/**', 'crates/perry-ext-zlib/**', 'crates/perry-ext-ws/**', 'crates/perry-stdlib/**', 'crates/perry-ffi/**', 'crates/perry-native-registration/**', 'crates/perry-abi/**', 'crates/perry-parser/**', 'crates/perry-diagnostics/**', 'crates/perry-dispatch/**', 'Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/**', 'scripts/wasi_build_runtime.*') }}
+    - name: Build the wasm32-wasip1 runtime
+      if: steps.runtime.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        start=$(date +%s)
+        scripts/wasi_build_runtime.sh wasm32-wasip1
+        {
+          echo "### wasm32-wasip1 runtime"
+          echo "- build: $(( $(date +%s) - start )) s"
+          echo '```'; sccache --show-stats | head -n 12; echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+    - name: Runtime archive
+      shell: bash
+      run: ls -l "$PERRY_RUNTIME_DIR"/libperry_runtime.a
