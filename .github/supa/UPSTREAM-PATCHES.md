@@ -68,6 +68,7 @@ Conventions in this file:
 | P44 | 540a34fc2 | fix(net): an application's end() after the protocol layer's close is a no-op | net (payload socket) | all (seen on wasm32) | wasi probe `http-early-reply.js` | not tried | PR-AA |
 | P45 | d9ebda76d | fix(dns): dispatch dns lookup and resolve exports reached through a CommonJS namespace | dns (`perry-runtime` native module dispatch) | all (seen on wasm32) | wasi probe `cjs-dns.js` | not tried | PR-AB |
 | P46 | TBD | fix(hir): construct the global when a program class shares a name with a globalThis alias | hir (`lower/expr_new.rs`, `lower/context.rs`, destructuring) | all | wasi probe `headers-global-alias.js` | not tried | PR-AC |
+| P47 | TBD | fix(runtime): start reading when a readable that is not flowing is piped | runtime (node:stream, `node_stream_readwrite.rs`) | all | wasi probe `stream-pipe-starts-read.js` | not tried | PR-AD |
 
 All 22 patches except P12's `.github` hunks, P05 and P06 cherry-pick cleanly.
 A stack of every patch except P05 and P06, with P12 limited to `crates/`, also applies cleanly in sequence on `1fd8ca2ae`.
@@ -105,6 +106,7 @@ Ordered by value and independence. Each PR carries its patches' tests.
 27. **PR-AA An application's `end()` after the HTTP layer's close is a no-op** (P44). Prerequisite: none.
 28. **PR-AB `dns.lookup`, `resolve*` and `reverse` work through a CommonJS `require`** (P45). Prerequisite: none.
 29. **PR-AC `new Alias()` constructs the global an alias holds, not a same-named program class** (P46). Prerequisite: none.
+30. **PR-AD `readable.pipe()` starts reading a stream that was not flowing** (P47). Prerequisite: none.
 
 Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616f5e` for P05, `79aae9aa7` for P06 and P15); drop them at the next upstream sync and take upstream's versions.
 
@@ -580,6 +582,15 @@ Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616
 - Test: wasi probe `.github/supa/wasi-probes/headers-global-alias.js` (fails with `append is not a function` before the fix, matches node after); port to `crates/perry/tests` for upstream.
 - Not covered: `new Wrapped.Headers()` (a member callee whose property is named like a global) still builds the native class, a separate bug found while writing the probe.
 - Upstream: not cherry-picked. Depends on: none. PR-AC.
+
+### P47 TBD fix(runtime): start reading when a readable that is not flowing is piped
+- Area / platform: runtime node:stream / all targets; seen on wasm32-wasip1.
+- Problem: `Readable.fromWeb(webStream).pipe(dest)` never delivered a byte and never ended; @tus/server pipes the request body this way (`Readable.fromWeb(body).pipe(PassThrough)`), so a TUS PATCH stored nothing.
+- Root cause: `pipe_stream_to_destination` attached the destination, flushed already buffered chunks and marked the source flowing, but never called `_read`. Only `on('data')` scheduled a read (`schedule_readable_resume`). A stream whose data is produced by `_read` (fromWeb pulls its web source there) therefore sat idle with nothing buffered. Node's `pipe` calls `src.resume()` when the source is not flowing, which reads.
+- Fix: `pipe_stream_to_destination` schedules `invoke_read_once` in a microtask (`schedule_read_after_pipe`), as resume's flow does, skipped when the stream was destroyed, paused again or has no destination left by then. The unit test `pipe_cleanup_does_not_swallow_destination_error` now gives its source a `read()`, since a bare Readable raises `ERR_METHOD_NOT_IMPLEMENTED` once a pipe reads it, as in Node. File: `perry-runtime/src/node_stream_readwrite.rs`.
+- Test: wasi probe `.github/supa/wasi-probes/stream-pipe-starts-read.js` (fromWeb piped into a Writable and into a PassThrough; times out before the fix, prints 1500 for both after); port to `crates/perry/tests` for upstream. The probe carries `// network: yes` because a program naming the global `ReadableStream` links the net imports (pre-existing, independent of this fix).
+- Not covered: the event order of `pipe` ('pause'/'close' relative to 'end') differs from Node, and a Readable whose `read()` pushes lazily still gets `_read` called once only (`hidden_read_invoked_key` is never reset on push).
+- Upstream: not cherry-picked. Depends on: none. PR-AD.
 
 ## Not for upstream
 

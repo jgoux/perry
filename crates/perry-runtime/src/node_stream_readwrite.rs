@@ -552,6 +552,41 @@ pub(super) fn schedule_readable_resume(stream: f64) {
     crate::builtins::js_queue_microtask(closure as i64);
 }
 
+/// `pipe()` on a stream that is not yet flowing starts it (`src.resume()` in
+/// Node), which is what first calls `_read`. The pipe already emitted
+/// `resume` and flushed what was buffered, so only the read remains, run in a
+/// microtask like `resume()`'s flow, and only while a destination is still
+/// attached (a destination destroyed in the meantime has already unpiped).
+fn schedule_read_after_pipe(stream: f64) {
+    let closure = js_closure_alloc(crate::fn_info!(ns_read_after_pipe_microtask, 0), 1);
+    js_closure_set_capture_ptr(closure, 0, stream.to_bits() as i64);
+    crate::builtins::js_queue_microtask(closure as i64);
+}
+
+extern "C" fn ns_read_after_pipe_microtask(
+    closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
+    if closure.is_null() {
+        return f64::from_bits(TAG_UNDEFINED);
+    }
+    // Reading the destinations and `_read` can collect.
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let stream =
+        scope.root_nanbox_f64(f64::from_bits(js_closure_get_capture_ptr(closure, 0) as u64));
+    let piped = crate::array::js_array_length(raw_ptr_from_value(pipe_destinations(
+        stream.get_nanbox_f64(),
+    )) as *const crate::array::ArrayHeader)
+        > 0;
+    if piped
+        && readable_is_flowing(stream.get_nanbox_f64())
+        && !stream_destroyed(stream.get_nanbox_f64())
+    {
+        invoke_read_once(stream.get_nanbox_f64());
+    }
+    f64::from_bits(TAG_UNDEFINED)
+}
+
 pub(super) fn pause_readable_stream(stream: f64) -> f64 {
     if get_hidden_value(stream, hidden_readable_flag_key()).is_some() && !readable_is_paused(stream)
     {
@@ -685,6 +720,7 @@ pub(super) fn pipe_stream_to_destination(stream: f64, dest: f64, end_dest: bool)
     );
     flush_pending_readable_chunks(stream.get_nanbox_f64());
     schedule_readable_from_drain(stream.get_nanbox_f64());
+    schedule_read_after_pipe(stream.get_nanbox_f64());
     dest.get_nanbox_f64()
 }
 

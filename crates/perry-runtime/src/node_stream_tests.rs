@@ -144,6 +144,13 @@ fn destroy_with_unhandled_error_reaches_process_uncaught_exception() {
     crate::os::test_clear_process_event_listeners();
 }
 
+extern "C" fn read_does_nothing(
+    _closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
+    f64::from_bits(TAG_UNDEFINED)
+}
+
 #[test]
 fn pipe_cleanup_does_not_swallow_destination_error() {
     crate::os::test_clear_process_event_listeners();
@@ -154,7 +161,12 @@ fn pipe_cleanup_does_not_swallow_destination_error() {
     let listener = box_pointer(listener as *const u8);
     let _ = crate::os::js_process_on(event.to_bits() as i64, listener.to_bits() as i64);
 
-    let source = js_node_stream_readable_new(f64::from_bits(TAG_UNDEFINED));
+    // A source with a `read()` of its own: a bare Readable raises
+    // ERR_METHOD_NOT_IMPLEMENTED once the pipe starts reading it, as in Node.
+    let options = crate::object::js_object_alloc(0, 1);
+    let read = js_closure_alloc(declared_fn!(read_does_nothing, 0), 0);
+    js_object_set_field_by_name(options, hidden_key(b"read"), box_pointer(read as *const u8));
+    let source = js_node_stream_readable_new(box_pointer(options as *const u8));
     let destination = js_node_stream_writable_new(f64::from_bits(TAG_UNDEFINED));
     let _ = js_node_stream_method_pipe(
         raw_ptr_from_value(source) as i64,
