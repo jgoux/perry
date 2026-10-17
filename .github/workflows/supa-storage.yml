@@ -168,6 +168,8 @@ jobs:
       WASM_TOOLS_VERSION: 1.261.0
       # exnref exception handling is what wasi-sdk's setjmp/longjmp lowering emits.
       WASMTIME_FLAGS: -W exceptions=y
+      # Host build scripts link with the system linker; LLVM 22 (and its lld) is not installed here.
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: cc
       # The wasm runtime archive, not the native one the other jobs use.
       PERRY_RUNTIME_DIR: ${{ github.workspace }}/target/wasm32-wasip1/release
     steps:
