@@ -4,6 +4,7 @@
 // `class Headers` that wraps a lazily built native Headers. `new NativeHeaders()`
 // built the program's class (an object without `append`), which failed with
 // "append is not a function" on the first request header read.
+// network: yes
 const WrappedHeaders = (() => {
   const NativeHeaders = globalThis.Headers;
   class Headers {
