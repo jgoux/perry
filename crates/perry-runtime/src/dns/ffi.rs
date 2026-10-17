@@ -488,8 +488,8 @@ pub extern "C" fn js_dns_promises_lookup_service(args: i64) -> f64 {
 /// The static native table (`NODE_DNS_ROWS`) resolves these at compile time
 /// for ESM and literal `dns.*` calls. A namespace obtained at runtime (the
 /// synthetic CommonJS `require`) reaches them through the dynamic native
-/// module dispatch instead, which funnels here.
-pub(crate) fn dispatch_export(promises: bool, method: &str, args: i64) -> Option<f64> {
+/// module dispatch instead, which funnels here through [`dispatch_export`].
+fn route_export(promises: bool, method: &str, args: i64) -> Option<f64> {
     macro_rules! route {
         ($($name:literal => $cb:ident, $pr:ident;)*) => {
             match (promises, method) {
@@ -520,4 +520,35 @@ pub(crate) fn dispatch_export(promises: bool, method: &str, args: i64) -> Option
         "resolveTxt" => js_dns_resolve_txt, js_dns_promises_resolve_txt;
         "reverse" => js_dns_reverse, js_dns_promises_reverse;
     }
+}
+
+type ExportRouter = fn(bool, &str, i64) -> Option<f64>;
+
+/// The router, once a program that names `dns` armed it. The dynamic native
+/// module dispatch is linked into every CommonJS program (all buckets are
+/// pinned there), so it must not reference the lookup and resolve FFIs
+/// directly: on wasm32-wasip1 they import the host's `supa_net.resolve`, and a
+/// program that never names `dns` has to stay instantiable on a plain WASI
+/// runtime. Only `js_dns_install_exports`, which codegen emits for programs
+/// that import or require `dns` / `dns/promises`, references them.
+static EXPORT_ROUTER: std::sync::atomic::AtomicPtr<()> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+#[no_mangle]
+pub extern "C" fn js_dns_install_exports() {
+    // `black_box` keeps the store opaque: with a single stored value the
+    // optimizer would devirtualize the load in `dispatch_export` into a direct
+    // reference and pin the FFIs in every program that links the dispatch.
+    let router = std::hint::black_box(route_export as ExportRouter);
+    EXPORT_ROUTER.store(router as *mut (), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// [`route_export`] when this program armed it, `None` otherwise.
+pub(crate) fn dispatch_export(promises: bool, method: &str, args: i64) -> Option<f64> {
+    let p = EXPORT_ROUTER.load(std::sync::atomic::Ordering::Relaxed);
+    if p.is_null() {
+        return None;
+    }
+    let router = unsafe { std::mem::transmute::<*mut (), ExportRouter>(p) };
+    router(promises, method, args)
 }

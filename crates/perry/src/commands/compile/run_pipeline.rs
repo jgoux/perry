@@ -1347,6 +1347,13 @@ pub fn run_with_parse_cache(
     // `const proc = process` alias, `process?.getBuiltinModule?.(id)` — the
     // returned module's methods had no dispatch and all returned undefined.
     // The feature scan sees every spelling, so arm the hooks up front.
+    // A program that names `dns` arms the router for the lookup/resolve
+    // exports a CommonJS `require('node:dns')` reaches through the dynamic
+    // native module dispatch (`js_dns_install_exports`); one that does not
+    // keeps those FFIs, and the host resolver import behind them, out.
+    if ctx.uses_dns {
+        native_provider_installs.push("js_dns_install_exports".to_string());
+    }
     if ctx.uses_get_builtin_module {
         native_provider_installs.push("js_nm_enable_install_all".to_string());
         native_provider_installs.push("js_node_submod_enable_install_all".to_string());

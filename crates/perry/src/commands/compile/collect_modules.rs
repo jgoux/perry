@@ -493,7 +493,14 @@ fn collect_module_one(
     // switch that contains EVERY builtin — so recover it from the literal call
     // sites, which is what `extract_require_specifiers` already finds for CJS
     // wrapping. Dynamic `require(someVar)` stays undetectable and unchanged.
+    let is_dns = |spec: &str| {
+        matches!(
+            spec.strip_prefix("node:").unwrap_or(spec),
+            "dns" | "dns/promises"
+        )
+    };
     for spec in super::cjs_wrap::extract_require_specifiers(&source) {
+        ctx.uses_dns |= is_dns(&spec);
         if !perry_hir::requires_stdlib(&spec) {
             continue;
         }
@@ -507,6 +514,7 @@ fn collect_module_one(
     // `node:` literal in a module that mentions `getBuiltinModule`.
     if source.contains("getBuiltinModule") {
         for spec in node_specifier_literals(&source) {
+            ctx.uses_dns |= is_dns(spec);
             if !perry_hir::requires_stdlib(spec) {
                 continue;
             }
@@ -1916,6 +1924,7 @@ fn collect_module_one(
         }
     }
 
+    ctx.uses_dns |= hir_module.imports.iter().any(|i| is_dns(&i.source));
     ctx.reexport_pruner.imports(&hir_module.imports);
 
     // Process re-exports
