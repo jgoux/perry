@@ -298,7 +298,41 @@ def parse_rust(files: dict[str, str]) -> tuple[dict[str, list[RustFn]], dict[str
         scan_extern_fns(text, lambda off: f"{path}:{line_of(text, off)}", defs)
         for where_off, expanded in expand_macros(text):
             scan_extern_fns(expanded, lambda _off: f"{path}:{line_of(text, where_off)}", defs)
+        scan_macro_entries(text, path, defs)
     return defs, aliases
+
+
+# Entry points defined by macros whose bodies the expander above cannot read
+# (repetitions around the whole definition). Each family has one fixed shape.
+#   js_closure_callN        closure_call_entry!( [unwind] name, …; a0, a1, … )
+#   js_<kind>_<op>__<Kind>  kind_entry! { Kind, fn name(recv: T, …) -> R { … } }
+#   js_{array,string}_{m,b}_<method><n>
+#                           array_entries!/string_entries!: `m / b = name, … recv(a, …) => …;`
+#                           every parameter and the return are f64.
+CLOSURE_ENTRY_RE = re.compile(
+    r"\bclosure_call_entry!\(\s*(?:unwind\s+)?(js_closure_call\d+)\s*,[^;]*;([^)]*)\)"
+)
+KIND_ENTRY_RE = re.compile(r"\bkind_entry!\s*\{\s*\w+\s*,\s*fn\s+(\w+)\s*\(([^)]*)\)\s*->\s*([^{]+?)\s*\{")
+PROTO_ENTRY_RE = re.compile(
+    r"\b(js_(?:array|string)_m_\w+)\s*/\s*(js_(?:array|string)_b_\w+)\s*=\s*b\"[^\"]*\"\s*,"
+    r"\s*(?:(?:own|any)\s*,\s*)?\w+\(([^)]*)\)\s*=>"
+)
+
+
+def scan_macro_entries(text: str, path: str, defs: dict[str, list[RustFn]]) -> None:
+    def add(name: str, params: list[str], ret: str, off: int) -> None:
+        defs[name].append(RustFn(name, params, ret, f"{path}:{line_of(text, off)}"))
+
+    for m in CLOSURE_ENTRY_RE.finditer(text):
+        args = [a for a in m.group(2).split(",") if a.strip()]
+        add(m.group(1), ["*const ClosureHeader", "JsThis"] + ["f64"] * len(args), "f64", m.start())
+    for m in KIND_ENTRY_RE.finditer(text):
+        params = [" ".join(p.split(":", 1)[1].split()) for p in split_top(m.group(2)) if ":" in p]
+        add(m.group(1), params, " ".join(m.group(3).split()), m.start())
+    for m in PROTO_ENTRY_RE.finditer(text):
+        args = [a for a in m.group(3).split(",") if a.strip()]
+        for name in (m.group(1), m.group(2)):
+            add(name, ["f64"] * (1 + len(args)), "f64", m.start())
 
 
 def scan_extern_fns(text: str, where, defs: dict[str, list[RustFn]]) -> None:
