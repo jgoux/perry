@@ -84,6 +84,11 @@ struct Handle {
     writes: VecDeque<Write>,
     shutdown: Option<u64>,
     write_closed: bool,
+    /// Owned by a link-routed `TransportCore` (id = the payload's cell): its
+    /// completions carry `NET_FLAG_LINK` and go to the core's route.
+    linked: bool,
+    /// Incarnation of a linked handle, lent to the sink with its `Closed`.
+    generation: u64,
 }
 impl Handle {
     fn new(fd: i32, subsystem: u8) -> Self {
@@ -102,6 +107,8 @@ impl Handle {
             writes: VecDeque::new(),
             shutdown: None,
             write_closed: false,
+            linked: false,
+            generation: 0,
         }
     }
     fn queued(&self) -> usize {
@@ -118,6 +125,8 @@ impl Drop for Handle {
 struct Timer {
     subsystem: u8,
     deadline: Option<Instant>,
+    /// A linked socket's deadline, keyed `cell | 1` (cells are 8-aligned).
+    linked: bool,
 }
 enum Event {
     Completion(u8, NetCompletion, Vec<u8>),
@@ -361,6 +370,7 @@ pub fn timer_arm(id: i64, subsystem: u8, delay_ms: u64) -> NetResult<()> {
             Timer {
                 subsystem,
                 deadline: Some(deadline),
+                linked: false,
             },
         )
     });
@@ -508,8 +518,12 @@ pub(crate) fn park(budget: Duration) -> bool {
     unsafe { perry_wasi_poll(fds.as_ptr(), kinds.as_ptr(), fds.len() as u32, timeout) };
     true
 }
-fn completion(events: &mut VecDeque<Event>, subsystem: u8, c: NetCompletion) {
-    events.push_back(Event::Completion(subsystem, c, Vec::new()));
+fn completion(events: &mut VecDeque<Event>, h: &Handle, c: NetCompletion) {
+    events.push_back(Event::Completion(
+        h.subsystem,
+        if h.linked { c.linked() } else { c },
+        Vec::new(),
+    ));
 }
 
 extern "C" fn pump() -> i32 {
@@ -532,7 +546,7 @@ extern "C" fn pump() -> i32 {
                     h.connected_event = false;
                     completion(
                         events,
-                        h.subsystem,
+                        h,
                         NetCompletion::error(
                             id,
                             0,
@@ -546,7 +560,7 @@ extern "C" fn pump() -> i32 {
             }
             if h.connected_event {
                 h.connected_event = false;
-                completion(events, h.subsystem, NetCompletion::connect(id));
+                completion(events, h, NetCompletion::connect(id));
             }
             if h.accepting {
                 for _ in 0..32 {
@@ -557,7 +571,7 @@ extern "C" fn pump() -> i32 {
                     if fd < 0 {
                         completion(
                             events,
-                            h.subsystem,
+                            h,
                             NetCompletion::error(id, 0, 0, errors::from_os(-fd, "accept"), false),
                         );
                         break;
@@ -583,7 +597,7 @@ extern "C" fn pump() -> i32 {
                         h.writes.pop_front();
                         completion(
                             events,
-                            h.subsystem,
+                            h,
                             NetCompletion::error(
                                 id,
                                 user,
@@ -602,7 +616,7 @@ extern "C" fn pump() -> i32 {
                 let w = h.writes.pop_front().unwrap();
                 completion(
                     events,
-                    h.subsystem,
+                    h,
                     NetCompletion::wrote(id, w.user, w.bytes.len(), h.queued()),
                 );
             }
@@ -611,7 +625,7 @@ extern "C" fn pump() -> i32 {
                     let result = unsafe { perry_wasi_socket_shutdown(h.fd) };
                     completion(
                         events,
-                        h.subsystem,
+                        h,
                         if result < 0 {
                             NetCompletion::error(
                                 id,
@@ -639,7 +653,7 @@ extern "C" fn pump() -> i32 {
                         h.reading = false;
                         completion(
                             events,
-                            h.subsystem,
+                            h,
                             if n == 0 {
                                 NetCompletion::eof(id)
                             } else {
@@ -655,9 +669,10 @@ extern "C" fn pump() -> i32 {
                         break;
                     }
                     bytes.truncate(n as usize);
+                    let data = NetCompletion::data(id, &bytes);
                     events.push_back(Event::Completion(
                         h.subsystem,
-                        NetCompletion::data(id, &bytes),
+                        if h.linked { data.linked() } else { data },
                         bytes,
                     ));
                     if h.read_once {
@@ -670,7 +685,12 @@ extern "C" fn pump() -> i32 {
         let now = Instant::now();
         timers.retain(|&id, t| {
             if t.deadline.is_some_and(|d| d <= now) {
-                completion(events, t.subsystem, NetCompletion::timer(id));
+                let event = if t.linked {
+                    NetCompletion::timer(id & !1).linked()
+                } else {
+                    NetCompletion::timer(id)
+                };
+                events.push_back(Event::Completion(t.subsystem, event, Vec::new()));
                 false
             } else {
                 true
@@ -682,16 +702,25 @@ extern "C" fn pump() -> i32 {
     while let Some(event) = events.pop_front() {
         match event {
             Event::Completion(subsystem, c, bytes) => {
-                if c.kind == sink::NET_CLOSED || c.kind == sink::NET_TIMER || is_live(c.id) {
+                if c.flags & sink::NET_FLAG_LINK != 0 {
+                    transport::deliver(subsystem, c, &bytes);
+                } else if c.kind == sink::NET_CLOSED || c.kind == sink::NET_TIMER || is_live(c.id)
+                {
                     sink::emit(subsystem, c);
                 }
                 drop(bytes); // The read payload stays alive through the sink call.
             }
             Event::Accepted(subsystem, server, fd) => {
-                let handle = Handle::new(fd, subsystem);
-                if !is_live(server) {
+                let linked = STATE.with(|s| s.borrow().handles.get(&server).map(|h| h.linked));
+                let Some(linked) = linked else {
+                    unsafe { perry_wasi_socket_close(fd) };
+                    continue;
+                };
+                if linked {
+                    transport::deliver_accept(subsystem, server, fd);
                     continue;
                 }
+                let handle = Handle::new(fd, subsystem);
                 let Some(id) = sink::allocate_id(subsystem) else {
                     continue;
                 };

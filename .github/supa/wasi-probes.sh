@@ -76,8 +76,11 @@ for n in "${names[@]}"; do
   fi
 
   mkdir -p "$d/work"
-  # The checkout's package.json says "type": "module"; node runs the probe as CommonJS.
-  cp "$d/$n.js" "$d/$n.cjs"
+  # The checkout's package.json says "type": "module"; node runs the probe as CommonJS,
+  # or as an ES module when it uses static imports (a CommonJS `require('node:dns')`
+  # does not reach Perry's dns bindings).
+  ext=cjs; grep -q '^import ' "$src" && ext=mjs
+  cp "$d/$n.js" "$d/$n.$ext"
   if [ -n "$port" ]; then
     # Server probe: the same requests against node, then against the wasm module.
     serve_requests() {  # out
@@ -98,7 +101,7 @@ for n in "${names[@]}"; do
         } >> "$1"
       done <<< "$requests"
     }
-    (cd "$d" && WORK_DIR="$d/work" timeout 120 node "$n.cjs" > node.out 2> node.err; echo $? > node.rc) &
+    (cd "$d" && WORK_DIR="$d/work" timeout 120 node "$n.$ext" > node.out 2> node.err; echo $? > node.rc) &
     node_pid=$!
     serve_requests "$d/node.serve"; wait $node_pid
     (cd "$d" && /usr/bin/time -v -o time.txt timeout 300 "$wasmtime_p1" run $flags -W unknown-imports-trap -S preview2=n -S "tcplisten=127.0.0.1:$port" --dir "$d/work::/work" "$n.wasm" > run.out 2> run.err; echo $? > run.rc) &
@@ -106,7 +109,7 @@ for n in "${names[@]}"; do
     serve_requests "$d/run.serve"; wait $wasm_pid
     cat "$d/node.serve" >> "$d/node.out"; cat "$d/run.serve" >> "$d/run.out"
   else
-    (cd "$d" && WORK_DIR="$d/work" timeout 120 node "$n.cjs" > node.out 2> node.err); echo $? > "$d/node.rc"
+    (cd "$d" && WORK_DIR="$d/work" timeout 120 node "$n.$ext" > node.out 2> node.err); echo $? > "$d/node.rc"
     (cd "$d" && /usr/bin/time -v -o time.txt timeout 300 "$wasmtime" run $flags --dir "$d/work::/work" "$n.wasm" > run.out 2> run.err); echo $? > "$d/run.rc"
   fi
   rss=$(awk -F': ' '/Maximum resident set size/ {printf "%d", $2 / 1024}' "$d/time.txt")

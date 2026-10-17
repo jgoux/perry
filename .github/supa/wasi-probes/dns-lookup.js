@@ -1,7 +1,7 @@
 // Name resolution through the host's supa_net.resolve.
 // compile-only: needs a resolver
 // network: yes
-const dns = require('node:dns');
+import * as dns from 'node:dns';
 
 dns.lookup('localhost', (err, address, family) => {
   console.log('localhost', err === null, ['127.0.0.1', '::1'].includes(address), family === 4 || family === 6);
