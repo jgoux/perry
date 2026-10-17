@@ -165,6 +165,9 @@ jobs:
       WASI_TOOLS: /home/runner/wasi-tools
       WASI_SDK_VERSION: "34"
       WASMTIME_VERSION: 49.0.2
+      # The last wasmtime with the legacy preview1 implementation; only it can hand a
+      # p1 guest a listener (`-S preview2=n -S tcplisten`). Used by the server probes.
+      WASMTIME_P1_VERSION: 46.0.3
       WASM_TOOLS_VERSION: 1.261.0
       # exnref exception handling is what wasi-sdk's setjmp/longjmp lowering emits.
       WASMTIME_FLAGS: -W exceptions=y
@@ -201,13 +204,14 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.WASI_TOOLS }}
-          key: wasi-tools-${{ runner.arch }}-sdk${{ env.WASI_SDK_VERSION }}-wasmtime${{ env.WASMTIME_VERSION }}-wasmtools${{ env.WASM_TOOLS_VERSION }}
+          key: wasi-tools-${{ runner.arch }}-sdk${{ env.WASI_SDK_VERSION }}-wasmtime${{ env.WASMTIME_VERSION }}-p1wasmtime${{ env.WASMTIME_P1_VERSION }}-wasmtools${{ env.WASM_TOOLS_VERSION }}
       - name: Install wasi-sdk, wasmtime and wasm-tools
         if: steps.tools.outputs.cache-hit != 'true'
         run: |
           mkdir -p "$WASI_TOOLS" && cd "$WASI_TOOLS"
           curl -fsSL "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_SDK_VERSION}/wasi-sdk-${WASI_SDK_VERSION}.0-arm64-linux.tar.gz" | tar xz
           curl -fsSL "https://github.com/bytecodealliance/wasmtime/releases/download/v${WASMTIME_VERSION}/wasmtime-v${WASMTIME_VERSION}-aarch64-linux.tar.xz" | tar xJ
+          curl -fsSL "https://github.com/bytecodealliance/wasmtime/releases/download/v${WASMTIME_P1_VERSION}/wasmtime-v${WASMTIME_P1_VERSION}-aarch64-linux.tar.xz" | tar xJ
           curl -fsSL "https://github.com/bytecodealliance/wasm-tools/releases/download/v${WASM_TOOLS_VERSION}/wasm-tools-${WASM_TOOLS_VERSION}-aarch64-linux.tar.gz" | tar xz
           ls
       - name: Tool environment
@@ -219,12 +223,14 @@ jobs:
             echo "CFLAGS_wasm32_wasip1=--sysroot=$WASI_TOOLS/wasi-sdk-${WASI_SDK_VERSION}.0-arm64-linux/share/wasi-sysroot"
           } >> "$GITHUB_ENV"
           echo "$WASI_TOOLS/wasmtime-v${WASMTIME_VERSION}-aarch64-linux" >> "$GITHUB_PATH"
+          echo "WASMTIME_P1=$WASI_TOOLS/wasmtime-v${WASMTIME_P1_VERSION}-aarch64-linux/wasmtime" >> "$GITHUB_ENV"
           echo "$WASI_TOOLS/wasm-tools-${WASM_TOOLS_VERSION}-aarch64-linux" >> "$GITHUB_PATH"
           command -v /usr/bin/time >/dev/null || sudo apt-get install -y -qq time
       - name: Tool versions
         run: |
           "$WASI_SDK_PATH/bin/clang" --version | head -n 1
           wasmtime --version
+          "$WASMTIME_P1" --version
           wasm-tools --version
           node --version
       - name: Runtime cache
@@ -282,6 +288,13 @@ jobs:
             supa-out/wasi-probes/*/*.diff
             supa-out/wasi-probes/hello/hello.wasm
             supa-out/start.wat
+          if-no-files-found: ignore
+      # Every compiled probe, for runs under the supa-wasm host (supa-host) on a dev machine.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wasi-probe-modules
+          path: supa-out/wasi-probes/*/*.wasm
           if-no-files-found: ignore
 
   # Tiny programs that isolate runtime behaviour on Linux arm without Storage.

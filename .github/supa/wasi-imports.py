@@ -2,16 +2,19 @@
 """Import hygiene for a wasip1 module: print its imports and target features,
 and fail if it imports anything the supa-wasm host does not provide.
 
-usage: wasi-imports.py [--quiet] app.wasm
+usage: wasi-imports.py [--quiet] [--allow-supa-net] app.wasm
 
 The host (supa-wasm, wasmtime 49) links a fixed preview1 subset, and an import
 it lacks fails instantiation. The only other module a guest may import is
-`supa_net`. Parsed straight from the binary so the check needs no tooling.
+`supa_net`, and only a program that networks (--allow-supa-net) may: every
+other module must run on a plain WASI runtime, which would not instantiate it.
+Parsed straight from the binary so the check needs no tooling.
 """
 import sys
 
 PREVIEW1 = "wasi_snapshot_preview1"
-HOST_MODULES = {"supa_net"}
+# The supa_net functions the host links.
+SUPA_NET = {"tcp_connect", "sock_error", "resolve", "udp_connect"}
 # Everything the host links. Missing on purpose: clock_res_get, fd_datasync,
 # fd_allocate, fd_fdstat_set_rights, proc_raise.
 HOST_PREVIEW1 = {
@@ -114,6 +117,7 @@ def parse(data):
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     quiet = "--quiet" in sys.argv
+    allow_net = "--allow-supa-net" in sys.argv
     if len(args) != 1:
         raise SystemExit(__doc__)
     with open(args[0], "rb") as f:
@@ -122,7 +126,7 @@ def main():
     for module, field, kind in imports:
         ok = (
             (module == PREVIEW1 and kind == 0 and field in HOST_PREVIEW1)
-            or (module in HOST_MODULES and kind == 0)
+            or (module == "supa_net" and kind == 0 and field in SUPA_NET and allow_net)
         )
         if not ok:
             bad.append(f"{module}.{field}")

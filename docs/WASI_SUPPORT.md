@@ -102,6 +102,51 @@ Regenerate it whenever a runtime `extern "C"` signature changes; a symbol missin
 from it, or a runtime-internal `extern` that declares a pointer as `i64`, is a wasm
 signature mismatch (a link error, or a trap in place of the call).
 
+### Networking on preview1 guests
+
+A p1 module has no `bind`, `listen` or `connect`, so the supa-wasm host supplies
+them. Programs that use `net`, `http`, `dns` or an npm client such as `pg` run
+unchanged; the runtime (`perry_wasi_net.c`, `wasi_net/mod.rs`) maps them as follows.
+
+- **Listening.** The host pre-opens listener sockets and names them in
+  `SUPA_LISTEN_FDS` (comma separated fds, optionally `SUPA_LISTEN_ADDRS` with their
+  bound addresses). Without it (wasmtime `-S tcplisten`) the runtime takes every
+  stream socket it finds before the guest opens one. The rule is deliberately
+  simple: **one Storage server on one host listener**. Each `server.listen()`
+  claims the next unclaimed listener in order and ignores the requested port;
+  `server.address().port` reports the host's bound address when
+  `SUPA_LISTEN_ADDRS` names it, otherwise the requested one. A second `listen()`
+  with no listener left fails with `EADDRNOTAVAIL`. Closing the server closes the
+  host listener. Accepting uses `sock_accept` on that fd.
+- **Outbound TCP and DNS.** `supa_net.tcp_connect` starts a non-blocking connect
+  and `supa_net.sock_error` reports its result; failures map to Node codes
+  (`ECONNREFUSED`, `ETIMEDOUT`, `EPIPE`, `ECONNRESET`). `dns.lookup` and
+  connecting by name use `supa_net.resolve`; a failed lookup is `ENOTFOUND`.
+  Lookups block the event loop while the host answers.
+- **Idle.** With open sockets and nothing runnable the loop blocks in one
+  `poll_oneoff` over the socket fds plus a relative monotonic clock for the next
+  timer, so an idle server uses no CPU. Programs with only timers keep sleeping
+  on the clock alone.
+- **Signals.** When `SUPA_SIGNAL_FD` is set the loop also watches that stream; each
+  byte is a signal number (1 HUP, 2 INT, 10 USR1, 12 USR2, 15 TERM) delivered to
+  `process.on('SIGTERM' | 'SIGINT' | ...)`. Without a handler TERM and INT exit
+  with 128 plus the signal number.
+- **Import gating.** `supa_net` is imported only by modules whose program reaches
+  the network code; wasm-ld drops the unreferenced imports from every other
+  module. `.github/supa/wasi-imports.py` rejects `supa_net` unless called with
+  `--allow-supa-net`, which a probe requests with `// network: yes`. Running a
+  networking module under plain wasmtime needs `-W unknown-imports-trap`.
+- **CI.** wasmtime 47 removed the legacy p1 implementation that `-S tcplisten`
+  needs, so the server probes run under wasmtime 46.0.3 (`WASMTIME_P1`); the other
+  probes use 49. Probes that need a service (a Postgres for `pg`) are compiled and
+  import-checked in CI, and run under supa-host from the `wasi-probe-modules`
+  artifact.
+
+Known gaps for Storage: no TLS, no keep-alive or half-close validation (the
+shutdown call sends FIN, reading after it is untested), no backpressure beyond the
+host socket buffer, the peer address of an accepted socket is unknown, and one
+request at a time per connection is the only tested shape.
+
 ## Reproducing on Windows
 
 Configure the repository's pinned Rust and LLVM 22 toolchain first. Python

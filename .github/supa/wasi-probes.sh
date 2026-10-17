@@ -10,15 +10,31 @@
 #   // max-rss-mb: N           the wasmtime process must stay under N MB
 #   // optional: REASON        a compile or link failure is recorded as MISSING,
 #                              not a failure (a probe that compiles must still match)
+#   // network: yes            the module may import supa_net (see wasi-imports.py)
+#   // compile-only: REASON    compile and check imports but do not run (needs a
+#                              service the CI runner lacks; the module is uploaded
+#                              for local runs under supa-host)
+#   // npm: PACKAGE            `npm install PACKAGE` next to the probe before compiling
+#   // server-port: PORT       the probe serves HTTP on 127.0.0.1:PORT. node runs it
+#                              on that port; wasmtime gets the listener as
+#                              `-S preview2=n -S tcplisten=127.0.0.1:PORT` (the
+#                              legacy p1 implementation, which wasmtime 47 removed,
+#                              so $WASMTIME_P1 must be 46.x), with unknown imports
+#                              trapping because the module carries supa_net. After
+#                              the server is up, every `// request: METHOD PATH [BODY]`
+#                              line is sent with curl and the status line,
+#                              content-type and body are compared with node's, as
+#                              well as the server's stdout and exit status.
 # Every run gets a writable scratch directory: WORK_DIR for node, preopened as
 # /work for wasmtime (--dir HOST::/work), so fs probes can write files.
-# Environment: PERRY_BIN, WASMTIME, WASMTIME_FLAGS, OUT.
+# Environment: PERRY_BIN, WASMTIME, WASMTIME_P1 (server probes), WASMTIME_FLAGS, OUT.
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 work=${OUT:-$PWD/supa-out}/wasi-probes
 mkdir -p "$work"
 perry=${PERRY_BIN:-$PWD/target/release/perry}
 wasmtime=${WASMTIME:-wasmtime}
+wasmtime_p1=${WASMTIME_P1:-$wasmtime}
 flags=${WASMTIME_FLAGS:--W exceptions=y}
 summary=${GITHUB_STEP_SUMMARY:-/dev/null}
 export PERRY_NO_AUTO_OPTIMIZE=1 PERRY_KEEP_SYMBOLS=1
@@ -32,9 +48,14 @@ for n in "${names[@]}"; do
   src="$here/wasi-probes/$n.js"; cp "$src" "$d/$n.js"
   marker() { sed -n "s|^// $1: ||p" "$src" | head -1; }
   optional=$(marker optional); want_err=$(marker stderr-contains); max_rss=$(marker max-rss-mb)
+  network=$(marker network); compile_only=$(marker compile-only); npm_pkg=$(marker npm)
+  port=$(marker server-port); requests=$(sed -n "s|^// request: ||p" "$src")
   echo "::group::probe $n"
   verdict=PASS; size=-; rss=-
 
+  if [ -n "$npm_pkg" ]; then
+    (cd "$d" && npm install --no-save --no-audit --no-fund --loglevel=error "$npm_pkg") || { echo "npm install $npm_pkg failed"; }
+  fi
   s=$(date +%s)
   if ! (cd "$d" && "$perry" compile --target wasip1 "$n.js" -o "$n.wasm" > compile.log 2>&1); then
     tail -n 25 "$d/compile.log"
@@ -45,15 +66,49 @@ for n in "${names[@]}"; do
   echo "compile: $(( $(date +%s) - s )) s"
   size=$(stat -c %s "$d/$n.wasm")
 
-  if ! python3 -I "$here/wasi-imports.py" --quiet "$d/$n.wasm" > "$d/imports.log" 2>&1; then
+  net_flag=; [ -n "$network" ] && net_flag=--allow-supa-net
+  if ! python3 -I "$here/wasi-imports.py" --quiet $net_flag "$d/$n.wasm" > "$d/imports.log" 2>&1; then
     cat "$d/imports.log"; verdict="FAIL (imports)"; rc=1
+  fi
+  if [ -n "$compile_only" ]; then
+    echo "probe $n: $verdict (compile only: $compile_only)"; echo "::endgroup::"
+    rows+=("| $n | $verdict (compile only) | $size | - |"); continue
   fi
 
   mkdir -p "$d/work"
   # The checkout's package.json says "type": "module"; node runs the probe as CommonJS.
   cp "$d/$n.js" "$d/$n.cjs"
-  (cd "$d" && WORK_DIR="$d/work" timeout 120 node "$n.cjs" > node.out 2> node.err); echo $? > "$d/node.rc"
-  (cd "$d" && /usr/bin/time -v -o time.txt timeout 300 "$wasmtime" run $flags --dir "$d/work::/work" "$n.wasm" > run.out 2> run.err); echo $? > "$d/run.rc"
+  if [ -n "$port" ]; then
+    # Server probe: the same requests against node, then against the wasm module.
+    serve_requests() {  # out
+      : > "$1"
+      while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        method=${line%% *}; rest=${line#* }; path=${rest%% *}; body=
+        [ "$rest" != "$path" ] && body=${rest#* }
+        args=(-s -S --max-time 120 --retry 60 --retry-delay 1 --retry-connrefused
+              -H 'Connection: close' -D "$d/h.txt" -o "$d/b.txt" -X "$method")
+        [ -n "$body" ] && args+=(--data-binary "$body" -H 'Content-Type: text/plain')
+        { echo "> $line"
+          if curl "${args[@]}" "http://127.0.0.1:$port$path"; then
+            head -n1 "$d/h.txt" | tr -d '\r'
+            grep -i '^content-type:' "$d/h.txt" | tr -d '\r' | tr 'A-Z' 'a-z'
+            cat "$d/b.txt"; echo
+          else echo "curl failed: $?"; fi
+        } >> "$1"
+      done <<< "$requests"
+    }
+    (cd "$d" && WORK_DIR="$d/work" timeout 120 node "$n.cjs" > node.out 2> node.err; echo $? > node.rc) &
+    node_pid=$!
+    serve_requests "$d/node.serve"; wait $node_pid
+    (cd "$d" && /usr/bin/time -v -o time.txt timeout 300 "$wasmtime_p1" run $flags -W unknown-imports-trap -S preview2=n -S "tcplisten=127.0.0.1:$port" --dir "$d/work::/work" "$n.wasm" > run.out 2> run.err; echo $? > run.rc) &
+    wasm_pid=$!
+    serve_requests "$d/run.serve"; wait $wasm_pid
+    cat "$d/node.serve" >> "$d/node.out"; cat "$d/run.serve" >> "$d/run.out"
+  else
+    (cd "$d" && WORK_DIR="$d/work" timeout 120 node "$n.cjs" > node.out 2> node.err); echo $? > "$d/node.rc"
+    (cd "$d" && /usr/bin/time -v -o time.txt timeout 300 "$wasmtime" run $flags --dir "$d/work::/work" "$n.wasm" > run.out 2> run.err); echo $? > "$d/run.rc"
+  fi
   rss=$(awk -F': ' '/Maximum resident set size/ {printf "%d", $2 / 1024}' "$d/time.txt")
   echo "--- stdout (wasm) ---"; head -c 3000 "$d/run.out"
   echo "--- stderr (wasm, tail) ---"; tail -n 12 "$d/run.err"
