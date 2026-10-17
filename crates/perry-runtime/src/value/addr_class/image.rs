@@ -28,12 +28,22 @@ static IMAGE_START: [u64; 1] = [0];
 static IMAGE_END: [u64; 1] = [0];
 
 /// The `(start, end)` of the image region that may hold a string at `addr`.
-/// One section on every target but wasm32, which has no section bounds and
-/// registers each string's own range from a constructor instead.
+/// One section on every target but wasm32, which has no section bounds. The
+/// runtime's own strings register their ranges from constructors; the strings
+/// the program emits are not registered, but all of them live in static data,
+/// so any address below `__data_end` is a candidate. `header` still requires
+/// the image marker, flags, sizes and NUL terminator to agree before it admits
+/// the string, and it never reads past the data end.
 #[cfg(target_family = "wasm")]
 #[inline]
 fn bounds(addr: usize) -> (usize, usize) {
-    crate::object::static_registry::image_range(addr).unwrap_or((0, 0))
+    if let Some(range) = crate::object::static_registry::image_range(addr) {
+        return range;
+    }
+    unsafe extern "C" {
+        static __data_end: u8;
+    }
+    (0, std::ptr::addr_of!(__data_end) as usize)
 }
 
 #[cfg(not(target_family = "wasm"))]
