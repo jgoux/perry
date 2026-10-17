@@ -89,6 +89,9 @@ struct Handle {
     linked: bool,
     /// Incarnation of a linked handle, lent to the sink with its `Closed`.
     generation: u64,
+    /// A listener's address as announced or requested: a p1 guest cannot ask
+    /// the host socket, so `server.address()` reads this when it cannot.
+    bound: Option<SocketAddr>,
 }
 impl Handle {
     fn new(fd: i32, subsystem: u8) -> Self {
@@ -109,6 +112,7 @@ impl Handle {
             write_closed: false,
             linked: false,
             generation: 0,
+            bound: None,
         }
     }
     fn queued(&self) -> usize {
@@ -198,12 +202,14 @@ pub fn tcp_listen(
         let mut handle = Handle::new(fd, subsystem);
         handle.listener = true;
         handle.nodelay = nodelay;
+        let local = socket_address(fd, false).unwrap_or(addr);
+        handle.bound = Some(local);
         state.handles.insert(id, handle);
         // Callers report this as `server.address()`. A p1 guest does not choose
         // its socket: the host announces a listener's address in
         // SUPA_LISTEN_ADDRS when it knows it, and otherwise the requested
         // address stands (an ephemeral port 0 stays 0).
-        Ok(socket_address(fd, false).unwrap_or(addr))
+        Ok(local)
     })
 }
 pub fn tcp_connect_host(
@@ -405,8 +411,8 @@ fn socket_address(fd: i32, peer: bool) -> Option<SocketAddr> {
     Some(SocketAddr::new(ip, port))
 }
 fn address(id: i64, peer: bool) -> Option<SocketAddr> {
-    let fd = STATE.with(|s| s.borrow().handles.get(&id).map(|h| h.fd))?;
-    socket_address(fd, peer)
+    let (fd, bound) = STATE.with(|s| s.borrow().handles.get(&id).map(|h| (h.fd, h.bound)))?;
+    socket_address(fd, peer).or(if peer { None } else { bound })
 }
 /// The host resolves a connect target itself and reports a failed lookup as
 /// `EHOSTUNREACH`; for a name that is libuv's `ENOTFOUND` (`-3008`).
@@ -728,6 +734,12 @@ extern "C" fn pump() -> i32 {
                 sink::emit(subsystem, NetCompletion::accept(server, id, peer_addr(id)));
             }
         }
+    }
+    if count > 0 {
+        // What the sinks just received (a request, a read) is consumed by the
+        // next turn's pumps. Nothing else tells the loop it owes that turn, so
+        // without this it would park on the idle cap with the work queued.
+        crate::event_pump::js_notify_main_thread();
     }
     count
 }
