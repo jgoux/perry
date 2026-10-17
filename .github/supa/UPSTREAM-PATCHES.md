@@ -67,6 +67,7 @@ Conventions in this file:
 | P43 | 4519a2f16 | fix(runtime): zero the DateCell padding on 32-bit targets | runtime (date) | wasm32 | wasi probe `date-cell-reuse.js` | not tried | PR-Z |
 | P44 | 540a34fc2 | fix(net): an application's end() after the protocol layer's close is a no-op | net (payload socket) | all (seen on wasm32) | wasi probe `http-early-reply.js` | not tried | PR-AA |
 | P45 | d9ebda76d | fix(dns): dispatch dns lookup and resolve exports reached through a CommonJS namespace | dns (`perry-runtime` native module dispatch) | all (seen on wasm32) | wasi probe `cjs-dns.js` | not tried | PR-AB |
+| P46 | TBD | fix(hir): construct the global when a program class shares a name with a globalThis alias | hir (`lower/expr_new.rs`, `lower/context.rs`, destructuring) | all | wasi probe `headers-global-alias.js` | not tried | PR-AC |
 
 All 22 patches except P12's `.github` hunks, P05 and P06 cherry-pick cleanly.
 A stack of every patch except P05 and P06, with P12 limited to `crates/`, also applies cleanly in sequence on `1fd8ca2ae`.
@@ -103,6 +104,7 @@ Ordered by value and independence. Each PR carries its patches' tests.
 26. **PR-Z A Date cell's padding is zeroed on 32-bit targets** (P43). Prerequisite: none.
 27. **PR-AA An application's `end()` after the HTTP layer's close is a no-op** (P44). Prerequisite: none.
 28. **PR-AB `dns.lookup`, `resolve*` and `reverse` work through a CommonJS `require`** (P45). Prerequisite: none.
+29. **PR-AC `new Alias()` constructs the global an alias holds, not a same-named program class** (P46). Prerequisite: none.
 
 Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616f5e` for P05, `79aae9aa7` for P06 and P15); drop them at the next upstream sync and take upstream's versions.
 
@@ -569,6 +571,15 @@ Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616
 - Test: wasi probe `.github/supa/wasi-probes/cjs-dns.js` (run as CommonJS: callback and promise lookup, `{ all: true }`, an IP literal, ENOTFOUND, `net.connect` by name; before the fix it prints only its first line and exits 0, after it matches node line for line); port to `crates/perry/tests` for upstream. It is compile-only in CI (needs a resolver) and runs locally under supa-host with `--listen 127.0.0.1:47123`.
 - Upstream: not cherry-picked. Depends on: none. PR-AB.
 - Not covered: instance methods of `new dns.Resolver()` reached through a CommonJS namespace were not re-tested.
+
+### P46 TBD fix(hir): construct the global when a program class shares a name with a globalThis alias
+- Area / platform: hir / all targets; seen on wasm32-wasip1.
+- Problem: Storage's resumable upload endpoint (`POST /upload/resumable`) answered 500 `TypeError: append is not a function`. srvx's node adapter keeps `const NativeHeaders = globalThis.Headers` and declares its own `class Headers` that wraps a lazily built native one; reading the first request header ran `new NativeHeaders()`.
+- Root cause: HIR records `const X = globalThis.Y` as a let-class alias (`let_class_aliases`, keyed by name) and lowers `new X()` to `Expr::New { class_name: "Y" }`. Codegen resolves that class by string, so a program class named `Y` declared in the same module captured the construction: `new NativeHeaders()` built the program's `Headers`, an object without `append`.
+- Fix: `LoweringContext::global_class_aliases` marks the aliases whose initializer is a `globalThis` read (`register_global_class_alias`, used by the three destructuring paths and the `PropertyGet` arm in `alias_tracking.rs`; `register_let_class_alias` clears the mark when a name is rebound). `lower_new` lowers `new Alias()` to `global_property_new_dynamic` when the alias is such a global and the program also binds that global's name, so the value on `globalThis` is constructed. Files: `perry-hir/src/lower/{lowering_context,context_new,context,expr_new}.rs`, `perry-hir/src/destructuring/{pattern_binding,var_decl/alias_tracking}.rs`.
+- Test: wasi probe `.github/supa/wasi-probes/headers-global-alias.js` (fails with `append is not a function` before the fix, matches node after); port to `crates/perry/tests` for upstream.
+- Not covered: `new Wrapped.Headers()` (a member callee whose property is named like a global) still builds the native class, a separate bug found while writing the probe.
+- Upstream: not cherry-picked. Depends on: none. PR-AC.
 
 ## Not for upstream
 
