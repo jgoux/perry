@@ -322,9 +322,10 @@ jobs:
         run: |
           wasm=$OUT/storage.wasm
           python3 -I .github/supa/wasi-imports.py --allow-supa-net "$wasm" | tee "$OUT/imports.txt"
-          wasm-tools validate "$wasm"
+          ls -l "$wasm"
+          wasm-tools validate "$wasm" 2>&1 | tee "$OUT/validate.txt"
           wasm-tools strip "$wasm" -o "$OUT/storage.stripped.wasm"
-          ls -l "$wasm" "$OUT/storage.stripped.wasm"
+          ls -l "$OUT/storage.stripped.wasm"
       - name: Job summary
         if: always()
         run: |
@@ -357,7 +358,7 @@ jobs:
             target/wasm32-wasip1/release/libperry_runtime.a
           retention-days: 3
       - uses: actions/upload-artifact@v4
-        if: success()
+        if: always() && hashFiles('supa-out/storage.wasm') != ''
         with:
           name: storage-wasi-module
           path: |
