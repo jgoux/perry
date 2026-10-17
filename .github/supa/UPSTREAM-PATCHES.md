@@ -68,7 +68,7 @@ Conventions in this file:
 | P44 | 540a34fc2 | fix(net): an application's end() after the protocol layer's close is a no-op | net (payload socket) | all (seen on wasm32) | wasi probe `http-early-reply.js` | not tried | PR-AA |
 | P45 | d9ebda76d | fix(dns): dispatch dns lookup and resolve exports reached through a CommonJS namespace | dns (`perry-runtime` native module dispatch) | all (seen on wasm32) | wasi probe `cjs-dns.js` | not tried | PR-AB |
 | P46 | 19c26c6a9 | fix(hir): construct the global when a program class shares a name with a globalThis alias | hir (`lower/expr_new.rs`, `lower/context.rs`, destructuring) | all | wasi probe `headers-global-alias.js` | not tried | PR-AC |
-| P47 | TBD | fix(runtime): start reading when a readable that is not flowing is piped | runtime (node:stream, `node_stream_readwrite.rs`) | all | wasi probe `stream-pipe-starts-read.js` | not tried | PR-AD |
+| P47 | bea2d51cb | fix(runtime): start reading when a readable that is not flowing is piped | runtime (node:stream, `node_stream_readwrite.rs`) | all | wasi probe `stream-pipe-starts-read.js` | not tried | PR-AD |
 | P48 | 19f404e40 | fix(runtime): hand a live stream to the function stage of stream.pipeline | runtime (node:stream, `node_stream_pipeline.rs`) | all | wasi probe `stream-pipeline-live-source.js` | not tried | PR-AE |
 | P49 | 32943d82a | fix(runtime): read an http request through Readable.toWeb with the request's own read() | runtime (node:stream web adapter, `node_stream_constructors/web_adapter.rs`) | all | wasi probe `http-request-to-web.js` | not tried | PR-AF |
 
