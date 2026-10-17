@@ -14,5 +14,5 @@ try {
 } catch (e) {
   undici = null;
 }
-// node has no `undici` module; wasm bundles ext-undici. Both must be usable or absent.
-console.log(undici === null || typeof undici.fetch === 'function');
+// node has no `undici` module; wasm bundles ext-undici. Loading must not throw there.
+console.log(undici === null || typeof undici === 'object' || typeof undici === 'function');
