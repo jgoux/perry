@@ -96,6 +96,12 @@ standard exnref exception handling, so run modules with
 and compares a probe set with node; `.github/supa/wasi-imports.py` rejects
 imports outside the supa-wasm host subset.
 
+wasm32 calls into the runtime go through `crates/perry-codegen/src/wasm32/runtime_abi.tsv`,
+generated from the runtime's source by `python3 scripts/runtime_abi_check.py --emit-wasm-abi`.
+Regenerate it whenever a runtime `extern "C"` signature changes; a symbol missing
+from it, or a runtime-internal `extern` that declares a pointer as `i64`, is a wasm
+signature mismatch (a link error, or a trap in place of the call).
+
 ## Reproducing on Windows
 
 Configure the repository's pinned Rust and LLVM 22 toolchain first. Python
