@@ -10,7 +10,9 @@
 #   // max-rss-mb: N           the wasmtime process must stay under N MB
 #   // optional: REASON        a compile or link failure is recorded as MISSING,
 #                              not a failure (a probe that compiles must still match)
-#   // network: yes            the module may import supa_net (see wasi-imports.py)
+#   // network: yes            the module may import supa_net (see wasi-imports.py); it
+#                              runs with unknown imports trapping, so a module that links
+#                              the net code but never opens a socket still starts
 #   // compile-only: REASON    compile and check imports but do not run (needs a
 #                              service the CI runner lacks; the module is uploaded
 #                              for local runs under supa-host)
@@ -110,7 +112,10 @@ for n in "${names[@]}"; do
     cat "$d/node.serve" >> "$d/node.out"; cat "$d/run.serve" >> "$d/run.out"
   else
     (cd "$d" && WORK_DIR="$d/work" timeout 120 node "$n.$ext" > node.out 2> node.err); echo $? > "$d/node.rc"
-    (cd "$d" && /usr/bin/time -v -o time.txt timeout 300 "$wasmtime" run $flags --dir "$d/work::/work" "$n.wasm" > run.out 2> run.err); echo $? > "$d/run.rc"
+    # A module that imports supa_net but never calls it needs wasmtime to trap on the import
+    # instead of refusing to instantiate.
+    trap_flag=; [ -n "$network" ] && trap_flag="-W unknown-imports-trap"
+    (cd "$d" && /usr/bin/time -v -o time.txt timeout 300 "$wasmtime" run $flags $trap_flag --dir "$d/work::/work" "$n.wasm" > run.out 2> run.err); echo $? > "$d/run.rc"
   fi
   rss=$(awk -F': ' '/Maximum resident set size/ {printf "%d", $2 / 1024}' "$d/time.txt")
   echo "--- stdout (wasm) ---"; head -c 3000 "$d/run.out"

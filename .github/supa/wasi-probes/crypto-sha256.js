@@ -1,5 +1,6 @@
 // node:crypto from the bundled perry-stdlib: hashes, HMAC, random bytes and the
 // WebCrypto subtle API (the HMAC and digest paths jose uses for HS256).
+// network: yes (links the shared net code; supa_net is imported but never called)
 const crypto = require('node:crypto');
 for (const alg of ['sha256', 'sha1', 'md5']) {
   console.log(alg, crypto.createHash(alg).update('abc').digest('hex'));

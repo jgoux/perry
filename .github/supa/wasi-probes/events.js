@@ -1,4 +1,5 @@
 // node:events: on/once/off ordering, the error event contract, once() promises.
+// network: yes (links the shared net code; supa_net is imported but never called)
 const { EventEmitter, once } = require('node:events');
 const e = new EventEmitter();
 const seen = [];

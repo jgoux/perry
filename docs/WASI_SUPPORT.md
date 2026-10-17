@@ -114,8 +114,9 @@ unchanged; the runtime (`perry_wasi_net.c`, `wasi_net/mod.rs`) maps them as foll
   stream socket it finds before the guest opens one. The rule is deliberately
   simple: **one Storage server on one host listener**. Each `server.listen()`
   claims the next unclaimed listener in order and ignores the requested port;
-  `server.address().port` reports the host's bound address when
-  `SUPA_LISTEN_ADDRS` names it, otherwise the requested one. A second `listen()`
+  `server.address()` reports the host's bound address when
+  `SUPA_LISTEN_ADDRS` names it, otherwise the requested one (an ephemeral port 0
+  stays 0). A second `listen()`
   with no listener left fails with `EADDRNOTAVAIL`. Closing the server closes the
   host listener. Accepting uses `sock_accept` on that fd.
 - **Outbound TCP and DNS.** `supa_net.tcp_connect` starts a non-blocking connect
@@ -131,11 +132,23 @@ unchanged; the runtime (`perry_wasi_net.c`, `wasi_net/mod.rs`) maps them as foll
   byte is a signal number (1 HUP, 2 INT, 10 USR1, 12 USR2, 15 TERM) delivered to
   `process.on('SIGTERM' | 'SIGINT' | ...)`. Without a handler TERM and INT exit
   with 128 plus the signal number.
-- **Import gating.** `supa_net` is imported only by modules whose program reaches
-  the network code; wasm-ld drops the unreferenced imports from every other
-  module. `.github/supa/wasi-imports.py` rejects `supa_net` unless called with
-  `--allow-supa-net`, which a probe requests with `// network: yes`. Running a
-  networking module under plain wasmtime needs `-W unknown-imports-trap`.
+- **Link transport.** `net.Server`, `net.Socket` and `http.Server` sit on the shared
+  link transport (`turnloop_net/abi.rs`); on wasi `wasi_net/transport.rs` maps its
+  listen, accept, connect, read, write, shutdown, close and deadline calls onto the
+  handle table of `wasi_net/mod.rs`. A handle owned by a link carries `NET_FLAG_LINK`
+  completions, which are delivered only while the owner's payload is open. Completions
+  handed to a sink notify the loop, so the next turn runs its pumps instead of parking.
+- **Import gating.** `supa_net` is imported only by modules that link the network code,
+  and wasm-ld cannot drop it from a module that requires `node:http`, `node:net`,
+  `node:events`, `node:crypto`, `node:zlib` or `node:async_hooks`, because those pull
+  the shared net code in. A module such as `hello` or a pure `fs`/`path` program
+  stays free of it. `.github/supa/wasi-imports.py` rejects `supa_net` unless called
+  with `--allow-supa-net`, which a probe requests with `// network: yes`; such a
+  module runs under plain wasmtime with `-W unknown-imports-trap` (the call is never
+  made unless the program opens a socket).
+- **`dns` in CommonJS.** `require('node:dns')` in a CommonJS-wrapped program does not
+  install Perry's dns bindings and `dns.lookup` silently does nothing; use
+  `import * as dns from 'node:dns'`.
 - **CI.** wasmtime 47 removed the legacy p1 implementation that `-S tcplisten`
   needs, so the server probes run under wasmtime 46.0.3 (`WASMTIME_P1`); the other
   probes use 49. Probes that need a service (a Postgres for `pg`) are compiled and

@@ -1,4 +1,5 @@
 // AsyncLocalStorage keeps its store across await and setTimeout.
+// network: yes (links the shared net code; supa_net is imported but never called)
 const { AsyncLocalStorage } = require('node:async_hooks');
 const als = new AsyncLocalStorage();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

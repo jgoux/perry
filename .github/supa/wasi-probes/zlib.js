@@ -1,4 +1,5 @@
 // node:zlib from perry-ext-zlib: sync and callback round trips.
+// network: yes (links the shared net code; supa_net is imported but never called)
 const zlib = require('node:zlib');
 const input = Buffer.from('hello hello hello hello zlib '.repeat(40));
 const gz = zlib.gzipSync(input);

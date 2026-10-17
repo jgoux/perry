@@ -1,4 +1,5 @@
 // The networking modules load and expose their entry points (no sockets here).
+// network: yes (links the shared net code; supa_net is imported but never called)
 const http = require('node:http');
 const https = require('node:https');
 const net = require('node:net');
