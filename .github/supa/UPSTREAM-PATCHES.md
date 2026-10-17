@@ -44,6 +44,24 @@ Conventions in this file:
 | P20 | 71129cbe7 | fix(runtime): accept an fs write stream as a stream.pipeline stage | runtime | all | integration | clean | PR-D |
 | P21 | 286f4ae58 | fix(http): pipe a server request's buffered body into its destination | perry-ext-http | all | integration | clean | PR-C |
 | P22 | 248ec8347 | fix(http): route req.pipe to the server request's dispatcher | perry-ext-http | all | covered by P21's test | clean | PR-C |
+| P23 | b416f00f7 | feat(runtime): register layouts, atoms and image ranges through init_array on wasm | runtime | wasm32 | integration (wasi probes) | not tried | PR-R |
+| P24 | bd6269a6b | fix(runtime): make the wasm32 runtime compile for wasip1 | runtime, updater | wasm32 | build + wasi probes | not tried | PR-R |
+| P25 | 20d4dc2cd | feat(stdlib): build a wasm32-wasip1 subset without openssl, zlib-ng or threads | stdlib, ext-zlib | wasm32 | build + wasi probes (crypto, zlib) | not tried | PR-R |
+| P26 | c0d32ab8c | fix(runtime): compare the 47-bit address ceiling in u64 so wasm32 release builds compile | runtime | wasm32 | build | not tried | PR-R |
+| P27 | 2f4a2a4f4 | feat(compile): add a wasip1 target that links a WASI preview1 core module | compile, codegen | wasm32 | wasi probes | not tried | PR-S |
+| P28 | 9e0beba53 | fix(codegen): regenerate the wasm32 runtime ABI table, which had drifted from the runtime | codegen (wasm32) | wasm32 | `scripts/runtime_abi_check.py` | not tried | PR-S |
+| P29 | c546aab14 | fix(codegen): cover macro-defined runtime entry points in the wasm32 ABI table | codegen (wasm32), scripts | wasm32 | `scripts/runtime_abi_check.py` | not tried | PR-S |
+| P30 | f7c9d2b0b | fix(runtime): declare the array builtin entries at pointer width so wasm32 calls resolve | runtime | wasm32 | wasi probes + ABI check | not tried | PR-R |
+| P31 | 5c4434bb7 | feat(wasip1): bundle perry-stdlib and the node ext crates into the wasm runtime | compile, runtime-static | wasm32 | wasi probes | not tried | PR-S |
+| P32 | 0dac0c454 | fix(runtime): admit program-emitted image strings on wasm32 | runtime | wasm32 | wasi probes (path, url, fs) | not tried | PR-R |
+| P33 | 202df7335 | feat(wasi): serve and connect over the host's supa_net sockets on wasip1 | runtime (wasi_net, signals) | wasm32 | wasi probes (http-server, net-echo, dns) | not tried | PR-T |
+| P34 | baf2f1d91 | feat(wasip1): route the link transport through the host socket handles | runtime | wasm32 | wasi probes (http-server, net-echo, pg-client) | not tried | PR-T |
+| P35 | 91629a4bd | fix(wasip1): report the bound listener address and wake the loop after dispatch | runtime (wasi_net) | wasm32 | wasi probes (http-server) | not tried | PR-T |
+| P36 | d9bda55e5 | fix(wasip1): declare imported static methods at their producer's width | codegen | all (matters on wasm32) | wasi probes (Storage compile) | not tried | PR-U |
+| P37 | 20bf06dc0 | fix(wasm32): keep calls out of setjmp frames so spill code stays linear | codegen (wasm32) | wasm32 | none (Storage compile only); possibly redundant after P38 | not tried | PR-U |
+| P38 | f0a9e8a1d | fix(cjs): share one registry helper across a module's deferred requires | compile (cjs_wrap) | all (shrinks native output too) | Storage compile size (530 MB to 414 MB module) | not tried | PR-V |
+| P39 | 28fa69faf | fix(wasm32): pass a JS body's callee as a pointer in indirect calls | codegen (wasm32) | wasm32 | wasi probe `closure-call-in-loop.js` + unit | not tried | PR-U |
+| P40 | 3d45a1e6d | fix(runtime): register the standard descriptors for fs on WASI | runtime (fs) | wasm32 (WASI) | wasi probe `fs-stdio-fd.js` | not tried | PR-W |
 
 All 22 patches except P12's `.github` hunks, P05 and P06 cherry-pick cleanly.
 A stack of every patch except P05 and P06, with P12 limited to `crates/`, also applies cleanly in sequence on `1fd8ca2ae`.
@@ -69,6 +87,12 @@ Ordered by value and independence. Each PR carries its patches' tests.
 15. **PR-O `.alt_entry` in the stack-map rewriter on Mach-O** (P04). Prerequisite: none.
 16. **PR-P root_reload cost cap** (P08). Last because the cap value was tuned from fork measurements and upstream reworked nearby code (`291142de3`). Prerequisite: none.
 17. **PR-Q `PERRY_TRACE_THROW`** (P18). Judged generally useful, see its section. Low priority. Prerequisite: none.
+18. **PR-R wasm32-wasip1 runtime builds** (P23, P24, P25, P26, P30, P32). The runtime and the stdlib subset compile for `wasm32-wasip1` and register their tables through `.init_array`. Prerequisite: none in the series, but PR-S and later need it. wasm/WASI-specific.
+19. **PR-S `--target wasip1` and the bundled runtime** (P27, P28, P29, P31). The compile target, the regenerated ABI table and the single runtime archive. Prerequisite: PR-R. wasm/WASI-specific.
+20. **PR-T WASI sockets over the host `supa_net` imports** (P33, P34, P35). Listen, accept, connect, DNS and signals on wasip1. Prerequisite: PR-R, PR-S. wasm/WASI-specific.
+21. **PR-U wasm32 codegen lowering fixes** (P36, P37, P39). Indirect-call ABI, setjmp spill size and static-method declaration width. Prerequisite: PR-S. Re-check P37 first, see its section.
+22. **PR-V Deferred CJS requires share one registry helper** (P38). Smaller output on every target. Prerequisite: none.
+23. **PR-W `fs.write*` on stdio descriptors under WASI** (P40). Prerequisite: PR-R.
 
 Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616f5e` for P05, `79aae9aa7` for P06 and P15); drop them at the next upstream sync and take upstream's versions.
 
@@ -358,6 +382,141 @@ Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616
 - Upstream: cherry-pick clean (alone and after P21). Upstream touched: none. Also affected: likely.
 - Depends on: P21 (adds the dispatcher arm). PR-C; squash into P21 so the PR is green.
 
+### P23 b416f00f7 feat(runtime): register layouts, atoms and image ranges through init_array on wasm
+- Area / platform: runtime / wasm32.
+- Problem: on wasm32 the runtime's static layout descriptors, atoms and string-image ranges need registering at startup.
+- Root cause: the commit message does not record one; the diff replaces the registration path with `.init_array` entries on wasm.
+- Fix: the runtime registers its layouts, atoms and image ranges from `.init_array` entries on wasm. Files: `perry-runtime/src/object/{layout_desc,layout_probe,mod,runtime_layouts,shapes_store,static_registry}.rs`, `runtime_layouts/stream_prototypes.rs`, `value/addr_class/image.rs`.
+- Test: none of its own; every wasi probe depends on it.
+- Upstream: not cherry-picked. Depends on: none. PR-R.
+
+### P24 bd6269a6b fix(runtime): make the wasm32 runtime compile for wasip1
+- Area / platform: runtime, updater / wasm32.
+- Problem: `perry-runtime` did not build for `wasm32-wasip1`.
+- Root cause: unix-only or pointer-width-dependent code (tty input, process streams, the net turnloop ABI, the thread pool) compiled unconditionally; the commit message records no detail.
+- Fix: cfg-gated stubs and a wasm pool (`turnloop_pool_wasm.rs`), plus `wasi_net` transport scaffolding; 20 files.
+- Test: the wasip1 runtime build in `wasi-linux`.
+- Upstream: not cherry-picked. Depends on: none. PR-R.
+
+### P25 20d4dc2cd feat(stdlib): build a wasm32-wasip1 subset without openssl, zlib-ng or threads
+- Area / platform: stdlib, ext-zlib / wasm32.
+- Problem: `perry-stdlib` and `perry-ext-zlib` could not build for wasip1 (openssl, zlib-ng and threads are unavailable).
+- Fix: Cargo features select a subset without them (wide digest in `crypto/wide_digest.rs`, an inflate context for wasm in `inflate_context_wasm.rs`) and the worker pump is gated.
+- Test: wasi probes `crypto-sha256`, `crypto-verify`, `zlib`.
+- Upstream: not cherry-picked. Depends on: none. PR-R.
+
+### P26 c0d32ab8c fix(runtime): compare the 47-bit address ceiling in u64 so wasm32 release builds compile
+- Area / platform: runtime / wasm32.
+- Problem: `addr >= 1 << 47` overflows `usize` on wasm32 and fails the release build.
+- Fix: compare as `u64` in `builtin_proto_entries.rs` (1 line).
+- Test: the wasm32 release build.
+- Upstream: not cherry-picked. Depends on: none. PR-R.
+
+### P27 2f4a2a4f4 feat(compile): add a wasip1 target that links a WASI preview1 core module
+- Area / platform: compile, codegen / wasm32.
+- Problem: no way to produce a module that runs on a WASI preview1 host.
+- Fix: `--target wasip1` reuses the wasm32 lowering and the wasi link with the `wasm32-wasip1` triple, wasi-sdk's p1 sysroot and no `cabi_realloc` export; `scripts/wasi_build_runtime.sh` takes the runtime target. Docs in `docs/WASI_SUPPORT.md`.
+- Test: wasi probes compared against node.
+- Upstream: not cherry-picked. Depends on: P23-P26. PR-S.
+
+### P28 9e0beba53 fix(codegen): regenerate the wasm32 runtime ABI table, which had drifted from the runtime
+- Area / platform: codegen (wasm32) / wasm32.
+- Problem: `wasm32/runtime_abi.tsv` no longer matched the runtime's entry points, so wasm calls were declared with the wrong widths.
+- Fix: regenerated with `scripts/runtime_abi_check.py`.
+- Test: `scripts/runtime_abi_check.py`.
+- Upstream: not cherry-picked; the table churns, so regenerate on the upstream base instead of cherry-picking. Depends on: none. PR-S.
+
+### P29 c546aab14 fix(codegen): cover macro-defined runtime entry points in the wasm32 ABI table
+- Area / platform: codegen (wasm32), scripts / wasm32.
+- Problem: the ABI check could not see entry points defined by macros (`closure_call_entry!`, `kind_entry!`, the array/string prototype entry macros), so rows for them were missing (222 added).
+- Fix: `scan_macro_entries` in `scripts/runtime_abi_check.py` reads each macro family's fixed shape, and the table gains the rows.
+- Test: `scripts/runtime_abi_check.py`.
+- Upstream: not cherry-picked. Depends on: P28. PR-S.
+
+### P30 f7c9d2b0b fix(runtime): declare the array builtin entries at pointer width so wasm32 calls resolve
+- Area / platform: runtime / wasm32 (no change on 64-bit).
+- Problem: array builtins declared `i64` pointers, so a wasm32 call to them had the wrong signature.
+- Fix: a target-width integer `Wp` and a `wide_ty!` macro declare the entries at pointer width in `builtin_proto_entries.rs`.
+- Test: wasi probes and the ABI check.
+- Upstream: not cherry-picked. Depends on: none. PR-R.
+
+### P31 5c4434bb7 feat(wasip1): bundle perry-stdlib and the node ext crates into the wasm runtime
+- Area / platform: compile, runtime-static / wasm32.
+- Problem: a storage-capable runtime needs perry-runtime, ext-net/http/undici/zlib/ws, http-server and the stdlib subset in one archive under one allocator.
+- Fix: new `perry-runtime-static` crate, and a generated `.init_array` object registers the feature installers; `wasi_build_runtime.py` and the link step use it. 22 files.
+- Test: wasi probes for crypto, zlib, events, streams, fs, path/url/util/os, AsyncLocalStorage, network modules and process basics.
+- Upstream: not cherry-picked. Depends on: P25, P27. PR-S.
+
+### P32 0dac0c454 fix(runtime): admit program-emitted image strings on wasm32
+- Area / platform: runtime / wasm32.
+- Problem: string readers that validate headers (`path.*`, `URLSearchParams`, fs paths) rejected every string literal.
+- Root cause: literals emitted by codegen live in static data, but only the runtime's own strings were registered as image strings.
+- Fix: bound the candidate range by `__data_end`; the header validation is unchanged. File: `value/addr_class/image.rs`.
+- Test: wasi probes `path-url-util-os`, `fs`.
+- Upstream: not cherry-picked. Depends on: P23. PR-R.
+
+### P33 202df7335 feat(wasi): serve and connect over the host's supa_net sockets on wasip1
+- Area / platform: runtime (wasi_net, signals, event pump) / wasm32.
+- Fix: listener discovery (`SUPA_LISTEN_FDS` or tcplisten sockets), accept, connect through `supa_net.tcp_connect`, DNS through `supa_net.resolve`, errno-to-Node-code mapping, one `poll_oneoff` when idle with sockets, `server.address()`, and `SUPA_SIGNAL_FD` signals for `process.on`.
+- Test: wasi probes `http-server`, `net-echo`, `dns-lookup` (added in 506e7d053).
+- Upstream: not cherry-picked. Depends on: P24, P31. PR-T. The `supa_net` import module is specific to the supa-wasm host.
+
+### P34 baf2f1d91 feat(wasip1): route the link transport through the host socket handles
+- Area / platform: runtime / wasm32.
+- Problem: servers and sockets built on the shared link ABI did not run on wasi.
+- Fix: listen, accept, connect, read, write, shutdown and close drive the `supa_net` imports with one `poll_oneoff` per idle turn. Also lifts the all-f64 trampoline arity cap on wasm, where an exact-arity call is always correct (pg's protocol writer needs 18 arguments).
+- Test: wasi probes `http-server`, `net-echo`, `pg-client`.
+- Upstream: not cherry-picked. Depends on: P33. PR-T.
+
+### P35 91629a4bd fix(wasip1): report the bound listener address and wake the loop after dispatch
+- Area / platform: runtime (wasi_net) / wasm32.
+- Problem: `server.address()` and the `'listening'` event had no address, and every request took a second.
+- Root cause: a p1 guest cannot ask its host socket for its address; completions handed to the sinks did not wake the loop, so it parked on the idle cap.
+- Fix: a listener keeps the announced or requested address; completions notify the loop.
+- Test: wasi probe `http-server`.
+- Upstream: not cherry-picked. Depends on: P34. PR-T.
+
+### P36 d9bda55e5 fix(wasip1): declare imported static methods at their producer's width
+- Area / platform: codegen / all (matters on wasm32).
+- Problem: wasm-ld rejected the same symbol with two signatures.
+- Root cause: cross-module static methods were declared with six double parameters; a wasm32 object records the function type, so a declaration wider than the definition conflicts.
+- Fix: declare at the producer's declared width (6 only when the producer did not report it), and truncate extra call arguments to the declared count (already evaluated).
+- Test: the Storage compile; no dedicated test.
+- Upstream: not cherry-picked. Depends on: none. PR-U.
+
+### P37 20bf06dc0 fix(wasm32): keep calls out of setjmp frames so spill code stays linear
+- Area / platform: codegen (wasm32) / wasm32.
+- Problem: one function reached 17 MB and the Storage module 530 MB, past the 7.6 MB function limit wasmtime enforces.
+- Root cause: sjlj lowering carries every block-crossing SSA value through phis and spills them around each call, so inlined callees inside a try function blow up.
+- Fix: `mark_call_noinline` marks call sites noinline inside setjmp functions (`wasm32/mod.rs`).
+- Test: none; seen only as module size.
+- Upstream: not cherry-picked. Depends on: none. PR-U.
+- Still needed? Unverified. f0a9e8a1d (P38) removed the root cause of the 17 MB function (the quadratic require shim), so this is likely redundant for Storage. It still bounds spill growth for any large try function, but that has not been measured. A CI run of the Storage compile without it would settle it; it is not reverted.
+
+### P38 f0a9e8a1d fix(cjs): share one registry helper across a module's deferred requires
+- Area / platform: compile (cjs_wrap) / all targets: Behaviour is unchanged everywhere and each module gets smaller.
+- Problem: a 3 KB barrel module with 16 requires produced a 17 MB function on wasm32; Storage's module was 530 MB.
+- Root cause: the require shim inlined the path-registry call, its try/finally, the cycle warning and the child link into every deferred specifier case; a try makes the function a returns-twice frame, and the sjlj lowering threads every case's values through one dispatch loop, so the shim grew with the square of the specifier count.
+- Fix: one helper per module holds that body and each case calls it; the import binding is read through a thunk because reading it can initialize the target. Files: `cjs_wrap/deferred_requires.rs`, `cjs_wrap/wrap.rs`.
+- Test: size, measured on the Storage compile (530 MB to 414 MB). No dedicated test; a native size/behaviour check would suit upstream.
+- Upstream: not cherry-picked. Depends on: none. PR-V.
+
+### P39 28fa69faf fix(wasm32): pass a JS body's callee as a pointer in indirect calls
+- Area / platform: codegen (wasm32) / wasm32.
+- Problem: Storage trapped with `indirect call type mismatch` (ajv `eachItem`).
+- Root cause: closure bodies are retyped to take the closure as a pointer so the runtime's `call_indirect` matches, but calls through a code pointer (loop-hoisted direct calls, method inline caches, native-argument-list entries) still passed the callee as `i64` and the length as `i64`.
+- Fix: `retype_indirect_body_calls` in `wasm32/closure_abi.rs` rewrites those calls in the wasm32 lowering.
+- Test: unit `indirect_body_calls_pass_the_callee_as_a_pointer` and wasi probe `closure-call-in-loop.js`.
+- Upstream: not cherry-picked. Depends on: PR-S. PR-U.
+
+### P40 3d45a1e6d fix(runtime): register the standard descriptors for fs on WASI
+- Area / platform: runtime (fs) / wasm32 (WASI).
+- Problem: `fs.writeSync(1, ...)` and `fs.write(1, ...)` threw EBADF; pino's sync stdout destination (sonic-boom) writes this way, so Storage's logger failed.
+- Root cause: the fd registry seeded descriptors 0..=2 only under `cfg(unix)`.
+- Fix: on WASI the registry wraps descriptors 0..=2 directly (no dup exists). File: `fs/mod.rs`.
+- Test: wasi probe `fs-stdio-fd.js`.
+- Upstream: not cherry-picked. Depends on: none. PR-W.
+
 ## Not for upstream
 
 Every other fork-only non-merge commit is CI, probes, a temporary diagnostic, or a Storage shim. None edits files outside `.github/` (checked with `git show --name-only`). There are 44 such commits, 22 fix/feat commits are the patches above, and the fork has no `test:` commits.
@@ -376,6 +535,8 @@ Every other fork-only non-merge commit is CI, probes, a temporary diagnostic, or
 
 **Storage dependency shims** (`.github/supa/shims.sh`, `patch-find-my-way.cjs`). The first replaces the four `new Function` generated functions in find-my-way 9.7.0 with closures; it also deletes upstream's `.github/dependabot.yml` from the fork. It predates P12, and whether it is still needed on Linux is unverified. The second removes the earlier agentkeepalive shim now that P02, P17 and P19 make the real package run.
 `da99fa8be` `7b9b592a3`
+
+**wasip1 series since storage-ci** (`supa/wasip1`): CI wiring and diagnostics `ef0f3969f` `dd33cf711` `f96fd56bd` `e81da245e` `04a35b714` `5c07ca9f3` `e5558632d` `628f36abe` `367281739` `5defe7f9a` `74694d7d4` `37c69af62` `61aa2c6df` (`supa-storage.yml`, `.github/supa/*.sh`, the temporary diagnostic probes and the `SMOKE_BYTES` smoke input). The `test(wasi)` probe commits `506e7d053` and `ec19714e1` and the `docs:` commit `b3cce1633` (how the wasm32 ABI table is regenerated) go upstream with PR-T and PR-S respectively.
 
 Merge commits (not counted): `1f3c775af` (merge of upstream main) and `03ef52d0f` (merge of `supa/upstream-sync`).
 
