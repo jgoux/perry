@@ -320,6 +320,7 @@ jobs:
         run: .github/supa/prune-caches.sh perry-wobj- 2
       - name: Module checks
         run: |
+          set -o pipefail
           wasm=$OUT/storage.wasm
           python3 -I .github/supa/wasi-imports.py --allow-supa-net "$wasm" | tee "$OUT/imports.txt"
           ls -l "$wasm"
