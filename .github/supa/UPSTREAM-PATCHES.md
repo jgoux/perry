@@ -67,10 +67,10 @@ Conventions in this file:
 | P43 | 4519a2f16 | fix(runtime): zero the DateCell padding on 32-bit targets | runtime (date) | wasm32 | wasi probe `date-cell-reuse.js` | not tried | PR-Z |
 | P44 | 540a34fc2 | fix(net): an application's end() after the protocol layer's close is a no-op | net (payload socket) | all (seen on wasm32) | wasi probe `http-early-reply.js` | not tried | PR-AA |
 | P45 | d9ebda76d | fix(dns): dispatch dns lookup and resolve exports reached through a CommonJS namespace | dns (`perry-runtime` native module dispatch) | all (seen on wasm32) | wasi probe `cjs-dns.js` | not tried | PR-AB |
-| P46 | TBD | fix(hir): construct the global when a program class shares a name with a globalThis alias | hir (`lower/expr_new.rs`, `lower/context.rs`, destructuring) | all | wasi probe `headers-global-alias.js` | not tried | PR-AC |
+| P46 | 19c26c6a9 | fix(hir): construct the global when a program class shares a name with a globalThis alias | hir (`lower/expr_new.rs`, `lower/context.rs`, destructuring) | all | wasi probe `headers-global-alias.js` | not tried | PR-AC |
 | P47 | TBD | fix(runtime): start reading when a readable that is not flowing is piped | runtime (node:stream, `node_stream_readwrite.rs`) | all | wasi probe `stream-pipe-starts-read.js` | not tried | PR-AD |
-| P48 | TBD | fix(runtime): hand a live stream to the function stage of stream.pipeline | runtime (node:stream, `node_stream_pipeline.rs`) | all | wasi probe `stream-pipeline-live-source.js` | not tried | PR-AE |
-| P49 | TBD | fix(runtime): read an http request through Readable.toWeb with the request's own read() | runtime (node:stream web adapter, `node_stream_constructors/web_adapter.rs`) | all | wasi probe `http-request-to-web.js` | not tried | PR-AF |
+| P48 | 19f404e40 | fix(runtime): hand a live stream to the function stage of stream.pipeline | runtime (node:stream, `node_stream_pipeline.rs`) | all | wasi probe `stream-pipeline-live-source.js` | not tried | PR-AE |
+| P49 | 32943d82a | fix(runtime): read an http request through Readable.toWeb with the request's own read() | runtime (node:stream web adapter, `node_stream_constructors/web_adapter.rs`) | all | wasi probe `http-request-to-web.js` | not tried | PR-AF |
 
 All 22 patches except P12's `.github` hunks, P05 and P06 cherry-pick cleanly.
 A stack of every patch except P05 and P06, with P12 limited to `crates/`, also applies cleanly in sequence on `1fd8ca2ae`.
@@ -578,7 +578,7 @@ Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616
 - Upstream: not cherry-picked. Depends on: none. PR-AB.
 - Not covered: instance methods of `new dns.Resolver()` reached through a CommonJS namespace were not re-tested.
 
-### P46 TBD fix(hir): construct the global when a program class shares a name with a globalThis alias
+### P46 19c26c6a9 fix(hir): construct the global when a program class shares a name with a globalThis alias
 - Area / platform: hir / all targets; seen on wasm32-wasip1.
 - Problem: Storage's resumable upload endpoint (`POST /upload/resumable`) answered 500 `TypeError: append is not a function`. srvx's node adapter keeps `const NativeHeaders = globalThis.Headers` and declares its own `class Headers` that wraps a lazily built native one; reading the first request header ran `new NativeHeaders()`.
 - Root cause: HIR records `const X = globalThis.Y` as a let-class alias (`let_class_aliases`, keyed by name) and lowers `new X()` to `Expr::New { class_name: "Y" }`. Codegen resolves that class by string, so a program class named `Y` declared in the same module captured the construction: `new NativeHeaders()` built the program's `Headers`, an object without `append`.
@@ -587,7 +587,7 @@ Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616
 - Not covered: `new Wrapped.Headers()` (a member callee whose property is named like a global) still builds the native class, a separate bug found while writing the probe.
 - Upstream: not cherry-picked. Depends on: none. PR-AC.
 
-### P47 TBD fix(runtime): start reading when a readable that is not flowing is piped
+### P47 bea2d51cb fix(runtime): start reading when a readable that is not flowing is piped
 - Area / platform: runtime node:stream / all targets; seen on wasm32-wasip1.
 - Problem: `Readable.fromWeb(webStream).pipe(dest)` never delivered a byte and never ended; @tus/server pipes the request body this way (`Readable.fromWeb(body).pipe(PassThrough)`), so a TUS PATCH stored nothing.
 - Root cause: `pipe_stream_to_destination` attached the destination, flushed already buffered chunks and marked the source flowing, but never called `_read`. Only `on('data')` scheduled a read (`schedule_readable_resume`). A stream whose data is produced by `_read` (fromWeb pulls its web source there) therefore sat idle with nothing buffered. Node's `pipe` calls `src.resume()` when the source is not flowing, which reads.
@@ -596,7 +596,7 @@ Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616
 - Not covered: the event order of `pipe` ('pause'/'close' relative to 'end') differs from Node, and a Readable whose `read()` pushes lazily still gets `_read` called once only (`hidden_read_invoked_key` is never reset on push).
 - Upstream: not cherry-picked. Depends on: none. PR-AD.
 
-### P48 TBD fix(runtime): hand a live stream to the function stage of stream.pipeline
+### P48 19f404e40 fix(runtime): hand a live stream to the function stage of stream.pipeline
 - Area / platform: runtime node:stream / all targets; seen on wasm32-wasip1.
 - Problem: `await streamP.pipeline(passThrough, transform, async (source) => { for await (const c of source) ... })` returned the result of an empty source whenever the data reached the first stream after the pipeline started (a request body piped in, a write from a timer or a microtask). @tus/server's `writeToStore` is this shape, so every TUS PATCH reported `Upload-Offset: 0`.
 - Root cause: a pipeline with a function stage takes the 'collected' path (`run_collected_pipeline`): it collects the first stage's chunks once at the start and passes that array, as a `Readable.from`, to the function. With nothing buffered yet the function got an empty stream.
@@ -605,7 +605,7 @@ Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616
 - Not covered: the collected path still snapshots a first stream that already holds data, and chunk boundaries can differ from Node (Node's `read()` coalesces everything buffered; the probe sums lengths). The settling pump blocks the caller until the function's promise resolves.
 - Upstream: not cherry-picked. Depends on: none. PR-AE.
 
-### P49 TBD fix(runtime): read an http request through Readable.toWeb with the request's own read()
+### P49 32943d82a fix(runtime): read an http request through Readable.toWeb with the request's own read()
 - Area / platform: runtime node:stream / all targets; seen on wasm32-wasip1.
 - Problem: `Readable.toWeb(req)` for a server `IncomingMessage` produced a web stream that closed at once with no data. srvx's node adapter builds a fetch `Request` body this way, so Storage handlers (TUS resumable uploads) saw an empty body.
 - Root cause: the web adapter's pull step read the node stream through the node:stream hidden buffer (`read_stream_with_size_arg`). A server request is a bare native handle with no such state, so the read returned null and the adapter closed the web stream. The handle exposes its own `read()` (the whole body on the first call, then null) and `destroy()`.
