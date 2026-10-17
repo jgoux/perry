@@ -65,6 +65,7 @@ Conventions in this file:
 | P41 | 5a0100769 | fix(runtime): report readableEnded only once the end event was emitted | runtime (node:stream) | all | unit + wasi probe `stream-readable-ended.js` | not tried | PR-X |
 | P42 | 743236204 | fix(gc): trace an array's named-property holder as a pointer | gc (layout) | wasm32 | wasi probe `array-named-props-gc.js` | not tried | PR-Y |
 | P43 | pending | fix(runtime): zero the DateCell padding on 32-bit targets | runtime (date) | wasm32 | wasi probe `date-cell-reuse.js` | not tried | PR-Z |
+| P44 | pending | fix(net): an application's end() after the protocol layer's close is a no-op | net (payload socket) | all (seen on wasm32) | wasi probe `http-early-reply.js` | not tried | PR-AA |
 
 All 22 patches except P12's `.github` hunks, P05 and P06 cherry-pick cleanly.
 A stack of every patch except P05 and P06, with P12 limited to `crates/`, also applies cleanly in sequence on `1fd8ca2ae`.
@@ -99,6 +100,7 @@ Ordered by value and independence. Each PR carries its patches' tests.
 24. **PR-X `readableEnded` means the end event was emitted** (P41). Prerequisite: none.
 25. **PR-Y GC traces an array's named-property holder as a pointer** (P42). Prerequisite: none.
 26. **PR-Z A Date cell's padding is zeroed on 32-bit targets** (P43). Prerequisite: none.
+27. **PR-AA An application's `end()` after the HTTP layer's close is a no-op** (P44). Prerequisite: none.
 
 Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616f5e` for P05, `79aae9aa7` for P06 and P15); drop them at the next upstream sync and take upstream's versions.
 
@@ -547,6 +549,15 @@ Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616
 - Fix: the cell gets an explicit `_meta_padding: u32` field on 32-bit targets, and `alloc_date_cell` zeroes it. The size and the timestamp offset are unchanged (the existing const asserts hold). File: `perry-runtime/src/date.rs`.
 - Test: wasi probe `.github/supa/wasi-probes/date-cell-reuse.js` allocates Dates into freed object memory and stringifies them (traps before the fix; prints `dates intact` after); port to `crates/perry/tests` for upstream.
 - Upstream: not cherry-picked. Depends on: none. PR-Z.
+
+### P44 pending fix(net): an application's end() after the protocol layer's close is a no-op
+- Area / platform: net (`perry-ext-net` `native_transport.rs`) / all targets; observed on wasm32.
+- Problem: Storage died with an uncaught `Error [ERR_UNHANDLED_ERROR]: shutdown EPIPE` when a client sent a multi-MB upload that the server rejected (401/400) before reading the body. Storage answers with `Connection: close`, sets `socket.destroySoon = () => socket.end()`, and calls `socket.end()` again when the response finishes so it can keep draining the body.
+- Root cause: the HTTP turnloop closes a finished connection with `native_transport::shutdown` (the same call WebSocket and HTTP/2 use), which shut the write side down without telling the Socket. The application's `socket.end()` then found `write_ended` still false and issued a second transport shutdown. On WASI the second shutdown fails with EPIPE, and `end()` reports a shutdown failure by destroying the socket with an `'error'`; a server connection has no `'error'` listener, so it was thrown as an uncaught exception. Node treats the second `end()` as a no-op, and ignores shutdown errors on a server socket anyway.
+- Fix: `native_transport::shutdown` sets the Socket's `write_ended` flag before it shuts down, so a later `end()` coalesces with it (its callback joins `extra_end_users`) and `writableEnded` is true, as in Node. File: `perry-ext-net/src/native_transport.rs`. The probe harness learns `// request: METHOD PATH @bytes:N` (a body too big for the command line): `.github/supa/wasi-probes.sh`.
+- Test: wasi probe `.github/supa/wasi-probes/http-early-reply.js` (a 401 before reading a 5 MB body, with Storage's half-close; the process exits 1 with the unhandled error before the fix, and answers the next request after it); port to `crates/perry/tests` for upstream.
+- Upstream: not cherry-picked. Depends on: none. PR-AA.
+- Not covered: the other order (the application's `end()` first, then the protocol layer's close) still gets the transport's duplicate-shutdown error, which the layers answer by destroying the connection without an `'error'`.
 
 ## Not for upstream
 

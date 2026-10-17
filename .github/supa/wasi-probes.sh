@@ -93,7 +93,12 @@ for n in "${names[@]}"; do
         [ "$rest" != "$path" ] && body=${rest#* }
         args=(-s -S --max-time 120 --retry 60 --retry-delay 1 --retry-connrefused
               -H 'Connection: close' -D "$d/h.txt" -o "$d/b.txt" -X "$method")
-        [ -n "$body" ] && args+=(--data-binary "$body" -H 'Content-Type: text/plain')
+        if [[ "$body" == @bytes:* ]]; then
+          head -c "${body#@bytes:}" /dev/zero | tr '\0' x > "$d/req-body.bin"
+          args+=(--data-binary "@$d/req-body.bin" -H 'Content-Type: application/octet-stream')
+        elif [ -n "$body" ]; then
+          args+=(--data-binary "$body" -H 'Content-Type: text/plain')
+        fi
         { echo "> $line"
           if curl "${args[@]}" "http://127.0.0.1:$port$path"; then
             head -n1 "$d/h.txt" | tr -d '\r'
