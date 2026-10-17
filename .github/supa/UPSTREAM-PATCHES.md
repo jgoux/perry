@@ -69,6 +69,7 @@ Conventions in this file:
 | P45 | d9ebda76d | fix(dns): dispatch dns lookup and resolve exports reached through a CommonJS namespace | dns (`perry-runtime` native module dispatch) | all (seen on wasm32) | wasi probe `cjs-dns.js` | not tried | PR-AB |
 | P46 | TBD | fix(hir): construct the global when a program class shares a name with a globalThis alias | hir (`lower/expr_new.rs`, `lower/context.rs`, destructuring) | all | wasi probe `headers-global-alias.js` | not tried | PR-AC |
 | P47 | TBD | fix(runtime): start reading when a readable that is not flowing is piped | runtime (node:stream, `node_stream_readwrite.rs`) | all | wasi probe `stream-pipe-starts-read.js` | not tried | PR-AD |
+| P48 | TBD | fix(runtime): hand a live stream to the function stage of stream.pipeline | runtime (node:stream, `node_stream_pipeline.rs`) | all | wasi probe `stream-pipeline-live-source.js` | not tried | PR-AE |
 
 All 22 patches except P12's `.github` hunks, P05 and P06 cherry-pick cleanly.
 A stack of every patch except P05 and P06, with P12 limited to `crates/`, also applies cleanly in sequence on `1fd8ca2ae`.
@@ -107,6 +108,7 @@ Ordered by value and independence. Each PR carries its patches' tests.
 28. **PR-AB `dns.lookup`, `resolve*` and `reverse` work through a CommonJS `require`** (P45). Prerequisite: none.
 29. **PR-AC `new Alias()` constructs the global an alias holds, not a same-named program class** (P46). Prerequisite: none.
 30. **PR-AD `readable.pipe()` starts reading a stream that was not flowing** (P47). Prerequisite: none.
+31. **PR-AE `stream.pipeline(streams..., fn)` gives the function the live stream** (P48). Prerequisite: none.
 
 Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616f5e` for P05, `79aae9aa7` for P06 and P15); drop them at the next upstream sync and take upstream's versions.
 
@@ -591,6 +593,15 @@ Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616
 - Test: wasi probe `.github/supa/wasi-probes/stream-pipe-starts-read.js` (fromWeb piped into a Writable and into a PassThrough; times out before the fix, prints 1500 for both after); port to `crates/perry/tests` for upstream. The probe carries `// network: yes` because a program naming the global `ReadableStream` links the net imports (pre-existing, independent of this fix).
 - Not covered: the event order of `pipe` ('pause'/'close' relative to 'end') differs from Node, and a Readable whose `read()` pushes lazily still gets `_read` called once only (`hidden_read_invoked_key` is never reset on push).
 - Upstream: not cherry-picked. Depends on: none. PR-AD.
+
+### P48 TBD fix(runtime): hand a live stream to the function stage of stream.pipeline
+- Area / platform: runtime node:stream / all targets; seen on wasm32-wasip1.
+- Problem: `await streamP.pipeline(passThrough, transform, async (source) => { for await (const c of source) ... })` returned the result of an empty source whenever the data reached the first stream after the pipeline started (a request body piped in, a write from a timer or a microtask). @tus/server's `writeToStore` is this shape, so every TUS PATCH reported `Upload-Offset: 0`.
+- Root cause: a pipeline with a function stage takes the 'collected' path (`run_collected_pipeline`): it collects the first stage's chunks once at the start and passes that array, as a `Readable.from`, to the function. With nothing buffered yet the function got an empty stream.
+- Fix: when every stage before a final function stage is a stream and the first has nothing buffered, is not ended and has no source iterator, `run_live_stream_to_function_pipeline` wires the streams end to end (`wire_pipeline_pair`, a source error destroys the stream the function reads), starts them, and passes the last stream itself to the function; the function's promise is settled by the existing pump. Other pipelines keep the collected path. File: `perry-runtime/src/node_stream_pipeline.rs`.
+- Test: wasi probe `.github/supa/wasi-probes/stream-pipeline-live-source.js` (a piped source, a timer write, a microtask write, a transform as first stage; each prints 0 before the fix and 1500 after, as node does); port to `crates/perry/tests` for upstream.
+- Not covered: the collected path still snapshots a first stream that already holds data, and chunk boundaries can differ from Node (Node's `read()` coalesces everything buffered; the probe sums lengths). The settling pump blocks the caller until the function's promise resolves.
+- Upstream: not cherry-picked. Depends on: none. PR-AE.
 
 ## Not for upstream
 
