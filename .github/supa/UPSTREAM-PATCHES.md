@@ -64,6 +64,7 @@ Conventions in this file:
 | P40 | 3d45a1e6d | fix(runtime): register the standard descriptors for fs on WASI | runtime (fs) | wasm32 (WASI) | wasi probe `fs-stdio-fd.js` | not tried | PR-W |
 | P41 | 5a0100769 | fix(runtime): report readableEnded only once the end event was emitted | runtime (node:stream) | all | unit + wasi probe `stream-readable-ended.js` | not tried | PR-X |
 | P42 | 743236204 | fix(gc): trace an array's named-property holder as a pointer | gc (layout) | wasm32 | wasi probe `array-named-props-gc.js` | not tried | PR-Y |
+| P43 | pending | fix(runtime): zero the DateCell padding on 32-bit targets | runtime (date) | wasm32 | wasi probe `date-cell-reuse.js` | not tried | PR-Z |
 
 All 22 patches except P12's `.github` hunks, P05 and P06 cherry-pick cleanly.
 A stack of every patch except P05 and P06, with P12 limited to `crates/`, also applies cleanly in sequence on `1fd8ca2ae`.
@@ -97,6 +98,7 @@ Ordered by value and independence. Each PR carries its patches' tests.
 23. **PR-W `fs.write*` on stdio descriptors under WASI** (P40). Prerequisite: PR-R.
 24. **PR-X `readableEnded` means the end event was emitted** (P41). Prerequisite: none.
 25. **PR-Y GC traces an array's named-property holder as a pointer** (P42). Prerequisite: none.
+26. **PR-Z A Date cell's padding is zeroed on 32-bit targets** (P43). Prerequisite: none.
 
 Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616f5e` for P05, `79aae9aa7` for P06 and P15); drop them at the next upstream sync and take upstream's versions.
 
@@ -537,6 +539,14 @@ Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616
 - Fix: arrays use the pointer-width slot descriptor like objects and closures. File: `perry-runtime/src/gc/layout_slot_visit.rs`.
 - Test: wasi probe `.github/supa/wasi-probes/array-named-props-gc.js` (traps without the fix, with and without `PERRY_GC_FORCE_EVACUATE=1`); port to `crates/perry/tests` for upstream.
 - Upstream: not cherry-picked. Depends on: none. PR-Y.
+
+### P43 pending fix(runtime): zero the DateCell padding on 32-bit targets
+- Area / platform: runtime (`date.rs`, `object/shape_rule3.rs`, `object/native_get.rs`) / wasm32.
+- Problem: Storage trapped with `out of bounds memory access` in `Renderer.setLastModifiedHeader` (a Date formatted into a response header) after a rejected duplicate 5 MB upload followed by a download. The same sequence also trapped in `JSON.stringify` of an object holding a Date (`date_to_json_value` -> `try_data_lookup_key`), which is where the fault was traced. The failure needs the allocator to hand a Date the memory of a dead object, so it is intermittent.
+- Root cause: a `DateCell` is `meta` (pointer-sized), then the timestamp at offset 8. On wasm32 the pointer is four bytes and four bytes of padding follow, which `alloc_date_cell` never wrote. The arena does not zero reused memory. The property-read paths treat the word at payload +4 as the object's ShapeId (the layout is `class_id`, `parent_class_id` = ShapeId, padding, `meta` on ILP32), so the padding is read as a ShapeId. When the previous occupant was an ordinary object, its ShapeId was still there, the Date was classified as an ordinary object, and the lookup dereferenced the object's overflow table and slots, which a Date cell does not have. On 64-bit targets that word is the high half of `meta`, which is null.
+- Fix: the cell gets an explicit `_meta_padding: u32` field on 32-bit targets, and `alloc_date_cell` zeroes it. The size and the timestamp offset are unchanged (the existing const asserts hold). File: `perry-runtime/src/date.rs`.
+- Test: wasi probe `.github/supa/wasi-probes/date-cell-reuse.js` allocates Dates into freed object memory and stringifies them (traps before the fix; prints `dates intact` after); port to `crates/perry/tests` for upstream.
+- Upstream: not cherry-picked. Depends on: none. PR-Z.
 
 ## Not for upstream
 
