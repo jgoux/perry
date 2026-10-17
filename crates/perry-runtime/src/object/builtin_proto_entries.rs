@@ -515,35 +515,111 @@ extern "C" {
     fn js_validate_array_callback(cb_boxed: f64) -> i64;
     fn js_validate_array_map_callback(arr: i64, cb_boxed: f64) -> i64;
     fn js_validate_array_comparator(cmp_boxed: f64) -> i64;
-    fn js_array_forEach(arr: i64, callback: i64);
-    fn js_array_map(arr: i64, callback: i64) -> i64;
-    fn js_array_map_discard(arr: i64, callback: i64);
-    fn js_array_filter(arr: i64, callback: i64) -> i64;
-    fn js_array_find(arr: i64, callback: i64) -> f64;
-    fn js_array_findIndex(arr: i64, callback: i64) -> i32;
-    fn js_array_find_last(arr: i64, callback: i64) -> f64;
-    fn js_array_find_last_index(arr: i64, callback: i64) -> i32;
-    fn js_array_some(arr: i64, callback: i64) -> f64;
-    fn js_array_every(arr: i64, callback: i64) -> f64;
-    fn js_array_flatMap(arr: i64, callback: i64) -> i64;
-    fn js_array_sort_with_comparator(arr: i64, comparator: i64) -> i64;
-    fn js_array_reduce(arr: i64, callback: i64, has_initial: i32, initial: f64) -> f64;
-    fn js_array_reduce_right(arr: i64, callback: i64, has_initial: i32, initial: f64) -> f64;
-    fn js_array_indexOf_jsvalue(arr: i64, value: f64, from_index: f64, has_from: i32) -> i64;
-    fn js_array_last_index_of_jsvalue(arr: i64, value: f64, from_index: f64, has_from: i32) -> i64;
-    fn js_array_includes_jsvalue(arr: i64, value: f64, from_index: f64, has_from: i32) -> i32;
-    fn js_array_at(arr: i64, index: f64) -> f64;
-    fn js_array_join_value(arr: i64, separator_value: f64) -> *mut StringHeader;
-    fn js_array_flat(arr: i64) -> i64;
-    fn js_array_to_reversed(arr: i64) -> i64;
-    fn js_array_to_sorted_default(arr: i64) -> i64;
-    fn js_array_to_sorted_with_comparator(arr: i64, comparator: i64) -> i64;
-    fn js_array_with(arr: i64, index: f64, value: f64) -> i64;
-    fn js_array_entries_iter_obj(arr: i64) -> i64;
-    fn js_array_keys_iter_obj(arr: i64) -> i64;
-    fn js_array_values_iter_obj(arr: i64) -> i64;
-    fn js_array_slice_values(arr: i64, start_value: f64, end_value: f64) -> i64;
-    fn js_array_shift_f64(arr: i64) -> f64;
+}
+
+/// Pointer-width integer of the target: what the array operations below take
+/// and return for `*const ArrayHeader` and friends.
+#[cfg(target_pointer_width = "64")]
+type Wp = i64;
+#[cfg(target_pointer_width = "32")]
+type Wp = i32;
+
+type StrPtr = *mut StringHeader;
+
+macro_rules! wide_ty {
+    (P) => {
+        i64
+    };
+    ($t:tt) => {
+        $t
+    };
+}
+macro_rules! native_ty {
+    (P) => {
+        Wp
+    };
+    ($t:tt) => {
+        $t
+    };
+}
+macro_rules! to_native {
+    (P, $e:expr) => {
+        $e as Wp
+    };
+    ($t:tt, $e:expr) => {
+        $e
+    };
+}
+macro_rules! from_native {
+    (P, $e:expr) => {
+        $e as i64
+    };
+    ($t:tt, $e:expr) => {
+        $e
+    };
+}
+
+/// The array operations take their heap pointers at the target's pointer width
+/// (`i32` on wasm32), while this file carries them as `i64` like codegen does.
+/// Declaring them `i64` made each call a signature mismatch, which wasm lowers
+/// to a trap. `P` marks a pointer slot; the wrappers keep the `i64` signature
+/// the call sites use and cast at the boundary (a no-op on LP64).
+macro_rules! pointer_externs {
+    ($( fn $name:ident($($arg:ident: $t:tt),*) $(-> $ret:tt)?; )*) => {
+        mod ffi {
+            use super::*;
+            extern "C" {
+                $( pub fn $name($($arg: native_ty!($t)),*) $(-> native_ty!($ret))?; )*
+            }
+        }
+        $( pointer_externs!(@wrap $name ($($arg: $t),*) $(-> $ret)?); )*
+    };
+    (@wrap $name:ident ($($arg:ident: $t:tt),*) -> $ret:tt) => {
+        #[inline(always)]
+        #[allow(clippy::unnecessary_cast, non_snake_case)]
+        unsafe fn $name($($arg: wide_ty!($t)),*) -> wide_ty!($ret) {
+            from_native!($ret, ffi::$name($(to_native!($t, $arg)),*))
+        }
+    };
+    (@wrap $name:ident ($($arg:ident: $t:tt),*)) => {
+        #[inline(always)]
+        #[allow(clippy::unnecessary_cast, non_snake_case)]
+        unsafe fn $name($($arg: wide_ty!($t)),*) {
+            ffi::$name($(to_native!($t, $arg)),*)
+        }
+    };
+}
+
+pointer_externs! {
+    fn js_array_forEach(arr: P, callback: P);
+    fn js_array_map(arr: P, callback: P) -> P;
+    fn js_array_map_discard(arr: P, callback: P);
+    fn js_array_filter(arr: P, callback: P) -> P;
+    fn js_array_find(arr: P, callback: P) -> f64;
+    fn js_array_findIndex(arr: P, callback: P) -> i32;
+    fn js_array_find_last(arr: P, callback: P) -> f64;
+    fn js_array_find_last_index(arr: P, callback: P) -> i32;
+    fn js_array_some(arr: P, callback: P) -> f64;
+    fn js_array_every(arr: P, callback: P) -> f64;
+    fn js_array_flatMap(arr: P, callback: P) -> P;
+    fn js_array_sort_with_comparator(arr: P, comparator: P) -> P;
+    fn js_array_reduce(arr: P, callback: P, has_initial: i32, initial: f64) -> f64;
+    fn js_array_reduce_right(arr: P, callback: P, has_initial: i32, initial: f64) -> f64;
+    fn js_array_indexOf_jsvalue(arr: P, value: f64, from_index: f64, has_from: i32) -> i64;
+    fn js_array_last_index_of_jsvalue(arr: P, value: f64, from_index: f64, has_from: i32) -> i64;
+    fn js_array_includes_jsvalue(arr: P, value: f64, from_index: f64, has_from: i32) -> i32;
+    fn js_array_at(arr: P, index: f64) -> f64;
+    fn js_array_join_value(arr: P, separator_value: f64) -> StrPtr;
+    fn js_array_flat(arr: P) -> P;
+    fn js_array_to_reversed(arr: P) -> P;
+    fn js_array_to_sorted_default(arr: P) -> P;
+    fn js_array_to_sorted_with_comparator(arr: P, comparator: P) -> P;
+    fn js_array_with(arr: P, index: f64, value: f64) -> P;
+    fn js_array_entries_iter_obj(arr: P) -> i64;
+    fn js_array_keys_iter_obj(arr: P) -> i64;
+    fn js_array_values_iter_obj(arr: P) -> i64;
+    fn js_array_slice_values(arr: P, start_value: f64, end_value: f64) -> P;
+    fn js_array_shift_f64(arr: P) -> f64;
 }
 
 /// Cell bits that say an array may not read `name` from
