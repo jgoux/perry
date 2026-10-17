@@ -63,7 +63,7 @@ Conventions in this file:
 | P39 | 28fa69faf | fix(wasm32): pass a JS body's callee as a pointer in indirect calls | codegen (wasm32) | wasm32 | wasi probe `closure-call-in-loop.js` + unit | not tried | PR-U |
 | P40 | 3d45a1e6d | fix(runtime): register the standard descriptors for fs on WASI | runtime (fs) | wasm32 (WASI) | wasi probe `fs-stdio-fd.js` | not tried | PR-W |
 | P41 | 5a0100769 | fix(runtime): report readableEnded only once the end event was emitted | runtime (node:stream) | all | unit + wasi probe `stream-readable-ended.js` | not tried | PR-X |
-| P42 | 7f704b6bb | fix(gc): trace an array's named-property holder as a pointer | gc (layout) | wasm32 | wasi probe `array-named-props-gc.js` | not tried | PR-Y |
+| P42 | 743236204 | fix(gc): trace an array's named-property holder as a pointer | gc (layout) | wasm32 | wasi probe `array-named-props-gc.js` | not tried | PR-Y |
 
 All 22 patches except P12's `.github` hunks, P05 and P06 cherry-pick cleanly.
 A stack of every patch except P05 and P06, with P12 limited to `crates/`, also applies cleanly in sequence on `1fd8ca2ae`.
@@ -530,7 +530,7 @@ Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616
 - Upstream: not cherry-picked. Depends on: none. PR-X.
 - Not covered: a server `IncomingMessage` still reports `readableEnded` as `complete` and `closed` as undefined (perry-ext-http `handle_dispatch.rs`).
 
-### P42 7f704b6bb fix(gc): trace an array's named-property holder as a pointer
+### P42 743236204 fix(gc): trace an array's named-property holder as a pointer
 - Area / platform: gc (`gc/layout_slot_visit.rs`) / wasm32.
 - Problem: Storage (ajv schema compilation, tagged templates) trapped nondeterministically with `out of bounds memory access` in `named_layout_holds_element_descriptors`; any program that keeps arrays with own named properties (tagged-template `strings.raw`, regexp `match` results, `arr.label = ...`) across a nursery collection could read a freed property holder.
 - Root cause: the array's `named` word is a raw machine pointer. The layout visitor gave it a `u64` slot descriptor (only objects and closures got the pointer-width one). On wasm32 the pointer is four bytes inside an eight-byte-aligned header, followed by four padding bytes, so the `u64` read folded whatever the padding held into the address; the edge was then neither marked nor rewritten, and the holder was reclaimed or left at its old address once the array was evacuated. Native targets read the full pointer word and were unaffected.
