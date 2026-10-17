@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Smoke flow against a running Storage: /status, create bucket, upload, download (bytes identical), list.
 # Writes a normalized transcript to <outfile>; exits non-zero on the first failed expectation.
-# usage: smoke.sh <port> <outfile>     (needs SERVICE_KEY)
+# usage: smoke.sh <port> <outfile>     (needs SERVICE_KEY; SMOKE_BYTES sets the upload size, default 100000)
 set -uo pipefail
 port=${1:?port}; out=${2:?outfile}
 base=http://127.0.0.1:$port
@@ -24,7 +24,7 @@ step() { # <name> <expected status> <curl args...> ; body -> $work/body
 }
 norm() { jq -S -c "$1" "$work/body" >> "$out"; }
 
-head -c 100000 /dev/urandom > "$work/up.bin"
+head -c "${SMOKE_BYTES:-100000}" /dev/urandom > "$work/up.bin"
 want_sum=$(sha256sum "$work/up.bin" | cut -d' ' -f1)
 
 step "GET /status" 200 "$base/status" || exit 1
