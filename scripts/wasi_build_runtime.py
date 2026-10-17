@@ -16,6 +16,16 @@ import sys
 
 ROOT = Path(__file__).resolve().parent.parent
 
+# perry-stdlib features of the wasip1 bundle. Mirrors what the native
+# no-auto Storage link selects: `compression-gzip` and `bundled-net/ws` are
+# replaced by their ext crates, which the bundle links directly.
+WASIP1_STDLIB_FEATURES = [
+    "async-bridge", "bundled-events", "bundled-streams", "crypto", "http-server",
+    "web-fetch", "external-http-client-pump", "external-http-server-pump",
+    "external-net-pump", "external-net-tls", "external-tls-server",
+    "external-ws-pump", "external-zlib-pump",
+]
+
 
 def main() -> int:
     target = sys.argv[1] if len(sys.argv) > 1 else "wasm32-wasip2"
@@ -32,7 +42,15 @@ def main() -> int:
     excluded = {"mod-dgram", "alloc-mimalloc"}
     if excluded - set(defaults):
         sys.exit("Stale WASI feature exclusions; update wasi_check.sh and this script")
-    features = ",".join(f"perry-runtime/{f}" for f in defaults if f not in excluded)
+    features = [f"perry-runtime/{f}" for f in defaults if f not in excluded]
+    if target == "wasm32-wasip1":
+        # One storage-capable bundle: the extension crates and the perry-stdlib
+        # features Supabase Storage's native link selects (well-known routing
+        # of http/https/net/tls/undici/zlib/ws plus crypto, events, streams and
+        # fetch), all in this archive under one allocator.
+        features += ["perry-runtime-static/wasi-node-modules"]
+        features += [f"perry-stdlib/{f}" for f in WASIP1_STDLIB_FEATURES]
+    features = ",".join(features)
     command = ["cargo", "build", "--locked", "--release", "-p", "perry-runtime-static",
                "--target", target, "--no-default-features", "--features", features,
                "--message-format=json-render-diagnostics"]

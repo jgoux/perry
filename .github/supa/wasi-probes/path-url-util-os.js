@@ -1,0 +1,20 @@
+// node:path, node:url, node:util and node:os basics.
+const path = require('node:path');
+const util = require('node:util');
+const os = require('node:os');
+console.log(path.join('/a', 'b', '../c', 'd.txt'), path.resolve('/x', 'y'), path.basename('/a/b.txt', '.txt'));
+console.log(path.extname('f.tar.gz'), path.dirname('/a/b/c'), path.normalize('/a//b/./c/..'), path.isAbsolute('a'));
+console.log(JSON.stringify(path.parse('/home/u/f.txt')), path.relative('/a/b', '/a/c/d'), path.sep);
+const u = new URL('https://user:pw@example.com:8443/p/a/t/h?query=string&a=1#hash');
+console.log(u.protocol, u.host, u.hostname, u.port, u.pathname, u.search, u.hash, u.username);
+console.log(new URL('../x?y=1', 'http://h.test/a/b/c').href);
+const sp = new URLSearchParams('a=1&b=2&a=3');
+sp.append('c', 'x y');
+sp.delete('b');
+console.log(sp.getAll('a').join(','), sp.toString(), sp.has('c'));
+console.log(util.inspect({ a: 1, b: [1, 2, { c: 3 }], s: 'str' }), util.format('%s=%d %j', 'x', 5, { k: 1 }));
+console.log(util.inspect('q'), util.types.isPromise(Promise.resolve()), util.isDeepStrictEqual({ a: [1] }, { a: [1] }));
+const later = util.promisify((x, cb) => setTimeout(() => cb(null, x * 2), 1));
+later(21).then((v) => console.log('promisify', v));
+console.log(typeof os.hostname(), os.EOL === '\n', typeof os.platform(), typeof os.cpus().length, os.tmpdir().length > 0);
+console.log(typeof os.totalmem(), typeof os.homedir());

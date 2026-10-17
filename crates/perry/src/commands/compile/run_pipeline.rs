@@ -6753,7 +6753,46 @@ pub fn run_with_parse_cache(
         // overwrite it with the component.
         if !args.no_link {
             let runtime_lib = find_runtime_library(Some(target_name))?;
-            super::link::wasi::link_wasi(flavour, &obj_paths, &runtime_lib, &exe_path, verbose)?;
+            let mut link_objects = obj_paths.clone();
+            // The preview1 runtime archive bundles perry-stdlib and the
+            // extension crates (`wasi-node-modules`), so its optional features
+            // install the way an auto-optimized native archive's do: one
+            // object whose static constructor (`.init_array`, run by
+            // `__wasm_call_ctors` from `_start`) registers the installers.
+            // The stdlib half is only referenced by programs that use it, so a
+            // program without Node built-ins does not retain the stdlib.
+            let installer_path = (flavour == super::link::wasi::Flavour::P1)
+                .then(|| -> Result<PathBuf> {
+                    let runtime_symbols = crate::commands::stdlib_installs::runtime_installer_callees(
+                        &crate::commands::stdlib_installs::FeatureInstalls::Compiled,
+                    );
+                    let stdlib_symbols = ctx.needs_stdlib.then(|| {
+                        crate::commands::stdlib_installs::installer_callees(
+                            &crate::commands::stdlib_installs::FeatureInstalls::Compiled,
+                        )
+                    });
+                    let bytes = perry_codegen::stubs::generate_feature_installer_object(
+                        &runtime_symbols,
+                        stdlib_symbols.as_deref(),
+                        Some(target_name),
+                    )?;
+                    let path = object_output_dir.join("_perry_feature_installs.o");
+                    fs::write(&path, &bytes)?;
+                    Ok(path)
+                })
+                .transpose()?;
+            link_objects.extend(installer_path.iter().cloned());
+            let linked = super::link::wasi::link_wasi(
+                flavour,
+                &link_objects,
+                &runtime_lib,
+                &exe_path,
+                verbose,
+            );
+            if let Some(path) = &installer_path {
+                let _ = fs::remove_file(path);
+            }
+            linked?;
             if let OutputFormat::Text = format {
                 println!("Wrote WASI component: {}", exe_path.display());
             }

@@ -12,7 +12,7 @@
 #                     changes keep it, so they cost a relink, not 35 min of codegen.
 #   storage-built-*   built Storage checkout (node_modules + dist), keyed by SHA.
 #   perry-wasip1-*    wasm32-wasip1 runtime archive for `perry compile --target
-#                     wasip1`, keyed by the runtime crates only.
+#                     wasip1`, keyed by the runtime, stdlib and ext crates only.
 #   wasi-tools-*      wasi-sdk, wasmtime and wasm-tools for the wasi-linux job.
 name: supa-storage
 run-name: supa-storage / ${{ github.sha }}
@@ -232,7 +232,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: target/wasm32-wasip1/release/libperry_runtime.a
-          key: perry-wasip1-runtime-${{ runner.arch }}-${{ hashFiles('crates/perry-runtime/**', 'crates/perry-runtime-static/**', 'crates/perry-ext-net/**', 'crates/perry-ffi/**', 'crates/perry-native-registration/**', 'crates/perry-abi/**', 'crates/perry-parser/**', 'crates/perry-diagnostics/**', 'crates/perry-dispatch/**', 'Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/**', 'scripts/wasi_build_runtime.*') }}
+          key: perry-wasip1-runtime-${{ runner.arch }}-${{ hashFiles('crates/perry-runtime/**', 'crates/perry-runtime-static/**', 'crates/perry-ext-net/**', 'crates/perry-ext-http/**', 'crates/perry-http-server/**', 'crates/perry-ext-undici/**', 'crates/perry-ext-zlib/**', 'crates/perry-ext-ws/**', 'crates/perry-stdlib/**', 'crates/perry-ffi/**', 'crates/perry-native-registration/**', 'crates/perry-abi/**', 'crates/perry-parser/**', 'crates/perry-diagnostics/**', 'crates/perry-dispatch/**', 'Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/**', 'scripts/wasi_build_runtime.*') }}
       - name: Build the wasm32-wasip1 runtime
         if: steps.runtime.outputs.cache-hit != 'true'
         run: |

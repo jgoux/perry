@@ -7,8 +7,9 @@
 //! and carries no component-model adapter, so it has no `cabi_realloc`.
 //!
 //! Deliberately separate from the native link path: no auto-optimize runtime
-//! rebuild, no stdlib, no link cache. Only compiled with the off-by-default
-//! `target-wasi` feature.
+//! rebuild, no link cache, no per-program stdlib selection (the preview1
+//! runtime archive already bundles perry-stdlib and the extension crates).
+//! Only compiled with the off-by-default `target-wasi` feature.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -120,9 +121,11 @@ pub(crate) fn link_wasi(
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         let hint = if stderr.contains("undefined symbol") {
-            "\n\nA symbol the runtime does not provide on WASI yet: most Node \
-             APIs beyond the core runtime (net, http, fetch, zlib, …) live in \
-             perry-stdlib, which is not available for --target wasi (#11377)."
+            "\n\nA symbol the runtime archive does not provide on WASI yet. \
+             `--target wasip1` links a runtime that bundles perry-stdlib and the \
+             http/net/undici/ws/zlib extension crates \
+             (`scripts/wasi_build_runtime.sh wasm32-wasip1`); `--target wasi` \
+             (preview 2) links the core runtime only, without perry-stdlib (#11377)."
         } else {
             ""
         };

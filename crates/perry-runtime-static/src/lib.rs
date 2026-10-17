@@ -14,6 +14,18 @@
 //! native code calls) into this archive.
 #[cfg(target_os = "wasi")]
 extern crate perry_ext_net;
+#[cfg(all(target_os = "wasi", feature = "wasi-node-modules"))]
+extern crate perry_ext_http;
+#[cfg(all(target_os = "wasi", feature = "wasi-node-modules"))]
+extern crate perry_ext_undici;
+#[cfg(all(target_os = "wasi", feature = "wasi-node-modules"))]
+extern crate perry_ext_ws;
+#[cfg(all(target_os = "wasi", feature = "wasi-node-modules"))]
+extern crate perry_ext_zlib;
+#[cfg(all(target_os = "wasi", feature = "wasi-node-modules"))]
+extern crate perry_http_server;
+#[cfg(all(target_os = "wasi", feature = "wasi-node-modules"))]
+extern crate perry_stdlib;
 extern crate perry_runtime;
 #[cfg(target_os = "wasi")]
 mod wasi_ffi;

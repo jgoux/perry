@@ -332,7 +332,6 @@ dashmap.workspace = true
 # sans-I/O session (declared with the turnloop client engines above), not on
 # tokio-rustls (turnloop P8 group H).
 rustls = { workspace = true, optional = true }
-rustls-native-certs = { version = "0.8", optional = true }
 rustls-pemfile = { workspace = true, optional = true }
 
 # Database
@@ -425,6 +424,9 @@ perry-uuid = { workspace = true, optional = true }
 # entirely (no terminal surface on those platforms).
 [target.'cfg(not(target_os = "wasi"))'.dependencies]
 openssl-sys = { version = "0.9", optional = true, features = ["vendored"] }
+# Enabled by the TLS features, but wasm32 WASI has no platform certificate
+# store (the wasi TLS client uses webpki-roots, see perry-ext-net).
+rustls-native-certs = { version = "0.8", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

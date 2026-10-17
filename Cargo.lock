@@ -5439,8 +5439,14 @@ dependencies = [
 name = "perry-runtime-static"
 version = "0.5.1659"
 dependencies = [
+ "perry-ext-http",
  "perry-ext-net",
+ "perry-ext-undici",
+ "perry-ext-ws",
+ "perry-ext-zlib",
+ "perry-http-server",
  "perry-runtime",
+ "perry-stdlib",
 ]
 
 [[package]]

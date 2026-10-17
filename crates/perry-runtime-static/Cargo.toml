@@ -24,6 +24,19 @@ path = "src/lib.rs"
 # the `dep/feature` form because perry-runtime is in this crate's dependency
 # graph), so no per-feature forwarding is needed here.
 default = ["perry-runtime/default"]
+# wasip1 only: fold perry-stdlib and every extension crate Supabase Storage's
+# native link pulls in into this one archive, under one allocator.
+# `scripts/wasi_build_runtime.py` turns it on for `wasm32-wasip1` together with
+# the perry-stdlib features Storage selects. Native and wasip2 builds leave it
+# off, so they do not compile the extra crates.
+wasi-node-modules = [
+    "dep:perry-stdlib",
+    "dep:perry-ext-http",
+    "dep:perry-http-server",
+    "dep:perry-ext-undici",
+    "dep:perry-ext-zlib",
+    "dep:perry-ext-ws",
+]
 
 [dependencies]
 # default-features = false so `--no-default-features` on this wrapper actually
@@ -36,3 +49,9 @@ perry-runtime = { path = "../perry-runtime", default-features = false }
 # Rust staticlibs both define allocator shims; one staticlib keeps a single
 # allocator and a single copy of std without permitting duplicate symbols.
 perry-ext-net = { path = "../perry-ext-net" }
+perry-stdlib = { path = "../perry-stdlib", default-features = false, optional = true }
+perry-ext-http = { path = "../perry-ext-http", optional = true }
+perry-http-server = { path = "../perry-http-server", optional = true }
+perry-ext-undici = { path = "../perry-ext-undici", optional = true }
+perry-ext-zlib = { path = "../perry-ext-zlib", optional = true }
+perry-ext-ws = { path = "../perry-ext-ws", optional = true }

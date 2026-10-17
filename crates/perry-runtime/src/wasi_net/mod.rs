@@ -158,7 +158,7 @@ pub fn tcp_listen(
     backlog: u32,
     reuse_port: bool,
     nodelay: bool,
-) -> NetResult<()> {
+) -> NetResult<SocketAddr> {
     initialize();
     STATE.with(|state| {
         let mut state = state.borrow_mut();
@@ -183,7 +183,11 @@ pub fn tcp_listen(
         handle.listener = true;
         handle.nodelay = nodelay;
         state.handles.insert(id, handle);
-        Ok(())
+        // Same contract as the turnloop transport (callers report this as
+        // `server.address()`). The p1 host binds the requested address, so
+        // the requested address is returned; an ephemeral port 0 stays 0
+        // until the socket slice reads the bound port back from the host.
+        Ok(addr)
     })
 }
 pub fn tcp_connect_host(

@@ -10,6 +10,8 @@
 #   // max-rss-mb: N           the wasmtime process must stay under N MB
 #   // optional: REASON        a compile or link failure is recorded as MISSING,
 #                              not a failure (a probe that compiles must still match)
+# Every run gets a writable scratch directory: WORK_DIR for node, preopened as
+# /work for wasmtime (--dir HOST::/work), so fs probes can write files.
 # Environment: PERRY_BIN, WASMTIME, WASMTIME_FLAGS, OUT.
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
@@ -47,8 +49,9 @@ for n in "${names[@]}"; do
     cat "$d/imports.log"; verdict="FAIL (imports)"; rc=1
   fi
 
-  (cd "$d" && timeout 120 node "$n.js" > node.out 2> node.err); echo $? > "$d/node.rc"
-  (cd "$d" && /usr/bin/time -v -o time.txt timeout 300 "$wasmtime" run $flags "$n.wasm" > run.out 2> run.err); echo $? > "$d/run.rc"
+  mkdir -p "$d/work"
+  (cd "$d" && WORK_DIR="$d/work" timeout 120 node "$n.js" > node.out 2> node.err); echo $? > "$d/node.rc"
+  (cd "$d" && /usr/bin/time -v -o time.txt timeout 300 "$wasmtime" run $flags --dir "$d/work::/work" "$n.wasm" > run.out 2> run.err); echo $? > "$d/run.rc"
   rss=$(awk -F': ' '/Maximum resident set size/ {printf "%d", $2 / 1024}' "$d/time.txt")
   echo "--- stdout (wasm) ---"; head -c 3000 "$d/run.out"
   echo "--- stderr (wasm, tail) ---"; tail -n 12 "$d/run.err"
