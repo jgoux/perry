@@ -109,7 +109,7 @@ jobs:
         run: .github/supa/simulate.sh "${{ inputs.simulate }}"
       - name: Cache key
         id: key
-        run: echo "key=perry-dist-${{ runner.arch }}-wasi-gcfx-${{ hashFiles('crates/**', 'Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/**', '!crates/*/tests/**', '!**/*.md') }}" >> "$GITHUB_OUTPUT"
+        run: echo "key=perry-dist-${{ runner.arch }}-wasi-gcfx2-${{ hashFiles('crates/**', 'Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/**', '!crates/*/tests/**', '!**/*.md') }}" >> "$GITHUB_OUTPUT"
       - name: Already built?
         id: have
         uses: actions/cache/restore@v4
@@ -129,7 +129,7 @@ jobs:
           # changes nothing for the native targets.
           cargo build --locked --release -p perry --bin perry --no-default-features --features compile-cli,target-wasi &
           compiler=$!
-          CARGO_TARGET_DIR="$PWD/target-libs" cargo build --locked --release -p perry-runtime-static -p perry-stdlib-static -p perry-ext-http -p perry-ext-net -p perry-ext-undici &
+          CARGO_TARGET_DIR="$PWD/target-libs" cargo build --locked --release -p perry-runtime-static -p perry-stdlib-static -p perry-ext-http -p perry-ext-net -p perry-ext-undici -p perry-ext-zlib -p perry-ext-ws &
           libs=$!
           rc=0; wait "$compiler" || rc=1; wait "$libs" || rc=1
           [ "$rc" = 0 ]
