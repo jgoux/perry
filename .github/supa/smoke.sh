@@ -2,6 +2,7 @@
 # Smoke flow against a running Storage: /status, create bucket, upload, download (bytes identical), list,
 # then four error paths (invalid key, duplicate upload, missing object, bad JWT) whose bodies must match node.
 # Storage answers each of them with HTTP 400 and the real status in the body's statusCode.
+# Then object info and HEAD, authenticated and public.
 # Writes a normalized transcript to <outfile>; exits non-zero on the first failed expectation.
 # usage: smoke.sh <port> <outfile>     (needs SERVICE_KEY; SMOKE_BYTES sets the upload size, default 100000)
 set -uo pipefail
@@ -64,5 +65,24 @@ step "GET /object/smoke/missing.bin" 400 "$base/object/smoke/missing.bin" -H "${
 norm '.'
 step "GET /bucket (bad JWT)" 400 "$base/bucket" -H 'Authorization: Bearer not.a.jwt' || exit 1
 norm '.'
-echo "smoke ok" >> "$out"
+# Object info and HEAD, authenticated and public. A failing step does not stop the flow, so
+# one run reports every route; a route that kills the server shows as curl-failed after it.
+step "HEAD /object/authenticated/smoke/hello.bin" 200 -I "$base/object/authenticated/smoke/hello.bin" -H "${auth[0]}"
+step "HEAD /object/smoke/hello.bin" 200 -I "$base/object/smoke/hello.bin" -H "${auth[0]}"
+step "GET /object/info/smoke/hello.bin" 200 "$base/object/info/smoke/hello.bin" -H "${auth[0]}" \
+  && norm 'del(.id, .version, .etag, .last_modified, .created_at)'
+step "GET /object/info/authenticated/smoke/hello.bin" 200 "$base/object/info/authenticated/smoke/hello.bin" -H "${auth[0]}" \
+  && norm 'del(.id, .version, .etag, .last_modified, .created_at)'
+step "GET /object/info/authenticated/smoke/missing.bin" 400 "$base/object/info/authenticated/smoke/missing.bin" -H "${auth[0]}" \
+  && norm '.'
+step "GET /object/info/public/smoke/hello.bin (private bucket)" 404 "$base/object/info/public/smoke/hello.bin" \
+  && norm '.'
+step "POST /bucket (public)" 200 -X POST "$base/bucket" -H "${auth[0]}" -H 'Content-Type: application/json' \
+  -d '{"name":"smokepub","public":true}' && norm '.'
+step "POST /object/smokepub/pub.txt" 200 -X POST "$base/object/smokepub/pub.txt" -H "${auth[0]}" \
+  -H 'Content-Type: text/plain' --data-binary 'public object' && norm 'del(.Id)'
+step "GET /object/info/public/smokepub/pub.txt" 200 "$base/object/info/public/smokepub/pub.txt" \
+  && norm 'del(.id, .version, .etag, .last_modified, .created_at)'
+step "HEAD /object/public/smokepub/pub.txt" 200 -I "$base/object/public/smokepub/pub.txt"
+if [ "$fail" = 0 ]; then echo "smoke ok" >> "$out"; fi
 exit $fail
