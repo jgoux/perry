@@ -75,7 +75,7 @@ step "GET /object/info/authenticated/smoke/hello.bin" 200 "$base/object/info/aut
   && norm 'del(.id, .version, .etag, .last_modified, .created_at)'
 step "GET /object/info/authenticated/smoke/missing.bin" 400 "$base/object/info/authenticated/smoke/missing.bin" -H "${auth[0]}" \
   && norm '.'
-step "GET /object/info/public/smoke/hello.bin (private bucket)" 404 "$base/object/info/public/smoke/hello.bin" \
+step "GET /object/info/public/smoke/hello.bin (private bucket)" 400 "$base/object/info/public/smoke/hello.bin" \
   && norm '.'
 step "POST /bucket (public)" 200 -X POST "$base/bucket" -H "${auth[0]}" -H 'Content-Type: application/json' \
   -d '{"name":"smokepub","public":true}' && norm '.'
