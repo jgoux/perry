@@ -65,6 +65,9 @@ on:
       wasi_probe_names:
         description: Space-separated wasi probe names to run in the wasi-linux job (default all)
         default: ''
+      smoke_baseline_run:
+        description: Run id whose storage-wasi-module artifact the storage-wasi-smoke job also runs, on the same host, to compare with (empty to skip)
+        default: ''
       simulate:
         description: Measurement aid, touch one source file to exercise cache invalidation without a commit
         type: choice
@@ -376,6 +379,115 @@ jobs:
             supa-out/storage.wasm
             supa-out/storage.stripped.wasm
           retention-days: 14
+
+  # Storage compiled to wasip1, run under supa-host (the host of supabase/supa-wasm) against
+  # Postgres and compared with the node reference: three fresh instances (100 KB upload, 5 MiB upload,
+  # GC verifier forced), each timed to /status and driven by smoke.sh. The host's source for this job
+  # is the supa/ci-supa-host branch of this repository (supabase/supa-wasm is out of reach of this
+  # token). With smoke_baseline_run the module of that run goes through the same host on the same
+  # runner, so the .cwasm size and the ready times compare like with like.
+  storage-wasi-smoke:
+    if: ${{ github.ref_name == 'supa/wasip1' || (github.event_name == 'workflow_dispatch' && inputs.storage_wasi) }}
+    needs: [storage-prep, storage-wasi]
+    runs-on: blacksmith-16vcpu-ubuntu-2404-arm
+    timeout-minutes: 90
+    env:
+      OUT: ${{ github.workspace }}/supa-out
+      PG_PORT: "5432"
+      RUST_VERSION: "1.99.0"
+      ENV_FILE: ${{ github.workspace }}/supa-out/storage.env
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s
+          --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          ref: supa/ci-supa-host
+          path: supa-host-src
+      - name: Storage environment
+        run: |
+          mkdir -p "$OUT"
+          .github/supa/env.sh > "$ENV_FILE"
+          grep -E '^(AUTH_JWT_SECRET|PGRST_JWT_SECRET|SERVICE_KEY|ANON_KEY)=' "$ENV_FILE" \
+            | cut -d= -f2- | while read -r v; do echo "::add-mask::$v"; done
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Built Storage
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.STORAGE_DIR }}
+          key: storage-built-${{ runner.arch }}-${{ needs.storage-prep.outputs.sha }}
+          fail-on-cache-miss: true
+      # The module was compiled from the shimmed checkout, which it reads at run time.
+      - name: Shims
+        working-directory: ${{ env.STORAGE_DIR }}
+        run: $GITHUB_WORKSPACE/.github/supa/shims.sh .
+      - name: supa-host cache
+        id: host
+        uses: actions/cache@v4
+        with:
+          path: supa-host-src/host/target/release/supa-host
+          key: supa-host-${{ runner.arch }}-rust${{ env.RUST_VERSION }}-${{ hashFiles('supa-host-src/host/**') }}
+      - name: Build supa-host
+        if: steps.host.outputs.cache-hit != 'true'
+        working-directory: supa-host-src/host
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          cargo "+$RUST_VERSION" build --release --locked
+      - name: Tools for the smoke flow
+        run: |
+          command -v psql >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client; }
+          jq --version
+          supa-host-src/host/target/release/supa-host --help | head -n 3
+      - uses: actions/download-artifact@v4
+        with:
+          name: node-reference
+          path: ${{ env.OUT }}/node-reference
+      - uses: actions/download-artifact@v4
+        with:
+          name: storage-wasi-module
+          path: ${{ env.OUT }}/new
+      - uses: actions/download-artifact@v4
+        if: ${{ inputs.smoke_baseline_run != '' }}
+        with:
+          name: storage-wasi-module
+          path: ${{ env.OUT }}/base
+          run-id: ${{ inputs.smoke_baseline_run }}
+          github-token: ${{ github.token }}
+      - name: Smoke
+        run: |
+          set -o pipefail
+          modules=(new="$OUT/new/storage.stripped.wasm")
+          [ -f "$OUT/base/storage.stripped.wasm" ] && modules=(base="$OUT/base/storage.stripped.wasm" "${modules[@]}")
+          ls -l "$OUT"/new "$OUT"/base 2>/dev/null || true
+          .github/supa/wasi-smoke.sh "$PWD/supa-host-src/host/target/release/supa-host" "$OUT/node-reference/node-transcript.txt" "$OUT/smoke" "${modules[@]}"
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "### storage-wasi-smoke"
+            echo "- perry: \`${GITHUB_SHA::8}\`, storage: \`${{ needs.storage-prep.outputs.sha }}\`, baseline run: \`${{ inputs.smoke_baseline_run || 'none' }}\`"
+            echo '```'; cat "$OUT/smoke/results.txt" 2>/dev/null; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: storage-wasi-smoke
+          path: |
+            supa-out/smoke/results.txt
+            supa-out/smoke/smoke_*.txt
+            supa-out/smoke/smoke_*.err
+            supa-out/smoke/host_*.log
+          if-no-files-found: ignore
 
   # Tiny programs that isolate runtime behaviour on Linux arm without Storage.
   probes-linux:
