@@ -72,6 +72,7 @@ Conventions in this file:
 | P47 | bea2d51cb | fix(runtime): start reading when a readable that is not flowing is piped | runtime (node:stream, `node_stream_readwrite.rs`) | all | wasi probe `stream-pipe-starts-read.js` | not tried | PR-AD |
 | P48 | 19f404e40 | fix(runtime): hand a live stream to the function stage of stream.pipeline | runtime (node:stream, `node_stream_pipeline.rs`) | all | wasi probe `stream-pipeline-live-source.js` | not tried | PR-AE |
 | P49 | 32943d82a | fix(runtime): read an http request through Readable.toWeb with the request's own read() | runtime (node:stream web adapter, `node_stream_constructors/web_adapter.rs`) | all | wasi probe `http-request-to-web.js` | not tried | PR-AF |
+| P50 | a5ffa98e1 | fix(hir): extend the member a class heritage names when it shares the class's name | HIR class lowering (`perry-hir/src/lower_decl/class_decl.rs`) | all | wasi probe `class-extends-same-name-member.js` | not tried | PR-AG |
 
 All 22 patches except P12's `.github` hunks, P05 and P06 cherry-pick cleanly.
 A stack of every patch except P05 and P06, with P12 limited to `crates/`, also applies cleanly in sequence on `1fd8ca2ae`.
@@ -112,6 +113,7 @@ Ordered by value and independence. Each PR carries its patches' tests.
 30. **PR-AD `readable.pipe()` starts reading a stream that was not flowing** (P47). Prerequisite: none.
 31. **PR-AE `stream.pipeline(streams..., fn)` gives the function the live stream** (P48). Prerequisite: none.
 32. **PR-AF `Readable.toWeb(req)` yields the request body** (P49). Prerequisite: PR-AD, PR-AE for the probe's roundtrip and pipeline routes.
+33. **PR-AG `class X extends ns.X` runs the base constructor** (P50). Prerequisite: none.
 
 Not proposed: P04, P05, P06, P10, P15, P16. Upstream fixed the same bugs independently (`c4bf643f6` for P04, `4ed616f5e` for P05, `79aae9aa7` for P06 and P15, `09e7861b4` for P10, `c1671d39d` for P16); the 2026-10-18 merge took upstream's versions and kept the fork's tests as regression tests.
 
@@ -635,6 +637,15 @@ Not proposed: P04, P05, P06, P10, P15, P16. Upstream fixed the same bugs indepen
 - Test: wasi probe `.github/supa/wasi-probes/http-request-to-web.js` (server probe: a 300 kB POST read with the web reader, through `fromWeb(toWeb(req)).pipe(PassThrough)`, and through that plus `pipeline(proxy, transform, async fn)`; before the fixes P47-P49 the routes answer 0 or hang, after they match node); port to `crates/perry/tests` for upstream. Runs under supa-host with `--listen 127.0.0.1:18323`.
 - Not covered: the CommonJS spelling `const { Readable } = require('node:stream'); Readable.toWeb(x)` goes through the method-value fallback, which returns a plain object rather than a ReadableStream; a `for await` over `Readable.fromWeb(...)` repeats the last chunk; `push(Uint8Array)` into a non-object-mode Readable yields a Uint8Array, not a Buffer.
 - Upstream: not cherry-picked. Depends on: PR-AD, PR-AE for the probe's roundtrip and pipeline routes. PR-AF.
+
+### P50 a5ffa98e1 fix(hir): extend the member a class heritage names when it shares the class's name
+- Area / platform: HIR class lowering / all targets; seen on wasm32-wasip1.
+- Problem: `class FileStore extends import_file_store.FileStore` (Storage's tus store, esbuild-style CommonJS interop) was lowered without a parent. The base constructor never ran, so `this.configstore`, `this.directory` and the other base fields were undefined and `POST /upload/resumable` failed with `Cannot read properties of undefined (reading 'set')`.
+- Root cause: a member heritage is resolved by its trailing property name, and when that name equals the subclass's own name (issue 4908: `class Agent extends http.Agent`) the lookup finds the subclass itself, so the lowering left the class parentless. That is right for a native-module member but wrong when the object is a value the program binds.
+- Fix: when the heritage object is neither a native-module binding nor a global-object alias (`member_heritage_object_is_program_value`), the colliding-name case lowers the heritage expression as the dynamic parent (`extends_expr`), with no static name or link, so `super()` runs the evaluated member's constructor. Native-module and global-alias members keep the parentless handling. Files: `perry-hir/src/lower_decl/class_decl.rs`, `class_decl/class_heritage.rs`.
+- Test: wasi probe `.github/supa/wasi-probes/class-extends-same-name-member.js` (subclass of `@tus/file-store`'s `FileStore` named `FileStore`; before: `instanceof` false, base fields undefined, `hasExtension is not a function`; after: matches node); port to `crates/perry/tests` for upstream.
+- Not covered: a base class and a same-named subclass in the SAME module (for example an IIFE-local base and a top-level subclass) still collide on the by-name class tables in codegen (`class_ids`), and `super()` fails with `Class constructor X cannot be invoked without 'new'`.
+- Upstream: not cherry-picked. Depends on: none. PR-AG.
 
 ## Not for upstream
 

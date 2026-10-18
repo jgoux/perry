@@ -134,3 +134,24 @@ pub(super) fn member_heritage_hides_global_builtin(
         _ => true,
     }
 }
+
+/// Whether the object of a `class X extends obj.Name` heritage is a value the
+/// program binds, as opposed to a native-module binding (`http.Agent`) or a
+/// global-object alias (`globalThis.Agent`), whose members the runtime
+/// provides rather than evaluates.
+pub(super) fn member_heritage_object_is_program_value(
+    ctx: &LoweringContext,
+    member: &ast::MemberExpr,
+) -> bool {
+    let mut obj = member.obj.as_ref();
+    while let ast::Expr::Paren(paren) = obj {
+        obj = paren.expr.as_ref();
+    }
+    let ast::Expr::Ident(ident) = obj else {
+        return false;
+    };
+    let n = ident.sym.as_ref();
+    let global_alias = matches!(n, "globalThis" | "global" | "window" | "self")
+        && ctx.locals.lookup(n).is_none();
+    !global_alias && ctx.lookup_native_module(n).is_none()
+}
