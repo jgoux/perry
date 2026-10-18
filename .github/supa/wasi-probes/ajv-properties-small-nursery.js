@@ -1,6 +1,6 @@
 // npm: ajv@8.18.0
 // max-rss-mb: 1500
-// wasm-env: PERRY_GC_SCHEDULE_SEED=3 PERRY_GC_SCHEDULE_RATE=0.1
+// wasm-env: PERRY_GC_SCAVENGE_NURSERY_MB=1
 // ajv's `properties` keyword keeps one generated name alive across the
 // recursive compilation of every property schema, which allocates enough to
 // collect. The generated code must name the variable, not print an object.
@@ -8,7 +8,7 @@ const Ajv = require('ajv');
 const ajv = new Ajv({ strict: false, code: { source: true } });
 const sources = [];
 let garbage = 0;
-for (let i = 0; i < 6; i++) {
+for (let i = 0; i < 30; i++) {
   const schema = {
     type: 'object',
     properties: {
@@ -24,7 +24,7 @@ for (let i = 0; i < 6; i++) {
   garbage += code.split('').reverse().join('').length;
   const ok = validate({ a: 'x', b: { c: 1, d: ['y'] }, ['p' + i]: 2 });
   const bad = validate({ a: '', b: { c: 1.5 } });
-  if (i % 1 === 0) console.log('schema', i, ok, bad, code.length);
+  if (i % 10 === 0) console.log('schema', i, ok, bad, code.length);
 }
 console.log(sources[0]);
 console.log('object names in generated code:', sources.filter((s) => s.includes('[object Object]')).length);
