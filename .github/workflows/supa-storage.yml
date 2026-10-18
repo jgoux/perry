@@ -80,7 +80,7 @@ on:
         default: none
 
 concurrency:
-  group: supa-storage-${{ github.ref }}
+  group: supa-storage-${{ github.ref }}-${{ inputs.schemas }}
   cancel-in-progress: true
 
 permissions:
