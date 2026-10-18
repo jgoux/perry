@@ -352,6 +352,12 @@ jobs:
           wasm-tools validate "$wasm" 2>&1 | tee "$OUT/validate.txt"
           wasm-tools strip "$wasm" -o "$OUT/storage.stripped.wasm"
           ls -l "$OUT/storage.stripped.wasm"
+      - name: Function source consumers
+        if: always()
+        run: |
+          mkdir -p "$OUT"
+          .github/supa/fn-tostring-scan.sh "$STORAGE_DIR" > "$OUT/fn-tostring-scan.txt" || true
+          grep -c . "$OUT/fn-tostring-scan.txt" || true
       - name: Job summary
         if: always()
         run: |
@@ -372,6 +378,7 @@ jobs:
             supa-out/compile.log
             supa-out/compile.time
             supa-out/imports.txt
+            supa-out/fn-tostring-scan.txt
           if-no-files-found: ignore
       # The compiler and the wasm runtime archive, for compiling small repros in a Linux
       # arm64 container on a dev machine (no LLVM 22 there).
