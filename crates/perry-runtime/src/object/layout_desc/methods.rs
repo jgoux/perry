@@ -24,8 +24,18 @@ pub struct PerryMethodHolder {
 unsafe impl Sync for PerryFamilyMethods {}
 unsafe impl Sync for PerryFamilyMethod {}
 unsafe impl Sync for PerryMethodHolder {}
+// Pointer-width aware like `layout_desc`'s own asserts: the tables spell
+// pointers as `ptr` in codegen's IR, which LLVM lays out at the target's width.
+// wasm32 emits no family tables from codegen, so the ILP32 sizes only pin the
+// runtime's own view of the types.
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<PerryFamilyMethods>() == 16);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<PerryFamilyMethod>() == 24);
+#[cfg(target_pointer_width = "32")]
+const _: () = assert!(std::mem::size_of::<PerryFamilyMethods>() == 12);
+#[cfg(target_pointer_width = "32")]
+const _: () = assert!(std::mem::size_of::<PerryFamilyMethod>() == 16);
 const _: () = assert!(std::mem::size_of::<PerryMethodHolder>() == 8);
 
 /// The carried descriptor band (including possible class method tables).
@@ -86,7 +96,7 @@ pub unsafe extern "C" fn perry_probe_family_method(
         }
         at = (at + 1) & table.mask;
     };
-    let word_dir = *(dir.add(crate::codegen_abi::SHAPE_DIR_FLAT_BASE + 24) as *const *const u8);
+    let word_dir = *(dir.add(super::super::shapes::WORD_DIR_OFFSET) as *const *const u8);
     if word_dir.is_null() {
         return 0;
     }
