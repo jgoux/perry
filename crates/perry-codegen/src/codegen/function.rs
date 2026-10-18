@@ -1180,8 +1180,11 @@ pub(super) fn compile_function(
     shadow_slot_map.retain(|id, _| {
         boxed_vars.contains(id) || !native_facts.number_by_construction_locals().contains(id)
     });
-    let shadow_slot_clears_after_stmt =
-        crate::collectors::collect_shadow_slot_clear_points(&f.body, &shadow_slot_map);
+    let shadow_slot_clears_after_stmt = crate::collectors::collect_shadow_slot_clear_points(
+        &f.body,
+        &shadow_slot_map,
+        &cross_module.scope_map,
+    );
 
     if let Some(plan) = spec_entry {
         // `--opt-report` (#6952): the spec-ABI win, recorded at the same site
