@@ -68,6 +68,11 @@ on:
       smoke_baseline_run:
         description: Run id whose storage-wasi-module artifact the storage-wasi-smoke job also runs, on the same host, to compare with (empty to skip)
         default: ''
+      schemas:
+        description: "lazy builds fastify route validators and serializers on first use (patch-fastify-lazy-schema.cjs); eager keeps fastify's own startup compile, for A/B runs"
+        type: choice
+        options: [lazy, eager]
+        default: lazy
       simulate:
         description: Measurement aid, touch one source file to exercise cache invalidation without a commit
         type: choice
@@ -100,6 +105,8 @@ env:
   PERRY_SRC: ${{ github.workspace }}
   PERRY_RUNTIME_DIR: ${{ github.workspace }}/target/release
   PERRY_BUILD_COMMIT: supa-storage-fork
+  # Read by .github/supa/shims.sh.
+  SUPA_LAZY_SCHEMAS: ${{ inputs.schemas == 'eager' && '0' || '1' }}
 
 jobs:
   # Compiler and runtime archives, built once per source hash.
@@ -851,6 +858,13 @@ jobs:
               [ -f "$OUT/$b" ] && echo "- $b: $(stat -c %s "$OUT/$b") bytes unstripped, $(strip -o /dev/stdout "$OUT/$b" 2>/dev/null | wc -c) bytes stripped"
             done
             [ -f "$OUT/native-idle-rss.txt" ] && sed 's/^/- idle /' "$OUT/native-idle-rss.txt"
+            echo "- fastify schemas: ${{ inputs.schemas || 'lazy' }}"
+            echo '```'
+            [ -f "$OUT/node/ready-times.txt" ] && sed "s/^/node-ref /" "$OUT/node/ready-times.txt"
+            [ -f "$OUT/ready-times.txt" ] && cat "$OUT/ready-times.txt"
+            [ -f "$OUT/native-transcript-timing.txt" ] && { echo 'native, seconds per smoke request:'; cat "$OUT/native-transcript-timing.txt"; }
+            [ -f "$OUT/node/node-transcript-timing.txt" ] && { echo 'node, seconds per smoke request:'; cat "$OUT/node/node-transcript-timing.txt"; }
+            echo '```'
             echo '```'; sccache --show-stats 2>/dev/null | sed -n 1,12p; echo '```'
             echo '```'
             [ -f "$OUT/native-transcript.txt" ] && cat "$OUT/native-transcript.txt"

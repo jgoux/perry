@@ -7,13 +7,16 @@ port=${1:?port}; out=${2:?outfile}
 base=http://127.0.0.1:$port
 auth=("Authorization: Bearer ${SERVICE_KEY:?}")
 work=$(mktemp -d)
-: > "$out"
+timing=${out%.txt}-timing.txt # seconds per request, kept out of the transcript that is diffed
+: > "$out"; : > "$timing"
 fail=0
 
 step() { # <name> <expected status> <curl args...> ; body -> $work/body
   local name=$1 want=$2; shift 2
   local got
-  got=$(curl -sS -m 60 -o "$work/body" -w '%{http_code}' "$@") || got=curl-failed
+  got=$(curl -sS -m 60 -o "$work/body" -w '%{http_code} %{time_total}' "$@") || got="curl-failed 0"
+  printf '%s %s\n' "$name" "${got#* }" >> "$timing"
+  got=${got%% *}
   printf '%s -> %s\n' "$name" "$got" >> "$out"
   if [ "$got" != "$want" ]; then
     printf 'FAIL %s: want %s got %s\n' "$name" "$want" "$got" | tee -a "$out" >&2

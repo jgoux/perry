@@ -24,21 +24,23 @@ export SERVER_PORT=$port SERVER_ADMIN_PORT=$((port + 1))
 rm -rf "$STORAGE_FILE_BACKEND_PATH"; mkdir -p "$STORAGE_FILE_BACKEND_PATH"
 export NODE_ENV=production
 ulimit -c unlimited || true
+t0=$(date +%s%N)
 "$@" > "$logdir/$label.log" 2>&1 &
 pid=$!
 echo "$pid" > "$logdir/$label.pid"
-for i in $(seq 1 ${START_TIMEOUT:-180}); do
+for i in $(seq 1 $(( ${START_TIMEOUT:-180} * 10 ))); do
   if ! kill -0 "$pid" 2>/dev/null; then
     wait "$pid" && rc=0 || rc=$?
-    echo "$label exited during startup (status $rc) after ${i}s" >&2
+    echo "$label exited during startup (status $rc) after $((i / 10))s" >&2
     tail -n 40 "$logdir/$label.log" >&2 || true
     exit 1
   fi
   if curl -fsS -m 2 -o /dev/null "http://127.0.0.1:$port/status"; then
-    echo "$label ready after ${i}s (pid $pid)"
+    echo "$label ready after $((i / 10))s (pid $pid)"
+    echo "$label ready_ms=$(( ($(date +%s%N) - t0) / 1000000 ))" | tee -a "$logdir/ready-times.txt"
     exit 0
   fi
-  sleep 1
+  sleep 0.1
 done
 echo "$label did not answer /status within ${START_TIMEOUT:-180}s" >&2
 tail -n 40 "$logdir/$label.log" >&2 || true
