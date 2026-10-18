@@ -54,6 +54,15 @@ pub fn closure_set_static_prototype(closure_ptr: usize, proto_bits: u64) {
     if closure_ptr == 0 || !is_closure_ptr(closure_ptr) {
         return;
     }
+    if unsafe { super::shape::is_class_info((*(closure_ptr as *const ClosureHeader)).info) } {
+        unsafe {
+            crate::object::class_value::constructor_parent_store(
+                closure_ptr as *mut ClosureHeader,
+                proto_bits,
+            );
+        }
+        return;
+    }
     unsafe { super::props::state_set_prototype(closure_ptr, proto_bits) };
     super::shape::note_function_own_state_changed(closure_ptr);
 }
@@ -62,6 +71,11 @@ pub fn closure_set_static_prototype(closure_ptr: usize, proto_bits: u64) {
 pub fn closure_static_prototype(closure_ptr: usize) -> Option<u64> {
     if closure_ptr == 0 || !is_closure_ptr(closure_ptr) {
         return None;
+    }
+    if unsafe { super::shape::is_class_info((*(closure_ptr as *const ClosureHeader)).info) } {
+        return Some(unsafe {
+            crate::object::class_value::constructor_parent_bits(closure_ptr as *mut ClosureHeader)
+        });
     }
     unsafe { super::props::state_prototype(closure_ptr) }
 }
@@ -206,7 +220,8 @@ pub(crate) fn closure_get_dynamic_prop_keyed(
         if closure.is_null() {
             return f64::from_bits(crate::value::TAG_UNDEFINED);
         }
-        let receiver = crate::value::js_nanbox_pointer(ptr as i64);
+        let receiver = crate::object::field_get_set::accessor_receiver_override_take()
+            .unwrap_or_else(|| crate::value::js_nanbox_pointer(ptr as i64));
         return crate::closure::js_closure_call0(
             closure,
             crate::closure::JsThis::from_f64(receiver),
@@ -297,8 +312,10 @@ pub(crate) fn closure_get_dynamic_prop_keyed(
                     return f64::from_bits(crate::value::TAG_UNDEFINED);
                 }
                 let this_scope = crate::gc::RuntimeHandleScope::new(); // #9445
-                let receiver =
-                    this_scope.root_nanbox_f64(crate::value::js_nanbox_pointer(ptr as i64));
+                let receiver = this_scope.root_nanbox_f64(
+                    crate::object::field_get_set::accessor_receiver_override_take()
+                        .unwrap_or_else(|| crate::value::js_nanbox_pointer(ptr as i64)),
+                );
                 let getter_bits = clone_closure_rebind_this(acc.get, receiver.get_nanbox_f64());
                 let getter = (getter_bits & crate::value::POINTER_MASK)
                     as *const crate::closure::ClosureHeader;
@@ -328,7 +345,10 @@ pub(crate) fn closure_get_dynamic_prop_keyed(
                 return f64::from_bits(crate::value::TAG_UNDEFINED);
             }
             let this_scope = crate::gc::RuntimeHandleScope::new(); // #9445
-            let receiver = this_scope.root_nanbox_f64(crate::value::js_nanbox_pointer(ptr as i64));
+            let receiver = this_scope.root_nanbox_f64(
+                crate::object::field_get_set::accessor_receiver_override_take()
+                    .unwrap_or_else(|| crate::value::js_nanbox_pointer(ptr as i64)),
+            );
             let getter_bits = clone_closure_rebind_this(acc.get, receiver.get_nanbox_f64());
             let getter =
                 (getter_bits & crate::value::POINTER_MASK) as *const crate::closure::ClosureHeader;

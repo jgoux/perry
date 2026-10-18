@@ -113,7 +113,6 @@ fn module_with_classes_and_params(
     body: Vec<Stmt>,
 ) -> Module {
     Module {
-        requested_modules: Vec::new(),
         name: name.to_string(),
         imports: Vec::new(),
         exports: Vec::new(),
@@ -164,7 +163,6 @@ fn module_with_classes_and_params(
         local_source_spans: std::collections::HashMap::new(),
         gen_param_prologue_len: std::collections::HashMap::new(),
         class_family_syntax: None,
-        requested_modules: Vec::new(),
     }
 }
 

@@ -232,6 +232,13 @@ fn emit_function_value_call(
                 continue;
             }
             seen.push(&lane.body);
+            // An inherited candidate can belong to another module. Naming
+            // its entry as a pointer needs the same lazy declare as a call.
+            ctx.pending_declares.push((
+                lane.body.clone(),
+                DOUBLE,
+                crate::expr::body_call::js_body_param_types(lane.arity),
+            ));
             let direct_idx = ctx.new_block("msite.candidate");
             let next_idx = ctx.new_block("msite.candidate_next");
             let direct_l = ctx.block_label(direct_idx);
@@ -460,6 +467,65 @@ pub(crate) fn emit_method_site(
     // The probe: the receiver's own layout, then its prototypes'.
     ctx.current_block = probe_idx;
     let (dir, key_bits, hash) = emit_site_key(ctx, property);
+    if !ctx.program_layouts.families.is_empty()
+        && crate::codegen::static_shape_ids::has_prototype_method(property)
+    {
+        let family_call = ctx.new_block("msite.family_call");
+        let ordinary_probe = ctx.new_block("msite.ordinary_probe");
+        let family_l = ctx.block_label(family_call);
+        let ordinary_l = ctx.block_label(ordinary_probe);
+        let family_probe = ctx.new_block("msite.family_probe");
+        let family_probe_l = ctx.block_label(family_probe);
+        let wp = emit_field_ptr(ctx.block(), &biased, 4);
+        let word = ctx.block().load(I32, &wp);
+        let index = ctx.block().sub(
+            I32,
+            &word,
+            &(crate::runtime_abi::SHAPE_ID_BASE + (1 << 19)).to_string(),
+        );
+        let family_word = ctx.block().icmp_ult(
+            I32,
+            &index,
+            &(crate::runtime_abi::STATIC_SHAPE_ID_COUNT / 2).to_string(),
+        );
+        ctx.block()
+            .cond_br(&family_word, &family_probe_l, &ordinary_l);
+        ctx.current_block = family_probe;
+        let callee = ctx.block().call(
+            I64,
+            "perry_probe_family_method",
+            &[
+                (PTR, &dir),
+                (I64, &biased),
+                (I64, &key_bits),
+                (I64, &hash),
+                (I32, &lowered_args.len().to_string()),
+            ],
+        );
+        let present = ctx.block().icmp_ne(I64, &callee, "0");
+        ctx.block().cond_br(&present, &family_l, &ordinary_l);
+        ctx.current_block = family_call;
+        let recv_bits = ctx.block().bitcast_double_to_i64(recv_box);
+        let ptr = ctx.block().inttoptr(I64, &callee);
+        let ip = ctx.block().gep(
+            crate::types::I8,
+            &ptr,
+            &[(I64, &crate::runtime_abi::CLOSURE_INFO_OFFSET.to_string())],
+        );
+        let info = ctx.block().load(PTR, &ip);
+        let code = ctx.block().load(PTR, &info);
+        let r = crate::expr::body_call::emit_js_body_call(
+            ctx.block(),
+            crate::expr::body_call::JsBody::Pointer(&code),
+            &callee,
+            &recv_bits,
+            lowered_args,
+        );
+        let end = ctx.block().label.clone();
+        ctx.block().br(&merge_l);
+        results.push((r, end));
+        ctx.current_block = ordinary_probe;
+    }
     crate::expr::note_site("probe-method");
     let answered = ctx.block().call(
         DOUBLE,

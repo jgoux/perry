@@ -85,7 +85,6 @@ fn mock_property_call(args: Vec<Expr>) -> Stmt {
 fn fixture_module() -> Module {
     let target = || Expr::Object(vec![("value".to_string(), Expr::Integer(5))]);
     Module {
-        requested_modules: Vec::new(),
         name: "node_test_mock_property_presence.ts".to_string(),
         imports: Vec::new(),
         exports: Vec::new(),
@@ -128,7 +127,6 @@ fn fixture_module() -> Module {
         local_source_spans: std::collections::HashMap::new(),
         gen_param_prologue_len: std::collections::HashMap::new(),
         class_family_syntax: None,
-        requested_modules: Vec::new(),
     }
 }
 

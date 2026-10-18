@@ -2500,11 +2500,11 @@ pub(crate) struct ElementShapeLoopFact {
 /// when `object.property` is a tracked `arr[counter].field` read inside an
 /// element-shape fast clone.
 ///
-/// The single entry point for the three sites that must agree about that read
+/// The single entry point for the four sites that must agree about that read
 /// — the field lowering itself
 /// (`expr::property_get::lower_raw_f64_class_field_get_for_number_context`),
-/// `type_analysis::is_numeric_expr`, and `expr::binary`'s arithmetic-operand
-/// router. #7480 step 3 made the clone self-contained by routing all three
+/// `type_analysis::is_numeric_expr`, `expr::binary`'s arithmetic-operand
+/// router, and `wpfacts_access::prove`, which declines a tracked read. #7480 step 3 made the clone self-contained by routing all three
 /// through the fact instead of through `receiver_class_name`, which by design
 /// does not resolve an object-literal element type; the fact's own
 /// `class_name` is therefore the authoritative answer rather than a filter on
@@ -3293,6 +3293,7 @@ mod typed_array_rmw;
 mod typed_array_update;
 pub(crate) use instance_misc1::builtin_parent_reserved_class_id;
 pub(crate) mod class_field_inline_guard;
+pub(crate) mod class_family_read;
 pub(crate) mod element_shape_guard;
 pub(crate) mod element_shape_reads;
 mod generator_control_slots;
@@ -3315,6 +3316,7 @@ pub(crate) mod private_field_site;
 pub(crate) mod property_get;
 pub(crate) mod property_set;
 pub(crate) use named_accessor::contained_number_get;
+pub(crate) mod checked_super;
 pub(crate) mod proxy_reflect;
 pub(crate) mod put_value_store_ic;
 pub(crate) mod receiver_range;
@@ -3322,6 +3324,7 @@ mod static_field_meta;
 pub(crate) mod static_method;
 pub(crate) mod store_census;
 mod string_regex_proc;
+pub(crate) mod super_constructor;
 mod super_method;
 #[cfg(test)]
 mod super_property_set_order_tests;

@@ -848,15 +848,20 @@ pub(crate) fn try_lower_instance_method_call(
                 *ctx.class_ids.get(&class_name).unwrap_or(&0),
                 fallback_fn.clone(),
             )];
+            let selectable_arms = if shape_only_guard {
+                subclass_arms.as_slice()
+            } else {
+                &[]
+            };
             constant_candidates.extend(
-                subclass_arms
+                selectable_arms
                     .iter()
                     .map(|a| (a.class_id, a.target_fn.clone())),
             );
             // Match the dynamic consumer and the holder proof being replaced:
             // an incomplete prototype never acquired a compiled fast arm.
             let constant_cased: Vec<bool> = std::iter::once(Some(class_name.as_str()))
-                .chain(subclass_arms.iter().map(|arm| {
+                .chain(selectable_arms.iter().map(|arm| {
                     ctx.class_ids
                         .iter()
                         .find(|(_, id)| **id == arm.class_id)
@@ -871,14 +876,73 @@ pub(crate) fn try_lower_instance_method_call(
                     })
                 })
                 .collect();
-            let constant_static = shape_only_guard
-                && !subclass_arms.is_empty()
+            // Only a family with a static holder proof enters the new
+            // pre-argument selection. Native-parent and unsupported wide
+            // prototypes keep their existing tower and argument lowering.
+            let family_method_proof =
+                crate::codegen::static_prototype::chain(ctx, &class_name, property).is_some();
+            let observes_lookup = family_method_proof
+                && crate::expr::method_site::args_may_observe_lookup(ctx, args);
+            // An observable argument needs a selection before it runs even
+            // for a single/typed arm. The later layout guard still licenses
+            // that arm's representation clone independently.
+            let constant_static = (shape_only_guard || observes_lookup)
+                && (!selectable_arms.is_empty() || observes_lookup)
                 && constant_cased.contains(&true)
                 && !fallback_fn.starts_with("perry_static_")
                 && !fallback_has_rest
                 && !fallback_has_synthetic_arguments
                 && crate::expr::method_site::method_site_enabled(ctx, property, args.len())
                 && ctx.ptr_shape_receiver_fact(object).is_none();
+            // A mutable method must be read before an argument can replace
+            // it. The guarded direct path below tests after evaluating args;
+            // use the existing split lookup/call when there is no preselected
+            // constant body. This also preserves accessor/Proxy side effects.
+            if family_method_proof
+                && !constant_static
+                && !fallback_fn.starts_with("perry_static_")
+                && crate::expr::method_site::method_site_enabled(ctx, property, args.len())
+                && crate::expr::method_site::args_may_observe_lookup(ctx, args)
+            {
+                let mut lanes =
+                    crate::codegen::static_constfn::static_method_lanes(ctx, object, property);
+                // Compare the actual selected function's code identity
+                // and pass its real environment on this proved family path.
+                if !fallback_has_rest
+                    && !fallback_has_synthetic_arguments
+                    && ctx.method_param_counts.contains_key(&fallback_key)
+                    && fallback_fn.starts_with("perry_method_")
+                    && ctx.classes.get(&fallback_key.0).is_some_and(|class| {
+                        !class.is_literal_shape()
+                            && class.specialized_from.is_none()
+                            && class.methods.iter().any(|m| {
+                                m.name == property && m.params.len() == fallback_decl_count
+                            })
+                    })
+                {
+                    let body = format!("{fallback_fn}__eclo");
+                    if !lanes.iter().any(|l| l.body == body) {
+                        lanes.push(crate::codegen::static_constfn::StaticMethodLane {
+                            word: 0,
+                            slot: 0,
+                            body,
+                            arity: fallback_decl_count,
+                            own: false,
+                        });
+                    }
+                }
+                return crate::lower_call::lower_split_method_call(
+                    ctx,
+                    object,
+                    property,
+                    args,
+                    call_byte_offset,
+                    &lanes,
+                    None,
+                    None,
+                )
+                .map(Some);
+            }
             let static_split =
                 constant_static && crate::expr::method_site::args_may_observe_lookup(ctx, args);
 
