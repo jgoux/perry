@@ -109,7 +109,7 @@ jobs:
         run: .github/supa/simulate.sh "${{ inputs.simulate }}"
       - name: Cache key
         id: key
-        run: echo "key=perry-dist-${{ runner.arch }}-wasi-${{ hashFiles('crates/**', 'Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/**', '!crates/*/tests/**', '!**/*.md') }}" >> "$GITHUB_OUTPUT"
+        run: echo "key=perry-dist-${{ runner.arch }}-wasi-gcfx-${{ hashFiles('crates/**', 'Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/**', '!crates/*/tests/**', '!**/*.md') }}" >> "$GITHUB_OUTPUT"
       - name: Already built?
         id: have
         uses: actions/cache/restore@v4
@@ -129,12 +129,17 @@ jobs:
           # changes nothing for the native targets.
           cargo build --locked --release -p perry --bin perry --no-default-features --features compile-cli,target-wasi &
           compiler=$!
-          CARGO_TARGET_DIR="$PWD/target-libs" cargo build --locked --release -p perry-runtime-static -p perry-stdlib-static -p perry-ext-http -p perry-ext-net &
+          CARGO_TARGET_DIR="$PWD/target-libs" cargo build --locked --release -p perry-runtime-static -p perry-stdlib-static -p perry-ext-http -p perry-ext-net -p perry-ext-undici &
           libs=$!
           rc=0; wait "$compiler" || rc=1; wait "$libs" || rc=1
           [ "$rc" = 0 ]
+          # A perry that runs from its workspace refuses to compile natively
+          # against an archive without its `.gc-effects` sidecar (the call-effect
+          # table is derived from the archive bytes), so write them over the
+          # exact bytes that get staged and ship them beside the archives.
+          scripts/gc_call_effects/sidecars.sh target-libs/release
           mkdir perry-dist
-          cp target/release/perry target-libs/release/lib*.a perry-dist/
+          cp target/release/perry target-libs/release/lib*.a target-libs/release/lib*.a.gc-effects perry-dist/
           ls -l perry-dist; du -sh perry-dist
           {
             echo "### build-perry"
@@ -778,7 +783,7 @@ jobs:
       - name: Build the test binaries
         if: steps.done.outputs.cache-hit != 'true'
         run: |
-          mkdir -p target/release && cp perry-dist/lib*.a target/release/
+          mkdir -p target/release && cp perry-dist/lib* target/release/
           start=$(date +%s)
           .github/supa/regressions.sh build
           {

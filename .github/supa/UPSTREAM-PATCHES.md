@@ -454,6 +454,7 @@ Not proposed: P04, P05, P06, P10, P15, P16. Upstream fixed the same bugs indepen
 - Fix: `--target wasip1` reuses the wasm32 lowering and the wasi link with the `wasm32-wasip1` triple, wasi-sdk's p1 sysroot and no `cabi_realloc` export; `scripts/wasi_build_runtime.sh` takes the runtime target. Docs in `docs/WASI_SUPPORT.md`.
 - Test: wasi probes compared against node.
 - Upstream: not cherry-picked. Depends on: P23-P26. PR-S.
+- Merge of upstream `2bbab8aff` (2026-10-18): adapted, no new id. Upstream's `native_link_set_skipped` in `run_pipeline.rs` (no native link set, so no runtime-archive effects sidecar, `Undescribed` table) named only the preview2 `wasi` target; it now also covers `wasip1`, which links the wasm32 archive after codegen the same way.
 
 ### P28 9e0beba53 fix(codegen): regenerate the wasm32 runtime ABI table, which had drifted from the runtime
 - Area / platform: codegen (wasm32) / wasm32.
@@ -651,7 +652,7 @@ Not proposed: P04, P05, P06, P10, P15, P16. Upstream fixed the same bugs indepen
 
 Every other fork-only non-merge commit is CI, probes, a temporary diagnostic, or a Storage shim. None edits files outside `.github/` (checked with `git show --name-only`). There are 44 such commits, 23 fix/feat commits are the patches above, and the fork has no `test:` commits.
 
-**Fork CI workflow, composite action and driver scripts** (`.github/workflows/supa-storage.yml`, `.github/actions/supa-rust-env`, `.github/supa/*.sh`; Blacksmith runner, sccache, lld, caches). Fork-specific infrastructure for supabase/perry.
+**Fork CI workflow, composite action and driver scripts** (`.github/workflows/supa-storage.yml`, `.github/actions/supa-rust-env`, `.github/supa/*.sh`; Blacksmith runner, sccache, lld, caches). Fork-specific infrastructure for supabase/perry. Merge of upstream `2bbab8aff` (2026-10-18): adapted. Upstream's perry compiles natively only against runtime archives that carry a `.gc-effects` sidecar and routes `undici` to `libperry_ext_undici.a`, so `build-perry` writes the sidecars (`scripts/gc_call_effects/sidecars.sh target-libs/release`), builds `perry-ext-undici`, stages both in `perry-dist` (cache key `perry-dist-*-wasi-gcfx-*`), and `regressions-linux` copies the sidecars with the archives.
 `e8ac78fea` `ece6015bb` `297306927` `18b63cef3` `512996ccb` `0c3401687` `9d2cbde15` `8a051e924` `53423af73` `942a6fe56` `5b1438709`
 
 **CI wiring of regression tests** (adds test names or log capture to `.github/supa/regressions.sh`; the tests themselves belong to the patches above).

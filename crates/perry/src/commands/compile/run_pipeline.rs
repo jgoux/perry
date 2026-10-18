@@ -3637,10 +3637,10 @@ pub fn run_with_parse_cache(
     }
     let program_providers = std::sync::Arc::new(program_providers);
 
-    // A standalone WASI build links against the wasm32 runtime after
-    // codegen and has no native link set.
+    // A standalone WASI build (preview2 `wasi` or preview1 `wasip1`) links
+    // against the wasm32 runtime after codegen and has no native link set.
     #[cfg(feature = "target-wasi")]
-    let native_link_set_skipped = target.as_deref() == Some("wasi");
+    let native_link_set_skipped = matches!(target.as_deref(), Some("wasi" | "wasip1"));
     #[cfg(not(feature = "target-wasi"))]
     let native_link_set_skipped = false;
 
