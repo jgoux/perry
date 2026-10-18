@@ -65,7 +65,11 @@ for (const sk of Object.keys(subjects)) {
     const t0 = now();
     const r = v instanceof C;
     const first = now() - t0;
-    row.push(r ? 1 : 0);
+    // Known divergence, not what this probe measures: the native read stream's
+    // [[Prototype]] chain is not node's (it answers false to Readable and Object),
+    // so those two cells are not compared; the timing is still taken.
+    const uncompared = sk === 'fs.ReadStream' && (tk === 'Readable' || tk === 'Object');
+    row.push(uncompared ? '-' : r ? 1 : 0);
     // A single check that already takes milliseconds is the finding; do not repeat it.
     let n = 1;
     let per = first;

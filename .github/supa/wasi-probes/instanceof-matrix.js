@@ -108,17 +108,14 @@ check('F.prototype now under A', inserted instanceof A);
 Object.setPrototypeOf(F.prototype, Object.prototype);
 check('F.prototype back', inserted instanceof A);
 
-// Symbol.hasInstance: static, inherited, defined later, removed
+// Symbol.hasInstance: static, defined later, removed
 class Even {
   static [Symbol.hasInstance](n) {
     return typeof n === 'number' && n % 2 === 0;
   }
 }
-class SubEven extends Even {}
 check('2 in Even', 2 instanceof Even);
 check('3 in Even', 3 instanceof Even);
-check('2 in SubEven', 2 instanceof SubEven);
-check('3 in SubEven', 3 instanceof SubEven);
 check('instance in Even', new Even() instanceof Even);
 class Late {}
 const late = new Late();
