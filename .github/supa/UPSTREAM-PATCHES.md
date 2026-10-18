@@ -69,10 +69,12 @@ Conventions in this file:
 | P44 | 540a34fc2 | fix(net): an application's end() after the protocol layer's close is a no-op | net (payload socket) | all (seen on wasm32) | wasi probe `http-early-reply.js` | not tried | PR-AA |
 | P45 | d9ebda76d | fix(dns): dispatch dns lookup and resolve exports reached through a CommonJS namespace | dns (`perry-runtime` native module dispatch) | all (seen on wasm32) | wasi probe `cjs-dns.js` | not tried | PR-AB |
 | P46 | 19c26c6a9 | fix(hir): construct the global when a program class shares a name with a globalThis alias | hir (`lower/expr_new.rs`, `lower/context.rs`, destructuring) | all | wasi probe `headers-global-alias.js` | not tried | PR-AC |
-| P47 | bea2d51cb | fix(runtime): start reading when a readable that is not flowing is piped | runtime (node:stream, `node_stream_readwrite.rs`) | all | wasi probe `stream-pipe-starts-read.js` | not tried | PR-AD |
+| P47 | bea2d51cb | fix(runtime): start reading when a readable that is not flowing is piped | runtime (node:stream, `node_stream_readwrite.rs`) | all | wasi probe `stream-pipe-starts-read.js` | superseded by upstream `b0d159c8c` (merged) | none: superseded |
 | P48 | 19f404e40 | fix(runtime): hand a live stream to the function stage of stream.pipeline | runtime (node:stream, `node_stream_pipeline.rs`) | all | wasi probe `stream-pipeline-live-source.js` | not tried | PR-AE |
 | P49 | 32943d82a | fix(runtime): read an http request through Readable.toWeb with the request's own read() | runtime (node:stream web adapter, `node_stream_constructors/web_adapter.rs`) | all | wasi probe `http-request-to-web.js` | not tried | PR-AF |
 | P50 | a5ffa98e1 | fix(hir): extend the member a class heritage names when it shares the class's name | HIR class lowering (`perry-hir/src/lower_decl/class_decl.rs`) | all | wasi probe `class-extends-same-name-member.js` | not tried | PR-AG |
+| P51 | a45195e98 | fix(gc-effects): size the disassembler output buffer with c_char | gc-effects (`perry-gc-effects/src/archive.rs`) | aarch64 Linux (build break) | the compiler's build (`build-perry`) | not tried | PR-AH |
+| P52 | 7eb0760bd | fix(wasm32): call a captureless some() callback at its declared arity | runtime (`array/iter_methods.rs`) | wasm32 | wasi probe `array-some-callback-arity.js` | not tried | PR-AI |
 
 All 22 patches except P12's `.github` hunks, P05 and P06 cherry-pick cleanly.
 A stack of every patch except P05 and P06, with P12 limited to `crates/`, also applies cleanly in sequence on `1fd8ca2ae`.
@@ -110,12 +112,14 @@ Ordered by value and independence. Each PR carries its patches' tests.
 27. **PR-AA An application's `end()` after the HTTP layer's close is a no-op** (P44). Prerequisite: none.
 28. **PR-AB `dns.lookup`, `resolve*` and `reverse` work through a CommonJS `require`** (P45). Prerequisite: none.
 29. **PR-AC `new Alias()` constructs the global an alias holds, not a same-named program class** (P46). Prerequisite: none.
-30. **PR-AD `readable.pipe()` starts reading a stream that was not flowing** (P47). Prerequisite: none.
+30. **PR-AD (withdrawn)** `readable.pipe()` starts reading a stream that was not flowing (P47). Upstream `b0d159c8c` fixed it; see "Not proposed".
 31. **PR-AE `stream.pipeline(streams..., fn)` gives the function the live stream** (P48). Prerequisite: none.
-32. **PR-AF `Readable.toWeb(req)` yields the request body** (P49). Prerequisite: PR-AD, PR-AE for the probe's roundtrip and pipeline routes.
+32. **PR-AF `Readable.toWeb(req)` yields the request body** (P49). Prerequisite: PR-AE for the probe's pipeline route (the roundtrip route now relies on upstream `b0d159c8c`).
 33. **PR-AG `class X extends ns.X` runs the base constructor** (P50). Prerequisite: none.
+34. **PR-AH `perry-gc-effects` builds on aarch64 Linux** (P51). `c_char` is `u8` there, so the disassembler buffer type must follow it. Tiny. Prerequisite: none.
+35. **PR-AI `arr.some(captureless arrow)` applies the arrow's declared arity on wasm32** (P52). Prerequisite: none (the probe needs PR-R and PR-S).
 
-Not proposed: P04, P05, P06, P10, P15, P16. Upstream fixed the same bugs independently (`c4bf643f6` for P04, `4ed616f5e` for P05, `79aae9aa7` for P06 and P15, `09e7861b4` for P10, `c1671d39d` for P16); the 2026-10-18 merge took upstream's versions and kept the fork's tests as regression tests.
+Not proposed: P04, P05, P06, P10, P15, P16, P47. Upstream fixed the same bugs independently (`c4bf643f6` for P04, `4ed616f5e` for P05, `79aae9aa7` for P06 and P15, `09e7861b4` for P10, `c1671d39d` for P16, `b0d159c8c` for P47); the 2026-10-18 merge took upstream's versions and kept the fork's tests as regression tests.
 
 ## Patches
 
@@ -485,7 +489,7 @@ Not proposed: P04, P05, P06, P10, P15, P16. Upstream fixed the same bugs indepen
 - Fix: new `perry-runtime-static` crate, and a generated `.init_array` object registers the feature installers; `wasi_build_runtime.py` and the link step use it. 22 files.
 - Test: wasi probes for crypto, zlib, events, streams, fs, path/url/util/os, AsyncLocalStorage, network modules and process basics.
 - Upstream: not cherry-picked. Depends on: P25, P27. PR-S.
-- Merge of upstream `2bbab8aff` (2026-10-18): adapted, no new id. The wasi block of `run_pipeline.rs` passes `&[]` for the new `registrations` argument of `generate_feature_installer_object`; `scripts/wasi_build_runtime.py` keeps the `{"alloc-mimalloc"}` exclusion and the `external-*-pump` stdlib features.
+- Merge of upstream `2bbab8aff` (2026-10-18): adapted, no new id. The wasi block of `run_pipeline.rs` passes `&[]` for the new `registrations` argument of `generate_feature_installer_object`; `scripts/wasi_build_runtime.py` keeps the `{"alloc-mimalloc"}` exclusion and the `external-*-pump` stdlib features. Upstream's `FeatureInstalls::Selected` derives the stdlib half of the installer from the program's imports and marks the `external-*-pump` features `Compiled`, which `generate_feature_installer_object` skips; the wasip1 bundle links those pumps, so `require('node:zlib')` returned undefined in the CI-built Storage module. `crates/perry/src/commands/stdlib_installs.rs` now has `WASIP1_STDLIB_FEATURES` and `wasip1_stdlib_installs()` (the stdlib half for the wasip1 target) and `run_pipeline.rs` uses it for the wasi block.
 
 ### P32 0dac0c454 fix(runtime): admit program-emitted image strings on wasm32
 - Area / platform: runtime / wasm32.
@@ -611,6 +615,7 @@ Not proposed: P04, P05, P06, P10, P15, P16. Upstream fixed the same bugs indepen
 - Test: wasi probe `.github/supa/wasi-probes/headers-global-alias.js` (fails with `append is not a function` before the fix, matches node after); port to `crates/perry/tests` for upstream.
 - Not covered: `new Wrapped.Headers()` (a member callee whose property is named like a global) still builds the native class, a separate bug found while writing the probe.
 - Upstream: not cherry-picked. Depends on: none. PR-AC.
+- Merge of upstream `2bbab8aff` (2026-10-18): still needed, kept as it was (the hir files merged without conflict). The upstream commits `3bc9b5492` (IncomingMessage explicit receivers) and `3ab9e5fa4` (native inits on user subclasses) do not touch how `new Alias()` resolves its class. Checked on CI (wasi-linux, experiment branches off the merge without this fix and with it): the probe `headers-global-alias.js` exits 1 without the fix and matches node with it.
 
 ### P47 bea2d51cb fix(runtime): start reading when a readable that is not flowing is piped
 - Area / platform: runtime node:stream / all targets; seen on wasm32-wasip1.
@@ -620,6 +625,7 @@ Not proposed: P04, P05, P06, P10, P15, P16. Upstream fixed the same bugs indepen
 - Test: wasi probe `.github/supa/wasi-probes/stream-pipe-starts-read.js` (fromWeb piped into a Writable and into a PassThrough; times out before the fix, prints 1500 for both after); port to `crates/perry/tests` for upstream. The probe carries `// network: yes` because a program naming the global `ReadableStream` links the net imports (pre-existing, independent of this fix).
 - Not covered: the event order of `pipe` ('pause'/'close' relative to 'end') differs from Node, and a Readable whose `read()` pushes lazily still gets `_read` called once only (`hidden_read_invoked_key` is never reset on push).
 - Upstream: not cherry-picked. Depends on: none. PR-AD.
+- Merge of upstream `2bbab8aff` (2026-10-18): superseded. Upstream `b0d159c8c` ("a Readable with a _read hook keeps reading, in node's order") makes `pipe` start the read itself, in Node's order, so the fork's `schedule_read_after_pipe` was dropped from `node_stream_readwrite.rs` (and its unit-test `read()` stub). The probe `stream-pipe-starts-read.js` stays as a regression test and passes on the merged tree.
 
 ### P48 19f404e40 fix(runtime): hand a live stream to the function stage of stream.pipeline
 - Area / platform: runtime node:stream / all targets; seen on wasm32-wasip1.
@@ -629,6 +635,7 @@ Not proposed: P04, P05, P06, P10, P15, P16. Upstream fixed the same bugs indepen
 - Test: wasi probe `.github/supa/wasi-probes/stream-pipeline-live-source.js` (a piped source, a timer write, a microtask write, a transform as first stage; each prints 0 before the fix and 1500 after, as node does); port to `crates/perry/tests` for upstream.
 - Not covered: the collected path still snapshots a first stream that already holds data, and chunk boundaries can differ from Node (Node's `read()` coalesces everything buffered; the probe sums lengths). The settling pump blocks the caller until the function's promise resolves.
 - Upstream: not cherry-picked. Depends on: none. PR-AE.
+- Merge of upstream `2bbab8aff` (2026-10-18): still needed, kept as it was. On a merge tree that has `b0d159c8c` but not this fix, the probe `stream-pipeline-live-source.js` still differs from node (checked on CI) while `stream-pipe-starts-read.js` passes, so `b0d159c8c` does not cover this path and `run_live_stream_to_function_pipeline` stays.
 
 ### P49 32943d82a fix(runtime): read an http request through Readable.toWeb with the request's own read()
 - Area / platform: runtime node:stream / all targets; seen on wasm32-wasip1.
@@ -638,6 +645,7 @@ Not proposed: P04, P05, P06, P10, P15, P16. Upstream fixed the same bugs indepen
 - Test: wasi probe `.github/supa/wasi-probes/http-request-to-web.js` (server probe: a 300 kB POST read with the web reader, through `fromWeb(toWeb(req)).pipe(PassThrough)`, and through that plus `pipeline(proxy, transform, async fn)`; before the fixes P47-P49 the routes answer 0 or hang, after they match node); port to `crates/perry/tests` for upstream. Runs under supa-host with `--listen 127.0.0.1:18323`.
 - Not covered: the CommonJS spelling `const { Readable } = require('node:stream'); Readable.toWeb(x)` goes through the method-value fallback, which returns a plain object rather than a ReadableStream; a `for await` over `Readable.fromWeb(...)` repeats the last chunk; `push(Uint8Array)` into a non-object-mode Readable yields a Uint8Array, not a Buffer.
 - Upstream: not cherry-picked. Depends on: PR-AD, PR-AE for the probe's roundtrip and pipeline routes. PR-AF.
+- Merge of upstream `2bbab8aff` (2026-10-18): still needed, kept as it was. Neither `3bc9b5492` ("initialize IncomingMessage explicit receivers") nor `b0d159c8c` covers it: on a merge tree without this fix the probe `http-request-to-web.js` still differs from node (checked on CI).
 
 ### P50 a5ffa98e1 fix(hir): extend the member a class heritage names when it shares the class's name
 - Area / platform: HIR class lowering / all targets; seen on wasm32-wasip1.
@@ -647,12 +655,31 @@ Not proposed: P04, P05, P06, P10, P15, P16. Upstream fixed the same bugs indepen
 - Test: wasi probe `.github/supa/wasi-probes/class-extends-same-name-member.js` (subclass of `@tus/file-store`'s `FileStore` named `FileStore`; before: `instanceof` false, base fields undefined, `hasExtension is not a function`; after: matches node); port to `crates/perry/tests` for upstream.
 - Not covered: a base class and a same-named subclass in the SAME module (for example an IIFE-local base and a top-level subclass) still collide on the by-name class tables in codegen (`class_ids`), and `super()` fails with `Class constructor X cannot be invoked without 'new'`.
 - Upstream: not cherry-picked. Depends on: none. PR-AG.
+- Merge of upstream `2bbab8aff` (2026-10-18): still needed, kept as it was (the class_decl files merged without conflict). Upstream's canonical-class and IIFE series (`d7918a6d6`, "Cover overridable IIFE call evaluating a class twice", and its neighbours) is in the merge, and the probe `class-extends-same-name-member.js` still differs from node without the fix (checked on CI). The gap listed under "Not covered" is still open: the probes `class-iife-base-same-name` (an IIFE-local base and a same-named top-level subclass) and `cbp1` to `cbp4` fail with and without the fork's fixes on the merged tree, so upstream's series does not close them either.
+
+### P51 a45195e98 fix(gc-effects): size the disassembler output buffer with c_char
+- Area / platform: gc-effects (`perry-gc-effects/src/archive.rs`) / aarch64 Linux (compile error); other targets unaffected.
+- Problem: upstream's `perry-gc-effects` does not compile on aarch64 Linux (the fork's CI runner): `Disassembler::instruction` hands LLVM's disassembler C API a `[0i8; 1024]` output buffer, and `c_char` is `u8` on aarch64 Linux, so the call does not type-check. `build-perry` failed on the first merge run because of it.
+- Root cause: the buffer type spelled the platform's `c_char` as `i8`.
+- Fix: the buffer is `[0 as std::ffi::c_char; 1024]`.
+- Test: none of its own; the compiler's build on aarch64 Linux (`build-perry` in the fork's CI) is the check.
+- Upstream: not cherry-picked (written on top of the 2026-10-18 merge). Depends on: none. PR-AH.
+
+### P52 7eb0760bd fix(wasm32): call a captureless some() callback at its declared arity
+- Area / platform: runtime array iteration (`perry-runtime/src/array/iter_methods.rs`) / wasm32-wasip1.
+- Problem: the merged Storage module trapped at startup with "indirect call type mismatch" inside `js_array_some_captureless` (Storage's route matcher calls `routes.some(captureless arrow)`).
+- Root cause: upstream lowers `arr.some(capturelessArrow)` to an inline loop and falls back to the runtime helper `js_array_some_captureless` for receivers the loop does not admit. The helper's loop calls the arrow's body with the element, the index and the array whatever it declares, relying on a native call being safe when over-applied. WebAssembly checks the type of every indirect call, so a body declaring one parameter trapped when called with three. Closure dispatch (`closure/registry.rs::dispatch_with_arity`) applies the declared arity.
+- Fix: on wasm32 (`cfg!(target_os = "wasi")`) the helper takes the generic path (`js_closure_alloc_singleton` + `js_array_some`) for every receiver, as it already did for typed arrays and buffers. Native keeps the loop.
+- Test: wasi probe `.github/supa/wasi-probes/array-some-callback-arity.js` (an accessor array, holes, an element on `Array.prototype`, arrows of zero to three parameters, a route table; traps before the fix, matches node after); port to `crates/perry/tests` for upstream.
+- Not covered: other helpers that over-apply a body on a native-only loop were not audited (`js_array_some_captureless` was the only one the Storage smoke reached).
+- Upstream: not cherry-picked (written on top of the 2026-10-18 merge). Depends on: none. PR-AI.
 
 ## Not for upstream
 
 Every other fork-only non-merge commit is CI, probes, a temporary diagnostic, or a Storage shim. None edits files outside `.github/` (checked with `git show --name-only`). There are 44 such commits, 23 fix/feat commits are the patches above, and the fork has no `test:` commits.
 
-**Fork CI workflow, composite action and driver scripts** (`.github/workflows/supa-storage.yml`, `.github/actions/supa-rust-env`, `.github/supa/*.sh`; Blacksmith runner, sccache, lld, caches). Fork-specific infrastructure for supabase/perry. Merge of upstream `2bbab8aff` (2026-10-18): adapted. Upstream's perry compiles natively only against runtime archives that carry a `.gc-effects` sidecar and routes `undici` to `libperry_ext_undici.a`, so `build-perry` writes the sidecars (`scripts/gc_call_effects/sidecars.sh target-libs/release`), builds `perry-ext-undici`, stages both in `perry-dist` (cache key `perry-dist-*-wasi-gcfx-*`), and `regressions-linux` copies the sidecars with the archives.
+**Fork CI workflow, composite action and driver scripts** (`.github/workflows/supa-storage.yml`, `.github/actions/supa-rust-env`, `.github/supa/*.sh`; Blacksmith runner, sccache, lld, caches). Fork-specific infrastructure for supabase/perry. Merge of upstream `2bbab8aff` (2026-10-18): adapted. Upstream's perry compiles natively only against runtime archives that carry a `.gc-effects` sidecar and routes `undici` to `libperry_ext_undici.a`, so `build-perry` writes the sidecars (`scripts/gc_call_effects/sidecars.sh target-libs/release`), builds `perry-ext-undici`, stages both in `perry-dist` (cache key `perry-dist-*-wasi-gcfx-*`), and `regressions-linux` copies the sidecars with the archives. The `perry-ext-zlib` and `perry-ext-ws` wrapper archives are built and staged the same way (compiled programs that import `zlib` or `ws` link them; cache key `perry-dist-*-wasi-gcfx2-*`), and the wasip1 compile of Storage needs no sidecar (`native_link_set_skipped` covers wasi targets; see P31 and P32).
+Known and parked: the probe `eh-uncaught` fails on aarch64 Linux native (FATAL, the unwinder returns a garbage reason); it fails the same way on the pre-merge head `add33c494` (run 39159589605), so it is not caused by the merge. The probes `cbp1` to `cbp4` and `class-iife-base-same-name` are open gaps (see P50).
 `e8ac78fea` `ece6015bb` `297306927` `18b63cef3` `512996ccb` `0c3401687` `9d2cbde15` `8a051e924` `53423af73` `942a6fe56` `5b1438709`
 
 **CI wiring of regression tests** (adds test names or log capture to `.github/supa/regressions.sh`; the tests themselves belong to the patches above).
@@ -678,5 +705,5 @@ Merge commits (not counted): `1f3c775af` (merge of upstream main) and `03ef52d0f
 - Last upstream sync merge: `1f3c775af` (2026-10-16 15:12 +0200, "Merge PerryTS/perry main into supa/storage-ci"), whose second parent is `43a40d056`. `03ef52d0f` (2026-10-16 17:25 +0200) merged the fork's own `supa/upstream-sync` branch.
 - Original fork point of the earlier patches (P01-P14): `5b76f8acc` (2026-10-15, "gc effects: regenerate macOS table for Object.create families"). The older branch `supa/storage` (an older tip) is an ancestor of `supa/storage-ci`.
 - Fork tip: `supa/storage-ci` (tip, 2026-10-16); 68 fork-only commits, 66 non-merge.
-- Upstream merge (2026-10-18): `supa/upstream-merge-1018` merges upstream `2bbab8aff` (2026-10-18, "docs(changelog): record V8 heap snapshot stream crash fix") into `supa/wasip1`; merge-base `43a40d056`, 231 upstream commits. Superseded by it: P04, P05, P06, P10, P15, P16. Adapted: P08, P11, P12, P17, P18, P19, P23, P24, P28, P29, P31, P32, P41, P45.
+- Upstream merge (2026-10-18): `supa/upstream-merge-1018` merges upstream `2bbab8aff` (2026-10-18, "docs(changelog): record V8 heap snapshot stream crash fix") into `supa/wasip1`; merge-base `43a40d056`, 231 upstream commits. Superseded by it: P04, P05, P06, P10, P15, P16, P47. Adapted: P08, P11, P12, P17, P18, P19, P23, P24, P28, P29, P31, P32, P41, P45. Checked and kept as they were: P46, P48, P49, P50. New on top of the merge: P51, P52.
 - Ledger written: 2026-10-17.
