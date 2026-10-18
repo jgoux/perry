@@ -17,6 +17,8 @@
 #                              service the CI runner lacks; the module is uploaded
 #                              for local runs under supa-host)
 #   // npm: PACKAGE            `npm install PACKAGE` next to the probe before compiling
+#   // wasm-env: NAME=VALUE... space-separated variables handed to the wasm run only
+#                              (--env), e.g. PERRY_GC_FORCE_EVACUATE=1
 #   // server-port: PORT       the probe serves HTTP on 127.0.0.1:PORT. node runs it
 #                              on that port; wasmtime gets the listener as
 #                              `-S preview2=n -S tcplisten=127.0.0.1:PORT` (the
@@ -51,6 +53,7 @@ for n in "${names[@]}"; do
   marker() { sed -n "s|^// $1: ||p" "$src" | head -1; }
   optional=$(marker optional); want_err=$(marker stderr-contains); max_rss=$(marker max-rss-mb)
   network=$(marker network); compile_only=$(marker compile-only); npm_pkg=$(marker npm)
+  wasm_env=$(marker wasm-env); env_flags=(); for kv in $wasm_env; do env_flags+=(--env "$kv"); done
   port=$(marker server-port); requests=$(sed -n "s|^// request: ||p" "$src")
   echo "::group::probe $n"
   verdict=PASS; size=-; rss=-
@@ -110,7 +113,7 @@ for n in "${names[@]}"; do
     (cd "$d" && WORK_DIR="$d/work" timeout 120 node "$n.$ext" > node.out 2> node.err; echo $? > node.rc) &
     node_pid=$!
     serve_requests "$d/node.serve"; wait $node_pid
-    (cd "$d" && /usr/bin/time -v -o time.txt timeout 300 "$wasmtime_p1" run $flags -W unknown-imports-trap -S preview2=n -S "tcplisten=127.0.0.1:$port" --dir "$d/work::/work" "$n.wasm" > run.out 2> run.err; echo $? > run.rc) &
+    (cd "$d" && /usr/bin/time -v -o time.txt timeout 300 "$wasmtime_p1" run $flags "${env_flags[@]}" -W unknown-imports-trap -S preview2=n -S "tcplisten=127.0.0.1:$port" --dir "$d/work::/work" "$n.wasm" > run.out 2> run.err; echo $? > run.rc) &
     wasm_pid=$!
     serve_requests "$d/run.serve"; wait $wasm_pid
     cat "$d/node.serve" >> "$d/node.out"; cat "$d/run.serve" >> "$d/run.out"
@@ -119,7 +122,7 @@ for n in "${names[@]}"; do
     # A module that imports supa_net but never calls it needs wasmtime to trap on the import
     # instead of refusing to instantiate.
     trap_flag=; [ -n "$network" ] && trap_flag="-W unknown-imports-trap"
-    (cd "$d" && /usr/bin/time -v -o time.txt timeout 300 "$wasmtime" run $flags $trap_flag --dir "$d/work::/work" "$n.wasm" > run.out 2> run.err); echo $? > "$d/run.rc"
+    (cd "$d" && /usr/bin/time -v -o time.txt timeout 300 "$wasmtime" run $flags $trap_flag "${env_flags[@]}" --dir "$d/work::/work" "$n.wasm" > run.out 2> run.err); echo $? > "$d/run.rc"
   fi
   rss=$(awk -F': ' '/Maximum resident set size/ {printf "%d", $2 / 1024}' "$d/time.txt")
   echo "--- stdout (wasm) ---"; head -c 3000 "$d/run.out"

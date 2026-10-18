@@ -62,6 +62,9 @@ on:
         description: Run the wasi-linux job (wasip1 probes under wasmtime); it always runs on supa/wasip1 pushes
         type: boolean
         default: false
+      wasi_probe_names:
+        description: Space-separated wasi probe names to run in the wasi-linux job (default all)
+        default: ''
       simulate:
         description: Measurement aid, touch one source file to exercise cache invalidation without a commit
         type: choice
@@ -198,9 +201,11 @@ jobs:
         with:
           node-version: 24
       - name: Probes
-        run: .github/supa/wasi-probes.sh
+        env:
+          WASI_PROBE_NAMES: ${{ inputs.wasi_probe_names }}
+        run: .github/supa/wasi-probes.sh $WASI_PROBE_NAMES
       - name: Hello module checks
-        if: always()
+        if: ${{ always() && inputs.wasi_probe_names == '' }}
         run: |
           hello="$OUT/wasi-probes/hello/hello.wasm"
           [ -f "$hello" ] || { echo "no hello.wasm"; exit 1; }
