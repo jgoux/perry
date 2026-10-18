@@ -84,5 +84,53 @@ step "POST /object/smokepub/pub.txt" 200 -X POST "$base/object/smokepub/pub.txt"
 step "GET /object/info/public/smokepub/pub.txt" 200 "$base/object/info/public/smokepub/pub.txt" \
   && norm 'del(.id, .version, .etag, .last_modified, .created_at)'
 step "HEAD /object/public/smokepub/pub.txt" 200 -I "$base/object/public/smokepub/pub.txt"
+# Optional probes of what the dependency-removal variants touch (SMOKE_EXTRA=1): status codes of the
+# docs endpoint, the S3 protocol (sigv4 signed by curl), TUS and the feature routes. They never fail the
+# smoke; the transcript lines show up in the diff against node, and in a variant's diff against the
+# unstubbed reference.
+if [ -n "${SMOKE_EXTRA:-}" ]; then
+  probe() { # <name> <curl args...> ; status only, body -> $work/pbody
+    local name=$1 got; shift
+    got=$(curl -sS -m 60 -o "$work/pbody" -w '%{http_code}' "$@") || got=curl-failed
+    printf 'extra %s -> %s\n' "$name" "$got" >> "$out"
+  }
+  s3() { # <name> <method> <path-and-query> [body file] ; sigv4 signed, payload hash given
+    local name=$1 method=$2 url=$3 file=${4:-} hash args=()
+    if [ -n "$file" ]; then hash=$(sha256sum "$file" | cut -d' ' -f1); args=(--data-binary @"$file" -X "$method"); else hash=$(printf '' | sha256sum | cut -d' ' -f1); args=(-X "$method"); fi
+    [ "$method" = HEAD ] && args=(-I)
+    probe "$name" "${args[@]}" --aws-sigv4 'aws:amz:us-east-1:s3' --user "${S3_PROTOCOL_ACCESS_KEY_ID:-}:${S3_PROTOCOL_ACCESS_KEY_SECRET:-}" \
+      -H "x-amz-content-sha256: $hash" "$base$url"
+  }
+  probe "GET /documentation/json" "$base/documentation/json"
+  probe "GET /documentation/" "$base/documentation/"
+  probe "GET /health" "$base/health" -H "${auth[0]}"
+  s3 "S3 ListBuckets" GET /s3/
+  grep -q '<Name>smoke</Name>' "$work/pbody" && echo "extra S3 ListBuckets lists the bucket" >> "$out" || echo "extra S3 ListBuckets does not list the bucket" >> "$out"
+  head -c 1000 /dev/urandom > "$work/s3.bin"
+  s3 "S3 PutObject" PUT /s3/smoke/s3.bin "$work/s3.bin"
+  s3 "S3 GetObject" GET /s3/smoke/s3.bin
+  [ "$(sha256sum < "$work/pbody")" = "$(sha256sum < "$work/s3.bin")" ] && echo "extra S3 GetObject bytes identical" >> "$out" || echo "extra S3 GetObject bytes differ" >> "$out"
+  s3 "S3 HeadObject" HEAD /s3/smoke/s3.bin
+  s3 "S3 ListObjectsV2" GET '/s3/smoke?list-type=2&prefix=s3.'
+  grep -q '<Key>s3.bin</Key>' "$work/pbody" && echo "extra S3 ListObjectsV2 lists the object" >> "$out" || echo "extra S3 ListObjectsV2 does not list the object" >> "$out"
+  s3 "S3 DeleteObject" DELETE /s3/smoke/s3.bin
+  # TUS: create an upload of 11 bytes and send them (bucket smoke, object tus.bin)
+  tus=(-H "${auth[0]}" -H 'Tus-Resumable: 1.0.0')
+  got=$(curl -sS -m 60 -D "$work/tus.headers" -o /dev/null -w '%{http_code}' -X POST "$base/upload/resumable" "${tus[@]}" -H 'Upload-Length: 11' \
+    -H 'Upload-Metadata: bucketName c21va2U=,objectName dHVzLmJpbg==,contentType dGV4dC9wbGFpbg==,cacheControl bWF4LWFnZT0zNjAw') || got=curl-failed
+  printf 'extra TUS create -> %s\n' "$got" >> "$out"
+  loc=$(tr -d '\r' < "$work/tus.headers" | sed -n 's/^[Ll]ocation: *//p' | head -n 1 | sed -E 's#^https?://[^/]+##')
+  if [ -n "$loc" ]; then
+    probe "TUS patch" -X PATCH "$base$loc" "${tus[@]}" -H 'Upload-Offset: 0' -H 'Content-Type: application/offset+octet-stream' --data-binary 'hello world'
+    probe "TUS download" "$base/object/smoke/tus.bin" -H "${auth[0]}"
+    [ "$(cat "$work/pbody")" = 'hello world' ] && echo "extra TUS download bytes identical" >> "$out" || echo "extra TUS download bytes differ" >> "$out"
+  else
+    echo "extra TUS no location" >> "$out"
+  fi
+  # Feature routes that are off in this environment: the status shows whether they are still registered
+  probe "GET /render/image/authenticated" "$base/render/image/authenticated/smoke/hello.bin" -H "${auth[0]}"
+  probe "POST /vector/ListVectorBuckets" -X POST "$base/vector/ListVectorBuckets" -H "${auth[0]}" -H 'Content-Type: application/json' -d '{}'
+  probe "GET /iceberg/v1/config" "$base/iceberg/v1/config?warehouse=smoke" -H "${auth[0]}"
+fi
 if [ "$fail" = 0 ]; then echo "smoke ok" >> "$out"; fi
 exit $fail

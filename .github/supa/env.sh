@@ -3,6 +3,8 @@
 # The JWT secret and both keys are generated per run; nothing here is a real credential.
 set -euo pipefail
 secret=$(openssl rand -hex 24)
+s3_key=$(openssl rand -hex 10)
+s3_secret=$(openssl rand -hex 20)
 b64() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
 sign() {
   local h p s
@@ -24,6 +26,9 @@ AUTH_ENCRYPTION_KEY=encryptionkey
 SERVER_ADMIN_API_KEYS=apikey
 SERVER_HOST=127.0.0.1
 STORAGE_BACKEND=file
+STORAGE_S3_REGION=us-east-1
+S3_PROTOCOL_ACCESS_KEY_ID=$s3_key
+S3_PROTOCOL_ACCESS_KEY_SECRET=$s3_secret
 STORAGE_FILE_ETAG_ALGORITHM=md5
 DB_INSTALL_ROLES=true
 DB_ALLOW_MIGRATION_REFRESH=true
