@@ -1,4 +1,9 @@
-//! Presence consumes key membership and prototype cells, never property values.
+//! Presence (`in`, `Object.hasOwn`) through the probe's presence mode
+//! (`layout_probe::probe_has`): key membership and prototype cells, never
+//! property values.
+
+// Membership-only own-key lookup, kept for the inherited-read resolver
+// (`first_possible_holder`, #12698); presence itself goes through probe_has.
 use super::*;
 use crate::object::shapes::{self, ShapeObjectKind};
 
@@ -86,15 +91,15 @@ pub(crate) unsafe fn own_position(
     // A layout that can have holes: an optional key whose slot holds the
     // hole is absent (`key_view`), and the answer is this object's alone.
     let holey = !table_owned && crate::object::key_view::summary_may_have_holes(shape.summary);
-    let position = position
-        .filter(|&p| !holey || !crate::object::key_view::position_is_hole(obj, view, p));
+    let position =
+        position.filter(|&p| !holey || !crate::object::key_view::position_is_hole(obj, view, p));
 
     if position.is_some() {
         if class_id != 0 && super::super::is_internal_runtime_key_bytes(name) {
             return None;
         }
         if shape.object_kind != ShapeObjectKind::Ordinary
-            && obj as usize == crate::array::function_prototype_addr_if_resolved()
+            && obj as usize == crate::array::function_prototype_addr()
         {
             return None;
         }
@@ -113,114 +118,84 @@ pub(crate) unsafe fn own_position(
     Some((position, shape.proto_id, shape.object_kind, reusable))
 }
 
-#[inline(never)]
-pub(crate) unsafe fn try_shape_has_property(receiver: f64, key: f64) -> Option<bool> {
-    let value = JSValue::from_bits(receiver.to_bits());
-    let key_value = JSValue::from_bits(key.to_bits());
-    if !value.is_pointer() || !key_value.is_any_string() {
-        return None;
-    }
-    let mut scratch = [0u8; crate::value::SHORT_STRING_MAX_LEN];
-    let name = crate::string::js_string_key_bytes(key_value, &mut scratch)?;
-    let mut obj = value.as_pointer::<ObjectHeader>() as *const ObjectHeader;
-    for _ in 0..32 {
-        if !crate::value::addr_class::is_above_handle_band(obj as usize) {
-            return None;
+/// Where an inherited read must continue on a chain (see
+/// [`first_possible_holder`]).
+pub(crate) enum ChainHolder {
+    /// The first object whose shapes do not prove it lacks the key: it holds
+    /// the key, or its own lookup must decide.
+    At(*const ObjectHeader),
+    /// The shapes prove no object on the chain has the key.
+    Absent,
+}
+
+/// Skip, without recursing, every object from `obj` up its chain whose shape
+/// proves `name` is not its own property (the membership [`own_position`]
+/// answers for `in`). Any object the shapes cannot decide stops the walk, so
+/// the caller's generic lookup resumes exactly there. A cycle of objects that
+/// all lack the key (a malformed chain) is absent.
+pub(crate) unsafe fn first_possible_holder(
+    mut obj: *const ObjectHeader,
+    name: &[u8],
+) -> ChainHolder {
+    let mut cycle = crate::object::prototype_chain::ChainCycle::new();
+    loop {
+        if cycle.repeats(obj as usize) {
+            return ChainHolder::Absent;
         }
-        let stamp = shapes::object_shape_stamp(obj);
-        // The ordinary boolean operation needs membership, not a slot or a
-        // holder proof. Reuse hasOwn's existing shape consumer; it declines
-        // private, table_owned, holey and per-object-prototype records.
-        let ordinary = shapes::shape_record_by_id(stamp)
-            .filter(|record| {
-                let kind = record.object_kind();
-                kind.is_ordinary_layout()
-                    && !matches!(
-                        kind,
-                        ShapeObjectKind::NativeNamespace | ShapeObjectKind::OrdinaryNativeAlias
-                    )
-                    && (*obj).class_id == 0
-                    && (kind == ShapeObjectKind::Ordinary
-                        || obj as usize != crate::array::function_prototype_addr_if_resolved())
-            })
-            .and_then(|record| {
-                shapes::plain_own_key_present(
-                    shapes::ordinary_dir_addr(),
-                    stamp,
-                    key_value.bits(),
-                    name,
-                )
-                .map(|(present, _)| (present, record.proto_id()))
-            });
-        let (present, pid) = if let Some((present, pid)) = ordinary {
-            // The authoritative record admitted the object. Receiver-only
-            // exotic flags still belong to the complete shared operation.
-            let header =
-                &*((obj as usize - crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader);
-            let meta = (*obj).meta;
-            if header.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
-                || header._reserved & crate::gc::OBJ_FLAG_TYPED_ARRAY_PROTO != 0
-                || (!meta.is_null()
-                    && ((*meta).elements != 0
-                        || (*meta).flags
-                            & (crate::object::OBJECT_META_FLAG_EXOTIC_READ_RECEIVER
-                                | crate::object::OBJECT_META_FLAG_NATIVE_ALIAS)
-                            != 0))
-            {
-                return None;
-            }
-            if present {
-                return Some(true);
-            }
-            (false, pid)
-        } else {
-            let (position, pid, _kind, _reusable) = own_position(obj, name)?;
-            (position.is_some(), pid)
+        let Some((position, pid, _kind, _reusable)) = own_position(obj, name) else {
+            return ChainHolder::At(obj);
         };
-        if present {
-            return Some(true);
+        if position.is_some() {
+            return ChainHolder::At(obj);
         }
-        if pid == shapes::PROTO_ID_NULL {
-            return Some(false);
-        }
-        let next = if pid == shapes::PROTO_ID_DEFAULT {
+        let next = if pid == shapes::PROTO_ID_NULL {
+            return ChainHolder::Absent;
+        } else if pid == shapes::PROTO_ID_DEFAULT {
             let prototype = crate::array::object_prototype_addr_if_resolved();
             if prototype == 0 {
-                return None;
+                return ChainHolder::At(obj);
             }
             if prototype == obj as usize {
-                return Some(false);
+                return ChainHolder::Absent;
             }
             prototype as *const ObjectHeader
         } else {
-            let word = shapes::shape_record_by_id(stamp)?.prototype_word();
-            let prototype = JSValue::from_bits(word);
+            let Some(record) = shapes::shape_record_by_id(shapes::object_shape_stamp(obj)) else {
+                return ChainHolder::At(obj);
+            };
+            let prototype = JSValue::from_bits(record.prototype_word());
             if !prototype.is_pointer() {
-                return None;
+                return ChainHolder::At(obj);
             }
             prototype.as_pointer::<ObjectHeader>() as *const ObjectHeader
         };
         obj = next;
     }
-    None
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::super::*;
+
+    unsafe fn try_shape_has_property(receiver: f64, key: f64) -> Option<bool> {
+        match crate::object::layout_probe::probe_has(receiver.to_bits(), key.to_bits(), false) {
+            1 => Some(true),
+            0 => Some(false),
+            _ => None,
+        }
+    }
 
     #[test]
     fn presence_shape_answer_does_not_repeat_allocator_admission() {
         let _lock = crate::gc::global_side_table_test_lock();
         let _no_gc = crate::gc::GcSuppressScope::new();
+        crate::object::ensure_object_intrinsics();
         unsafe {
             let obj = crate::object::object_alloc_plain(1);
             let key = crate::string::canonical_key(b"shapePresence");
             crate::object::js_object_set_field_by_name(obj, key, 42.0);
             let probes = crate::value::addr_class::tracked_header_probe_count_for_tests;
             let before = probes();
-            let answer = own_position(obj, b"shapePresence").expect("subject: shape answer");
-            assert!(answer.0.is_some());
             assert_eq!(
                 try_shape_has_property(
                     crate::value::js_nanbox_pointer(obj as i64),
@@ -233,11 +208,16 @@ mod tests {
                 before,
                 "shape authority already admits the object"
             );
-            assert!(own_position(
-                perry_abi::RECEIVER_HANDLE_FLOOR.wrapping_sub(1) as *const ObjectHeader,
-                b"shapePresence"
-            )
-            .is_none());
+            assert_eq!(
+                try_shape_has_property(
+                    f64::from_bits(
+                        crate::value::POINTER_TAG
+                            | perry_abi::RECEIVER_HANDLE_FLOOR.wrapping_sub(1) as u64
+                    ),
+                    crate::value::js_nanbox_string(key as i64),
+                ),
+                None
+            );
         }
     }
 
@@ -267,7 +247,8 @@ mod tests {
                 2,
                 "subject: two namespaces share one spelling"
             );
-            assert_eq!(try_shape_has_property(receiver, boxed_key), Some(true));
+            // The probe declines a spelling a private name shares (or answers it).
+            assert_ne!(try_shape_has_property(receiver, boxed_key), Some(false));
             assert_eq!(
                 crate::object::js_object_has_own(receiver, boxed_key).to_bits(),
                 crate::value::TAG_TRUE
@@ -284,7 +265,7 @@ mod tests {
                 1,
                 "only the private element remains"
             );
-            assert_eq!(try_shape_has_property(receiver, boxed_key), Some(false));
+            assert_ne!(try_shape_has_property(receiver, boxed_key), Some(true));
             assert_eq!(
                 crate::object::js_object_has_own(receiver, boxed_key).to_bits(),
                 crate::value::TAG_FALSE

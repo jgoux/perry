@@ -130,6 +130,7 @@ fn entry_opts() -> CompileOptions {
 
 fn module_with_init(name: &str, init: Vec<Stmt>) -> Module {
     Module {
+        requested_modules: Vec::new(),
         name: name.to_string(),
         imports: Vec::new(),
         exports: Vec::new(),
@@ -164,6 +165,8 @@ fn module_with_init(name: &str, init: Vec<Stmt>) -> Module {
         async_generator_funcs: std::collections::HashSet::new(),
         local_source_spans: std::collections::HashMap::new(),
         gen_param_prologue_len: std::collections::HashMap::new(),
+        class_family_syntax: None,
+        requested_modules: Vec::new(),
     }
 }
 
@@ -874,10 +877,10 @@ fn string_literal_concat_operand_is_not_re_derived_when_nothing_collects() {
 fn string_literal_array_element_is_re_derived_below_an_allocating_element() {
     let ir = ir_for(
         "array_reload.ts",
-        vec![Stmt::Expr(Expr::Array(vec![
-            Expr::String("lit".to_string()),
-            allocating(),
-        ]))],
+        vec![Stmt::Expr(Expr::Array(
+            vec![Expr::String("lit".to_string()), allocating()],
+            None,
+        ))],
     );
 
     let f = init_ir(&ir);

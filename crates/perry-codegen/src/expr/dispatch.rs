@@ -24,6 +24,7 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
     // Hoisted byte-access proofs are dirtied by every executed call at the
     // call-emission choke point and revalidated at their next use; no
     // expression boundary refreshes them.
+    let _fallback = crate::fallback_diag::enter_expr(ctx, expr);
     let value = lower_expr_inner(ctx, expr)?;
     if let Some(desc) = crate::layout_desc::array_families::birth_layout(expr) {
         Ok(ctx.block().call(
@@ -67,11 +68,8 @@ fn lower_expr_inner(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
     if let Some(value) = super::suffix_cursor::try_lower(ctx, expr)? {
         return Ok(value);
     }
-    if let Some(value) = super::literal_descriptor::try_lower(ctx, expr) {
+    if let Some(value) = super::literal_descriptor::try_lower(ctx, expr)? {
         return Ok(value);
-    }
-    if let Some(result) = super::property_rmw::try_lower_logical(ctx, expr)? {
-        return Ok(result);
     }
     if let Some(lowered) = lower_expr_value(ctx, expr)? {
         if ctx.discard_expr_value {
@@ -144,6 +142,20 @@ fn lower_expr_inner(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 if let Some(read) =
                     crate::proto_constants::lower_known_holder_read(ctx, object, property, expr)
                 {
+                    return read;
+                }
+                // §3.6: an inherited method through a class family's layout
+                // is a read of its holder's slot.
+                if let Some(read) =
+                    crate::proto_constants::lower_class_holder_read(ctx, object, property, expr)
+                {
+                    return read;
+                }
+                // §3.6: an inherited read on an `Object.create(P)` family's
+                // object through its chain's carried layouts.
+                if let Some(read) = crate::layout_desc::create_families::lower_holder_read(
+                    ctx, object, property, expr,
+                ) {
                     return read;
                 }
                 super::property_get::lower(ctx, expr)

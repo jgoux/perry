@@ -73,6 +73,7 @@ fn empty_module() -> Module {
     Module {
         name: "gc_exit_teardown.ts".to_string(),
         imports: Vec::new(),
+        requested_modules: Vec::new(),
         exports: Vec::new(),
         classes: Vec::new(),
         interfaces: Vec::new(),
@@ -105,6 +106,7 @@ fn empty_module() -> Module {
         async_generator_funcs: std::collections::HashSet::new(),
         local_source_spans: std::collections::HashMap::new(),
         gen_param_prologue_len: std::collections::HashMap::new(),
+        class_family_syntax: None,
     }
 }
 
@@ -598,7 +600,7 @@ fn dylib_closures_keep_native_roots() {
                     name: "result".to_string(),
                     ty: Type::Array(Box::new(Type::Any)),
                     mutable: true,
-                    init: Some(Expr::Array(Vec::new())),
+                    init: Some(Expr::Array(Vec::new(), None)),
                 },
                 Stmt::Return(Some(Expr::LocalGet(2))),
             ],

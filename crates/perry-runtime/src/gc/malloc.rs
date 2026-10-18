@@ -30,7 +30,7 @@ impl MallocKindTelemetry {
         }
     }
 
-    #[cfg(perry_diagnostics)]
+    #[cfg(any(perry_diagnostics, test))]
     pub(super) fn reset_cycle_deltas(&mut self) {
         self.allocated_count = 0;
         self.allocated_bytes = 0;
@@ -477,7 +477,7 @@ impl MallocState {
             counters.copied_minor_validation_lookups.saturating_add(1);
     }
 
-    #[cfg(perry_diagnostics)]
+    #[cfg(any(perry_diagnostics, test))]
     pub(super) fn take_kind_telemetry(
         &mut self,
     ) -> [MallocKindTelemetry; MALLOC_KIND_BUCKET_COUNT] {
@@ -953,7 +953,6 @@ pub(super) fn malloc_resident_bytes() -> usize {
 /// Visit current malloc custody during native environment shutdown. The
 /// visitor may enqueue plain native finalizer records, but never collect or
 /// invoke JS. This does not alter incremental sweep snapshot/forwarding state.
-#[cfg(feature = "node-api-host")]
 pub(crate) fn walk_malloc_headers_for_native_shutdown(visit: &mut dyn FnMut(*mut GcHeader)) {
     let _no_move = super::GcSuppressScope::new();
     let headers = MALLOC_STATE.with(|state| state.borrow().objects.clone());

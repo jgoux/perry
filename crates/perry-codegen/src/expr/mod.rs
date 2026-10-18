@@ -81,6 +81,7 @@ use crate::types::{DOUBLE, F32, I1, I16, I32, I64, I8, PTR};
 // (`perry_abi::AGENT_PTR_SLOTS`).
 #[allow(dead_code)]
 pub(crate) mod agent_ptr;
+pub(crate) mod function_bind;
 pub(crate) mod layout_read;
 
 /// `PERRY_SITE_STATS=1`: one stderr line `PERRY_SITE <kind>` per lowered
@@ -102,6 +103,11 @@ pub(crate) mod folded_builtin_override;
 pub(crate) mod hot_tls;
 pub(crate) mod inline_birth;
 mod literal_descriptor;
+/// A worker program's literal-descriptor IR, for the dialect reader's round trip.
+#[cfg(test)]
+pub(crate) fn literal_descriptor_worker_ir() -> String {
+    literal_descriptor::tests::worker_program_ir()
+}
 #[cfg(test)]
 mod map_entry_at_tests;
 pub(crate) mod stack_guard;
@@ -129,7 +135,6 @@ mod proven_view_access;
 mod proven_view_guarded;
 mod range_facts;
 mod regex_literal;
-mod shape_chain;
 mod strings;
 mod typed_feedback;
 mod url_helpers;
@@ -224,6 +229,7 @@ pub(crate) use write_barrier::{
     emit_write_barrier_slot_on_block, emit_write_barrier_slot_value_and_generation_tested,
     lower_array_super_init, lower_event_emitter_async_resource_subclass_init,
     lower_event_emitter_subclass_init, lower_node_stream_super_init, lower_stream_super_init,
+    EVENT_EMITTER_INIT_KEYS,
 };
 
 // Issue #1098 phase 3: the `FnCtx` definition stays in this trunk, but its
@@ -266,8 +272,6 @@ mod scalar_slot_root;
 pub(crate) mod shadow_inline;
 #[cfg(test)]
 mod typed_element_tests;
-#[cfg(test)]
-mod write_pic_barrier_tests;
 // `pub(crate)` since #7615 slice 8: `rooting/temp_root.rs` binds a pooled
 // temp alloca through the same shadow-slot emission every named local uses,
 // and it now lives outside `crate::expr`.
@@ -337,6 +341,14 @@ pub(crate) struct InlineCtorReturn {
     /// `return`s a non-object, non-undefined value throws a TypeError; a base
     /// ctor silently ignores it and keeps `this`.
     pub is_derived: bool,
+    /// Object model step 2c: the body's run of family stores in flight
+    /// (`layout_read::family_run_plan`); every statement that is not a
+    /// `this.k = v` store ends it.
+    pub family_run: Option<crate::expr::layout_read::FamilyRun>,
+    /// A run store whose value is `this.k.bind(...)` arms this (`Some(None)`);
+    /// the bind call's lowering records whether the builtin ran
+    /// (`function_bind::emit_bind_call`).
+    pub bind_watch: Option<Option<String>>,
 }
 
 /// Per-function codegen context. Held briefly during lowering, never stored.
@@ -361,11 +373,27 @@ pub(crate) struct FnCtx<'a> {
     /// `this_stack` is one of these slots (an inlined constructor pushes its
     /// own).
     pub wpfacts_this: Vec<(String, u32)>,
+    /// `(this slot, class)` of each inlined `new C(…)` constructor body
+    /// being lowered: while the top of `this_stack` is that slot, `this` is
+    /// the instance born for `C` (`proto_constants::lower_class_holder_read`).
+    pub inline_new_leaf: Vec<(String, String)>,
+    /// `(this slot, class)` of the standalone constructor being lowered:
+    /// while the top of `this_stack` is that slot, `this` is an instance of
+    /// the class or of a class descending from it, constructed by `new` of
+    /// that class or reached through `super(…)`
+    /// (`proto_constants::lower_class_holder_read`).
+    pub ctor_receiver: Option<(String, String)>,
+    /// The standalone constructor's receiver selector, made on first use
+    /// (`proto_constants::emit_receiver_class`).
+    pub ctor_receiver_selector: Option<String>,
     /// Elided sites emitted so far in this function (witness site ids).
     pub wpfacts_sites: u32,
     /// (stable local, block) pairs whose receiver test already passed in
     /// that block (`wpfacts_access::tested_in_block`).
     pub wpfacts_tested: Vec<(i64, usize)>,
+    /// Set while lowering the generic arm of a guarded proof (decision 150):
+    /// that arm is the site's complete operation without the facts.
+    pub wpfacts_off: bool,
     pub program_has_worker: bool,
     pub program_has_thread_agents: bool,
     /// Function being built (blocks, params, registers).
@@ -403,6 +431,16 @@ pub(crate) struct FnCtx<'a> {
     /// every executable write produces this type by construction and whose
     /// every read follows a write. Holds at every read, reassigned or not.
     pub typed_locals: std::collections::HashMap<u32, HirType>,
+    /// Closed World 5d: the body's int32-or-NaN Number locals
+    /// (`TypedLocals::code_units`); the array-key admission's char-code proof.
+    pub code_unit_locals: std::collections::HashSet<u32>,
+    /// Proven Array bindings no code but their construction and element /
+    /// `length` reads names (`collectors::definite_init::confined`): their
+    /// guarded element reads drop the per-read descriptor-layout query.
+    pub confined_arrays: &'a std::collections::HashSet<u32>,
+    /// Set only while the guarded element tier lowers a read whose receiver
+    /// is a confined array (`index_get::with_confined_read`).
+    pub confined_array_read: bool,
     /// Immutable CSE/local aliases of a property read from another local,
     /// recorded as `alias_id -> (owner_id, property)`. Guarded discriminant
     /// narrowing uses this only after proving the owner at runtime; the alias
@@ -530,8 +568,10 @@ pub(crate) struct FnCtx<'a> {
     /// to nested arrow functions through the runtime binding stack.
     pub shared_super_scope_active: bool,
     /// This separately-emitted closure captures lexical `this` from a derived
-    /// constructor and must consult that constructor's shared TDZ cell.
-    pub lexical_this_uses_derived_binding: bool,
+    /// constructor and must consult that constructor's shared TDZ cell:
+    /// `Some(class id)` of the constructor's class (0 when it has none), which
+    /// with the captured receiver names that constructor's activation.
+    pub lexical_this_uses_derived_binding: Option<u32>,
     /// Stack of lexical `new.target` slot pointers. Arrow closures that
     /// reference `new.target` capture the enclosing value here.
     pub new_target_stack: Vec<String>,
@@ -917,9 +957,6 @@ pub(crate) struct FnCtx<'a> {
     /// calls. See `CompileOptions::object_literal_method_candidates`.
     pub object_literal_method_candidates:
         &'a std::collections::HashMap<String, Vec<crate::ObjectLiteralMethodCandidate>>,
-    /// The whole program's class accessor names. See
-    /// `CompileOptions::program_class_accessor_names`.
-    pub program_class_accessor_names: Option<&'a crate::ClassAccessorNames>,
     /// FFI manifest: `name -> (params, return)` from `package.json`
     /// `nativeLibrary.functions`. Descriptors use the shared native-library
     /// ABI vocabulary. `lower_call` consults
@@ -1198,7 +1235,6 @@ pub(crate) struct FnCtx<'a> {
     /// so no conversion exists on either edge; the stale number left in the
     /// root slot during the clone is harmless to a GC scan.
     pub numeric_accumulator_f64_slots: std::collections::HashMap<u32, String>,
-    pub transition_cache_base_slot: Option<String>,
     /// #9254 active materialised receiver descriptors. Entries carry
     /// poll-refreshed receiver addresses, cached scalar lengths and bounds,
     /// scoped packed/masked representation proofs, or non-moving native
@@ -1413,6 +1449,9 @@ pub(crate) struct FnCtx<'a> {
     /// (`typed_element::yields_element`). A selection hint for the relational
     /// lowering, which is exact for any value.
     pub typed_element_locals: std::collections::HashSet<u32>,
+    /// The body's `Object.create(P)` binding families
+    /// (`layout_desc::create_families`).
+    pub create_families: crate::layout_desc::create_families::CreateState,
     /// The open class-guard run (`class_guard_memo`).
     pub class_guard_window: Option<class_guard_memo::Window>,
 
@@ -1707,6 +1746,11 @@ pub(crate) struct FnCtx<'a> {
     /// specialised ABI body plus its boxed body), so a per-function counter
     /// would collide across those emissions.
     pub typed_parse_rodata: Vec<String>,
+
+    /// The declaration being lowered whose closure a birth table already bore
+    /// and stored (`closure_births::try_lower_let_run`): its `Stmt::Let`
+    /// records every fact as usual but skips the birth and the store.
+    pub born_let: Option<u32>,
 
     /// (Issue #50) Per-function row aliases. When a function declares
     /// `let krow = X[i]` where `X` is in `flat_const_arrays`, this map
@@ -2606,34 +2650,6 @@ pub(crate) fn inline_cache_global_definition(name: &str) -> String {
     format!("@{name} = private global ptr null")
 }
 
-/// A site's inline-cache slot, loaded in the current block (#9708).
-///
-/// `slot_ref` is the `@perry_ic_N` global — what the runtime miss entries
-/// take. `cache` is the `ptr` loaded from it and `present` the `i1` proving
-/// it non-null: a site must branch (or fold `present` into a guard that
-/// dominates) before it emits any load through `cache`, because the slot is
-/// null until the site's first priming miss.
-pub(crate) struct InlineCacheSlot {
-    pub slot_ref: String,
-    pub cache: String,
-    pub present: String,
-}
-
-/// Load `@<cache_name>`'s cache pointer in the current block and test it.
-/// The load has no dependency on the receiver, so it is free to issue early;
-/// folding `present` into the receiver guard the site already evaluates costs
-/// a single fused compare on the hit path.
-pub(crate) fn emit_inline_cache_slot(ctx: &mut FnCtx<'_>, cache_name: &str) -> InlineCacheSlot {
-    let slot_ref = format!("@{cache_name}");
-    let cache = ctx.block().load(PTR, &slot_ref);
-    let present = ctx.block().icmp_ne(PTR, &cache, "null");
-    InlineCacheSlot {
-        slot_ref,
-        cache,
-        present,
-    }
-}
-
 /// Record a cold-arm bailout for a compiler-private versioned-loop callback.
 /// The stack context is `[counter_slot_ptr, original_bound, resume_index]` as
 /// three i64 words. The first cold arm stores `counter + 1` and poisons the
@@ -2795,13 +2811,6 @@ mod inline_cache_name_tests {
 }
 
 impl<'a> FnCtx<'a> {
-    /// May some compiled class of the program declare a setter named `name`?
-    /// Where this is false a store site emits no class-setter arm.
-    pub(crate) fn program_may_declare_setter(&self, name: &str) -> bool {
-        self.program_class_accessor_names
-            .is_none_or(|names| names.may_set(name))
-    }
-
     /// Is `e` the `this` of a STATIC class member — i.e. a receiver that holds
     /// the class CONSTRUCTOR (an INT32 class ref) rather than an instance?
     ///
@@ -3154,6 +3163,7 @@ impl<'a> FnCtx<'a> {
     }
 
     pub fn block(&mut self) -> &mut LlBlock {
+        crate::fallback_diag::set_symbol(&self.func.name);
         self.func
             .block_mut(self.current_block)
             .expect("current_block index points at a valid block")
@@ -3219,10 +3229,10 @@ pub(crate) mod class_env;
 pub(crate) mod class_field_push;
 pub(crate) mod class_first_evaluation;
 mod closure;
+pub(crate) use closure::{plain_async_step_release_ids, push_capture_word};
 mod compare;
 pub(crate) use compare::ordinary_object_allocation;
 pub(crate) mod region_guard;
-pub(crate) mod region_read_run;
 pub(crate) use compare::lower_string_literal_strict_eq;
 #[cfg(test)]
 mod compare_tests;
@@ -3279,7 +3289,6 @@ mod index_set_packed_loop;
 mod index_set_typed_array;
 mod instance_misc1;
 mod member_update;
-mod property_rmw;
 mod typed_array_rmw;
 mod typed_array_update;
 pub(crate) use instance_misc1::builtin_parent_reserved_class_id;
@@ -3290,7 +3299,7 @@ mod generator_control_slots;
 pub(crate) mod ic_fast_split;
 mod js_runtime;
 mod literals_vars;
-pub(crate) use literals_vars::bind_lowered_value_to_local;
+pub(crate) use literals_vars::{bind_lowered_value_to_local, note_born_local_write};
 mod logical_collections;
 mod math_simple;
 pub(crate) mod method_site;
@@ -4348,6 +4357,7 @@ fn lower_compare_value(
 /// value. The compatibility `lower_expr` path below materializes this value
 /// when an existing caller still expects the generic JSValue/`double` ABI.
 pub(crate) fn lower_expr_value(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<Option<LoweredValue>> {
+    let _fallback = crate::fallback_diag::enter_expr(ctx, expr);
     match expr {
         Expr::Bool(value) => {
             let lowered = LoweredValue::i1(if *value { "true" } else { "false" });

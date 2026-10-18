@@ -74,6 +74,7 @@ fn module_with(functions: Vec<Function>) -> Module {
     Module {
         name: "clone_suffix.ts".to_string(),
         imports: Vec::new(),
+        requested_modules: Vec::new(),
         exports: Vec::new(),
         classes: Vec::new(),
         interfaces: Vec::new(),
@@ -106,6 +107,7 @@ fn module_with(functions: Vec<Function>) -> Module {
         async_generator_funcs: std::collections::HashSet::new(),
         local_source_spans: std::collections::HashMap::new(),
         gen_param_prologue_len: std::collections::HashMap::new(),
+        class_family_syntax: None,
     }
 }
 

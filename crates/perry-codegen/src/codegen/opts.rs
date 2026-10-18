@@ -589,7 +589,8 @@ pub struct CompileOptions {
     /// The runtime call-effect table this compilation lowers under: which
     /// runtime calls can collect or unwind. One value per compilation, shared
     /// by every module; its digest is in the object-cache key. Default: the
-    /// committed per-target tables ([`crate::GcEffects::from_committed`]).
+    /// table that proves nothing ([`crate::GcEffects::all_unsafe`]); the
+    /// compiler installs the verified sidecar table of the archive it links.
     pub gc_effects: std::sync::Arc<crate::GcEffects>,
 }
 
@@ -873,6 +874,7 @@ pub struct ImportedObjectLiteral {
     pub receiver_class_name: String,
     /// LocalId of the defining module's immutable global binding.
     pub source_global_id: u32,
+    pub final_shape: Option<super::BirthShape>,
     pub methods: Vec<ImportedObjectLiteralMethod>,
 }
 
@@ -886,6 +888,7 @@ pub struct ExportedObjectLiteralCapability {
     pub global_id: u32,
     pub shape_id_global: String,
     pub field_names: Vec<String>,
+    pub final_shape: Option<super::BirthShape>,
     pub methods: Vec<ImportedObjectLiteralMethod>,
 }
 
@@ -917,6 +920,9 @@ impl ImportedCtor {
 /// adding five more individual parameters to every compile_* function.
 /// Built once in `compile_module` from `CompileOptions`.
 pub(crate) struct CrossModuleCtx {
+    /// Closure regions of the splitter (`split_regions`): one body each,
+    /// typed by the parameter types its only caller proved.
+    pub region_closures: std::collections::HashSet<u32>,
     /// wpfacts slice 2: the elision facts of this module
     /// (`CompileOptions::program_facts`).
     pub wpfacts: std::sync::Arc<super::ElisionFacts>,
@@ -1319,6 +1325,9 @@ pub(crate) struct CrossModuleCtx {
     /// Untyped string accumulators, module-wide
     /// (`collectors::string_accumulator_locals`).
     pub string_accumulator_locals: std::collections::HashSet<u32>,
+    /// Bindings assigned before any reader can run
+    /// (`collectors::definite_init`), module-wide.
+    pub definite_init: crate::collectors::DefiniteInit,
     /// Debug/benchmark switch that forces Buffer/Uint8Array accesses through
     /// the generic helper path.
     pub disable_buffer_fast_path: bool,

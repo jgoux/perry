@@ -920,6 +920,8 @@ fn lower_new_impl_inner<'a>(
         this_slot.clone()
     });
     ctx.class_stack.push(class_name.to_string());
+    ctx.inline_new_leaf
+        .push((this_slot.clone(), class_name.to_string()));
 
     // #2768/new.target: `new C()` is fully inlined here, so the runtime
     // `js_new_target_*` cell is never set on this path. Bind `new.target`
@@ -984,6 +986,8 @@ fn lower_new_impl_inner<'a>(
             || class.extends_name.is_some()
             || class.native_extends.is_some()
             || class.extends_expr.is_some(),
+        family_run: None,
+        bind_watch: None,
     });
 
     // Apply ANCESTOR field initializers — refs #420 / #631-followup.
@@ -1268,6 +1272,8 @@ fn lower_new_impl_inner<'a>(
                         result_slot: parent_result_slot,
                         after_label: parent_after_label.clone(),
                         is_derived: parent_is_derived,
+                        family_run: None,
+                        bind_watch: None,
                     });
                     if parent_is_derived {
                         crate::expr::this_super_call::push_shared_super_called_slot(ctx);
@@ -1924,5 +1930,6 @@ fn lower_new_impl_inner<'a>(
         ctx.wpfacts_this.retain(|(s, _)| *s != slot);
     }
     ctx.class_stack.pop();
+    ctx.inline_new_leaf.pop();
     Ok(final_box)
 }

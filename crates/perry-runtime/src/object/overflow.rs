@@ -246,6 +246,7 @@ pub(crate) unsafe fn ensure(obj: *mut ObjectHeader) -> *mut Table {
     if !existing.is_null() {
         return existing;
     }
+    super::layout_desc::diag_note_install(obj);
     let scope = crate::gc::RuntimeHandleScope::new();
     let owner = scope.root_raw_mut_ptr(obj);
     super::object_meta_ensure(obj);
@@ -263,6 +264,18 @@ pub(crate) unsafe fn ensure(obj: *mut ObjectHeader) -> *mut Table {
         let shape = super::shapes::object_shape_descriptor(obj).unwrap();
         let keys = ObjectKeys::new(shape.keys as usize as *mut ArrayHeader, count);
         let fixed = if i < count { keys.storage_slot(i) } else { i };
+        // A key whose slot holds the hole (an optional key not written, a
+        // tombstone) is a tombstoned entry: no atom, no barrier, no index.
+        if i < count && slot_holds_hole(obj, fixed, shape.live_inline_slot_count) {
+            let attrs = super::key_attrs::keys_entry(shape.keys as usize as *const ArrayHeader, i);
+            let t = rooted.get_raw_mut_ptr::<Table>();
+            *key_at(t, i) = TAG_HOLE;
+            *value_at(t, i) = crate::value::INT32_TAG | fixed as u64;
+            *attrs_at(t, i) = attrs as u64 | SLOT_REF;
+            (*t).summary |= u32::from(super::key_attrs::entry_summary(attrs));
+            (*t).length = i + 1;
+            continue;
+        }
         let key = if i < count {
             let value = if fixed < shape.live_inline_slot_count {
                 super::field_get_set::object_field_at_with_live(
@@ -314,6 +327,18 @@ pub(crate) unsafe fn ensure(obj: *mut ObjectHeader) -> *mut Table {
     }
     install(owner.get_raw_mut_ptr::<ObjectHeader>(), t);
     t
+}
+
+/// Does storage slot `fixed` of `obj` (live inline slots `live`) hold the
+/// hole?
+#[inline]
+unsafe fn slot_holds_hole(obj: *const ObjectHeader, fixed: u32, live: u32) -> bool {
+    if fixed < live {
+        super::field_get_set::object_field_at_with_live(obj, fixed, live).bits() == TAG_HOLE
+    } else {
+        super::spill::spill_get_present(obj as usize, fixed as usize).unwrap_or(TAG_HOLE)
+            == TAG_HOLE
+    }
 }
 
 unsafe fn reserve(obj: *mut ObjectHeader) -> *mut Table {
@@ -426,9 +451,9 @@ pub(crate) unsafe fn insert_key_bits(
         *attrs_at(t, slot) = attrs as u64;
         (*t).summary |= u32::from(super::key_attrs::entry_summary(attrs));
     }
-    crate::gc::runtime_write_barrier_slot(t as usize, key_at(t, slot) as usize, key);
+    crate::gc::runtime_write_barrier_resolved_slot(t as usize, key_at(t, slot) as usize, key);
     if *attrs_at(t, slot) & SLOT_REF == 0 {
-        crate::gc::runtime_write_barrier_slot(
+        crate::gc::runtime_write_barrier_resolved_slot(
             t as usize,
             value_at(t, slot) as usize,
             *value_at(t, slot),
@@ -443,6 +468,17 @@ pub(crate) unsafe fn get(obj: *const ObjectHeader, slot: u32) -> Option<u64> {
         return None;
     }
     get_from(t, obj, slot)
+}
+
+/// The fixed storage slot entry `slot` of `t` refers to: a layout key's
+/// entry names the slot its value lives in. `None` for a tombstone and for
+/// an entry whose value the table holds.
+///
+/// # Safety
+/// `t` is a live table.
+pub(crate) unsafe fn fixed_slot_of(t: *const Table, slot: u32) -> Option<u32> {
+    (slot < (*t).length && *key_at(t, slot) != TAG_HOLE && *attrs_at(t, slot) & SLOT_REF != 0)
+        .then(|| *value_at(t, slot) as u32)
 }
 
 pub(crate) unsafe fn get_from(t: *const Table, obj: *const ObjectHeader, slot: u32) -> Option<u64> {
@@ -537,6 +573,39 @@ pub(crate) unsafe fn reattach_fixed(obj: *mut ObjectHeader, key: u64) {
     *attrs_at(t, entry) |= SLOT_REF;
 }
 
+/// Is entry `i` a plain writable data property holding its own value (not
+/// a fixed-slot reference, an accessor or a private name)?
+pub(crate) unsafe fn plain_writable_value(t: *const Table, i: u32) -> bool {
+    let attrs = *attrs_at(t, i);
+    attrs & SLOT_REF == 0
+        && *key_at(t, i) != TAG_HOLE
+        && super::key_attrs::entry_is_plain_writable_data(attrs as u8)
+}
+
+/// Case 2c (`layout_desc::route_family_add`): a static family object, whose
+/// layout word never changes, gains `key` (a string or a symbol) that its
+/// layout does not hold. The overflow is installed (it orders the object from
+/// now on) and the key's entry references fixed slot `slot`, past the layout's
+/// slots, where the caller's add stores the value.
+pub(crate) unsafe fn append_fixed_ref(obj: *mut ObjectHeader, key: u64, slot: u32) {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let owner = scope.root_raw_mut_ptr(obj);
+    let key = if crate::JSValue::from_bits(key).is_any_string() {
+        crate::string::property_atom_from_value(key)
+    } else {
+        key
+    };
+    let entry = insert_key_bits(
+        owner.get_raw_mut_ptr::<ObjectHeader>(),
+        key,
+        crate::value::TAG_UNDEFINED,
+        0,
+    );
+    let t = table(owner.get_raw_mut_ptr::<ObjectHeader>());
+    *value_at(t, entry) = crate::value::INT32_TAG | slot as u64;
+    *attrs_at(t, entry) |= SLOT_REF;
+}
+
 /// A table key's positional field is its value or its fixed-slot reference.
 pub(crate) unsafe fn store_index(obj: *mut ObjectHeader, slot: u32, value: u64) -> bool {
     let t = table(obj);
@@ -562,6 +631,9 @@ pub(crate) unsafe fn store_index(obj: *mut ObjectHeader, slot: u32, value: u64) 
 pub(crate) unsafe fn delete(obj: *mut ObjectHeader, key: &[u8]) -> bool {
     let hash = super::key_bytes_hash(key.as_ptr(), key.len());
     if table(obj).is_null() {
+        // Class-family births have hole-only placeholders, so an absent
+        // delete preserves their birth proof. Ordinary shapes retain their
+        // existing overflow/order path; this is a typed family operation.
         // A layout key list may hold a spelling that is not yet its atom (a
         // runtime key added by bytes). The table interns every key it
         // orders, so it is established before the atom is looked up.
@@ -570,6 +642,20 @@ pub(crate) unsafe fn delete(obj: *mut ObjectHeader, key: &[u8]) -> bool {
             if let Some(slot) =
                 super::keys_find_property_slot_by_bytes(keys, record.logical_key_count(), key)
             {
+                // A hole is an absent property, including allocator-owned
+                // placeholders before a derived constructor's super call.
+                // Deleting it changes neither membership nor insertion order.
+                // The immutable summary proves solid records have no
+                // holes; avoid building a key view on their ordinary deletes.
+                let hole = super::key_view::summary_may_have_holes(record.summary())
+                    && super::key_view::position_is_hole(
+                        obj,
+                        ObjectKeys::new(keys.cast_mut(), record.logical_key_count()),
+                        slot,
+                    );
+                if hole && super::layout_desc::is_family_layout_word((*obj).parent_class_id) {
+                    return true;
+                }
                 // A refused delete changes nothing, so it establishes no
                 // overflow (and leaves the layout word as it was).
                 if super::key_attrs::keys_entry(keys, slot)
@@ -578,7 +664,15 @@ pub(crate) unsafe fn delete(obj: *mut ObjectHeader, key: &[u8]) -> bool {
                 {
                     return false;
                 }
+                super::layout_desc::note_install_cause(if hole {
+                    super::layout_desc::install_cause::DELETE_HOLE
+                } else {
+                    super::layout_desc::install_cause::DELETE
+                });
                 ensure(obj);
+            } else if super::layout_desc::is_family_layout_word((*obj).parent_class_id) {
+                // An absent family spelling has no order entry to retire.
+                return true;
             }
         }
     }

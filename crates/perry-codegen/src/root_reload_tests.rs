@@ -89,8 +89,7 @@ fn a_non_collecting_window_is_left_byte_for_byte_alone() {
 #[test]
 fn dispatch_probes_do_not_open_a_reload_window() {
     // `js_object_get_own_field_or_undef` was the second probe here. The
-    // generated call-graph table proves it reaches JS (#11522), so the hand
-    // list alone no longer makes it non-collecting; see
+    // linked archive's table decides it, not the hand list (#11522); see
     // `own_field_probe_reaching_js_opens_a_reload_window` below.
     for helper in ["js_object_get_class_id"] {
         assert!(
@@ -104,14 +103,15 @@ fn dispatch_probes_do_not_open_a_reload_window() {
     }
 }
 
-/// #11522: the hand-kept `NON_COLLECTING` entry is overruled by the generated
-/// table, because the call graph proves the helper can reach a Proxy trap.
+/// #11522: the hand-kept `NON_COLLECTING` entry is overruled by the linked
+/// archive's table: in a world whose table says the helper can collect (the
+/// test world states it), the reload window stays.
 #[test]
 fn own_field_probe_reaching_js_opens_a_reload_window() {
     let helper = "js_object_get_own_field_or_undef";
     assert!(NON_COLLECTING.contains(&helper));
     assert_ne!(
-        crate::gc_call_effects::committed_for_tests().classify_direct_callee(helper),
+        crate::gc_call_effects::test_effects().classify_direct_callee(helper),
         crate::gc_call_effects::GcCallEffect::CannotCollect
     );
     let mut f = one_block(helper);
@@ -1248,5 +1248,91 @@ fn the_cap_does_not_count_groups_that_never_walk() {
         BLOCKS + 1,
         "every per-block handle use and the one cross-block derived use must \
          be reloaded; a declined function keeps all of them stale"
+    );
+}
+
+/// Past `MAX_BLOCK_LOAD_PRODUCT`: `BLOCKS` blocks, each with its own root
+/// load, plus one cell address derived at entry and read in every block below
+/// a collecting call (`closure_capture_cells`' entry cache, the shape tsc's
+/// module-body closure carried stale across every collection once it outgrew
+/// the cap). Each block also reads the previous block's receiver, so every
+/// root load is a group that needs a walk and the cap counts it. `store_in_body`
+/// adds a store to the slot in the last block.
+fn past_the_cap(store_in_body: bool) -> (LlFunction, usize) {
+    const BLOCKS: usize = 8300;
+    let mut f = LlFunction::new("huge", DOUBLE, vec![(DOUBLE, "%arg".into())]);
+    let mut labels = Vec::with_capacity(BLOCKS + 1);
+    labels.push(f.create_block("entry").label.clone());
+    for i in 0..BLOCKS {
+        labels.push(f.create_block(&format!("b{i}")).label.clone());
+    }
+    let slot;
+    let cell;
+    {
+        let b = f.block_mut(0).unwrap();
+        slot = b.alloca(DOUBLE);
+        b.store(DOUBLE, "%arg", &slot);
+        b.call_void(
+            "js_shadow_slot_bind",
+            &[(crate::types::I32, "0"), (PTR, &slot)],
+        );
+        let boxed = b.load(DOUBLE, &slot);
+        let bits = b.bitcast_double_to_i64(&boxed);
+        let base = b.and(I64, &bits, "281474976710655");
+        cell = b.add(I64, &base, "24");
+        b.br(&labels[1]);
+    }
+    let mut prev: Option<String> = None;
+    for i in 0..BLOCKS {
+        let next = labels.get(i + 2).cloned();
+        let b = f.block_mut(i + 1).unwrap();
+        let boxed = b.load(DOUBLE, &slot);
+        let recv = b.bitcast_double_to_i64(&boxed);
+        b.call(DOUBLE, "js_object_get_field_by_name_f64", &[]);
+        b.call_void(
+            "js_object_set_field_by_name",
+            &[(I64, &recv), (DOUBLE, "0.0")],
+        );
+        if let Some(p) = &prev {
+            b.call_void(
+                "js_object_set_field_by_name",
+                &[(I64, p), (DOUBLE, "0.0")],
+            );
+        }
+        b.call(I64, "js_box_get_bits_trusted", &[(I64, &cell)]);
+        if store_in_body && next.is_none() {
+            b.store(DOUBLE, "%arg", &slot);
+        }
+        prev = Some(recv);
+        match next {
+            Some(n) => b.br(&n),
+            None => b.ret(DOUBLE, "0.0"),
+        }
+    }
+    assert!((BLOCKS + 1) * BLOCKS > MAX_BLOCK_LOAD_PRODUCT);
+    (f, BLOCKS)
+}
+
+#[test]
+fn past_the_cap_an_entry_stored_root_is_still_reloaded() {
+    let (mut f, blocks) = past_the_cap(false);
+    assert_eq!(
+        apply_to_function(&mut f),
+        3 * blocks - 1,
+        "each block's own receiver, the previous block's receiver and the \
+         entry-derived cell address are read below a collecting call; declining \
+         the whole function leaves every one of them naming the pre-collection \
+         address"
+    );
+}
+
+#[test]
+fn past_the_cap_a_root_stored_in_the_body_keeps_its_ir() {
+    let (mut f, _) = past_the_cap(true);
+    assert_eq!(
+        apply_to_function(&mut f),
+        0,
+        "past the cap there is no path walk, so a root the body stores to \
+         cannot be proven unchanged at a use and must be left alone"
     );
 }

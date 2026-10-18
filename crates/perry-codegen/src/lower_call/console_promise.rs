@@ -827,6 +827,42 @@ fn emit_native_method_str_dispatch_with(
     // Pass a tagged pointer to the immutable StringPool dispatch descriptor.
     // A GC-backed string handle belongs to the main thread's arena and cannot
     // be resolved safely by a `perry/thread` worker executing this closure.
+    // `f.bind(...)` on a base-shape function is the builtin
+    // (`expr/function_bind.rs`); this dispatch is its miss.
+    if property == "bind" {
+        return crate::expr::function_bind::emit_bind_call(ctx, recv_box, lowered_args, |ctx| {
+            emit_native_method_dispatch_generic(
+                ctx,
+                property,
+                call_byte_offset,
+                recv_box,
+                lowered_args,
+                site,
+                lanes,
+            )
+        });
+    }
+    emit_native_method_dispatch_generic(
+        ctx,
+        property,
+        call_byte_offset,
+        recv_box,
+        lowered_args,
+        site,
+        lanes,
+    )
+}
+
+/// [`emit_native_method_str_dispatch_with`] past its `bind` lowering.
+fn emit_native_method_dispatch_generic(
+    ctx: &mut FnCtx<'_>,
+    property: &str,
+    call_byte_offset: u32,
+    recv_box: &str,
+    lowered_args: &[String],
+    site: bool,
+    lanes: &[crate::codegen::static_constfn::StaticMethodLane],
+) -> String {
     let key_idx = ctx.strings.intern(property);
     let dispatch_global = ctx.strings.static_dispatch_global(key_idx);
     let method_id = crate::strings::emit_static_dispatch_id(ctx.block(), &dispatch_global);
@@ -846,6 +882,7 @@ fn emit_native_method_str_dispatch_with(
         // direct call. Its miss performs the dispatch below.
         return crate::expr::method_site::emit_method_site(
             ctx,
+            property,
             recv_box,
             lowered_args,
             &site_id,
@@ -961,11 +998,7 @@ pub(crate) fn lower_split_method_call(
         // A getter or a nullish receiver throws from the lookup.
         crate::expr::calls::emit_call_location_at(ctx, call_byte_offset);
         let lookup = crate::expr::method_site::emit_method_site_lookup(
-            ctx,
-            &recv,
-            &method_id,
-            args.len(),
-            lanes,
+            ctx, property, &recv, &method_id, lanes,
         );
         let value = lookup.value.clone();
         let value_root =
@@ -1425,6 +1458,11 @@ pub fn try_lower_native_method_str_dispatch(
             return with_operands_rooted(ctx, &operand_exprs, |ctx, rereads| {
                 let recv_box = rereads[0].clone();
                 let lowered_args: Vec<String> = rereads[1..].to_vec();
+                // §3.6: the method of a create family's object through its
+                // chain's carried layouts (taken by the method site).
+                let holder =
+                    crate::layout_desc::create_families::holder_read(ctx, object, property);
+                let saved = std::mem::replace(&mut ctx.create_families.method_holder, holder);
                 let result = emit_native_method_str_dispatch_lanes(
                     ctx,
                     property,
@@ -1433,6 +1471,7 @@ pub fn try_lower_native_method_str_dispatch(
                     &lowered_args,
                     &lanes,
                 );
+                ctx.create_families.method_holder = saved;
                 // The group is released AFTER the dispatch, not before: the
                 // dispatcher allocates while it reads these values. That is the
                 // combinator's own contract now, not a line a future edit can move.

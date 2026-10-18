@@ -98,7 +98,7 @@ fn numeric_layout_oob_array_read_ir() -> String {
                 init: Some(Expr::PropertyGet {
                     object: Box::new(Expr::Object(vec![(
                         "value".to_string(),
-                        Expr::Array(vec![]),
+                        Expr::Array(vec![], None),
                     )])),
                     property: "value".to_string(),
                     byte_offset: 0,
@@ -258,8 +258,8 @@ const DYNAMIC_INDEX_SITE_BLOCKS: &[&str] = &[
 
 /// #T2 ("inline hit, one exit"): the emitted `obj[i]` for an erased receiver
 /// keeps exactly two inline hits — the packed ordinary-Array arm and the
-/// object-backed MRU cache hit — and routes everything else through ONE
-/// runtime call.
+/// elements-backed Array-subclass load — and routes everything else through
+/// ONE runtime call.
 ///
 /// This replaces `unknown_numeric_read_guards_dense_subclass_families_and_
 /// spilled_length`, which pinned the tower those arms used to be inlined
@@ -268,9 +268,8 @@ const DYNAMIC_INDEX_SITE_BLOCKS: &[&str] = &[
 /// tiers, the elements-backed subclass probe and the lazy-JSON-array probe —
 /// ~50 blocks and ~316 pre-RS4GC instructions per site, 55% of all IR on
 /// `prettier/plugins/flow.mjs`). Each of those was an acceleration of a
-/// decision `js_packed_arraylike_index_get` already makes, and the exit still
-/// calls it with this site's own cache slot, so neither the answer nor the
-/// primed cache words moved.
+/// decision `js_packed_arraylike_index_get` already makes, so the answer did
+/// not move.
 #[test]
 fn unknown_numeric_read_is_one_inline_hit_and_one_out_of_line_exit() {
     let ir = ir_for(
@@ -286,7 +285,7 @@ fn unknown_numeric_read_is_one_inline_hit_and_one_out_of_line_exit() {
                 init: Some(Expr::PropertyGet {
                     object: Box::new(Expr::Object(vec![(
                         "value".to_string(),
-                        Expr::Array(vec![Expr::Number(7.0)]),
+                        Expr::Array(vec![Expr::Number(7.0)], None),
                     )])),
                     property: "value".to_string(),
                     byte_offset: 0,
@@ -386,24 +385,16 @@ fn unknown_numeric_read_is_one_inline_hit_and_one_out_of_line_exit() {
         elem_load.contains("load double") && !elem_load.contains("call "),
         "the elements-backed hit must load the element with no runtime call:\n{elem_load}"
     );
-    // Nothing inline reads the site's cache any more; only the exit mentions
-    // it, and only as an ADDRESS — a link-time constant needing no load. (The
-    // tier that used to load word 0 through `emit_inline_cache_slot` is the
-    // shape-carried tower, now behind the exit.)
+    // No arm, the exit included, touches a per-site cache: the arraylike
+    // index cache is deleted (object model step 5, phase 2) and the exit
+    // takes only the receiver and the index.
     for block in dynamic_index_site_blocks(&ir) {
         let body = super::class_field_barrier_tests::block_body(&ir, &format!("{block}."))
             .unwrap_or_else(|| panic!("{block} block exists"));
-        if block == "arrlike.ic.miss" {
-            assert!(
-                body.contains("ptr @perry_ic_") && !body.contains("load ptr, ptr @perry_ic_"),
-                "the exit must take the slot's address, not its contents:\n{body}"
-            );
-        } else {
-            assert!(
-                !body.contains("@perry_ic_"),
-                "no inline arm may touch the site's cache slot ({block}):\n{body}"
-            );
-        }
+        assert!(
+            !body.contains("@perry_ic_"),
+            "no arm may touch a per-site cache slot ({block}):\n{body}"
+        );
     }
 }
 
@@ -449,7 +440,7 @@ fn the_number_context_coercion_is_coupled_across_every_arm() {
                     init: Some(Expr::PropertyGet {
                         object: Box::new(Expr::Object(vec![(
                             "value".to_string(),
-                            Expr::Array(vec![Expr::Number(7.0)]),
+                            Expr::Array(vec![Expr::Number(7.0)], None),
                         )])),
                         property: "value".to_string(),
                         byte_offset: 0,
@@ -626,7 +617,7 @@ fn unknown_numeric_read_routes_typed_arrays_through_the_single_exit() {
                 init: Some(Expr::PropertyGet {
                     object: Box::new(Expr::Object(vec![(
                         "value".to_string(),
-                        Expr::Array(vec![Expr::Number(7.0)]),
+                        Expr::Array(vec![Expr::Number(7.0)], None),
                     )])),
                     property: "value".to_string(),
                     byte_offset: 0,
@@ -757,7 +748,7 @@ fn any_typed_dynamic_key_takes_the_numeric_tiers_when_it_is_an_array_index() {
                 init: Some(Expr::PropertyGet {
                     object: Box::new(Expr::Object(vec![(
                         "value".to_string(),
-                        Expr::Array(vec![Expr::Number(7.0)]),
+                        Expr::Array(vec![Expr::Number(7.0)], None),
                     )])),
                     property: "value".to_string(),
                     byte_offset: 0,
@@ -771,7 +762,7 @@ fn any_typed_dynamic_key_takes_the_numeric_tiers_when_it_is_an_array_index() {
                 init: Some(Expr::PropertyGet {
                     object: Box::new(Expr::Object(vec![(
                         "value".to_string(),
-                        Expr::Array(vec![Expr::Number(0.0)]),
+                        Expr::Array(vec![Expr::Number(0.0)], None),
                     )])),
                     property: "value".to_string(),
                     byte_offset: 0,
@@ -820,7 +811,7 @@ fn claimed_array_receiver_brands_before_committing_a_canonical_key_to_the_plain_
                 init: Some(Expr::PropertyGet {
                     object: Box::new(Expr::Object(vec![(
                         "value".to_string(),
-                        Expr::Array(vec![Expr::Number(7.0)]),
+                        Expr::Array(vec![Expr::Number(7.0)], None),
                     )])),
                     property: "value".to_string(),
                     byte_offset: 0,
@@ -834,7 +825,7 @@ fn claimed_array_receiver_brands_before_committing_a_canonical_key_to_the_plain_
                 init: Some(Expr::PropertyGet {
                     object: Box::new(Expr::Object(vec![(
                         "value".to_string(),
-                        Expr::Array(vec![Expr::Number(0.0)]),
+                        Expr::Array(vec![Expr::Number(0.0)], None),
                     )])),
                     property: "value".to_string(),
                     byte_offset: 0,

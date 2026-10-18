@@ -106,7 +106,15 @@ fn resolve_keyvalue_key(ctx: &mut LoweringContext, key: &ast::PropName) -> KeyRe
                         if let Some(value) = ctx.lookup_enum_member(&enum_name, &member_name) {
                             match value {
                                 EnumValue::String(s) => KeyResolution::Static(s.clone()),
-                                EnumValue::Number(n) => KeyResolution::Static(n.to_string()),
+                                EnumValue::Number(n) => {
+                                    KeyResolution::Static(crate::js_number_to_string(*n))
+                                }
+                                EnumValue::Computed => {
+                                    match lower_expr(ctx, computed.expr.as_ref()) {
+                                        Ok(e) => KeyResolution::Dynamic(e),
+                                        Err(_) => KeyResolution::Skip,
+                                    }
+                                }
                             }
                         } else {
                             // Non-enum member access: lower as a dynamic expression.
@@ -1284,7 +1292,7 @@ pub(super) fn lower_object(ctx: &mut LoweringContext, obj: &ast::ObjectLit) -> R
                 })
                 .collect();
             ctx.exit_scope(scope_mark);
-            return Ok(Expr::Object(props));
+            return Ok(Expr::object_literal(props));
         }
 
         // Static data definitions and spreads already have a source-ordered
@@ -1642,7 +1650,7 @@ pub(super) fn lower_object(ctx: &mut LoweringContext, obj: &ast::ObjectLit) -> R
     }
     // No computed-key post-init: emit a plain object literal.
     if computed_post_init.is_empty() {
-        return Ok(Expr::Object(props));
+        return Ok(Expr::object_literal(props));
     }
     // Has computed keys: synthesize an IIFE wrapper that builds the
     // object with static props, then runs IndexSet for each computed
@@ -1774,7 +1782,7 @@ pub(super) fn lower_object(ctx: &mut LoweringContext, obj: &ast::ObjectLit) -> R
     // also correctness-safe but adds a small per-call cost for the
     // common non-this-key cases; the scan keeps the existing fast path.
     let body_uses_this = body.iter().any(uses_this_stmt);
-    let static_obj = Expr::Object(props);
+    let static_obj = Expr::object_literal(props);
     let closure = Expr::Closure {
         func_id: iife_func_id,
         params: vec![param],

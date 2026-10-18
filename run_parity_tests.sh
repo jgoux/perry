@@ -1,6 +1,8 @@
 #!/bin/bash
 # Perry Parity Test Runner
 # Compares output between Node.js and Perry native compilation
+# Fixture parity-rlimit-as-mb ceilings apply only to native execution;
+# unsupported containment fails before the test binary can run.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TEST_DIR="$SCRIPT_DIR/test-files"
@@ -849,6 +851,11 @@ if [[ "$PERRY_SKIP_BUILD" == "0" && "$needs_wasm_host" -eq 1 ]]; then
         exit 1
     fi
 fi
+if [[ "$PERRY_SKIP_BUILD" == "0" ]]; then
+    # GC effects sidecars over the final archive bytes (after every build above).
+    "$SCRIPT_DIR/scripts/gc_call_effects/sidecars.sh" "${CARGO_TARGET_DIR:-$SCRIPT_DIR/target}/release" >"$PARITY_TMP/sidecars.log" 2>&1 \
+        || { tail -40 "$PARITY_TMP/sidecars.log" >&2; exit 1; }
+fi
 # #7629 — PERRY_SKIP_BUILD=1 exports PERRY_NO_AUTO_OPTIMIZE=1 and then builds
 # NOTHING, so every wrapper archive the run needs must already be in
 # PERRY_RUNTIME_DIR *and* must have come from the same `cargo build` as the
@@ -1438,6 +1445,13 @@ for (( selected_i = 0; selected_i < JOURNAL_TOTAL; selected_i++ )); do
         continue
     fi
 
+    parity_runtime_prefix=()
+    if grep -qE '^[[:space:]]*//[[:space:]]*parity-rlimit-as-mb:' "$test_file"; then
+        # Validate before oracle/compile work; enforce only on the native run.
+        python3 -B "$SCRIPT_DIR/scripts/parity_fixture_limits.py" --print-limit "$test_file" >/dev/null || exit 2
+        parity_runtime_prefix=(python3 -B "$SCRIPT_DIR/scripts/parity_fixture_limits.py" "$test_file")
+    fi
+
     # Check if test should be skipped
     if should_skip "$test_name"; then
         echo -e "${YELLOW}SKIP${NC}  $test_id (suite skip list)"
@@ -1653,7 +1667,7 @@ for (( selected_i = 0; selected_i < JOURNAL_TOTAL; selected_i++ )); do
         # Windows processes. The Python-backed timeout starts a fresh process
         # group and kills its tree, even when GNU timeout is unavailable.
         run_with_timeout "$PERRY_RUN_TIMEOUT" env PERRY_STUB_DIAG=off "${parity_env[@]}" \
-            "$perry_binary" "${test_argv[@]}" > "$perry_tmp" 2>&1
+            "${parity_runtime_prefix[@]}" "$perry_binary" "${test_argv[@]}" > "$perry_tmp" 2>&1
     else
         run_with_timeout "$PERRY_RUN_TIMEOUT" "$BASH" -c '
             if [ "$(uname -s)" = "Linux" ]; then
@@ -1676,7 +1690,7 @@ for (( selected_i = 0; selected_i < JOURNAL_TOTAL; selected_i++ )); do
                 echo "failed to apply the per-test process limit" >&2
                 exit 125
             fi
-            exec "$@"' _ env PERRY_STUB_DIAG=off "${parity_env[@]}" "$perry_binary" "${test_argv[@]}" > "$perry_tmp" 2>&1
+            exec "$@"' _ env PERRY_STUB_DIAG=off "${parity_env[@]}" "${parity_runtime_prefix[@]}" "$perry_binary" "${test_argv[@]}" > "$perry_tmp" 2>&1
     fi
     perry_exit=$?
     # Reap orphaned Unix children of the test binary (cluster tests fork

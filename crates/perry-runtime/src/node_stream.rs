@@ -68,8 +68,9 @@ pub(crate) fn has_stream_listeners(stream: f64, event: &[u8]) -> bool {
 pub(crate) use event_emitter::validate_max_listeners;
 // node EventEmitter instance state (EventEmitter.init) and the prototype defaults.
 pub(crate) use event_emitter::{
-    init_event_emitter_capture, init_event_emitter_state, init_event_emitter_state_with_presence,
-    install_event_emitter_prototype_state, new_events_object,
+    constructor_field_set, init_event_emitter_capture, init_event_emitter_state,
+    init_event_emitter_state_with_presence, install_event_emitter_prototype_state,
+    new_events_object,
 };
 pub use event_emitter::{
     js_node_stream_method_event_names, js_node_stream_method_get_max_listeners,
@@ -361,10 +362,18 @@ extern "C" fn ns_readable_resume_microtask(
         f64::from_bits(TAG_FALSE),
     );
     if readable_is_flowing(s()) && !stream_destroyed(s()) {
+        // node's `resume_`: `read(0)` unless a `_read` is in flight, then
+        // 'resume', the flow, and `read(0)` again while flowing.
+        let hook = has_read_hook(s());
+        if hook && !read_in_flight(s()) {
+            invoke_read_once(s());
+        }
         let _ = emit_stream_event(s(), literal_string_value(b"resume"), &[]);
         flush_pending_readable_chunks(s());
         schedule_readable_from_drain(s());
-        invoke_read_once(s());
+        if !hook || (readable_is_flowing(s()) && !read_in_flight(s())) {
+            invoke_read_once(s());
+        }
     }
     f64::from_bits(TAG_UNDEFINED)
 }
@@ -660,6 +669,7 @@ fn push_chunk(stream: f64, chunk: f64) -> f64 {
     if stream_destroyed(stream) {
         return f64::from_bits(TAG_FALSE);
     }
+    let answered = note_push(stream);
     let jsval = JSValue::from_bits(chunk.to_bits());
     if jsval.is_null() || jsval.is_undefined() {
         flush_readable_decoder(stream);
@@ -672,6 +682,7 @@ fn push_chunk(stream: f64, chunk: f64) -> f64 {
         return f64::from_bits(TAG_FALSE);
     }
     let Some(chunk) = decode_readable_chunk_for_encoding(stream, chunk) else {
+        maybe_read_more(stream, answered);
         return f64::from_bits(TAG_TRUE);
     };
     let chunk = if !readable_object_mode(stream)
@@ -684,7 +695,11 @@ fn push_chunk(stream: f64, chunk: f64) -> f64 {
     } else {
         chunk
     };
-    push_chunk_backpressure_result(stream, append_readable_output_chunk(stream, chunk))
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let stream = scope.root_nanbox_f64(stream);
+    let total = append_readable_output_chunk(stream.get_nanbox_f64(), chunk);
+    maybe_read_more(stream.get_nanbox_f64(), answered);
+    push_chunk_backpressure_result(stream.get_nanbox_f64(), total)
 }
 
 fn append_readable_output_chunk(stream: f64, chunk: f64) -> f64 {
@@ -701,11 +716,18 @@ fn append_readable_output_chunk(stream: f64, chunk: f64) -> f64 {
         push_readable_buffered_chunk(stream, chunk);
         mark_readable_live_push(stream);
         schedule_readable_event(stream);
-        if readable_is_flowing(stream) && !should_defer_initial_data_emit(stream) {
+        if readable_is_flowing(stream)
+            && !should_defer_initial_data_emit(stream)
+            && !read_is_sync(stream)
+            && pending_readable_chunk_count(stream) == 0
+        {
             consume_readable_buffered_front_on_live_emit(stream, chunk);
             emit_readable_data(stream, chunk);
         } else {
             buffer_pending_readable_chunk(stream, chunk);
+            if readable_is_flowing(stream) && !should_defer_initial_data_emit(stream) {
+                read_more::schedule_flow(stream);
+            }
         }
     }
     total
@@ -1209,8 +1231,10 @@ fn invoke_writable_write(stream: f64, chunk: f64, enc: f64, len: f64, callback: 
     let chunk = scope.root_nanbox_f64(chunk);
     let enc = scope.root_nanbox_f64(enc);
     let callback = scope.root_nanbox_f64(callback);
+    // The prototypes' `_write` is a builtin: a stream with no user hook
+    // writes through its hidden one (`proto_methods::is_builtin_hook`).
     let write = crate::runtime_state_key!(b"_write").read_value(stream.get_nanbox_f64());
-    let write = scope.root_nanbox_f64(if is_callable_value(write) {
+    let write = scope.root_nanbox_f64(if user_hook_value(write).is_some() {
         write
     } else {
         writable_hidden_write(stream.get_nanbox_f64()).unwrap_or(f64::from_bits(TAG_UNDEFINED))
@@ -1842,8 +1866,10 @@ use pipeline::*;
 mod readwrite;
 pub use readwrite::*;
 
+mod read_more;
 #[path = "node_stream_readable_read.rs"]
 mod readable_read;
+use read_more::{maybe_read_more, note_push, read_ahead, read_in_flight, read_is_sync};
 use readable_read::*;
 
 #[path = "node_stream_compose_live.rs"]
@@ -1871,7 +1897,11 @@ mod destroy_state;
 pub(crate) mod native_hooks;
 mod proto_methods;
 mod state_record;
-pub(crate) use proto_methods::{install_stream_prototype_methods, StreamProto};
+pub(crate) use constructors::instance_birth;
+pub(crate) use proto_methods::{
+    build_legacy_stream_prototype, build_passthrough_prototype, build_stream_prototype,
+    stream_prototype_value, user_hook_value, StreamProto,
+};
 use state_record::*;
 pub(crate) use state_record::{
     is_stream_record_word, record_alias_word, record_payload_cell, store_record_alias_word,

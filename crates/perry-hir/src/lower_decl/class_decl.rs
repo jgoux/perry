@@ -68,6 +68,45 @@ use member_registration::*;
 
 use super::*;
 
+// Pull each top-level `this.<ident> = …` field name out of one ctor
+// statement-expression. Minified bundles (Next.js `BaseNextRequest`'s
+// `constructor(a,b,c){this.method=a,this.url=b,this.body=c}`) collapse
+// every ctor assignment into ONE comma-`Seq` expression-statement, so a
+// scan that only matched `Expr::Assign` detected ZERO fields — the
+// parent's `method`/`url`/`body` never entered `packed_keys`, leaving
+// the subclass instance allocated with too-few inline slots so the
+// captured-class shape prepends `__perry_cap_*` over the (missing) real
+// slots and `e.url` reads undefined ("Invalid URL" 500 on dynamic page
+// routes). Descend through `Seq` (and the `Paren`/`Assign`-result-chain
+// wrappers minifiers emit) so each comma-separated `this.x = …` is
+// recognised the same as a standalone assignment statement.
+pub(super) fn collect_this_field_assigns(expr: &ast::Expr, out: &mut Vec<String>) {
+    match expr {
+        ast::Expr::Assign(assign) => {
+            // A chained assignment's RHS can itself be `this.x = …`
+            // (`this.a = this.b = v`): the inner `this.b = v` evaluates
+            // (and creates `b`'s slot) BEFORE the outer assignment to
+            // `this.a`, so collect the RHS first to keep Object.keys in
+            // the same insertion order Node produces (`b` then `a`).
+            collect_this_field_assigns(&assign.right, out);
+            if let ast::AssignTarget::Simple(ast::SimpleAssignTarget::Member(mem)) = &assign.left {
+                if let ast::Expr::This(_) = &*mem.obj {
+                    if let ast::MemberProp::Ident(prop_ident) = &mem.prop {
+                        out.push(prop_ident.sym.to_string());
+                    }
+                }
+            }
+        }
+        ast::Expr::Seq(seq) => {
+            for e in &seq.exprs {
+                collect_this_field_assigns(e, out);
+            }
+        }
+        ast::Expr::Paren(p) => collect_this_field_assigns(&p.expr, out),
+        _ => {}
+    }
+}
+
 pub fn lower_class_decl(
     ctx: &mut LoweringContext,
     class_decl: &ast::ClassDecl,
@@ -76,6 +115,16 @@ pub fn lower_class_decl(
     // Resolve through any active scope-local rename so a disambiguated
     // duplicate class registers (and self-references) under its unique name.
     let name = ctx.resolve_class_name(class_decl.ident.sym.as_str());
+    let synthesized =
+        super::class_field_assign::with_synthesized_constructor(ctx, &class_decl.class).map(
+            |class| ast::ClassDecl {
+                ident: class_decl.ident.clone(),
+                declare: class_decl.declare,
+                class: Box::new(class),
+            },
+        );
+    let class_decl = synthesized.as_ref().unwrap_or(class_decl);
+    let field_inits = super::class_field_assign::assigned_field_inits(ctx, &class_decl.class);
     // #11157: consume the declaration arm's request before anything below can
     // lower a nested class declaration.
     let self_binding_wanted = std::mem::take(&mut ctx.class_decl_self_binding_wanted);
@@ -717,7 +766,7 @@ pub fn lower_class_decl(
     for (member_index, member) in class_decl.class.body.iter().enumerate() {
         match member {
             ast::ClassMember::Constructor(ctor) => {
-                constructor = Some(lower_constructor(ctx, &name, ctor)?);
+                constructor = Some(lower_constructor(ctx, &name, ctor, &field_inits)?);
             }
             ast::ClassMember::Method(method) => {
                 // Skip TypeScript overload declarations (no body)
@@ -866,6 +915,28 @@ pub fn lower_class_decl(
                             computed_members.push(ClassComputedMember {
                                 key_expr: lower_expr(ctx, &computed.expr)?,
                                 function,
+                                is_static: false,
+                                kind: ClassComputedMemberKind::Method,
+                                source_order: member_index,
+                            });
+                            continue;
+                        }
+                        // `[Symbol.asyncIterator]()` (plain or `async *`) — the
+                        // same computed-symbol registration: the prototype holds
+                        // the method under its symbol, so `obj[Symbol.asyncIterator]`
+                        // reads it (React Flight's async-iterable test on Next.js's
+                        // VaryParamsAccumulator), and the registration installs the
+                        // `@@asyncIterator` dispatch alias `for await` uses.
+                        // Registered under the string name it was an own
+                        // "@@asyncIterator" key the source never declared, and the
+                        // symbol read found nothing.
+                        if prop_name == "@@asyncIterator" && !method.is_static {
+                            let ast::PropName::Computed(computed) = &method.key else {
+                                unreachable!("@@asyncIterator key must be computed");
+                            };
+                            computed_members.push(ClassComputedMember {
+                                key_expr: lower_expr(ctx, &computed.expr)?,
+                                function: func,
                                 is_static: false,
                                 kind: ClassComputedMemberKind::Method,
                                 source_order: member_index,
@@ -1029,6 +1100,9 @@ pub fn lower_class_decl(
     {
         let declared_field_names: std::collections::HashSet<String> =
             fields.iter().map(|f| f.name.clone()).collect();
+        // Defined fields: TypeScript (ES2022+) declares parameter properties
+        // ahead of every class field, so their keys come first.
+        let mut param_prop_fields = Vec::new();
         for member in &class_decl.class.body {
             if let ast::ClassMember::Constructor(ctor) = member {
                 for param in &ctor.params {
@@ -1050,8 +1124,15 @@ pub fn lower_class_decl(
                             }
                         };
                         if !param_name.is_empty() && !declared_field_names.contains(&param_name) {
-                            fields.push(ClassField {
-                                origin: crate::ClassFieldOrigin::Definition,
+                            // Assigned fields: the parameter property's store
+                            // creates the key (`class_field_assign`).
+                            let origin = if ctx.assign_class_fields {
+                                crate::ClassFieldOrigin::ConstructorStore
+                            } else {
+                                crate::ClassFieldOrigin::Definition
+                            };
+                            param_prop_fields.push(ClassField {
+                                origin,
                                 name: param_name,
                                 key_expr: None,
                                 ty: param_type,
@@ -1064,6 +1145,11 @@ pub fn lower_class_decl(
                     }
                 }
             }
+        }
+        if ctx.assign_class_fields {
+            fields.extend(param_prop_fields);
+        } else {
+            fields.splice(0..0, param_prop_fields);
         }
     }
 
@@ -1152,46 +1238,6 @@ pub fn lower_class_decl(
 
         let declared_field_names: std::collections::HashSet<String> =
             fields.iter().map(|f| f.name.clone()).collect();
-        // Pull each top-level `this.<ident> = …` field name out of one ctor
-        // statement-expression. Minified bundles (Next.js `BaseNextRequest`'s
-        // `constructor(a,b,c){this.method=a,this.url=b,this.body=c}`) collapse
-        // every ctor assignment into ONE comma-`Seq` expression-statement, so a
-        // scan that only matched `Expr::Assign` detected ZERO fields — the
-        // parent's `method`/`url`/`body` never entered `packed_keys`, leaving
-        // the subclass instance allocated with too-few inline slots so the
-        // captured-class shape prepends `__perry_cap_*` over the (missing) real
-        // slots and `e.url` reads undefined ("Invalid URL" 500 on dynamic page
-        // routes). Descend through `Seq` (and the `Paren`/`Assign`-result-chain
-        // wrappers minifiers emit) so each comma-separated `this.x = …` is
-        // recognised the same as a standalone assignment statement.
-        fn collect_this_field_assigns(expr: &ast::Expr, out: &mut Vec<String>) {
-            match expr {
-                ast::Expr::Assign(assign) => {
-                    // A chained assignment's RHS can itself be `this.x = …`
-                    // (`this.a = this.b = v`): the inner `this.b = v` evaluates
-                    // (and creates `b`'s slot) BEFORE the outer assignment to
-                    // `this.a`, so collect the RHS first to keep Object.keys in
-                    // the same insertion order Node produces (`b` then `a`).
-                    collect_this_field_assigns(&assign.right, out);
-                    if let ast::AssignTarget::Simple(ast::SimpleAssignTarget::Member(mem)) =
-                        &assign.left
-                    {
-                        if let ast::Expr::This(_) = &*mem.obj {
-                            if let ast::MemberProp::Ident(prop_ident) = &mem.prop {
-                                out.push(prop_ident.sym.to_string());
-                            }
-                        }
-                    }
-                }
-                ast::Expr::Seq(seq) => {
-                    for e in &seq.exprs {
-                        collect_this_field_assigns(e, out);
-                    }
-                }
-                ast::Expr::Paren(p) => collect_this_field_assigns(&p.expr, out),
-                _ => {}
-            }
-        }
         for member in &class_decl.class.body {
             if let ast::ClassMember::Constructor(ctor) = member {
                 if let Some(ref body) = ctor.body {
@@ -1225,6 +1271,7 @@ pub fn lower_class_decl(
         // Dedup fields: keep first occurrence of each name
         let mut seen = std::collections::HashSet::new();
         fields.retain(|f| seen.insert(f.name.clone()));
+        super::class_field_assign::settle_reservations(ctx, &class_decl.class, &mut fields);
 
         // Register this class's complete field set (own + inherited) so subclasses that
         // extend it can see the full inheritance chain during their own lowering.

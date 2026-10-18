@@ -32,6 +32,30 @@ pub(crate) fn lower_ident_expr(ctx: &mut LoweringContext, ident: &ast::Ident) ->
     let expr_ident = ast::Expr::Ident(ident.clone());
     let expr = &expr_ident;
     let name = ident.sym.to_string();
+    if let Some((enum_name, local_mark)) = &ctx.enum_initializer_scope {
+        // A nested parameter/local shadows this implicit member scope. Outer
+        // bindings do not: `enum E { A = x, B = A + 1 }` reads the stored E.A.
+        if ctx
+            .locals
+            .lookup_index(&name)
+            .is_none_or(|index| index < *local_mark)
+        {
+            if let Some(value) = ctx.lookup_enum_member(enum_name, &name) {
+                return Ok(match value {
+                    EnumValue::Number(_) | EnumValue::String(_) => Expr::EnumMember {
+                        enum_name: enum_name.clone(),
+                        member_name: name,
+                    },
+                    EnumValue::Computed => Expr::IndexGet {
+                        object: Box::new(Expr::LocalGet(
+                            ctx.lookup_local(enum_name).expect("enum binding"),
+                        )),
+                        index: Box::new(Expr::String(name)),
+                    },
+                });
+            }
+        }
+    }
     // A named import from a node-core module that is not a value export of that
     // module was deferred (neither bound nor rejected) at import lowering — see
     // `LoweringContext::deferred_unknown_native_imports`. Type annotations are
@@ -156,22 +180,6 @@ pub(crate) fn lower_ident_expr(ctx: &mut LoweringContext, ident: &ast::Ident) ->
         }
         Ok(Expr::LocalGet(id))
     } else if let Some(id) = ctx.lookup_func(&name) {
-        // #10222: inside a namespace body an EXPORTED namespace function is
-        // emitted as a static method of the namespace class, not as a module
-        // function. Calls are redirected to `StaticMethodCall` (expr_call), but
-        // a VALUE reference (`const f = g`, `call(g)`, `Effect.gen(g)`) still
-        // lowered to `FuncRef(id)` — a closure over a function that has no
-        // module-function body — and calling it returned garbage. Read the
-        // published namespace member instead, exactly as `NS.g` resolves from
-        // outside the namespace; this also keeps `g === NS.g`.
-        if let Some(ref ns_name) = ctx.current_namespace {
-            if ctx.has_static_method(ns_name, &name) {
-                return Ok(Expr::IndexGet {
-                    object: Box::new(Expr::ClassRef(ns_name.clone())),
-                    index: Box::new(Expr::String(name)),
-                });
-            }
-        }
         Ok(Expr::FuncRef(id))
     } else if ctx.lookup_native_module(&name).is_some() {
         Ok(native_module_binding_value(ctx, &name))
@@ -204,16 +212,6 @@ pub(crate) fn lower_ident_expr(ctx: &mut LoweringContext, ident: &ast::Ident) ->
         // emit a ClassRef by name — codegen resolves it from the
         // class registry, which has every pending class by then.
         Ok(class_binding_read(ctx, &name))
-    } else if let Some(members) = ctx.lookup_enum(&name).map(|(_, m)| m.to_vec()) {
-        // A TypeScript enum used as a VALUE (`Object.values(E)`,
-        // `Object.keys(E)`, `const e = E`, `fn(E)`). Enums are folded away at
-        // compile time (`E.A` -> `Expr::EnumMember`) and no binding named `E`
-        // exists at runtime, so the bare identifier fell through to the
-        // unresolved-global lookup and threw `ReferenceError: E is not
-        // defined`. Materialize the runtime object (forward members plus the
-        // numeric reverse mapping), exactly as the computed-access form
-        // `E[expr]` does.
-        Ok(Expr::Object(super::helpers::enum_runtime_object_fields(&members)))
     } else if name == "undefined" {
         // Global undefined identifier
         Ok(Expr::Undefined)

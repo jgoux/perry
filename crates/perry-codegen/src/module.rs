@@ -283,7 +283,7 @@ impl LlModule {
     pub(crate) fn gc_effects(&self) -> Arc<crate::gc_call_effects::GcEffects> {
         self.gc_effects
             .clone()
-            .unwrap_or_else(crate::gc_call_effects::GcEffects::committed_fallback)
+            .unwrap_or_else(crate::gc_call_effects::GcEffects::outside_compilation)
     }
 
     /// Append a raw metadata definition line (e.g. `!1 = distinct !{!1}`).
@@ -307,11 +307,11 @@ impl LlModule {
         }
         self.declared_names.insert(name.to_string());
         let param_str = param_types.join(", ");
-        // Verified-pure runtime helpers get the #2/#3 optimization groups
-        // (#6082) — see `helper_decl_attrs` for the audit invariants. The
+        // Runtime helpers get `nounwind` from the linked archive's table and
+        // the audited memory contracts (#6082); see `helper_decl_attrs`. The
         // lookup is name-keyed here in the single declaration funnel so
         // every declaration path agrees on the attributes.
-        let attrs = helper_decl_attrs(name);
+        let attrs = helper_decl_attrs(&self.gc_effects(), name);
         self.declarations.push((
             name.to_string(),
             format!("declare {} @{}({}){}", return_type, name, param_str, attrs),
@@ -354,7 +354,7 @@ impl LlModule {
         }
         self.declared_names.insert(name.to_string());
         let param_str = param_types.join(", ");
-        let attrs = helper_decl_attrs(name);
+        let attrs = helper_decl_attrs(&self.gc_effects(), name);
         self.declarations.push((
             name.to_string(),
             format!(
@@ -635,6 +635,11 @@ impl LlModule {
         self.defined_names.contains(name)
     }
 
+    /// Every symbol this module defines, in no particular order.
+    pub fn defined_function_names(&self) -> impl Iterator<Item = &str> {
+        self.defined_names.iter().map(String::as_str)
+    }
+
     pub fn add_global(&mut self, name: &str, ty: LlvmType, init: &str) {
         self.globals
             .push(format!("@{} = global {} {}", name, ty, init));
@@ -906,7 +911,7 @@ impl LlModule {
             ir.push('\n');
         }
         ir.push('\n');
-        self.push_attrs_and_metadata(&mut ir);
+        self.push_metadata(&mut ir);
         ir
     }
 
@@ -966,43 +971,15 @@ impl LlModule {
             ir.push('\n');
         }
 
-        self.push_attrs_and_metadata(&mut ir);
+        self.push_metadata(&mut ir);
 
         ir
     }
 
-    /// Emit the shared setjmp attribute groups + the `!0`/buffer-alias metadata
-    /// tail. Factored out of [`to_ir`] so each codegen unit can replicate the
-    /// same attributes and metadata (so `#0`/`#1` and `!N` references resolve in
-    /// every unit). Over-emitting an unused attribute group is harmless.
-    fn push_attrs(&self, ir: &mut String) {
-        // Verified runtime-helper groups (#6082) — emitted only when a
-        // declaration actually references them (mirrors the setjmp gating
-        // above). See `helper_decl_attrs` for the audit invariants.
-        let mut used_pure = false;
-        let mut used_readonly = false;
-        let mut used_nounwind_willreturn = false;
-        for name in &self.declared_names {
-            match helper_decl_attrs(name) {
-                " #2" => used_pure = true,
-                " #3" => used_readonly = true,
-                " #4" => used_nounwind_willreturn = true,
-                _ => {}
-            }
-        }
-        if used_pure {
-            ir.push_str("\nattributes #2 = { nounwind willreturn readnone }\n");
-        }
-        if used_readonly {
-            ir.push_str("\nattributes #3 = { nounwind willreturn readonly }\n");
-        }
-        if used_nounwind_willreturn {
-            ir.push_str("\nattributes #4 = { nounwind willreturn }\n");
-        }
-    }
-
-    fn push_attrs_and_metadata(&self, ir: &mut String) {
-        self.push_attrs(ir);
+    /// Emit the `!0`/buffer-alias metadata tail. Factored out of [`to_ir`]
+    /// so each codegen unit can replicate the same metadata (so `!N`
+    /// references resolve in every unit).
+    fn push_metadata(&self, ir: &mut String) {
         // Issue #52: `!0 = !{}` referenced by `!invariant.load !0`, plus the
         // buffer alias-scope metadata. LICM/GVN hoist invariant loads out of
         // loops only with these present.
@@ -1019,8 +996,7 @@ impl LlModule {
     /// and duplicated gigabytes of parse input. References between metadata
     /// nodes are closed transitively (scope lists -> scopes -> domain), while
     /// preserving original definition order for deterministic output.
-    fn push_attrs_and_referenced_metadata_ids(&self, ir: &mut String, mut needed: HashSet<u32>) {
-        self.push_attrs(ir);
+    fn push_referenced_metadata_ids(&self, ir: &mut String, mut needed: HashSet<u32>) {
         ir.push_str("\n!0 = !{}\n");
         needed.remove(&0);
         let mut by_id: HashMap<u32, &str> = HashMap::with_capacity(self.metadata_lines.len());
@@ -1046,6 +1022,34 @@ impl LlModule {
                 ir.push('\n');
             }
         }
+    }
+
+    /// Render on demand from owned parts, releasing each function graph as
+    /// its text enters the bounded LLVM work queue.
+    pub(crate) fn into_codegen_unit_texts(
+        self,
+        n: usize,
+    ) -> Box<dyn ExactSizeIterator<Item = String>> {
+        if n <= 1 || self.functions.len() <= 1 {
+            return Box::new(std::iter::once(self.to_ir()));
+        }
+        let parts = self.into_codegen_unit_parts_with(
+            n,
+            crate::workers::unit_workers(),
+            |function, _, _| function,
+        );
+        Box::new(parts.into_iter().map(|part| {
+            let mut ir = part.pre;
+            for function in part.funcs {
+                ir.push_str(&render_fn_external_with_gc_leaf_callees(
+                    &function,
+                    &part.gc_leaf_callees,
+                ));
+                ir.push('\n');
+            }
+            ir.push_str(&part.post);
+            ir
+        }))
     }
 
     /// Render this module as `n` independent codegen-unit `.ll` texts (#5391).
@@ -1421,7 +1425,7 @@ impl LlModule {
             .into_iter()
             .map(|metadata_refs| {
                 let mut post = String::new();
-                self.push_attrs_and_referenced_metadata_ids(&mut post, metadata_refs);
+                self.push_referenced_metadata_ids(&mut post, metadata_refs);
                 post
             })
             .collect();
@@ -1634,3 +1638,6 @@ fn is_js_body(f: &LlFunction) -> bool {
         && f.params[0].1 == crate::expr::body_call::JS_BODY_CALLEE
         && f.params[1].1 == crate::expr::body_call::JS_BODY_THIS
 }
+
+#[cfg(test)]
+mod text_stream_tests;

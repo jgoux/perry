@@ -7,13 +7,31 @@ use crate::object::ObjectHeader;
 #[derive(Clone, Copy)]
 pub(crate) struct NamedStateKey {
     pub(crate) bytes: &'static [u8],
+    /// `key_bytes_hash(bytes)`, computed when the site is compiled.
+    pub(crate) hash: u64,
+}
+
+/// `object::key_bytes_hash` (FNV-1a) as a `const fn`, for a fixed key.
+pub(crate) const fn const_key_hash(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    let mut i = 0;
+    while i < bytes.len() {
+        h ^= bytes[i] as u64;
+        h = h.wrapping_mul(0x100000001b3);
+        i += 1;
+    }
+    h
 }
 
 #[macro_export]
 macro_rules! runtime_state_key {
     ($key:expr) => {{
         const KEY: &[u8] = $key;
-        $crate::runtime_state_key::NamedStateKey { bytes: KEY }
+        const HASH: u64 = $crate::runtime_state_key::const_key_hash(KEY);
+        $crate::runtime_state_key::NamedStateKey {
+            bytes: KEY,
+            hash: HASH,
+        }
     }};
 }
 
@@ -31,7 +49,7 @@ impl NamedStateKey {
     pub(crate) fn write_value(self, target: f64, value: f64) {
         if let Some(obj) = crate::object::field_get_set::runtime_read_site::object_receiver(target)
         {
-            if unsafe { self.write_existing(obj, value) } {
+            if unsafe { self.write_existing(obj, value) || self.add_family(obj, value) } {
                 return;
             }
         }
@@ -49,17 +67,69 @@ impl NamedStateKey {
         }
     }
 
+    /// The add of this key to a family object with no overflow, as the store
+    /// entries make it (`layout_desc::family_store`: in key order into its
+    /// slot, else through the overflow), when the add is plain (an extensible
+    /// receiver, a chain that does not intercept it). `false`, having stored
+    /// nothing, for every other receiver or add, and for a key text with no
+    /// atom yet (no layout names it).
+    pub(crate) unsafe fn add_family(self, obj: *mut ObjectHeader, value: f64) -> bool {
+        // A family object, or a node instance layout naming the key (an
+        // optional key whose slot holds the hole: node's lazy
+        // `_eventsCount` on a stream).
+        if crate::object::layout_desc::family_own_key_hashed(obj, self.bytes, Some(self.hash))
+            .is_none()
+            && !matches!(
+                crate::node_stream::instance_birth::instance_layout_slot(
+                    obj,
+                    self.bytes,
+                    Some(self.hash),
+                ),
+                Some(Some(_))
+            )
+        {
+            return false;
+        }
+        let Some(atom) = crate::string::atom_lookup(self.bytes, self.hash)
+            .filter(|&atom| crate::string::is_property_atom(atom))
+        else {
+            return false;
+        };
+        crate::object::layout_desc::family_store(
+            obj,
+            crate::value::STRING_TAG | atom as u64,
+            self.bytes,
+            value.to_bits(),
+        )
+    }
+
     pub(crate) unsafe fn write_existing(self, obj: *mut ObjectHeader, value: f64) -> bool {
         let Some(header) = crate::value::addr_class::try_read_gc_header(obj as usize) else {
             return false;
         };
-        // An object with an overflow keeps its keys' attributes and any key
-        // added after it there, not in its layout (object model step 4): the
-        // ordinary Set decides.
-        if header._reserved & crate::gc::OBJ_FLAG_FROZEN != 0
-            || (header._reserved & crate::gc::OBJ_FLAG_HAS_DESCRIPTORS != 0
-                && !crate::object::key_attrs::attrs_live_in_keys(obj as usize))
-            || crate::object::overflow::has_overflow(obj)
+        if header._reserved & crate::gc::OBJ_FLAG_FROZEN != 0 {
+            return false;
+        }
+        // An object with an overflow keeps every present key there, with its
+        // attributes (object model step 4): a live plain writable data entry
+        // is overwritten in place, anything else takes the ordinary Set.
+        let table = crate::object::overflow::table(obj);
+        if !table.is_null() {
+            let Some(entry) = crate::object::overflow::find_bytes(table, self.bytes) else {
+                return false;
+            };
+            let attrs = crate::object::overflow::entry_attrs(
+                table as *const crate::array::ArrayHeader,
+                entry,
+            );
+            // A slot reference to a hole is an absent layout key: an add.
+            return crate::object::key_attrs::entry_is_plain_writable_data(attrs)
+                && crate::object::overflow::get_from(table, obj, entry)
+                    .is_some_and(|bits| bits != crate::value::TAG_HOLE)
+                && crate::object::overflow::store_index(obj, entry, value.to_bits());
+        }
+        if header._reserved & crate::gc::OBJ_FLAG_HAS_DESCRIPTORS != 0
+            && !crate::object::key_attrs::attrs_live_in_keys(obj as usize)
         {
             return false;
         }
@@ -70,22 +140,43 @@ impl NamedStateKey {
             return false;
         }
         let keys = shape.keys as usize as *const crate::array::ArrayHeader;
-        let Some(position) = crate::object::keys_find_property_slot_by_bytes(
-            keys,
-            shape.logical_key_count,
+        // A family object answers from its layout's index (its keys are
+        // plain writable data); any other layout from its key list.
+        let slot = match crate::object::layout_desc::family_own_key_hashed(
+            obj,
             self.bytes,
-        ) else {
-            return false;
+            Some(self.hash),
+        ) {
+            Some(Some((_, slot))) => slot,
+            Some(None) => return false,
+            None => match crate::node_stream::instance_birth::instance_layout_slot(
+                obj,
+                self.bytes,
+                Some(self.hash),
+            ) {
+                // A node instance layout's keys are plain writable data.
+                Some(Some(slot)) => slot,
+                Some(None) => return false,
+                None => {
+                    let Some(position) = crate::object::keys_find_property_slot_by_bytes(
+                        keys,
+                        shape.logical_key_count,
+                        self.bytes,
+                    ) else {
+                        return false;
+                    };
+                    let entry = crate::object::key_attrs::keys_entry(keys, position);
+                    if entry
+                        & (crate::object::key_attrs::ENTRY_NON_WRITABLE
+                            | crate::object::key_attrs::ENTRY_ACCESSOR)
+                        != 0
+                    {
+                        return false;
+                    }
+                    crate::object::key_attrs::key_storage_slot(keys, position)
+                }
+            },
         };
-        let slot = crate::object::key_attrs::key_storage_slot(keys, position);
-        let entry = crate::object::key_attrs::keys_entry(keys, position);
-        if entry
-            & (crate::object::key_attrs::ENTRY_NON_WRITABLE
-                | crate::object::key_attrs::ENTRY_ACCESSOR)
-            != 0
-        {
-            return false;
-        }
         if crate::object::object_field_at_with_live(obj, slot, shape.live_inline_slot_count).bits()
             == crate::value::TAG_HOLE
         {
@@ -139,15 +230,31 @@ impl NamedStateKey {
         }
         let shape = crate::object::shapes::object_shape_descriptor(obj)?;
         let keys = shape.keys as usize as *const crate::array::ArrayHeader;
-        let position = crate::object::keys_find_property_slot_by_bytes(
-            keys,
-            shape.logical_key_count,
+        let slot = match crate::object::layout_desc::family_own_key_hashed(
+            obj,
             self.bytes,
-        )?;
-        if crate::object::key_attrs::key_is_accessor_at(keys, position) {
-            return None;
-        }
-        let slot = crate::object::key_attrs::key_storage_slot(keys, position);
+            Some(self.hash),
+        ) {
+            Some(found) => found?.1,
+            None => match crate::node_stream::instance_birth::instance_layout_slot(
+                obj,
+                self.bytes,
+                Some(self.hash),
+            ) {
+                Some(found) => found?,
+                None => {
+                    let position = crate::object::keys_find_property_slot_by_bytes(
+                        keys,
+                        shape.logical_key_count,
+                        self.bytes,
+                    )?;
+                    if crate::object::key_attrs::key_is_accessor_at(keys, position) {
+                        return None;
+                    }
+                    crate::object::key_attrs::key_storage_slot(keys, position)
+                }
+            },
+        };
         let live = crate::object::object_live_slot_count(obj);
         // A slot holding the hole is an absent optional key (`key_view`).
         let bits = crate::object::object_field_at_with_live(obj, slot, live).bits();
@@ -180,6 +287,47 @@ pub unsafe extern "C-unwind" fn js_runtime_state_key_get(
     let key = crate::string::intern_ascii_literal(bytes);
     let key = crate::value::JSValue::string_ptr(key as *mut _);
     crate::object::js_object_get_property_key(value.get_nanbox_f64(), f64::from_bits(key.bits()))
+}
+
+/// Fixed-key Set for an extension's call site: node's `this.<key> = value`
+/// in a native constructor or method. An own writable data slot is
+/// overwritten in place; adds use the by-name store, whose layout proof and
+/// ordinary interception walk honor inherited setters and read-only data.
+/// # Safety
+/// As js_runtime_state_key_get; `value` and `v` are live JavaScript values.
+#[no_mangle]
+#[inline(never)]
+pub unsafe extern "C-unwind" fn js_runtime_state_key_set(
+    value: f64,
+    key: *const u8,
+    len: usize,
+    v: f64,
+) {
+    // SAFETY: the key is only read for the duration of this call.
+    let bytes: &'static [u8] = std::mem::transmute(std::slice::from_raw_parts(key, len));
+    let named = NamedStateKey {
+        bytes,
+        hash: const_key_hash(bytes),
+    };
+    let Some(obj) = crate::object::field_get_set::runtime_read_site::object_receiver(value) else {
+        named.write_value(value, v);
+        return;
+    };
+    if named.write_existing(obj, v) {
+        return;
+    }
+    // Interning allocates nothing for a key a layout or earlier store named;
+    // the receiver is re-read after it either way.
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let target = scope.root_nanbox_f64(value);
+    let v = scope.root_nanbox_f64(v);
+    let interned = crate::string::intern_ascii_literal(bytes);
+    let Some(obj) =
+        crate::object::field_get_set::runtime_read_site::object_receiver(target.get_nanbox_f64())
+    else {
+        return;
+    };
+    crate::object::js_object_set_field_by_name(obj, interned, v.get_nanbox_f64());
 }
 
 /// Call the method `key` of `value`, with the receiver as `this`. Exotic

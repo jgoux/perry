@@ -458,6 +458,14 @@ fn build_clang_compile_plan(
     clang_args.push(effective_target.clone());
 
     let mut analysis_clang_args = vec![opt_flag.to_string(), "-fno-math-errno".to_string()];
+    if crate::fallback_diag::enabled() {
+        // LLVM22's statepoint machine-call lowering does not retain nomerge.
+        // A backend tail merge erases the distinct call-site discriminators.
+        // This diagnostic-only choice is subject to the instruction gate.
+        for args in [&mut clang_args, &mut analysis_clang_args] {
+            args.extend(["-mllvm".into(), "-enable-tail-merge=false".into()]);
+        }
+    }
     if effective_target.starts_with("wasm32") {
         for args in [&mut clang_args, &mut analysis_clang_args] {
             args.extend(
@@ -555,24 +563,10 @@ fn maybe_rs4gc_preprocess(ll_text: &str, native_roots: bool) -> Result<Option<St
     if inprocess_requested(native_roots) {
         return Ok(None);
     }
-    let opt = std::env::var("PERRY_LLVM_OPT")
-        .map(PathBuf::from)
-        .ok()
-        .filter(|p| p.exists())
-        .or_else(|| {
-            [
-                "/opt/homebrew/opt/llvm/bin/opt",
-                "/usr/local/opt/llvm/bin/opt",
-            ]
-            .iter()
-            .map(PathBuf::from)
-            .find(|p| p.exists())
-        })
-        .or_else(|| which_in_path("opt"))
-        .context(
-            "native statepoints require an LLVM `opt` binary: set PERRY_LLVM_OPT, \
+    let opt = find_opt().context(
+        "native statepoints require an LLVM `opt` binary: set PERRY_LLVM_OPT, \
              install Homebrew LLVM, or put `opt` on PATH",
-        )?;
+    )?;
     let passes_arg = format!("-passes={STATEPOINT_REWRITE_PASSES}");
     let mut child = Command::new(&opt)
         .arg(&passes_arg)
@@ -617,6 +611,63 @@ fn maybe_rs4gc_preprocess(ll_text: &str, native_roots: bool) -> Result<Option<St
     Ok(Some(String::from_utf8(output.stdout)?))
 }
 
+/// The LLVM `opt` the statepoint rewrite runs: `PERRY_LLVM_OPT`, then
+/// Homebrew LLVM, then PATH.
+fn find_opt() -> Option<PathBuf> {
+    std::env::var("PERRY_LLVM_OPT")
+        .map(PathBuf::from)
+        .ok()
+        .filter(|p| p.exists())
+        .or_else(|| {
+            [
+                "/opt/homebrew/opt/llvm/bin/opt",
+                "/usr/local/opt/llvm/bin/opt",
+            ]
+            .iter()
+            .map(PathBuf::from)
+            .find(|p| p.exists())
+        })
+        .or_else(|| which_in_path("opt"))
+}
+
+/// The external tools object emission runs, for the object-cache key: each
+/// tool's resolved path, size, mtime and `--version` text (two snapshot
+/// builds of one LLVM can share a path and a version string). PATH and the `PERRY_LLVM_*`
+/// overrides reach an object only through these, so another `opt` or `clang`
+/// changes the key and an unrelated PATH entry does not. Resolved once per
+/// process.
+pub fn object_toolchain_key() -> &'static str {
+    static KEY: OnceLock<String> = OnceLock::new();
+    KEY.get_or_init(|| {
+        [("opt", find_opt()), ("clang", find_clang())]
+            .into_iter()
+            .map(|(name, tool)| match tool {
+                Some(tool) => {
+                    let tool = fs::canonicalize(&tool).unwrap_or(tool);
+                    let version = Command::new(&tool)
+                        .arg("--version")
+                        .output()
+                        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+                        .unwrap_or_default();
+                    let (len, mtime) = fs::metadata(&tool)
+                        .map(|meta| {
+                            let mtime = meta
+                                .modified()
+                                .ok()
+                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                .map_or(0, |d| d.as_nanos());
+                            (meta.len(), mtime)
+                        })
+                        .unwrap_or((0, 0));
+                    format!("{name}={}:{len}:{mtime}:{version}", tool.display())
+                }
+                None => format!("{name}=none"),
+            })
+            .collect::<Vec<_>>()
+            .join("|")
+    })
+}
+
 fn which_in_path(name: &str) -> Option<PathBuf> {
     std::env::var_os("PATH").and_then(|paths| {
         std::env::split_paths(&paths)
@@ -628,6 +679,38 @@ fn which_in_path(name: &str) -> Option<PathBuf> {
 pub fn compile_ll_to_object(ll_text: &str, target_triple: Option<&str>) -> Result<Vec<u8>> {
     let native_roots = crate::codegen::helpers::native_stack_roots_enabled();
     compile_ll_to_object_with_native_roots(ll_text, target_triple, native_roots)
+}
+
+/// Owned text path: LLVM releases the input immediately after parsing it.
+pub(crate) fn compile_owned_ll_to_object(
+    ll_text: String,
+    target_triple: Option<&str>,
+) -> Result<Vec<u8>> {
+    let native_roots = crate::codegen::helpers::native_stack_roots_enabled();
+    compile_owned_ll_with_native_roots(ll_text, target_triple, native_roots)
+}
+
+fn compile_owned_ll_with_native_roots(
+    mut ll_text: String,
+    target_triple: Option<&str>,
+    native_roots: bool,
+) -> Result<Vec<u8>> {
+    let tmp_dir = env::temp_dir();
+    reap_stale_llvm_scratch_once(&tmp_dir);
+    if let Some(debug) = crate::debug_info::attach_line_tables(&ll_text) {
+        ll_text = debug;
+    }
+    if let Some(rewritten) = maybe_rs4gc_preprocess(&ll_text, native_roots)? {
+        ll_text = rewritten;
+    }
+    compile_input_to_object_in_with_retention(
+        &tmp_dir,
+        std::borrow::Cow::Owned(ll_text),
+        target_triple,
+        TempFilePolicy::from_env(),
+        native_roots,
+        &PROCESS_FAILURE_RETENTION,
+    )
 }
 
 fn compile_ll_to_object_with_native_roots(
@@ -814,13 +897,13 @@ fn inprocess_requested(native_roots: bool) -> bool {
 #[cfg(feature = "llvm-inprocess")]
 fn compile_ll_inprocess_in(
     tmp_dir: &Path,
-    ll_text: &str,
+    ll_text: std::borrow::Cow<'_, str>,
     target_triple: Option<&str>,
     policy: TempFilePolicy,
     native_roots: bool,
     failure_retention: &FailureRetention,
 ) -> Result<Vec<u8>> {
-    let (paths, _pid, _nonce) = llvm_temp_paths(tmp_dir, ll_text);
+    let (paths, _pid, _nonce) = llvm_temp_paths(tmp_dir, &ll_text);
     let _cleanup = TempPathGuard::with(&paths.scratch_dir, policy.keep);
     let failed_scratch = FailedScratch::new(
         &paths.scratch_dir,
@@ -848,7 +931,7 @@ fn compile_ll_inprocess_in(
     if policy.keep {
         fs::create_dir_all(&paths.scratch_dir)
             .with_context(|| format!("Failed to create {}", paths.scratch_dir.display()))?;
-        fs::write(&paths.ll_path, ll_text)
+        fs::write(&paths.ll_path, ll_text.as_bytes())
             .with_context(|| format!("Failed to write {}", paths.ll_path.display()))?;
         let metadata_path = PathBuf::from(format!("{}.compile-plan.json", plan.obj_path.display()));
         write_compile_plan_metadata(&plan, &metadata_path)?;
@@ -858,6 +941,22 @@ fn compile_ll_inprocess_in(
             metadata_path.display()
         );
     }
+    // Preserve the existing first-failure IR diagnostic on disk for owned
+    // input. Successful parses can then free the source before optimization.
+    let borrowed_ir = match &ll_text {
+        std::borrow::Cow::Borrowed(text) => Some(*text),
+        std::borrow::Cow::Owned(_) => {
+            if !policy.keep {
+                fs::create_dir_all(&paths.scratch_dir)?;
+                fs::write(&paths.ll_path, ll_text.as_bytes())?;
+            }
+            None
+        }
+    };
+    let retain_failure = |error| match borrowed_ir {
+        Some(text) => failed_scratch.finish_with_ir(error, text),
+        None => failed_scratch.finish(error),
+    };
     match crate::inprocess::compile_ll_to_object_inprocess(
         ll_text,
         &plan.effective_target,
@@ -869,7 +968,7 @@ fn compile_ll_inprocess_in(
         // piece is finished on its own and the pieces are merged.
         Ok(pieces) if pieces.len() > 1 => {
             let obj = finish_native_pieces(pieces, &plan.effective_target, &plan.clang_args)
-                .map_err(|error| failed_scratch.finish_with_ir(error, ll_text))?;
+                .map_err(|error| retain_failure(error))?;
             if policy.keep {
                 let _ = fs::create_dir_all(&paths.scratch_dir);
                 if let Err(e) = fs::write(&plan.obj_path, &obj) {
@@ -895,7 +994,7 @@ fn compile_ll_inprocess_in(
             }
             fs::write(asm_path, &bytes)
                 .with_context(|| format!("Failed to write {}", asm_path.display()))
-                .map_err(|error| failed_scratch.finish_with_ir(error, ll_text))?;
+                .map_err(|error| retain_failure(error))?;
             // The in-process version-skew problem concerns IR parsing; any
             // contemporary system clang can assemble the emitted text.
             let assembler = find_clang()
@@ -903,7 +1002,7 @@ fn compile_ll_inprocess_in(
                     "the statepoint compact-map rewrite needs an assembler to turn \
                  the emitted assembly into an object, and no clang was found",
                 )
-                .map_err(|error| failed_scratch.finish_with_ir(error, ll_text))?;
+                .map_err(|error| retain_failure(error))?;
             crate::gc_map::compact_and_assemble(
                 &assembler,
                 &plan.effective_target,
@@ -911,10 +1010,10 @@ fn compile_ll_inprocess_in(
                 &plan.obj_path,
                 &plan.clang_args,
             )
-            .map_err(|error| failed_scratch.finish_with_ir(error, ll_text))?;
+            .map_err(|error| retain_failure(error))?;
             let obj = fs::read(&plan.obj_path)
                 .with_context(|| format!("Failed to read assembled {}", plan.obj_path.display()))
-                .map_err(|error| failed_scratch.finish_with_ir(error, ll_text))?;
+                .map_err(|error| retain_failure(error))?;
             if policy.keep {
                 // This arm retains the object too — `compact_and_assemble`
                 // wrote it to `plan.obj_path` and the scratch dir survives
@@ -960,7 +1059,7 @@ fn compile_ll_inprocess_in(
                 plan.effective_target
             ));
 
-            Err(failed_scratch.finish_with_ir(error, ll_text))
+            Err(retain_failure(error))
         }
     }
 }
@@ -968,7 +1067,7 @@ fn compile_ll_inprocess_in(
 #[cfg(not(feature = "llvm-inprocess"))]
 fn compile_ll_inprocess_in(
     _tmp_dir: &Path,
-    _ll_text: &str,
+    _ll_text: std::borrow::Cow<'_, str>,
     _target_triple: Option<&str>,
     _policy: TempFilePolicy,
     _native_roots: bool,
@@ -988,6 +1087,24 @@ fn compile_ll_inprocess_in(
 fn compile_ll_to_object_in_with_retention(
     tmp_dir: &Path,
     ll_text: &str,
+    target_triple: Option<&str>,
+    policy: TempFilePolicy,
+    native_roots: bool,
+    failure_retention: &FailureRetention,
+) -> Result<Vec<u8>> {
+    compile_input_to_object_in_with_retention(
+        tmp_dir,
+        std::borrow::Cow::Borrowed(ll_text),
+        target_triple,
+        policy,
+        native_roots,
+        failure_retention,
+    )
+}
+
+fn compile_input_to_object_in_with_retention(
+    tmp_dir: &Path,
+    ll_text: std::borrow::Cow<'_, str>,
     target_triple: Option<&str>,
     policy: TempFilePolicy,
     native_roots: bool,
@@ -1032,7 +1149,7 @@ fn compile_ll_to_object_in_with_retention(
     // object on ELF). #509: keep the `.o` unique via the per-call counter.
     // #7144: put both under a directory this call owns, so the `.ll` can be
     // deleted again without racing a sibling that hashed the same IR.
-    let (paths, write_pid, write_nonce) = llvm_temp_paths(tmp_dir, ll_text);
+    let (paths, write_pid, write_nonce) = llvm_temp_paths(tmp_dir, &ll_text);
     let LlvmTempPaths {
         scratch_dir,
         ll_path,
@@ -1041,7 +1158,8 @@ fn compile_ll_to_object_in_with_retention(
     let _cleanup = TempPathGuard::with(&scratch_dir, policy.keep);
     fs::create_dir_all(&scratch_dir)
         .with_context(|| format!("Failed to create temp dir at {}", scratch_dir.display()))?;
-    write_ll_atomically(&ll_path, ll_text, write_pid, write_nonce)?;
+    write_ll_atomically(&ll_path, &ll_text, write_pid, write_nonce)?;
+    drop(ll_text);
     let failed_scratch = FailedScratch::new(&scratch_dir, &ll_path, policy.keep, failure_retention);
 
     let plan = build_clang_compile_plan(
@@ -1247,6 +1365,66 @@ pub fn compile_units_to_object(units: &[String], target_triple: Option<&str>) ->
         );
     }
     merge_unit_objects(&objs)
+}
+
+/// Compile a lazy producer with at most one queued text per worker. Input
+/// indices fix object merge order regardless of worker completion order.
+pub(crate) fn compile_streamed_units_to_object(
+    units: impl ExactSizeIterator<Item = String>,
+    target_triple: Option<&str>,
+) -> Result<Vec<u8>> {
+    let total = units.len();
+    if total == 0 {
+        return compile_owned_ll_to_object(String::new(), target_triple);
+    }
+    let jobs = crate::workers::unit_workers().max(1).min(total);
+    let native_roots = crate::codegen::helpers::native_stack_roots_enabled();
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<(usize, String)>(jobs);
+    let receiver = std::sync::Arc::new(std::sync::Mutex::new(receiver));
+    let (results, completed) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        for _ in 0..jobs {
+            let receiver = std::sync::Arc::clone(&receiver);
+            let results = results.clone();
+            scope.spawn(move || loop {
+                let Ok((index, text)) = receiver.lock().expect("text unit queue poisoned").recv()
+                else {
+                    break;
+                };
+                let result = compile_owned_ll_with_native_roots(text, target_triple, native_roots);
+                if results.send((index, result)).is_err() {
+                    break;
+                }
+            });
+        }
+        // Workers own the receiving end. If they unwind, a producer blocked
+        // on the bounded queue wakes instead of retaining its own receiver.
+        drop(receiver);
+        drop(results);
+        for (index, text) in units.enumerate() {
+            if sender.send((index, text)).is_err() {
+                break;
+            }
+        }
+        drop(sender);
+    });
+    let mut objects: Vec<Option<Result<Vec<u8>>>> = (0..total).map(|_| None).collect();
+    for (index, object) in completed {
+        objects[index] = Some(object);
+    }
+    let objects: Vec<_> = objects
+        .into_iter()
+        .enumerate()
+        .map(|(index, object)| {
+            object
+                .expect("every text unit is compiled")
+                .with_context(|| format!("codegen unit {}/{} failed to compile", index + 1, total))
+        })
+        .collect::<Result<_>>()?;
+    if objects.len() == 1 {
+        return Ok(objects.into_iter().next().expect("one object"));
+    }
+    merge_unit_objects(&objects)
 }
 
 /// Combine already-compiled codegen-unit objects into one linker input.
@@ -1774,179 +1952,6 @@ fn is_executable(p: &Path) -> bool {
 #[cfg(not(unix))]
 fn is_executable(p: &Path) -> bool {
     p.exists()
-}
-
-// ---------------------------------------------------------------------------
-// Bitcode link pipeline (Phase J)
-// ---------------------------------------------------------------------------
-
-/// Find an LLVM tool (llvm-link, opt, llc, llvm-as) on the system.
-fn find_llvm_tool(tool: &str) -> Option<PathBuf> {
-    let env_key = format!("PERRY_LLVM_{}", tool.to_uppercase().replace('-', "_"));
-    if let Ok(p) = env::var(&env_key) {
-        let candidate = PathBuf::from(p);
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-    for prefix in &[
-        "/opt/homebrew/opt/llvm/bin",
-        "/usr/local/opt/llvm/bin",
-        "/usr/lib64/rocm/llvm/bin",
-        "/usr/lib/llvm-19/bin",
-        "/usr/lib/llvm-18/bin",
-        "/usr/lib/llvm-17/bin",
-    ] {
-        let candidate = PathBuf::from(prefix).join(tool);
-        if candidate.exists() && is_executable(&candidate) {
-            return Some(candidate);
-        }
-    }
-    if let Some(path) = which_path(tool) {
-        return Some(path);
-    }
-    None
-}
-
-/// Whole-program bitcode link pipeline.
-///
-/// Converts user `.ll` files to `.bc`, merges them with the runtime/stdlib
-/// bitcode via `llvm-link`, runs `opt -O3`, then `llc -filetype=obj` to
-/// produce a single object file. Returns the path to that `.o`.
-pub fn bitcode_link_pipeline(
-    user_ll_files: &[PathBuf],
-    runtime_bc: &Path,
-    stdlib_bc: Option<&Path>,
-    extra_bc: &[PathBuf],
-    target_triple: Option<&str>,
-) -> Result<PathBuf> {
-    let llvm_as = find_llvm_tool("llvm-as")
-        .ok_or_else(|| anyhow!("llvm-as not found (required for bitcode link)"))?;
-    let llvm_link = find_llvm_tool("llvm-link")
-        .ok_or_else(|| anyhow!("llvm-link not found (required for bitcode link)"))?;
-    let opt_tool = find_llvm_tool("opt")
-        .ok_or_else(|| anyhow!("opt not found (required for bitcode link)"))?;
-    let llc = find_llvm_tool("llc")
-        .ok_or_else(|| anyhow!("llc not found (required for bitcode link)"))?;
-
-    let tmp_dir = env::temp_dir();
-    let pid = std::process::id();
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let prefix = format!("perry_bc_{}_{}", pid, nonce);
-    let keep = env::var_os("PERRY_LLVM_KEEP_IR").is_some();
-    let mut intermediates: Vec<PathBuf> = Vec::new();
-
-    // Step 1: llvm-as each .ll → .bc
-    let mut user_bc_files: Vec<PathBuf> = Vec::new();
-    for (i, ll_file) in user_ll_files.iter().enumerate() {
-        let bc_path = tmp_dir.join(format!("{}_{}.bc", prefix, i));
-        let output = Command::new(&llvm_as)
-            .arg(ll_file)
-            .arg("-o")
-            .arg(&bc_path)
-            .output()
-            .with_context(|| format!("Failed to invoke llvm-as on {}", ll_file.display()))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow!(
-                "llvm-as failed on {} (status={}):\n{}",
-                ll_file.display(),
-                output.status,
-                stderr
-            ));
-        }
-        intermediates.push(bc_path.clone());
-        user_bc_files.push(bc_path);
-    }
-
-    // Step 2: llvm-link all bitcode into one module.
-    // perry-stdlib re-exports/wraps some perry-runtime symbols, so we
-    // pass the stdlib as `--override` to let its definitions win.
-    let linked_bc = tmp_dir.join(format!("{}_linked.bc", prefix));
-    {
-        let mut cmd = Command::new(&llvm_link);
-        for bc in &user_bc_files {
-            cmd.arg(bc);
-        }
-        cmd.arg(runtime_bc);
-        if let Some(stdlib) = stdlib_bc {
-            cmd.arg("--override").arg(stdlib);
-        }
-        for bc in extra_bc {
-            cmd.arg(bc);
-        }
-        cmd.arg("-o").arg(&linked_bc);
-        log::debug!("perry-codegen bitcode-link: {:?}", cmd);
-        let output = cmd.output().context("Failed to invoke llvm-link")?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow!(
-                "llvm-link failed (status={}):\n{}",
-                output.status,
-                stderr
-            ));
-        }
-    }
-    intermediates.push(linked_bc.clone());
-
-    // Step 3: opt -O3
-    let opt_bc = tmp_dir.join(format!("{}_opt.bc", prefix));
-    {
-        let mut cmd = Command::new(&opt_tool);
-        cmd.arg("-O3").arg(&linked_bc).arg("-o").arg(&opt_bc);
-        log::debug!("perry-codegen opt: {:?}", cmd);
-        let output = cmd.output().context("Failed to invoke opt")?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow!(
-                "opt -O3 failed (status={}):\n{}",
-                output.status,
-                stderr
-            ));
-        }
-    }
-    intermediates.push(opt_bc.clone());
-
-    // Step 4: llc -filetype=obj → .o
-    let linked_obj = PathBuf::from(format!("{}_linked.o", prefix));
-    {
-        let mut cmd = Command::new(&llc);
-        cmd.arg("-filetype=obj")
-            .arg("-O3")
-            .arg(&opt_bc)
-            .arg("-o")
-            .arg(&linked_obj);
-        if let Some(triple) = target_triple {
-            cmd.arg("-mtriple").arg(triple);
-        }
-        log::debug!("perry-codegen llc: {:?}", cmd);
-        let output = cmd.output().context("Failed to invoke llc")?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow!(
-                "llc failed (status={}):\n{}",
-                output.status,
-                stderr
-            ));
-        }
-    }
-
-    if keep {
-        eprintln!("[perry-codegen] bitcode-link intermediates kept:");
-        for f in &intermediates {
-            eprintln!("  {}", f.display());
-        }
-        eprintln!("  → {}", linked_obj.display());
-    } else {
-        for f in &intermediates {
-            let _ = fs::remove_file(f);
-        }
-    }
-
-    Ok(linked_obj)
 }
 
 /// Clang discovery, version preflight, compile-plan shaping, and temp-path

@@ -25,9 +25,12 @@ fn general_block_offset(idx: usize) -> usize {
 }
 
 pub(super) fn run_with_fresh_arenas(test: impl FnOnce() + Send + 'static) {
-    std::thread::spawn(test)
-        .join()
-        .expect("arena test panicked");
+    std::thread::spawn(move || {
+        crate::test_support::opt_out_of_thread_bootstrap();
+        test()
+    })
+    .join()
+    .expect("arena test panicked");
 }
 
 fn reset_old_nursery_block(dead_cycles_before: u32) -> (usize, usize, usize, ArenaResetStats) {

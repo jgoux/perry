@@ -78,6 +78,7 @@ fn empty_opts() -> CompileOptions {
 
 fn module_with_init(init: Vec<Stmt>) -> Module {
     Module {
+        requested_modules: Vec::new(),
         name: "argless_extra_args.ts".to_string(),
         imports: Vec::new(),
         exports: Vec::new(),
@@ -112,6 +113,8 @@ fn module_with_init(init: Vec<Stmt>) -> Module {
         async_generator_funcs: std::collections::HashSet::new(),
         local_source_spans: std::collections::HashMap::new(),
         gen_param_prologue_len: std::collections::HashMap::new(),
+        class_family_syntax: None,
+        requested_modules: Vec::new(),
     }
 }
 
@@ -257,7 +260,7 @@ fn array_pop_with_extra_arg_compiles() {
     let stmt = Stmt::Expr(Expr::Call {
         callee: Box::new(Expr::PropertyGet {
             byte_offset: 0,
-            object: Box::new(Expr::Array(vec![Expr::Number(1.0)])),
+            object: Box::new(Expr::Array(vec![Expr::Number(1.0)], None)),
             property: "pop".to_string(),
         }),
         args: vec![Expr::Number(99.0)],

@@ -21,7 +21,7 @@ abort_target_dir="${PERRY_ABORT_TARGET_DIR:-target-abort}"
 case "$target" in
   x86_64-unknown-linux-musl)
     expected_machine=x86_64
-    rustflags="-C force-unwind-tables=yes -Zuse-sync-unwind=yes -C force-frame-pointers=yes -C target-feature=+crt-static -L native=/opt/perry-musl/lib"
+    rustflags="-C force-unwind-tables=yes -Zuse-sync-unwind=yes -C target-feature=+crt-static -L native=/opt/perry-musl/lib"
     export CC_x86_64_unknown_linux_musl=musl-gcc
     export AR_x86_64_unknown_linux_musl=ar
     ;;
@@ -107,6 +107,10 @@ cargo_build=(mbx build)
 "${cargo_build[@]}" --profile prod --target "$target" -p perry
 "${cargo_build[@]}" --profile prod --target "$target" -p perry-runtime -p perry-runtime-static
 "${cargo_build[@]}" --profile prod --target "$target" -p perry-stdlib -p perry-stdlib-static
+# The WebAssembly host archive, co-built with the archives it links beside:
+# perry links it for a WebAssembly program and never builds it while compiling.
+"${cargo_build[@]}" --profile prod --target "$target" \
+  -p perry -p perry-runtime-static -p perry-stdlib-static -p perry-wasm-host
 
 # Ship the panic=abort runtime variant from the same sysroot.
 env CARGO_TARGET_DIR="$abort_target_dir" CARGO_PROFILE_PROD_PANIC=abort \
@@ -114,7 +118,8 @@ env CARGO_TARGET_DIR="$abort_target_dir" CARGO_PROFILE_PROD_PANIC=abort \
 cp "$abort_target_dir/$target/prod/libperry_runtime.a" \
    "$target_dir/$target/prod/libperry_runtime_abort.a"
 
-bash scripts/build_core_runtime.sh "$target"
+# GC effects sidecars (<archive>.gc-effects) over the final runtime bytes.
+bash scripts/gc_call_effects/sidecars.sh "$target_dir/$target/prod"
 
 # A dynamically linked binary can run on the glibc build host and still fail
 # immediately for users on Alpine. Gate the artifact itself, not just the

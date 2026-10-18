@@ -46,11 +46,8 @@ fn fixtures() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/llhttp")
 }
 
-/// Dedicated target dir for this suite's `wasm-host`-enabled runtime, for the
-/// same reason `issue_5234_wasm_esm_import` has one (#8547): built into the
-/// shared `target/debug` it would replace `libperry_runtime.a` with one
-/// carrying undefined `perry_wasm_host_*` references, breaking every other
-/// suite that links runtime-only.
+/// Dedicated target dir for this suite's runtime and wasm host archives, as
+/// in `issue_5234_wasm_esm_import`.
 fn wasm_host_target_dir() -> PathBuf {
     std::env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
@@ -68,15 +65,28 @@ fn ensure_runtime_archives() {
             .arg("build")
             .arg("-p")
             .arg("perry-runtime-static")
-            .arg("--features")
-            .arg("perry-runtime/wasm-host")
+            .arg("-p")
+            .arg("perry-wasm-host")
             .output()
-            .expect("build static runtime wrapper with wasm host shims");
+            .expect("build the static runtime and wasm host archives");
         assert!(
             build.status.success(),
             "static runtime build failed\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&build.stdout),
             String::from_utf8_lossy(&build.stderr)
+        );
+        // The GC effects sidecar beside the archives just built: perry reads it
+        // before codegen and refuses archives without one in the workspace.
+        assert!(
+            std::process::Command::new("bash")
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../scripts/gc_call_effects/sidecars.sh"
+                ))
+                .args(["--cargo-profile", "debug"])
+                .status()
+                .is_ok_and(|status| status.success()),
+            "scripts/gc_call_effects/sidecars.sh failed"
         );
     });
 }

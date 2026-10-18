@@ -51,6 +51,19 @@ pub fn declare_phase_b_arrays(module: &mut LlModule) {
         DOUBLE,
         &[PTR, I32, PTR, I32],
     );
+    // A literal descriptor whose tree holds fresh closures: their birth
+    // records and the caller's capture source words (`closure_births`).
+    module.declare_function(
+        "js_value_from_literal_descriptor_closures",
+        DOUBLE,
+        &[PTR, I32, PTR, I32, PTR, I32, PTR, I32, PTR, I32],
+    );
+    // A fresh enum object: its layout image, and its stores for the replay.
+    module.declare_function(
+        "js_enum_from_literal_descriptor",
+        DOUBLE,
+        &[PTR, I32, PTR, I32, PTR, I32, I32],
+    );
     module.declare_function("js_array_push_f64", I64, &[I64, DOUBLE]);
     module.declare_function(
         "js_array_append_set",
@@ -152,12 +165,7 @@ pub fn declare_phase_b_arrays(module: &mut LlModule) {
     // it preserves `undefined` and non-numeric property values and throws for
     // nullish receivers.
     module.declare_function("js_value_length_property_f64", DOUBLE, &[DOUBLE]);
-    module.declare_function("js_value_length_property_ic_f64", DOUBLE, &[DOUBLE, PTR]);
-    module.declare_function(
-        "js_value_length_property_key_ic_f64",
-        DOUBLE,
-        &[DOUBLE, PTR, I64],
-    );
+    module.declare_function("js_value_length_property_key_f64", DOUBLE, &[DOUBLE, I64]);
 
     // Shadow stack for precise root tracking (gen-GC Phase A per
     // docs/generational-gc-plan.md). Declared now so codegen can

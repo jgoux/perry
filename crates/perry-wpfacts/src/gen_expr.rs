@@ -10,6 +10,9 @@ use crate::gen::{Fx, Gen, ReadSite};
 use crate::model::*;
 use perry_hir::{ArrayElement, CallArg, CompareOp, Expr, LogicalOp, UnaryOp};
 
+/// The sink reason of an unmodeled construct's operands (`Gen::fail_closed`).
+pub(crate) const UNMODELED_OPERAND: &str = "operand of unmodeled HIR construct";
+
 impl<'a> Gen<'a> {
     pub(crate) fn tmp(&mut self, what: &'static str) -> NodeId {
         self.m.node_l(what)
@@ -80,7 +83,7 @@ impl<'a> Gen<'a> {
 
     /// Fail closed: every operand escapes, the result is ⊤.
     pub(crate) fn fail_closed(&mut self, fx: &Fx, e: &Expr, name: &str) -> NodeId {
-        let why = format!("operand of unmodeled HIR construct {name}");
+        let why = format!("{UNMODELED_OPERAND} {name}");
         let mut kids: Vec<&Expr> = Vec::new();
         perry_hir::walker::walk_expr_children(e, &mut |c| kids.push(c));
         for c in kids {
@@ -142,6 +145,29 @@ impl<'a> Gen<'a> {
         site
     }
 
+    /// A store whose site may be a construction-phase writer of `new f()`
+    /// (`mark_fn_phase`). The phase is set before the constraint exists:
+    /// generation solves online, so a `Store` already applies to what `recv`
+    /// holds, and a site marked afterwards would also count as a
+    /// post-construction writer of those instances.
+    #[allow(clippy::too_many_arguments)]
+    fn store_phased(
+        &mut self,
+        fx: &Fx,
+        e: &Expr,
+        object: &Expr,
+        recv: NodeId,
+        key: Key,
+        src: NodeId,
+        desc: String,
+        owner: Option<TmplId>,
+    ) -> SiteId {
+        let site = self.store_site(fx.module, fx.f, desc, owner, false);
+        self.mark_fn_phase(fx, e, object, site);
+        self.m.cons(recv, Cons::Store { key, src, site });
+        site
+    }
+
     /// A `this.k = v` store in a function `new` may call, before `this`
     /// leaks: a birth writer of `new f()` instances.
     fn mark_fn_phase(&mut self, fx: &Fx, e: &Expr, object: &Expr, site: SiteId) {
@@ -161,6 +187,23 @@ impl<'a> Gen<'a> {
         match index {
             Expr::String(s) => Key::Named(self.m.atom(s)),
             _ => Key::Any,
+        }
+    }
+
+    /// The key of a computed READ or method call. `Symbol.iterator` & co.:
+    /// HIR folds a well-known symbol to the runtime's `@@__perry_wk_<name>`
+    /// sentinel, one symbol per name, so the read names it. Stores keep
+    /// `Key::Any`, which every named read sees; as an atom it can only
+    /// merge with a string key of the same spelling (more flow, never less).
+    pub(crate) fn read_key(&mut self, index: &Expr) -> Key {
+        match index {
+            Expr::SymbolFor(name) => match name.as_ref() {
+                Expr::String(s) if s.starts_with(crate::builtins::WK_PREFIX) => {
+                    Key::Named(self.m.atom(s))
+                }
+                _ => Key::Any,
+            },
+            _ => self.key_of(index),
         }
     }
 
@@ -269,27 +312,17 @@ impl<'a> Gen<'a> {
 
     /// The values produced by iterating whatever `v` holds: elements of
     /// arrays/collections/primitive boxes, and for iterables the protocol:
-    /// `v[Symbol.iterator]()` (every method, conservatively), then `.next()`
-    /// on the result and on `v` itself, then `.value`.
+    /// `v[Symbol.iterator]()`, then `.next()` on the result and on `v`
+    /// itself, then `.value`.
     pub(crate) fn iterate(&mut self, v: NodeId) -> NodeId {
         let out = self.tmp("iterated");
-        self.m.cons(
-            v,
-            Cons::Load {
-                key: Key::Any,
-                dst: out,
-            },
-        );
+        let ik = self.m.iter_key();
+        self.m.cons(v, Cons::Load { key: ik, dst: out });
         let (pc, it) = self.new_call(ThisArg::Node(v), vec![], vec![]);
+        let wk = Key::Named(self.m.atom(crate::builtins::WK_ITERATOR));
         self.m.protocol_calls.insert(pc);
         self.m.rel(|| format!("protocolcall {pc}"));
-        self.m.cons(
-            v,
-            Cons::MCall {
-                key: Key::Any,
-                call: pc,
-            },
-        );
+        self.m.cons(v, Cons::MCall { key: wk, call: pc });
         let na = self.m.atom("next");
         let r1 = self.mcall(it, Key::Named(na), vec![], vec![]);
         let r2 = self.mcall(v, Key::Named(na), vec![], vec![]);
@@ -569,16 +602,16 @@ impl<'a> Gen<'a> {
                 let v = self.expr(fx, value);
                 let a = self.m.atom(property);
                 let owner = self.phase_owner(fx, e, object);
-                let site = self.store(
+                self.store_phased(
                     fx,
+                    e,
+                    object,
                     o,
                     Key::Named(a),
                     v,
                     format!(".{property}="),
                     owner,
-                    false,
                 );
-                self.mark_fn_phase(fx, e, object, site);
                 v
             }
             Expr::PutValueSet {
@@ -596,11 +629,9 @@ impl<'a> Gen<'a> {
                 let rv = self.expr(fx, receiver);
                 let key = self.key_of(key);
                 let owner = self.phase_owner(fx, e, target);
-                let s1 = self.store(fx, t, key, v, "putvalue".into(), owner, false);
-                self.mark_fn_phase(fx, e, target, s1);
+                self.store_phased(fx, e, target, t, key, v, "putvalue".into(), owner);
                 // A receiver other than the target gets the own data store.
-                let s2 = self.store(fx, rv, key, v, "putvalue-receiver".into(), owner, false);
-                self.mark_fn_phase(fx, e, target, s2);
+                self.store_phased(fx, e, target, rv, key, v, "putvalue-receiver".into(), owner);
                 v
             }
             Expr::PropertyUpdate {
@@ -620,16 +651,16 @@ impl<'a> Gen<'a> {
                     },
                 );
                 let owner = self.phase_owner(fx, e, object);
-                let site = self.store(
+                self.store_phased(
                     fx,
+                    e,
+                    object,
                     o,
                     Key::Named(a),
                     nv2,
                     format!(".{property}++"),
                     owner,
-                    false,
                 );
-                self.mark_fn_phase(fx, e, object, site);
                 nv2
             }
             Expr::IndexGet { object, index } => {
@@ -637,7 +668,7 @@ impl<'a> Gen<'a> {
                 let i = self.expr(fx, index);
                 let r = self.m.reason("ToPropertyKey");
                 self.m.cons(i, Cons::Implicit { reason: r });
-                match self.key_of(index) {
+                match self.read_key(index) {
                     Key::Named(a) => self.load(o, Key::Named(a)),
                     Key::Any => {
                         let dst = self.tmp("idxload");
@@ -734,6 +765,37 @@ impl<'a> Gen<'a> {
                 }
                 obj
             }
+            // A fresh enum object: a literal of its stores' keys, each
+            // holding the numbers and strings stored there.
+            Expr::EnumImage { stores, .. } => {
+                let mut seen = std::collections::HashSet::new();
+                let keys: Vec<&str> = stores
+                    .iter()
+                    .map(|(k, _)| k.as_str())
+                    .filter(|k| seen.insert(*k))
+                    .collect();
+                let (tm, t) = self.new_lit(mi, &keys);
+                let obj = self.tok_node(t);
+                for (k, v) in stores {
+                    let vn = self.prim_node(match v {
+                        perry_hir::EnumValue::Number(_) | perry_hir::EnumValue::Computed => {
+                            prim::NUM
+                        }
+                        perry_hir::EnumValue::String(_) => prim::STR,
+                    });
+                    let a = self.m.atom(k);
+                    self.store(
+                        fx,
+                        obj,
+                        Key::Named(a),
+                        vn,
+                        format!("enum.{k}"),
+                        Some(tm),
+                        true,
+                    );
+                }
+                obj
+            }
             Expr::ObjectSpread { parts } => {
                 let named: Vec<&str> = parts.iter().filter_map(|(k, _)| k.as_deref()).collect();
                 let has_spread = parts.iter().any(|(k, _)| k.is_none());
@@ -781,7 +843,7 @@ impl<'a> Gen<'a> {
                 self.store(fx, obj, Key::Any, vals, "rest".into(), Some(tm), true);
                 obj
             }
-            Expr::Array(elems) => {
+            Expr::Array(elems, _) => {
                 let tm = self.new_arr_template(mi, "lit");
                 let t = self.m.tok(TokKind::Obj(tm));
                 let fa = self.m.field_any(t);

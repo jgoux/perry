@@ -177,7 +177,7 @@ pub(crate) fn is_entry_chunk(function: &perry_hir::Function) -> bool {
 /// Every entry-chunk function in `hir.functions`, indexed by id. Chunks are
 /// origin-agnostic — this map does not distinguish a chunk split from
 /// `hir.init` from one split from an outlined function body (#10575).
-fn chunk_map(hir: &HirModule) -> std::collections::HashMap<u32, &perry_hir::Function> {
+pub(crate) fn chunk_map(hir: &HirModule) -> std::collections::HashMap<u32, &perry_hir::Function> {
     hir.functions
         .iter()
         .filter(|function| is_entry_chunk(function))
@@ -204,7 +204,7 @@ fn as_chunk_call<'a>(
 
 /// Reconstruct the source-order statement stream of `stmts` after outlining:
 /// every chunk-call site is replaced by that chunk's body, in place.
-fn logical_stmts_of<'a>(
+pub(crate) fn logical_stmts_of<'a>(
     stmts: &'a [perry_hir::Stmt],
     chunks: &std::collections::HashMap<u32, &'a perry_hir::Function>,
 ) -> Vec<&'a perry_hir::Stmt> {
@@ -720,7 +720,7 @@ pub enum OutlineOutcome {
 /// Largest `FuncId` used anywhere in `hir`. New chunk ids are minted strictly
 /// above it so generated functions cannot collide with a class member, nested
 /// closure, or an id retained only in module metadata.
-fn max_func_id(hir: &HirModule) -> u32 {
+pub(crate) fn max_func_id(hir: &HirModule) -> u32 {
     let mut max = 0u32;
     for (_, id) in &hir.script_global_functions {
         max = max.max(*id);
@@ -1333,8 +1333,9 @@ mod tests {
         let allocation_heavy_stmt = || {
             Stmt::Expr(Expr::Array(
                 (0..DEFAULT_CHUNK_SAFEPOINTS)
-                    .map(|_| Expr::Array(vec![]))
+                    .map(|_| Expr::Array(vec![], None))
                     .collect(),
+                None,
             ))
         };
         let mut m = module_with_init(vec![allocation_heavy_stmt(), allocation_heavy_stmt()]);

@@ -109,13 +109,17 @@ fn descriptor_pointer<T>(base: *const u8, offset: i32) -> *const T {
 /// The bytes are BORROWED from the program image and never copied: this map
 /// is written only by [`js_register_function_name_static`], whose contract is
 /// process lifetime.
+///
+/// Keyed by code address with the runtime's pointer hasher: `Error`
+/// construction probes it once per frame it walks.
 fn function_name_registry(
-) -> &'static std::sync::Mutex<std::collections::HashMap<usize, &'static [u8]>> {
+) -> &'static std::sync::Mutex<crate::fast_hash::PtrHashMap<usize, &'static [u8]>> {
     use std::sync::OnceLock;
-    static REGISTRY: OnceLock<std::sync::Mutex<std::collections::HashMap<usize, &'static [u8]>>> =
-        OnceLock::new();
+    static REGISTRY: OnceLock<
+        std::sync::Mutex<crate::fast_hash::PtrHashMap<usize, &'static [u8]>>,
+    > = OnceLock::new();
     crate::once_init::get_or_init(&REGISTRY, || {
-        std::sync::Mutex::new(std::collections::HashMap::new())
+        std::sync::Mutex::new(crate::fast_hash::new_ptr_hash_map())
     })
 }
 
@@ -356,6 +360,19 @@ pub fn bundle_function_name_registry_len() -> Option<usize> {
     Some(function_name_registry().lock().ok()?.len())
 }
 
+/// Run `f` with the generated-bundle name map held, keyed by function start
+/// address: the set `Error.stack` resolves against, so a capture can tell a
+/// JS frame from a runtime one while it walks (and stop at
+/// `Error.stackTraceLimit` JS frames). `f` must not register names. Only
+/// the x86_64 Linux capture classifies frames as it walks.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub(crate) fn with_bundle_function_names<R>(
+    f: impl FnOnce(&crate::fast_hash::PtrHashMap<usize, &'static [u8]>) -> R,
+) -> Option<R> {
+    let names = function_name_registry().lock().ok()?;
+    Some(f(&names))
+}
+
 /// Snapshot only the generated-bundle names registered through
 /// [`js_register_function_name_static`].
 ///
@@ -372,6 +389,36 @@ pub fn bundle_function_name_registry_entries() -> Option<Vec<(usize, std::sync::
             .collect(),
     )
 }
+
+/// The image string a compiled body's name range is the text of
+/// ([`FN_NAME_IMAGE`](crate::codegen_abi::FN_NAME_IMAGE)): the function's own
+/// `name` value, static data of its body, with nothing to allocate. `None`
+/// for a body whose name is not image data.
+///
+/// # Safety
+/// `info` is null or a live function info.
+#[inline(always)]
+pub(crate) unsafe fn function_name_image(
+    info: *const crate::closure::JsFunctionInfo,
+) -> Option<*const crate::StringHeader> {
+    let body = info.as_ref()?;
+    const IMAGE_NAME: u32 = crate::codegen_abi::FN_HAS_NAME | crate::codegen_abi::FN_NAME_IMAGE;
+    if body.flags & IMAGE_NAME != IMAGE_NAME {
+        return None;
+    }
+    let base = info.cast::<u8>();
+    let source_tail =
+        body.flags & crate::codegen_abi::FN_HAS_SOURCE != 0 && !body.versioned_code.is_null();
+    let tail = base.add(
+        std::mem::size_of::<crate::closure::JsFunctionInfo>() + if source_tail { 8 } else { 0 },
+    );
+    let bytes: *const u8 = descriptor_pointer(base, tail.cast::<i32>().read_unaligned());
+    Some(bytes.sub(std::mem::size_of::<crate::StringHeader>()).cast())
+}
+const _: () = assert!(
+    std::mem::size_of::<crate::StringHeader>() == 20,
+    "codegen places an image name's bytes 20 bytes past its header"
+);
 
 /// A compiled closure's immutable name range comes from its body descriptor.
 /// Legacy/native names retain their existing code-address metadata fallback.

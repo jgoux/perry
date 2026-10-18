@@ -100,6 +100,7 @@ fn assert_runtime_barrier_metadata_emitted(ir: &str) {
 
 fn module_with_large_pointer_array_literal(element_count: usize) -> Module {
     Module {
+        requested_modules: Vec::new(),
         name: "large_object_barriers.ts".to_string(),
         imports: Vec::new(),
         exports: Vec::new(),
@@ -120,9 +121,12 @@ fn module_with_large_pointer_array_literal(element_count: usize) -> Module {
                     name: "child".to_string(),
                     ty: Type::Any,
                     mutable: false,
-                    init: Some(Expr::Array(Vec::new())),
+                    init: Some(Expr::Array(Vec::new(), None)),
                 },
-                Stmt::Return(Some(Expr::Array(vec![Expr::LocalGet(1); element_count]))),
+                Stmt::Return(Some(Expr::Array(
+                    vec![Expr::LocalGet(1); element_count],
+                    None,
+                ))),
             ],
             is_async: false,
             is_generator: false,
@@ -158,11 +162,14 @@ fn module_with_large_pointer_array_literal(element_count: usize) -> Module {
         async_generator_funcs: std::collections::HashSet::new(),
         local_source_spans: std::collections::HashMap::new(),
         gen_param_prologue_len: std::collections::HashMap::new(),
+        class_family_syntax: None,
+        requested_modules: Vec::new(),
     }
 }
 
 fn module_with_large_local_array_push(element_count: usize) -> Module {
     Module {
+        requested_modules: Vec::new(),
         name: "large_object_push_barriers.ts".to_string(),
         imports: Vec::new(),
         exports: Vec::new(),
@@ -190,7 +197,7 @@ fn module_with_large_local_array_push(element_count: usize) -> Module {
                     name: "arr".to_string(),
                     ty: Type::Array(Box::new(Type::Any)),
                     mutable: true,
-                    init: Some(Expr::Array(vec![Expr::Number(0.0); element_count])),
+                    init: Some(Expr::Array(vec![Expr::Number(0.0); element_count], None)),
                 },
                 Stmt::Expr(Expr::ArrayPush {
                     array_id: 2,
@@ -233,6 +240,8 @@ fn module_with_large_local_array_push(element_count: usize) -> Module {
         async_generator_funcs: std::collections::HashSet::new(),
         local_source_spans: std::collections::HashMap::new(),
         gen_param_prologue_len: std::collections::HashMap::new(),
+        class_family_syntax: None,
+        requested_modules: Vec::new(),
     }
 }
 

@@ -55,6 +55,13 @@ pub(crate) struct TypedLocals {
     pub numbers: HashSet<u32>,
     /// Locals that hold an Array created by a literal in this body.
     pub arrays: HashSet<u32>,
+    /// The Number locals that are int32-or-NaN at every read: every write is
+    /// `charCodeAt` on a proven String (a UTF-16 code unit, or NaN for an
+    /// index out of range), a bounded int32 ([`int32_writer_range`]), another
+    /// such local, or a conditional of those. NaN is NOT an int32: a consumer
+    /// must handle it (the array-key admission rejects it with one ordered
+    /// compare). `++`/`--` writes are excluded (they can leave int32).
+    pub code_units: HashSet<u32>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -318,6 +325,48 @@ impl Env<'_> {
         let rec = |x: &Expr| self.kind(x, depth + 1);
         match e {
             Expr::Integer(_) | Expr::Number(_) => Some(Kind::Num),
+            // `Number(x)` and the Math functions: the canonical-double
+            // producers codegen trusts (`expr_produces_canonical_raw_f64`).
+            Expr::NumberCoerce(_)
+            | Expr::MathFloor(..)
+            | Expr::MathCeil(..)
+            | Expr::MathRound(..)
+            | Expr::MathTrunc(..)
+            | Expr::MathSign(..)
+            | Expr::MathAbs(..)
+            | Expr::MathSqrt(..)
+            | Expr::MathLog(..)
+            | Expr::MathLog2(..)
+            | Expr::MathLog10(..)
+            | Expr::MathPow(..)
+            | Expr::MathMin(..)
+            | Expr::MathMax(..)
+            | Expr::MathMinSpread(..)
+            | Expr::MathMaxSpread(..)
+            | Expr::MathImul(..)
+            | Expr::MathRandom
+            | Expr::MathSin(..)
+            | Expr::MathCos(..)
+            | Expr::MathTan(..)
+            | Expr::MathAsin(..)
+            | Expr::MathAcos(..)
+            | Expr::MathAtan(..)
+            | Expr::MathAtan2(..)
+            | Expr::MathCbrt(..)
+            | Expr::MathHypot(..)
+            | Expr::MathFround(..)
+            | Expr::MathF16round(..)
+            | Expr::MathClz32(..)
+            | Expr::MathExpm1(..)
+            | Expr::MathLog1p(..)
+            | Expr::MathSinh(..)
+            | Expr::MathCosh(..)
+            | Expr::MathTanh(..)
+            | Expr::MathAsinh(..)
+            | Expr::MathAcosh(..)
+            | Expr::MathAtanh(..)
+            | Expr::MathExp(..)
+            | Expr::DateNow => Some(Kind::Num),
             Expr::String(_)
             | Expr::WtfString(_)
             | Expr::StringCoerce(_)
@@ -327,7 +376,9 @@ impl Env<'_> {
             | Expr::StringFromCharCode(_)
             | Expr::StringFromCharCodeSpread(_)
             | Expr::StringFromCodePoint(_) => Some(Kind::Str),
-            Expr::Array(_) | Expr::ArraySpread(_) => Some(Kind::Arr),
+            Expr::Array(_, _) | Expr::ArraySpread(_) => Some(Kind::Arr),
+            // `s.split(d)` on a proven String: a fresh dense Array.
+            Expr::StringSplit(string, _) if rec(string) == Some(Kind::Str) => Some(Kind::Arr),
             Expr::LocalGet(id) => self.local(*id),
             Expr::LocalSet(_, v) => rec(v),
             Expr::Sequence(v) => v.last().and_then(rec),
@@ -481,12 +532,97 @@ fn iife_return_kind(
 /// What a `String.prototype` method returns, for a String receiver: the
 /// lists `string_value_is_runtime_guaranteed` and
 /// `string_method_returns_number` trust.
+/// One write of a [`TypedLocals::code_units`] candidate: int32-or-NaN by
+/// construction. `charCodeAt` answers a code unit in [0, 0xFFFF] for an index
+/// in range and NaN otherwise (never a fraction, never -0 through ToInteger of
+/// the index); only a receiver the String fixed point proved qualifies, so a
+/// user object's `charCodeAt` never does.
+fn is_code_unit(e: &Expr, env: &Env<'_>, set: &HashSet<u32>, depth: usize) -> bool {
+    if depth > 24 {
+        return false;
+    }
+    let rec = |x: &Expr| is_code_unit(x, env, set, depth + 1);
+    match e {
+        Expr::Call { callee, .. } => matches!(callee.as_ref(),
+            Expr::PropertyGet { object, property, .. }
+            if property == "charCodeAt" && env.is(object, Kind::Str)),
+        Expr::LocalGet(id) => set.contains(id),
+        Expr::LocalSet(_, v) => rec(v),
+        Expr::Sequence(v) => v.last().is_some_and(rec),
+        Expr::Conditional {
+            then_expr,
+            else_expr,
+            ..
+        } => rec(then_expr) && rec(else_expr),
+        _ => int32_writer_range(e).is_some(),
+    }
+}
+
+/// Closed bounds for additional writers. In particular qs combines surrogate
+/// code units using masks, a constant shift, OR, and addition. Never assume
+/// that an arbitrary Number assignment is integral or within fptosi's range.
+pub(crate) fn int32_writer_range(expr: &Expr) -> Option<(i64, i64)> {
+    match expr {
+        Expr::Integer(n) if i32::try_from(*n).is_ok() => return Some((*n, *n)),
+        Expr::Number(n)
+            if n.is_finite()
+                && n.fract() == 0.0
+                && *n >= i32::MIN as f64
+                && *n <= i32::MAX as f64 =>
+        {
+            return Some((*n as i64, *n as i64));
+        }
+        _ => {}
+    }
+    let Expr::Binary { op, left, right } = expr else {
+        return None;
+    };
+    if *op == BinaryOp::BitAnd {
+        let mask = int32_writer_range(left).or_else(|| int32_writer_range(right));
+        if let Some((lo, hi)) = mask {
+            if lo == hi && lo >= 0 && hi <= i64::from(i32::MAX) {
+                return Some((0, hi));
+            }
+        }
+    }
+    let (lo, hi) = int32_writer_range(left)?;
+    let (rlo, rhi) = int32_writer_range(right)?;
+    match op {
+        BinaryOp::Add => {
+            let lower = lo.checked_add(rlo)?;
+            let upper = hi.checked_add(rhi)?;
+            (lower >= i64::from(i32::MIN) && upper <= i64::from(i32::MAX)).then_some((lower, upper))
+        }
+        BinaryOp::Shl
+            if lo >= 0 && hi <= i64::from(i32::MAX) && rlo == rhi && (0..32).contains(&rlo) =>
+        {
+            let lower = lo.checked_shl(rlo as u32)?;
+            let upper = hi.checked_shl(rlo as u32)?;
+            (upper <= i64::from(i32::MAX)).then_some((lower, upper))
+        }
+        BinaryOp::BitOr
+            if lo >= 0 && rlo >= 0 && hi <= i64::from(i32::MAX) && rhi <= i64::from(i32::MAX) =>
+        {
+            let max = hi.max(rhi) as u64;
+            let bound = if max == 0 {
+                0
+            } else {
+                (1u64 << (64 - max.leading_zeros())) - 1
+            };
+            Some((0, bound as i64))
+        }
+        _ => None,
+    }
+}
+
 fn string_method_kind(name: &str) -> Option<Kind> {
     match name {
         "toString" | "toLowerCase" | "toUpperCase" | "trim" | "trimStart" | "trimEnd" | "slice"
         | "substring" | "substr" | "charAt" | "repeat" | "replace" | "replaceAll" | "padStart"
         | "padEnd" | "concat" | "normalize" => Some(Kind::Str),
         "charCodeAt" | "indexOf" | "lastIndexOf" | "search" | "localeCompare" => Some(Kind::Num),
+        // A fresh dense Array of Strings.
+        "split" => Some(Kind::Arr),
         _ => None,
     }
 }
@@ -716,22 +852,60 @@ pub(crate) fn collect_typed_locals(
         }
         excluded.extend(bad);
     };
+    let mut code_units: HashSet<u32> = numbers
+        .iter()
+        .copied()
+        .filter(|id| !updates.contains(id))
+        .collect();
+    loop {
+        let env = Env {
+            iife: &iife,
+            boxed_vars,
+            module_globals,
+            proofs,
+            strings: &strings,
+            numbers: &numbers,
+            arrays: &arrays,
+        };
+        let drop: Vec<u32> = code_units
+            .iter()
+            .copied()
+            .filter(|id| {
+                !writes.get(id).is_some_and(|ws| {
+                    ws.iter()
+                        .all(|w| w.is_some_and(|e| is_code_unit(e, &env, &code_units, 0)))
+                })
+            })
+            .collect();
+        if drop.is_empty() {
+            break;
+        }
+        for id in drop {
+            code_units.remove(&id);
+        }
+    }
     if std::env::var_os("PERRY_TYPED_LOCALS_TRACE").is_some() {
         let mut s: Vec<_> = strings.iter().collect();
         let mut n: Vec<_> = numbers.iter().collect();
         s.sort();
         n.sort();
         eprintln!(
-            "[typed_locals] proofs={:?} candidates={} strings={s:?} numbers={n:?} arrays={}",
+            "[typed_locals] proofs={:?} candidates={} strings={s:?} numbers={n:?} arrays={} code_units={:?}",
             proofs.keys().collect::<Vec<_>>(),
             candidates.len(),
-            arrays.len()
+            arrays.len(),
+            {
+                let mut c: Vec<_> = code_units.iter().collect();
+                c.sort();
+                c
+            }
         );
     }
     TypedLocals {
         strings,
         numbers,
         arrays,
+        code_units,
     }
 }
 
@@ -771,36 +945,131 @@ pub(crate) fn number_proof_params(
         .filter_map(|(id, ty)| matches!(ty, HirType::Number | HirType::Int32).then_some(*id))
 }
 
+/// The one seed set of a body: what it may assume about the bindings it
+/// reads but does not own, each holding its type at every read in the body.
+/// Two analyses contribute, over disjoint questions:
+/// - `capture_proofs` (this file): a local typed in an enclosing body, seen
+///   by the closures it creates;
+/// - `collectors::definite_init`: a top-level `var` of a module, CommonJS
+///   factory or function body written once before any reader can run, seen
+///   by every body but its declaring one (module globals are outside this
+///   file's walk, and a hoisted function declaration that reads the var is
+///   proven by the reader taint there rather than refused as an early read).
+///
+/// When both claim a binding the facts meet ([`meet`]): equal facts stand,
+/// the narrower of two comparable facts wins, and incomparable facts (one of
+/// the two would be unsound) leave the binding unproven. The set feeds both
+/// the body's lowering oracle ([`seed_local_types`]) and its proof map
+/// ([`apply`]); nothing else seeds either from these analyses.
+pub(crate) fn outer_proofs(
+    captures: Option<&HashMap<u32, HirType>>,
+    definite: &super::DefiniteInit,
+    body: Option<u32>,
+) -> HashMap<u32, HirType> {
+    let mut out: HashMap<u32, HirType> = captures.cloned().unwrap_or_default();
+    let mut refused: Vec<u32> = Vec::new();
+    for (id, ty) in definite.facts_for(body) {
+        match out.get(&id) {
+            None => {
+                out.insert(id, ty.clone());
+            }
+            Some(prev) => match meet(prev, ty) {
+                Some(m) => {
+                    out.insert(id, m);
+                }
+                None => refused.push(id),
+            },
+        }
+    }
+    for id in refused {
+        if std::env::var_os("PERRY_TYPED_LOCALS_TRACE").is_some() {
+            eprintln!(
+                "[typed_locals] outer proof conflict on {id}: {:?}",
+                out.get(&id)
+            );
+        }
+        debug_assert!(
+            false,
+            "typed_locals: incomparable outer proofs for local {id}"
+        );
+        out.remove(&id);
+    }
+    out
+}
+
+/// The meet of two facts about one binding: the narrower when comparable.
+fn meet(a: &HirType, b: &HirType) -> Option<HirType> {
+    if a == b {
+        return Some(a.clone());
+    }
+    match (a, b) {
+        (HirType::Array(x), HirType::Array(_)) if matches!(**x, HirType::Any) => Some(b.clone()),
+        (HirType::Array(_), HirType::Array(y)) if matches!(**y, HirType::Any) => Some(a.clone()),
+        (HirType::String, HirType::StringLiteral(_)) => Some(b.clone()),
+        (HirType::StringLiteral(_), HirType::String) => Some(a.clone()),
+        _ => None,
+    }
+}
+
+/// The part of an outer seed set the proof map and the oracle carry:
+/// Numbers answer through `number_by_construction` alone (THE Number
+/// query), and an outer binding's storage is not this body's to change.
+fn outer_non_number(outer: &HashMap<u32, HirType>) -> impl Iterator<Item = (u32, &HirType)> {
+    outer
+        .iter()
+        .filter(|(_, ty)| !matches!(ty, HirType::Number | HirType::Int32))
+        .map(|(id, ty)| (*id, ty))
+}
+
+/// Seed the body's binding oracle `local_types` (what picks the lowering,
+/// e.g. `is_array_expr`) from its outer seed set. Fills only `Any`/`Unknown`
+/// slots; a declared or inferred type is never overwritten.
+pub(crate) fn seed_local_types(
+    outer: &HashMap<u32, HirType>,
+    local_types: &mut HashMap<u32, HirType>,
+) {
+    for (id, ty) in outer_non_number(outer) {
+        match local_types.get(&id) {
+            None | Some(HirType::Any) | Some(HirType::Unknown) => {
+                local_types.insert(id, ty.clone());
+            }
+            Some(_) => {}
+        }
+    }
+}
+
+/// `FnCtx::typed_locals` of a body that runs no local analysis (static
+/// methods): its outer seed set alone.
+pub(crate) fn outer_only(outer: &HashMap<u32, HirType>) -> HashMap<u32, HirType> {
+    outer_non_number(outer)
+        .map(|(id, ty)| (id, ty.clone()))
+        .collect()
+}
+
 /// Run the analysis for one compiled body: Number locals (and Number
 /// parameters proven at entry) join `number_by_construction`, and the
-/// returned map is the body's `FnCtx::typed_locals`.
+/// returned map is the body's `FnCtx::typed_locals`. `outer` is the body's
+/// seed set ([`outer_proofs`]).
 pub(crate) fn apply(
     body: &[Stmt],
     proofs: &HashMap<u32, HirType>,
-    captures: Option<&HashMap<u32, HirType>>,
+    outer: &HashMap<u32, HirType>,
     boxed_vars: &HashSet<u32>,
     module_globals: &HashMap<u32, String>,
     number_by_construction: &mut HashSet<u32>,
+    code_units: &mut HashSet<u32>,
 ) -> HashMap<u32, HirType> {
     let mut all = proofs.clone();
-    if let Some(c) = captures {
-        for (id, ty) in c {
-            all.entry(*id).or_insert_with(|| ty.clone());
-        }
+    for (id, ty) in outer {
+        all.entry(*id).or_insert_with(|| ty.clone());
     }
     let t = collect_typed_locals(body, &all, boxed_vars, module_globals);
     number_by_construction.extend(t.numbers.iter().copied());
     number_by_construction.extend(number_proof_params(proofs));
+    code_units.extend(t.code_units.iter().copied());
     // Numbers answer through `number_by_construction` alone (THE Number
     // query); the map carries the String and Array proofs.
-    let mut m: HashMap<u32, HirType> = captures
-        .map(|c| {
-            c.iter()
-                .filter(|(_, ty)| !matches!(ty, HirType::Number | HirType::Int32))
-                .map(|(id, ty)| (*id, ty.clone()))
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut m = outer_only(outer);
     m.extend(t.strings.iter().map(|id| (*id, HirType::String)));
     m.extend(
         t.arrays

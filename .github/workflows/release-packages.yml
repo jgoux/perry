@@ -56,14 +56,6 @@ concurrency:
   group: release-packages-${{ github.event.release.tag_name || inputs.existing_tag || ((inputs.cut_release || inputs.nightly) && inputs.candidate_sha) || github.run_id }}
   cancel-in-progress: false
 
-# Shipped runtime archives carry no GC/diagnostic instruments: perry-runtime's
-# build script compiles them out when this is set (see its
-# `emit_instrument_cfgs`). Every cargo build in these jobs sees it, including
-# the per-ext-crate invocations that rebuild the runtime, so all shipped
-# archives share one feature set (#6303). The container builds pass it through.
-env:
-  PERRY_RELEASE_STRIP_INSTRUMENTS: "1"
-
 jobs:
   # ---------------------------------------------------------------------------
   # Resolve the run mode + release tag ONCE, up front. Every downstream job
@@ -797,13 +789,17 @@ jobs:
         # crate, which downloaded a prebuilt V8 that 404'd on musl, was
         # removed.)
         if: matrix.old_glibc_image == '' && matrix.musl_image == ''
-        run: mbx build --profile prod --target ${{ matrix.target }} -p perry
+        run: ${{ runner.os == 'Windows' && 'cargo' || 'mbx' }} build --profile prod --target ${{ matrix.target }} -p perry
 
       - name: Build runtime libraries
         if: matrix.old_glibc_image == '' && matrix.musl_image == ''
         run: |
-          mbx build --profile prod --target ${{ matrix.target }} -p perry-runtime -p perry-runtime-static
-          mbx build --profile prod --target ${{ matrix.target }} -p perry-stdlib -p perry-stdlib-static
+          ${{ runner.os == 'Windows' && 'cargo' || 'mbx' }} build --profile prod --target ${{ matrix.target }} -p perry-runtime -p perry-runtime-static
+          ${{ runner.os == 'Windows' && 'cargo' || 'mbx' }} build --profile prod --target ${{ matrix.target }} -p perry-stdlib -p perry-stdlib-static
+          # The WebAssembly host archive, co-built with the archives it links
+          # beside: perry links it for a WebAssembly program and never builds
+          # it while compiling one.
+          ${{ runner.os == 'Windows' && 'cargo' || 'mbx' }} build --profile prod --target ${{ matrix.target }} -p perry -p perry-runtime-static -p perry-stdlib-static -p perry-wasm-host
 
       - name: Build panic=abort runtime variant (Unix)
         # Out-of-tree installs can't rebuild the runtime, so ship the
@@ -819,10 +815,6 @@ jobs:
             mbx build --profile prod --target ${{ matrix.target }} -p perry-runtime -p perry-runtime-static
           cp "target-abort/${{ matrix.target }}/prod/libperry_runtime.a" \
              "target/${{ matrix.target }}/prod/libperry_runtime_abort.a"
-
-      - name: Build core runtime profile (Unix)
-        if: runner.os != 'Windows' && matrix.old_glibc_image == '' && matrix.musl_image == ''
-        run: bash scripts/build_core_runtime.sh '${{ matrix.target }}'
 
       - name: Build native ext libraries (Unix)
         # #2532 — the perry-ext-* wrapper crates ship the host functions for
@@ -849,7 +841,7 @@ jobs:
           while IFS= read -r name; do
             echo "::group::build $name"
             mbx build --profile prod --target ${{ matrix.target }} \
-              -p perry -p perry-runtime-static -p perry-stdlib-static -p "$name" \
+              -p perry -p perry-runtime-static -p perry-stdlib-static -p perry-wasm-host -p "$name" \
               || echo "  (skipped $name — failed to build on this host)"
             echo "::endgroup::"
           done <<< "$governed_ext_packages"
@@ -871,6 +863,12 @@ jobs:
             --tag perry-glibc-2.31-llvm22 \
             --file scripts/linux-glibc-2.31.Dockerfile \
             .
+          # build_linux_*.sh build with mbx, which perry-mbx-cache installed on
+          # the runner (a static musl binary): hand the container that binary
+          # and its object store.
+          mbx_bin=$(command -v mbx)
+          mbx_cache=$(mbx cache dir)
+          mkdir -p "$mbx_cache"
           docker run --rm \
             --user "$(id -u):$(id -g)" \
             --env HOME=/tmp/perry-home \
@@ -880,9 +878,11 @@ jobs:
             --env CARGO_TARGET_DIR=/work/target-glibc231 \
             --env PERRY_ABORT_TARGET_DIR=/work/target-glibc231-abort \
             --env PERRY_CLI_UPDATE_PUBLIC_KEYS \
-            --env PERRY_RELEASE_STRIP_INSTRUMENTS \
             --volume "$HOME/.cargo:/tmp/cargo-home" \
             --volume "$HOME/.rustup:/tmp/rustup-home" \
+            --volume "$mbx_bin:/usr/local/bin/mbx:ro" \
+            --env MBX_CACHE_DIR=/tmp/mbx-cache \
+            --volume "$mbx_cache:/tmp/mbx-cache" \
             --volume "$GITHUB_WORKSPACE:/work" \
             --workdir /work \
             perry-glibc-2.31-llvm22 \
@@ -893,11 +893,12 @@ jobs:
           src="target-glibc231/$TARGET/prod"
           dst="target/$TARGET/prod"
           mkdir -p "$dst"
-          for artifact in perry libperry_runtime.a libperry_runtime_abort.a libperry_runtime_core.a libperry_stdlib.a; do
+          for artifact in perry libperry_runtime.a libperry_runtime_abort.a libperry_stdlib.a \
+              libperry_runtime.a.gc-effects libperry_runtime_abort.a.gc-effects; do
             test -s "$src/$artifact"
             cp "$src/$artifact" "$dst/$artifact"
           done
-          for archive in "$src"/libperry_ext_*.a; do
+          for archive in "$src"/libperry_ext_*.a "$src"/libperry_wasm_host.a; do
             [ -f "$archive" ] && cp "$archive" "$dst/"
           done
 
@@ -919,6 +920,12 @@ jobs:
             --tag perry-musl-llvm22 \
             --file scripts/linux-musl-llvm22.Dockerfile \
             .
+          # build_linux_*.sh build with mbx, which perry-mbx-cache installed on
+          # the runner (a static musl binary): hand the container that binary
+          # and its object store.
+          mbx_bin=$(command -v mbx)
+          mbx_cache=$(mbx cache dir)
+          mkdir -p "$mbx_cache"
           docker run --rm \
             --user "$(id -u):$(id -g)" \
             --env HOME=/tmp/perry-home \
@@ -927,9 +934,11 @@ jobs:
             --env CARGO_TARGET_DIR=/work/target-musl \
             --env PERRY_ABORT_TARGET_DIR=/work/target-musl-abort \
             --env PERRY_CLI_UPDATE_PUBLIC_KEYS \
-            --env PERRY_RELEASE_STRIP_INSTRUMENTS \
             --volume "$HOME/.cargo:/tmp/cargo-home" \
             --volume "$HOME/.rustup:/tmp/rustup-home" \
+            --volume "$mbx_bin:/usr/local/bin/mbx:ro" \
+            --env MBX_CACHE_DIR=/tmp/mbx-cache \
+            --volume "$mbx_cache:/tmp/mbx-cache" \
             --volume "$GITHUB_WORKSPACE:/work" \
             --workdir /work \
             perry-musl-llvm22 \
@@ -940,7 +949,9 @@ jobs:
           src="target-musl/$TARGET/prod"
           dst="target/$TARGET/prod"
           mkdir -p "$dst"
-          for artifact in perry libperry_runtime.a libperry_runtime_abort.a libperry_runtime_core.a libperry_stdlib.a; do
+          for artifact in perry libperry_runtime.a libperry_runtime_abort.a libperry_stdlib.a \
+              libperry_runtime.a.gc-effects libperry_runtime_abort.a.gc-effects \
+              libperry_wasm_host.a; do
             test -s "$src/$artifact"
             cp "$src/$artifact" "$dst/$artifact"
           done
@@ -977,7 +988,7 @@ jobs:
 
       - name: Build UI library (Windows)
         if: runner.os == 'Windows'
-        run: mbx build --profile prod --target ${{ matrix.target }} -p perry-ui-windows
+        run: ${{ runner.os == 'Windows' && 'cargo' || 'mbx' }} build --profile prod --target ${{ matrix.target }} -p perry-ui-windows
 
       # Closes #872 / #4823: cross-compile the Android runtime libs (and the
       # perry-ui-android UI backend) on the Windows leg so the WinGet zip
@@ -1039,9 +1050,9 @@ jobs:
           # pwsh has no `set -e`; these two are mandatory, so fail the step on a
           # non-zero exit (otherwise the best-effort UI build below, which resets
           # $LASTEXITCODE, could mask a runtime/stdlib failure).
-          mbx build --profile prod --target aarch64-linux-android -p perry-runtime -p perry-runtime-static
+          cargo build --profile prod --target aarch64-linux-android -p perry-runtime -p perry-runtime-static
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          mbx build --profile prod --target aarch64-linux-android -p perry-stdlib -p perry-stdlib-static
+          cargo build --profile prod --target aarch64-linux-android -p perry-stdlib -p perry-stdlib-static
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           # #4823 (option 1): the Android UI backend so a WinGet/Scoop-installed
           # perry can link `perry/ui` apps for android without a source tree.
@@ -1051,7 +1062,7 @@ jobs:
           # staticlib (UI crates are already staticlib — no -static wrapper); the
           # global-dynamic TLS rustflag only matters at the consumer's final
           # cdylib link, not here.
-          mbx build --profile prod --target aarch64-linux-android -p perry-ui-android
+          cargo build --profile prod --target aarch64-linux-android -p perry-ui-android
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # #4856 — defense in depth behind the cache eviction above: assert
@@ -1059,11 +1070,38 @@ jobs:
       # Android cross triples) defines the sentinel #[no_mangle] symbols.
       # A stale cached archive fails the release here instead of breaking
       # consumer links with `undefined symbol: _perry_macos_bundle_chdir`.
+      # GC effects sidecars (design 4.3): one `<archive>.gc-effects` beside
+      # every runtime archive (default, _abort, iOS, Android, ...),
+      # computed over the exact bytes staged below and after the last cargo
+      # call. The rules the analyzer enforces make this the release gate for
+      # the effects tables. The glibc 2.31 and musl legs run the same script
+      # inside their containers (build_linux_*.sh) and copy the results out.
+      - name: Write GC effects sidecars
+        if: matrix.old_glibc_image == '' && matrix.musl_image == ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            # The analyzer imports LLVM-C.dll.
+            export PATH="$(cygpath -u "$LLVM_SYS_221_PREFIX")/bin:$PATH"
+          fi
+          # mbx makes target/ a symlink into its store: -H follows it.
+          dirs=$(find -H target \( -path "*/prod/libperry_runtime.a" -o -path "*/prod/perry_runtime.lib" \) -exec dirname {} \; | sort -u)
+          if [ -z "$dirs" ]; then
+            echo "::error::no built runtime archives found under target/ -- nothing to analyze"
+            exit 1
+          fi
+          for dir in $dirs; do
+            echo "::group::sidecars $dir"
+            time ./scripts/gc_call_effects/sidecars.sh "$dir"
+            echo "::endgroup::"
+          done
+
       - name: Verify runtime archives are fresh (#4856)
         shell: bash
         run: |
           set -euo pipefail
-          libs=$(find target -path "*/prod/libperry_runtime.a" -o -path "*/prod/perry_runtime.lib")
+          libs=$(find -H target -path "*/prod/libperry_runtime.a" -o -path "*/prod/perry_runtime.lib")
           if [ -z "$libs" ]; then
             echo "::error::no built runtime archives found under target/ — nothing to verify"
             exit 1
@@ -1077,9 +1115,13 @@ jobs:
           mkdir -p staging
           cp target/${{ matrix.target }}/prod/perry staging/
           # Include static libraries for linking (runtime, stdlib, UI)
-          for lib in libperry_runtime.a libperry_runtime_abort.a libperry_runtime_core.a libperry_stdlib.a libperry_ui_macos.a libperry_ui_gtk4.a; do
+          for lib in libperry_runtime.a libperry_runtime_abort.a libperry_stdlib.a libperry_wasm_host.a libperry_ui_macos.a libperry_ui_gtk4.a; do
             if [ -f "target/${{ matrix.target }}/prod/$lib" ]; then
               cp "target/${{ matrix.target }}/prod/$lib" staging/
+              # The GC effects sidecar travels beside its runtime archive.
+              case "$lib" in
+                libperry_runtime*) cp "target/${{ matrix.target }}/prod/$lib.gc-effects" staging/ ;;
+              esac
             fi
           done
           # #2532 — ship the perry-ext-* staticlibs so an out-of-tree install
@@ -1099,6 +1141,7 @@ jobs:
             dev_dir="target/aarch64-apple-ios/prod"
             if [ -f "$dev_dir/libperry_runtime.a" ]; then
               cp "$dev_dir/libperry_runtime.a" "staging/libperry_runtime_ios.a"
+              cp "$dev_dir/libperry_runtime.a.gc-effects" "staging/libperry_runtime_ios.a.gc-effects"
             fi
             if [ -f "$dev_dir/libperry_stdlib.a" ]; then
               cp "$dev_dir/libperry_stdlib.a" "staging/libperry_stdlib_ios.a"
@@ -1109,6 +1152,7 @@ jobs:
             sim_dir="target/aarch64-apple-ios-sim/prod"
             if [ -f "$sim_dir/libperry_runtime.a" ]; then
               cp "$sim_dir/libperry_runtime.a" "staging/libperry_runtime_ios_sim.a"
+              cp "$sim_dir/libperry_runtime.a.gc-effects" "staging/libperry_runtime_ios_sim.a.gc-effects"
             fi
             if [ -f "$sim_dir/libperry_stdlib.a" ]; then
               cp "$sim_dir/libperry_stdlib.a" "staging/libperry_stdlib_ios_sim.a"
@@ -1117,6 +1161,10 @@ jobs:
               cp "$sim_dir/libperry_ui_ios.a" "staging/libperry_ui_ios_sim.a"
             fi
           fi
+          # Every runtime archive in the package has its sidecar.
+          for lib in staging/libperry_runtime*.a; do
+            [ -f "$lib.gc-effects" ] || { echo "::error::$lib has no .gc-effects sidecar"; exit 1; }
+          done
           cd staging
           tar czf ../${{ matrix.artifact }}.tar.gz *
 
@@ -1219,11 +1267,14 @@ jobs:
           Copy-Item $llvmRuntime staging/
           Copy-Item "xwin-install/bin/xwin.exe" staging/
           # Include static libraries for linking (runtime, stdlib, UI)
-          $libs = @("perry_runtime.lib", "perry_stdlib.lib", "perry_ui_windows.lib")
+          $libs = @("perry_runtime.lib", "perry_stdlib.lib", "perry_wasm_host.lib", "perry_ui_windows.lib")
           foreach ($lib in $libs) {
             $path = "target/${{ matrix.target }}/prod/$lib"
             if (Test-Path $path) {
               Copy-Item $path staging/
+              if ($lib -like "perry_runtime*") {
+                Copy-Item "$path.gc-effects" staging/
+              }
             }
           }
           # #872: stage the Android cross-compiled archives next to the
@@ -1251,6 +1302,9 @@ jobs:
                 exit 1
               }
               Copy-Item $src $androidLibDir
+              if ($lib -eq "libperry_runtime.a") {
+                Copy-Item "$src.gc-effects" $androidLibDir
+              }
             }
           }
           Compress-Archive -Path staging/* -DestinationPath "${{ matrix.artifact }}.zip"
@@ -1554,13 +1608,25 @@ jobs:
           fi
           # cc-rs lookup vars: `CC_<triple>` / `CXX_<triple>` / `AR_<triple>`
           # with `-` → `_`. The cargo-target linker var uses uppercase + `_`.
+          API=${CLANG##*/"$TRIPLE"}
+          API=${API%-clang}
           TRIPLE_UNDER=$(echo "$TRIPLE" | tr '-' '_')
           TRIPLE_UPPER=$(echo "$TRIPLE_UNDER" | tr '[:lower:]' '[:upper:]')
           {
             echo "CC_${TRIPLE_UNDER}=$CLANG"
             echo "CXX_${TRIPLE_UNDER}=$CLANGXX"
             echo "AR_${TRIPLE_UNDER}=$TOOLCHAIN/llvm-ar"
+            # NDK r23+ ships no <triple>-ranlib, the default cc-rs hands the
+            # vendored OpenSSL's `make install`.
+            echo "RANLIB_${TRIPLE_UNDER}=$TOOLCHAIN/llvm-ranlib"
             echo "CARGO_TARGET_${TRIPLE_UPPER}_LINKER=$CLANG"
+            # cc-rs adds `--target=<triple>` (no API level) to every C flag
+            # list. Under mbx, CMake gets mbx's compiler shim, not the NDK
+            # wrapper, so its Android support picks the NDK's bare clang and
+            # that flag overrides the API: no crtbegin_dynamic.o (libz-ng-sys).
+            # Name the wrapper's API level last.
+            echo "CFLAGS_${TRIPLE_UNDER}=--target=${TRIPLE}${API}"
+            echo "CXXFLAGS_${TRIPLE_UNDER}=--target=${TRIPLE}${API}"
           } >> "$GITHUB_ENV"
           echo "NDK wired for $TRIPLE: $CLANG"
 
@@ -1574,16 +1640,48 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mbx build --profile prod --target ${{ matrix.target }} -p perry-runtime -p perry-runtime-static
-          mbx build --profile prod --target ${{ matrix.target }} -p perry-stdlib -p perry-stdlib-static
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            # The vendored OpenSSL's Configure needs Locale::Maketext::Simple,
+            # which Git Bash's msys perl lacks, and Git's perl comes first on
+            # this shell's PATH (pwsh inherits it). Take the first perl on
+            # PATH, then Strawberry's, that loads the module.
+            OPENSSL_SRC_PERL=
+            while IFS= read -r perl_exe; do
+              perl_exe=${perl_exe%$'\r'}
+              [ -n "$perl_exe" ] || continue
+              if "$(cygpath -u "$perl_exe")" -MLocale::Maketext::Simple -e1 2>/dev/null; then
+                OPENSSL_SRC_PERL=$perl_exe
+                break
+              fi
+            done < <(where.exe perl 2>/dev/null; echo 'C:\Strawberry\perl\bin\perl.exe')
+            if [ -z "$OPENSSL_SRC_PERL" ]; then
+              echo "::error::no Windows perl with Locale::Maketext::Simple for the vendored OpenSSL Configure"
+              exit 1
+            fi
+            export OPENSSL_SRC_PERL
+            echo "OPENSSL_SRC_PERL=$OPENSSL_SRC_PERL"
+          fi
+          ${{ runner.os == 'Windows' && 'cargo' || 'mbx' }} build --profile prod --target ${{ matrix.target }} -p perry-runtime -p perry-runtime-static
+          ${{ runner.os == 'Windows' && 'cargo' || 'mbx' }} build --profile prod --target ${{ matrix.target }} -p perry-stdlib -p perry-stdlib-static
           # UI crate is matrix-driven. perry-ui-android needs the NDK env
           # we wired above; perry-ui-windows builds against the MSVC SDK
           # already on windows-latest. Both go through plain `cargo build`.
-          mbx build --profile prod --target ${{ matrix.target }} -p ${{ matrix.ui_crate }}
+          ${{ runner.os == 'Windows' && 'cargo' || 'mbx' }} build --profile prod --target ${{ matrix.target }} -p ${{ matrix.ui_crate }}
 
       # #4856 — defense in depth behind the cache eviction above: a stale
       # cached runtime archive fails the release here instead of breaking
       # every consumer executable link on the build workers.
+      # GC effects sidecar for the runtime archive built above (same step as
+      # the native legs; the analyzer runs on the host for any target triple).
+      - name: Write GC effects sidecars
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            export PATH="$(cygpath -u "$LLVM_SYS_221_PREFIX")/bin:$PATH"
+          fi
+          time ./scripts/gc_call_effects/sidecars.sh "target/${{ matrix.target }}/prod"
+
       - name: Verify runtime archive is fresh (#4856)
         shell: bash
         run: |
@@ -1613,7 +1711,7 @@ jobs:
           rm -rf "$STAGING"
           mkdir -p "$STAGING"
           # Required runtime + stdlib (always present on a successful build).
-          for lib in libperry_runtime.a libperry_stdlib.a; do
+          for lib in libperry_runtime.a libperry_stdlib.a libperry_runtime.a.gc-effects; do
             src="target/${TARGET}/prod/${lib}"
             if [ ! -f "$src" ]; then
               echo "::error::Expected $src after build but it's missing — aborting bundle."
@@ -1648,7 +1746,7 @@ jobs:
           # (paths and triples are safe ASCII today, but the schema is the
           # contract — let jq own it).
           files_json=$(jq -n '[]')
-          for f in libperry_runtime.a libperry_stdlib.a "$UI_LIB"; do
+          for f in libperry_runtime.a libperry_stdlib.a libperry_runtime.a.gc-effects "$UI_LIB"; do
             files_json=$(jq -n --argjson acc "$files_json" \
               --arg path "$f" \
               --arg sha "$(sha "$STAGING/$f")" \
@@ -1676,7 +1774,7 @@ jobs:
           # Windows MSVC builds emit `perry_runtime.lib` / `perry_stdlib.lib`
           # (no `lib` prefix, `.lib` extension) — match the host-build
           # behavior at line ~448 above.
-          $libs = @("perry_runtime.lib", "perry_stdlib.lib", $uiLib)
+          $libs = @("perry_runtime.lib", "perry_stdlib.lib", "perry_runtime.lib.gc-effects", $uiLib)
           foreach ($lib in $libs) {
             $src = "target/$target/prod/$lib"
             if (-not (Test-Path $src)) {
@@ -2079,12 +2177,13 @@ jobs:
             def install
               if OS.mac?
                 bin.install "perry"
-                lib.install Dir["libperry_*.a"]
+                lib.install Dir["libperry_*.a"] + Dir["libperry_*.a.gc-effects"]
               else
                 system "cargo", "build", "--profile", "prod"
                 system "cargo", "build", "--profile", "prod", "-p", "perry-runtime", "-p", "perry-stdlib", "-p", "perry-runtime-static", "-p", "perry-stdlib-static"
+                system "cargo", "run", "--release", "-p", "perry-gc-effects", "--", "sidecars", "target/prod"
                 bin.install "target/prod/perry"
-                lib.install Dir["target/prod/libperry_*.a"]
+                lib.install Dir["target/prod/libperry_*.a"] + Dir["target/prod/libperry_*.a.gc-effects"]
               end
             end
 
@@ -2223,6 +2322,19 @@ jobs:
             chmod 644 "${pkg_dir}/usr/lib/perry/$lib"
           }
 
+          # The GC effects sidecar rides in the same package as its runtime
+          # archive. NOTE: the strip above rewrites the archive bytes, so the
+          # SHA-256 in this sidecar names the unstripped archive that was
+          # analyzed (the rows hold: --strip-debug removes no code).
+          copy_runtime_sidecar() {
+            local lib="$1"
+            local pkg_dir="$2"
+
+            require_staging_file "$lib.gc-effects"
+            cp "staging/$lib.gc-effects" "${pkg_dir}/usr/lib/perry/"
+            chmod 644 "${pkg_dir}/usr/lib/perry/$lib.gc-effects"
+          }
+
           build_deb() {
             local pkg_dir="$1"
 
@@ -2284,6 +2396,7 @@ jobs:
             "Perry runtime static library" \
             "Static runtime archive required by the Perry compiler when linking generated executables."
           copy_static_archive libperry_runtime.a "$RUNTIME_PKG"
+          copy_runtime_sidecar libperry_runtime.a "$RUNTIME_PKG"
           build_deb "$RUNTIME_PKG"
 
           STDLIB_PKG="perry-stdlib_${VERSION}_${ARCH}"

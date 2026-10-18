@@ -635,13 +635,6 @@ impl LoweringContext {
             .unwrap_or(false)
     }
 
-    pub(crate) fn lookup_namespace_var(&self, ns_name: &str, member_name: &str) -> Option<LocalId> {
-        self.namespace_vars
-            .iter()
-            .find(|(ns, member, _)| ns == ns_name && member == member_name)
-            .map(|(_, _, id)| *id)
-    }
-
     pub(crate) fn define_enum(
         &mut self,
         name: String,
@@ -649,6 +642,18 @@ impl LoweringContext {
         members: Vec<(String, EnumValue)>,
     ) {
         self.enums.push((name, id, members));
+    }
+
+    /// Add the members of a later declaration of the enum `name` that it
+    /// does not hold yet.
+    pub(crate) fn extend_enum(&mut self, name: &str, members: Vec<(String, EnumValue)>) {
+        if let Some((_, _, existing)) = self.enums.iter_mut().find(|(n, _, _)| n == name) {
+            for (member, value) in members {
+                if !existing.iter().any(|(m, _)| *m == member) {
+                    existing.push((member, value));
+                }
+            }
+        }
     }
 
     pub(crate) fn lookup_enum(&self, name: &str) -> Option<(EnumId, &[(String, EnumValue)])> {
@@ -796,7 +801,7 @@ impl LoweringContext {
             .map(|(_, id, _)| *id)
     }
 
-    fn lookup_local_index(&self, name: &str) -> Option<usize> {
+    pub(crate) fn lookup_local_index(&self, name: &str) -> Option<usize> {
         self.locals.lookup_index(name)
     }
 
@@ -1669,14 +1674,7 @@ impl LoweringContext {
     }
 }
 
-// Internal anchor — keeps the file's outer impl block intact while
-// `native_instance_from_return_type` lives at module scope.
-#[allow(dead_code)]
-struct __PerryHirSentinel;
 impl LoweringContext {
-    #[allow(dead_code)]
-    fn __perry_hir_sentinel(&self) {}
-
     pub(crate) fn register_func_return_type(&mut self, name: String, ty: Type) {
         self.func_return_types.push((name, ty));
     }
@@ -1773,13 +1771,17 @@ impl LoweringContext {
             self.locals.extend(kept);
         }
         self.truncate_native_instances(mark.1);
-        // Remove index entries for functions being truncated, then restore any
-        // earlier entries that were shadowed by the removed ones.
-        for i in mark.2..self.functions.len() {
+        self.truncate_functions(mark.2);
+    }
+
+    /// Drop function registrations made after `mark`, restoring any earlier
+    /// same-named entries they shadowed (scope exit, namespace body end).
+    pub(crate) fn truncate_functions(&mut self, mark: usize) {
+        for i in mark..self.functions.len() {
             let name = &self.functions[i].0;
             // Find if there's an earlier entry with the same name
             let mut earlier_idx = None;
-            for j in (0..mark.2).rev() {
+            for j in (0..mark).rev() {
                 if self.functions[j].0 == *name {
                     earlier_idx = Some(j);
                     break;
@@ -1791,7 +1793,7 @@ impl LoweringContext {
                 self.functions_index.remove(name);
             }
         }
-        self.functions.truncate(mark.2);
+        self.functions.truncate(mark);
     }
 
     /// Enter a nested block scope for `{ ... }`, `if`/`else`, loop body, etc.

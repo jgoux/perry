@@ -31,7 +31,7 @@ pub extern "C" fn js_object_delete_field(
     mut obj: *mut ObjectHeader,
     key: *const crate::StringHeader,
 ) -> i32 {
-    #[cfg(feature = "contract-checks")]
+    #[cfg(perry_contract_checks)]
     crate::contracts::hard_ptr(obj, "delete");
     if obj.is_null() || key.is_null() {
         return 1;
@@ -861,7 +861,7 @@ pub extern "C" fn js_object_delete_field_value(
     obj_value: f64,
     key: *const crate::StringHeader,
 ) -> i32 {
-    #[cfg(feature = "contract-checks")]
+    #[cfg(perry_contract_checks)]
     crate::contracts::hard_value(obj_value, "delete");
     if let Some(class_id) = super::class_prototype_ref_id(obj_value) {
         if key.is_null() {
@@ -895,7 +895,7 @@ pub extern "C" fn js_object_delete_field_value(
 /// `js_object_delete_field_value`, delegating real objects to the dynamic path.
 #[no_mangle]
 pub extern "C" fn js_object_delete_dynamic_value(obj_value: f64, key: f64) -> i32 {
-    #[cfg(feature = "contract-checks")]
+    #[cfg(perry_contract_checks)]
     crate::contracts::hard_value(obj_value, "delete");
     if let Some(class_id) = super::class_prototype_ref_id(obj_value) {
         if unsafe { crate::symbol::js_is_symbol(key) } != 0 {
@@ -1117,7 +1117,7 @@ pub extern "C" fn js_object_delete_dynamic(obj: *mut ObjectHeader, key: f64) -> 
         (obj as u64 & crate::value::POINTER_MASK) as usize,
         "delete",
     );
-    #[cfg(feature = "contract-checks")]
+    #[cfg(perry_contract_checks)]
     crate::contracts::hard_ptr(obj, "delete");
     if let Some(result) = unsafe { super::delete_last_key::try_delete_last_added_dynamic(obj, key) }
     {
@@ -1325,12 +1325,8 @@ pub extern "C" fn js_object_rest(
             }) as usize
         };
 
-        // Collect indices of keys to include (not in exclude list and not undefined/deleted).
-        // #1781: SSO-aware — the pre-fix `is_string()` on the source
-        // key dropped ≤5-byte SSO keys from `rest`; the exclude-loop's
-        // `is_string()` similarly missed inline-SSO exclude entries,
-        // so a `{a, ...rest}` pattern silently kept `a` in `rest` when
-        // both the source key and the exclude key were SSO.
+        // Collect present, enumerable keys outside the exclude list.
+        // Read both source and excluded names through the SSO-aware key API.
         let mut include_indices: Vec<usize> = Vec::new();
         let mut src_buf = [0u8; crate::value::SHORT_STRING_MAX_LEN];
         for i in 0..key_count {
@@ -1342,21 +1338,27 @@ pub extern "C" fn js_object_rest(
                 None => continue,
             };
 
-            // Check if field was deleted. An accessor key's slot holds its
-            // accessor pair (`accessor_pair.rs`), not a value: it is copied
-            // below through [[Get]].
-            let is_accessor = keys_handle.with_const_ptr::<crate::array::ArrayHeader, _>(|keys| {
-                crate::object::key_attrs::key_is_accessor_at(keys, i as u32)
+            // CopyDataProperties copies enumerable properties only. A private
+            // entry (a class's `#x` field, a runtime layout's internal slot)
+            // is non-enumerable as well as never a property, so the entry at
+            // the key's position drops both.
+            let entry = keys_handle.with_const_ptr::<crate::array::ArrayHeader, _>(|keys| {
+                crate::object::key_attrs::keys_entry(keys, i as u32)
             });
-            let field_val = src_handle.with_const_ptr::<ObjectHeader, _>(|obj| {
-                crate::object::field_get_set::js_object_get_key_field(obj, i as u32)
-            });
-            if !is_accessor && field_val.is_undefined() {
+            if entry & crate::object::key_attrs::ENTRY_NON_ENUMERABLE != 0 {
                 continue;
             }
 
-            // Check if this key is in the exclude list. Neither `js_array_get`
-            // nor the byte compare can collect, so one scoped read of the
+            // Presence belongs to the key layout, not the value: a present
+            // data property may contain undefined. Tombstoned key names were
+            // skipped above; optional layout slots use the hole-aware view.
+            if !src_handle.with_const_ptr::<ObjectHeader, _>(|obj| {
+                super::key_view::KeyView::of(obj).present(i as u32)
+            }) {
+                continue;
+            }
+
+            // Neither the key read nor byte comparison can collect; one read of the
             // exclude array covers the whole scan.
             let excluded = exclude_handle.with_const_ptr::<crate::array::ArrayHeader, _>(|ex| {
                 (0..exclude_count).any(|j| {
@@ -1369,11 +1371,9 @@ pub extern "C" fn js_object_rest(
             }
         }
 
-        // Allocate new object with the right number of fields
         let rest_count = include_indices.len() as u32;
         let rest_handle = scope.root_raw_mut_ptr(js_object_alloc(0, rest_count));
 
-        // Create keys array for the rest object
         let rest_keys_handle =
             scope.root_raw_mut_ptr(crate::array::js_array_alloc_with_length(rest_count));
         // A fresh list, the rest object's own until it is published, so its
@@ -1384,7 +1384,6 @@ pub extern "C" fn js_object_rest(
             })
         });
 
-        // Copy included key-value pairs
         for (new_idx, &src_idx) in include_indices.iter().enumerate() {
             let key_val = keys_handle.with_const_ptr::<crate::array::ArrayHeader, _>(|keys| {
                 crate::array::js_array_get(keys, src_idx as u32)
@@ -1412,7 +1411,7 @@ pub extern "C" fn js_object_rest(
                 crate::JSValue::from_bits(value.to_bits())
             } else {
                 src_handle.with_const_ptr::<ObjectHeader, _>(|obj| {
-                    js_object_get_field(obj, src_idx as u32)
+                    crate::object::field_get_set::js_object_get_key_field(obj, src_idx as u32)
                 })
             };
             rest_handle.with_mut_ptr::<ObjectHeader, _>(|rest| {
@@ -1995,3 +1994,7 @@ unsafe fn squeeze_holes_and_delete(
     super::shapes::publish_object_shape_holes(obj, floor as u32);
     set_object_live_slot_count(obj, std::cmp::min(out, alloc_limit) as u32);
 }
+
+#[cfg(test)]
+#[path = "rest_undefined_tests.rs"]
+mod rest_undefined_tests;

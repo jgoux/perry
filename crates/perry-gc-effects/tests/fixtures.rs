@@ -1,5 +1,6 @@
-//! Same compiled C fixtures and sabotage assertions as self_test.py.
+//! Compiled C fixtures (from the retired Python self-test) and sabotage assertions.
 //! Binaries are checked in so cargo test needs LLVM, but never clang/a cross SDK.
+#![cfg(feature = "analyzer")]
 use perry_gc_effects::*;
 use std::path::{Path, PathBuf};
 const RULES: &str = include_str!("fixtures/seeds.txt");
@@ -109,14 +110,15 @@ fn three_formats_classification_and_planted_violations() {
             (&res.table, &pr.table, "leaf_helper"),
             (&native.table, &pn.table, "js_back_hot_text"),
         ] {
-            let (unsafe_drift, _) = compare(old, new);
+            // The plant makes the row weaker on both solves.
+            let (old, new) = (old[name], new[name]);
             assert!(
-                unsafe_drift.iter().any(|d| d.name == name && !d.throws),
-                "{tag}: planted class drift not detected"
+                old.class == Class::Leaf && new.class > old.class,
+                "{tag}: planted class change not detected ({old:?} -> {new:?})"
             );
             assert!(
-                unsafe_drift.iter().any(|d| d.name == name && d.throws),
-                "{tag}: planted throws drift not detected"
+                !old.throws && new.throws,
+                "{tag}: planted throws change not detected ({old:?} -> {new:?})"
             );
         }
         for mode in [Mode::L2, Mode::Throws] {
@@ -145,7 +147,7 @@ fn three_formats_classification_and_planted_violations() {
     }
 }
 #[test]
-fn drift_absence_and_agreement_gate() {
+fn agreement_gate() {
     fn table(rows: &[(&str, Class, bool)]) -> Table {
         rows.iter()
             .map(|(n, class, throws)| {
@@ -159,45 +161,6 @@ fn drift_absence_and_agreement_gate() {
             })
             .collect()
     }
-    let c = table(&[
-        ("a", Class::Leaf, false),
-        ("b", Class::Reenters, true),
-        ("d", Class::Leaf, false),
-    ]);
-    let f = table(&[
-        ("b", Class::Leaf, false),
-        ("c", Class::Leaf, false),
-        ("d", Class::Leaf, true),
-    ]);
-    let (u, s) = compare(&c, &f);
-    assert_eq!(
-        u.iter()
-            .filter(|d| !d.throws)
-            .map(|d| d.name.as_str())
-            .collect::<Vec<_>>(),
-        ["a"]
-    );
-    assert_eq!(
-        s.iter()
-            .filter(|d| !d.throws)
-            .map(|d| d.name.as_str())
-            .collect::<Vec<_>>(),
-        ["b", "c"]
-    );
-    assert_eq!(
-        u.iter()
-            .filter(|d| d.throws)
-            .map(|d| d.name.as_str())
-            .collect::<Vec<_>>(),
-        ["a", "d"]
-    );
-    assert_eq!(
-        s.iter()
-            .filter(|d| d.throws)
-            .map(|d| d.name.as_str())
-            .collect::<Vec<_>>(),
-        ["b", "c"]
-    );
     let mut fake = Classification::default();
     fake.table = table(&[
         ("a", Class::Leaf, true),
@@ -208,56 +171,48 @@ fn drift_absence_and_agreement_gate() {
     assert!(fake.validate().is_err());
 }
 #[test]
-fn cli_rejects_sabotaged_table_dead_seed_and_forbid() {
+fn cli_rejects_dead_seed_and_forbid() {
     let tmp = tempfile::tempdir().unwrap();
     let root = workspace_root();
     let bin = env!("CARGO_BIN_EXE_perry-gc-effects");
     let rules = tmp.path().join("rules.txt");
     std::fs::write(&rules, RULES).unwrap();
     let lib = archive(tmp.path(), "baseline.a", FORMATS[0].1);
-    let plant = archive(tmp.path(), "planted.a", FORMATS[0].2);
     let table = tmp.path().join("effects.tsv");
-    let run = |command: &str, input: &Path| {
+    let run = |input: &Path| {
         std::process::Command::new(bin)
             .arg("--root")
             .arg(&root)
             .arg("--rules")
             .arg(&rules)
-            .arg(command)
+            .arg("generate")
             .args(["--target", "linux-x86_64", "--min-symbols", "1"])
-            .arg(if command == "generate" {
-                "--out"
-            } else {
-                "--table"
-            })
+            .arg("--out")
             .arg(&table)
             .arg(input)
             .output()
             .unwrap()
     };
-    let generated = run("generate", &lib);
+    let generated = run(&lib);
     assert!(
         generated.status.success(),
         "{}",
         String::from_utf8_lossy(&generated.stderr)
     );
-    let check = run("check", &plant);
-    assert!(!check.status.success());
-    assert!(String::from_utf8_lossy(&check.stderr).contains("UNSAFE"));
     for extra in [
         "js exact no_such_symbol_anywhere -- deliberately dead fixture seed\n",
         "forbid exact unknown_external -- deliberately violated fixture premise\n",
     ] {
         std::fs::write(&rules, RULES.to_owned() + extra).unwrap();
         assert!(
-            !run("generate", &lib).status.success(),
+            !run(&lib).status.success(),
             "planted hard-check violation succeeded"
         );
     }
 }
 
 #[test]
-fn complete_tsv_bytes_match_python_goldens_in_three_formats() {
+fn complete_tsv_bytes_match_goldens_in_three_formats() {
     let tmp = tempfile::tempdir().unwrap();
     let root = workspace_root();
     let rules = load_rules(RULES).unwrap();
@@ -291,6 +246,34 @@ fn complete_tsv_bytes_match_python_goldens_in_three_formats() {
             let out = tmp.path().join("fresh.tsv");
             write_table(&res.table, target, &[path], &out).unwrap();
             assert_eq!(std::fs::read_to_string(out).unwrap(), want, "{tag}{suffix}");
+        }
+    }
+}
+
+#[test]
+fn duplicate_definitions_take_the_weaker_row_in_any_order() {
+    let tmp = tempfile::tempdir().unwrap();
+    let rules = load_rules(RULES).unwrap();
+    for (tag, normal, planted, _) in FORMATS {
+        let n = archive(tmp.path(), &format!("n-{tag}.a"), normal);
+        let p = archive(tmp.path(), &format!("p-{tag}.a"), planted);
+        let weak = Entry {
+            class: Class::Reenters,
+            throws: true,
+        };
+        for order in [[n.clone(), p.clone()], [p.clone(), n.clone()]] {
+            let g = build_graph(&order).unwrap();
+            let res = classify(&g, &rules, None).unwrap();
+            assert_eq!(res.table["leaf_helper"], weak, "{tag}: {order:?}");
+            assert!(res.defs["leaf_helper"].len() >= 2, "{tag}: not duplicated");
+            // Untouched rows keep their class, and the explanation walks the
+            // definition that reaches a seed.
+            assert_eq!(res.table["alloc_helper"].class, Class::AllocOnly);
+            let why = res.witness_path(&g, "leaf_helper", Mode::L2);
+            assert!(
+                why.iter().all(|l| !l.contains("reaches no seed")),
+                "{why:?}"
+            );
         }
     }
 }

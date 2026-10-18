@@ -182,7 +182,7 @@ mod artifact_display_names;
 mod artifact_source_text;
 mod artifacts;
 pub(crate) mod boxed_locals;
-mod cjs_exports;
+pub(crate) mod cjs_exports;
 mod class_artifacts;
 pub(crate) mod class_hierarchy;
 #[cfg(test)]
@@ -225,6 +225,9 @@ mod indexed_method_artifacts;
 #[cfg(test)]
 mod literal_method_this_tests;
 mod ordinary_method_artifacts;
+pub mod split_regions;
+#[cfg(test)]
+mod split_regions_tests;
 #[cfg(test)]
 mod string_accumulator_tests;
 mod tdz_names;
@@ -465,7 +468,30 @@ pub fn user_function_symbol(module_name: &str, function_name: &str) -> String {
 /// guarantee — do not change to `&mut` without also moving the cache
 /// hash to AFTER codegen.
 pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> {
-    compile_module_impl(hir, opts, None)
+    let _fallback = crate::fallback_diag::begin(
+        &hir.name,
+        opts.module_source.as_deref(),
+        opts.debug_source_line_offset,
+        opts.program_facts.fallback.clone(),
+    );
+    match lower_module(hir, opts, None)? {
+        Some(lowered) => emit_lowered_module(lowered),
+        None => unreachable!("normal lowering produces a module"),
+    }
+}
+
+/// Compile an owned HIR input, releasing it at the lowering/LLVM boundary.
+/// Lowering only borrows the input, preserving its object-cache identity.
+pub fn compile_module_owned(hir: HirModule, opts: CompileOptions) -> Result<Vec<u8>> {
+    let _fallback = crate::fallback_diag::begin(
+        &hir.name,
+        opts.module_source.as_deref(),
+        opts.debug_source_line_offset,
+        opts.program_facts.fallback.clone(),
+    );
+    let lowered = lower_module(&hir, opts, None)?;
+    drop(hir);
+    emit_lowered_module(lowered.expect("normal lowering produces a module"))
 }
 
 /// Design step 4's pre-pass: the content of every class birth this module's
@@ -474,17 +500,16 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
 /// return. `opts` must be the options the module's codegen will get.
 pub fn module_birth_shapes(hir: &HirModule, opts: CompileOptions) -> Result<Vec<ModuleBirth>> {
     let mut births = Vec::new();
-    compile_module_impl(hir, opts, Some(&mut births))?;
+    lower_module(hir, opts, Some(&mut births))?;
     Ok(births)
 }
 
-/// `compile_module`, or — with `births` — its pre-pass form: fill `births`
-/// and return an empty object right after the header-image table.
-fn compile_module_impl(
+/// Lower the module, or collect births and return before body lowering.
+fn lower_module(
     hir: &HirModule,
     opts: CompileOptions,
     births: Option<&mut Vec<ModuleBirth>>,
-) -> Result<Vec<u8>> {
+) -> Result<Option<LoweredModule>> {
     let collect_births = births.is_some();
     // No family facts of a previous module on this thread reach this one's
     // early analyses; this module's are installed once its births are known.
@@ -1931,6 +1956,10 @@ fn compile_module_impl(
     let mut typed_string_functions = std::collections::HashSet::new();
     let mut typed_i1_function_param_reps = std::collections::HashMap::new();
     for f in &hir.functions {
+        // A split region is one body by design: no typed-ABI clone.
+        if split_regions::is_region_function(f) {
+            continue;
+        }
         match typed_abi::typed_f64_function_rejection_reason(f) {
             None => {
                 typed_f64_functions.insert(f.id);
@@ -2638,21 +2667,25 @@ fn compile_module_impl(
                 );
             }
         }
-        if crate::layout_desc::layouts_enabled(&opts.output_type, &triple) {
+        let layouts_enabled = crate::layout_desc::layouts_enabled(&opts.output_type, &triple);
+        if layouts_enabled {
             layouts.extend(crate::layout_desc::array_families::collect(
                 hir,
                 &module_prefix,
             ));
-            crate::layout_desc::create_families::collect(hir, &module_prefix);
+            crate::layout_desc::create_families::collect(hir, &module_prefix, &triple);
         } else {
-            crate::layout_desc::array_families::clear();
             crate::layout_desc::create_families::clear();
         }
         crate::layout_desc::set_module_families(adds, layouts);
+        if layouts_enabled {
+            crate::layout_desc::set_array_layout_prefix(&module_prefix);
+        }
     }
     // Step 5C: a literal's method slot holding a module function's value is a
     // ConstFn lane too; births and lowering read the same admitted set.
     static_constfn::set_module_function_values(hir, &module_prefix);
+    static_constfn::set_module_constructions(hir, &module_prefix);
     static_constfn::set_module_object_create_protos(hir);
     if let Some(births) = births {
         *births = static_shape_ids::module_births(
@@ -2680,7 +2713,12 @@ fn compile_module_impl(
                 &class_ids,
             );
             births.extend(class_finals);
-            births.extend(static_prototype::collect(hir, &module_prefix, &class_ids));
+            births.extend(static_prototype::collect(
+                hir,
+                &module_prefix,
+                &class_ids,
+                &opts.program_layouts,
+            ));
             let widths = hir
                 .classes
                 .iter()
@@ -2714,7 +2752,7 @@ fn compile_module_impl(
             );
             births.extend(private_finals);
         }
-        return Ok(Vec::new());
+        return Ok(None);
     }
     static_shape_ids::set_module_static_ids(
         &module_prefix,
@@ -2802,6 +2840,12 @@ fn compile_module_impl(
             .filter(|id| !funcs_reading_dynamic_this.contains(id))
             .collect();
     let mut cross_module = CrossModuleCtx {
+        region_closures: hir
+            .closure_display_names
+            .iter()
+            .filter(|(_, name)| name.contains(split_regions::REGION_MARK))
+            .map(|(id, _)| *id)
+            .collect(),
         wpfacts: opts.program_facts.elision.clone(),
         capture_type_proofs: Default::default(),
         program_layouts: Arc::clone(&opts.program_layouts),
@@ -2970,6 +3014,7 @@ fn compile_module_impl(
         compiler_private_async_i1_control_locals,
         scope_map: Default::default(),
         string_accumulator_locals: Default::default(),
+        definite_init: Default::default(),
         disable_buffer_fast_path,
         program_shadows_buffer_read_method:
             crate::lower_call::buffer_intrinsic::module_shadows_buffer_read_method(hir),
@@ -3192,6 +3237,7 @@ fn compile_module_impl(
     cross_module.string_accumulator_locals = crate::collectors::string_accumulator_locals(hir);
     cross_module.capture_type_proofs =
         crate::collectors::typed_locals::capture_proofs(hir, &module_boxed_vars, &module_globals);
+    cross_module.definite_init = crate::collectors::definite_init::collect(hir);
     // #6369: the *receiver-type oracle* for closure bodies — every module-wide
     // `Stmt::Let` type, with NO representation-driven filtering. `FnCtx.
     // local_types` is what `static_type_of` / `is_array_expr` /
@@ -3317,6 +3363,10 @@ fn compile_module_impl(
     cross_module.typed_closure_capture_reps.clear();
     cross_module.typed_i1_closure_param_reps.clear();
     for (func_id, expr) in &closures {
+        // A closure region is one body by design: no typed-ABI clone.
+        if cross_module.region_closures.contains(func_id) {
+            continue;
+        }
         if let Some(captures) =
             typed_abi::typed_f64_closure_capture_reps(expr, &typed_abi_local_types)
         {
@@ -3460,6 +3510,7 @@ fn compile_module_impl(
         .chain(cross_module.typed_i32_closures.iter())
         .chain(cross_module.typed_i1_closures.iter())
         .chain(cross_module.typed_string_closures.iter())
+        .chain(cross_module.region_closures.iter())
         .copied()
         .collect();
     let trusted_box_closures = closure_collect::select_trusted_box_closures(
@@ -3510,6 +3561,11 @@ fn compile_module_impl(
             // BEFORE any rejection was constructed, so `--opt-report` said
             // nothing at all about the function: indistinguishable from "not
             // analysed" and from "analysed and denied". Say "moot" instead.
+            // A split region has one call site and one body, already typed
+            // by its caller's proofs: no specialized copy.
+            if split_regions::is_region_function(f) {
+                continue;
+            }
             let sites = spec_facts.call_sites.get(&f.id);
             // A guard executed when a generator object is CREATED cannot
             // prove the argument when its body later runs. Likewise, an
@@ -4212,6 +4268,55 @@ fn compile_module_impl(
         .native_rep_records
         .extend(typed_clone_rejection_records);
 
+    progress.phase(1, "lowering complete; releasing HIR and analyses");
+    // Return only emission inputs: every lowering analysis, borrowed callable,
+    // CJS HIR copy, string-pool index and CompileOptions graph dies here.
+    Ok(Some(LoweredModule {
+        llmod,
+        progress,
+        module_name: hir.name.clone(),
+        callable_count: module_callable_count(hir),
+        interned_strings: strings.len(),
+        opts: EmissionOptions {
+            target: opts.target,
+            emit_ir_only: opts.emit_ir_only,
+            verify_native_regions: opts.verify_native_regions,
+            output_type: opts.output_type,
+        },
+        module_prefix,
+        triple,
+    }))
+}
+
+struct EmissionOptions {
+    target: Option<String>,
+    emit_ir_only: bool,
+    verify_native_regions: bool,
+    output_type: String,
+}
+
+struct LoweredModule {
+    llmod: LlModule,
+    progress: CompileProgress,
+    module_name: String,
+    callable_count: usize,
+    interned_strings: usize,
+    opts: EmissionOptions,
+    module_prefix: String,
+    triple: String,
+}
+
+fn emit_lowered_module(lowered: LoweredModule) -> Result<Vec<u8>> {
+    let LoweredModule {
+        mut llmod,
+        progress,
+        module_name,
+        callable_count,
+        interned_strings,
+        opts,
+        module_prefix,
+        triple,
+    } = lowered;
     // #7280: re-read every shadow slot below the collection points that can run
     // under it. Whole-function, so it runs here rather than inside a lowering —
     // the shape it fixes is spread over dozens of lowerings, fifteen arms of
@@ -4231,9 +4336,23 @@ fn compile_module_impl(
     }
 
     crate::native_value::write_native_rep_artifact_if_enabled(
-        &hir.name,
+        &module_name,
         &llmod.native_rep_records,
     )?;
+
+    if let Some((guid, _)) = crate::fallback_diag::module_probe() {
+        llmod.declare_function(
+            "llvm.pseudoprobe",
+            "void",
+            &[
+                crate::types::I64,
+                crate::types::I64,
+                crate::types::I32,
+                crate::types::I64,
+            ],
+        );
+        llmod.add_raw_global(format!("!llvm.pseudo_probe_desc = !{{!3999999999}}\n!3999999999 = !{{i64 {guid}, i64 1, !\"perry-fallback\"}}"));
+    }
 
     // #5391 codegen units: large modules split their object compilation into N
     // independently-compiled units so clang's peak RSS stays ~whole/N instead of
@@ -4262,10 +4381,7 @@ fn compile_module_impl(
     let n_units = if opts.emit_ir_only || wasm32 {
         1
     } else {
-        decide_codegen_units(
-            module_callable_count(hir),
-            llmod.estimated_function_ir_bytes(),
-        )
+        decide_codegen_units(callable_count, llmod.estimated_function_ir_bytes())
     };
     if n_units > 1 {
         progress.phase(2, &format!("partitioning into {n_units} codegen units"));
@@ -4284,24 +4400,21 @@ fn compile_module_impl(
             return result;
         }
         {
-            let units = llmod.render_codegen_units(n_units);
+            let units = llmod.into_codegen_unit_texts(n_units);
             log::debug!(
                 "perry-codegen: split '{}' into {} codegen units",
-                hir.name,
+                module_name,
                 units.len()
             );
-            // #7154: dump the units. The comment above used to claim
-            // `PERRY_SAVE_LL` took the single-text path — it never did; this
-            // return fires before the write below. One file per unit, not one
-            // concatenation: the units are already materialized here, so this
-            // adds no peak.
-            if let Ok(save_dir) = std::env::var("PERRY_SAVE_LL") {
-                for (i, unit) in units.iter().enumerate() {
-                    let filename = format!("{}/{}.unit{}.ll", save_dir, module_prefix, i);
-                    let _ = std::fs::write(&filename, unit);
+            let save_dir = std::env::var("PERRY_SAVE_LL").ok();
+            let units = units.enumerate().map(|(i, unit)| {
+                if let Some(dir) = &save_dir {
+                    let filename = format!("{dir}/{module_prefix}.unit{i}.ll");
+                    let _ = std::fs::write(filename, &unit);
                 }
-            }
-            match crate::linker::compile_units_to_object(&units, opts.target.as_deref()) {
+                unit
+            });
+            match crate::linker::compile_streamed_units_to_object(units, opts.target.as_deref()) {
                 Ok(object) => return Ok(object),
                 Err(error) => return Err(error),
             }
@@ -4323,6 +4436,7 @@ fn compile_module_impl(
 
     {
         let ll_text = llmod.to_ir();
+        drop(llmod);
         #[cfg(feature = "target-wasi")]
         let ll_text = if wasm32 {
             crate::wasm32::lower_module(&ll_text)
@@ -4332,8 +4446,8 @@ fn compile_module_impl(
         log::debug!(
             "perry-codegen: emitted {} bytes of LLVM IR for '{}' ({} interned strings)",
             ll_text.len(),
-            hir.name,
-            strings.len()
+            module_name,
+            interned_strings
         );
         // Save .ll files when PERRY_SAVE_LL=<dir> is set
         if let Ok(save_dir) = std::env::var("PERRY_SAVE_LL") {
@@ -4343,7 +4457,7 @@ fn compile_module_impl(
         if opts.emit_ir_only {
             return Ok(ll_text.into_bytes());
         }
-        match crate::linker::compile_ll_to_object(&ll_text, opts.target.as_deref()) {
+        match crate::linker::compile_owned_ll_to_object(ll_text, opts.target.as_deref()) {
             #[cfg(feature = "target-wasi")]
             Ok(object) if wasm32 => return Ok(crate::wasm32::trim_object(object)),
             Ok(object) => return Ok(object),
@@ -4400,11 +4514,15 @@ fn try_native_construction(
     // builds landing pads fine — so there is nothing left to decline here.
     match crate::native_emit::native_mode() {
         crate::native_emit::NativeMode::Off => None,
-        crate::native_emit::NativeMode::Native => Some(crate::native_emit::compile_module_native(
-            llmod,
-            target,
-            module_prefix,
-        )),
+        crate::native_emit::NativeMode::Native => {
+            let triple = llmod.target_triple.clone();
+            let owned = std::mem::replace(llmod, LlModule::new(triple));
+            Some(crate::native_emit::compile_module_native_owned(
+                owned,
+                target,
+                module_prefix,
+            ))
+        }
         crate::native_emit::NativeMode::Diff => Some(crate::native_emit::compile_module_diff(
             llmod,
             target,
@@ -4421,3 +4539,6 @@ fn try_native_construction(
 ) -> Option<Result<Vec<u8>>> {
     None
 }
+
+#[cfg(test)]
+mod memory_ownership_tests;

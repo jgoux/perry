@@ -159,6 +159,25 @@ pub use replace_fn::{
     js_string_replace_all_js, js_string_replace_all_string, js_string_replace_all_string_fn,
     js_string_replace_js, js_string_replace_string, js_string_replace_string_fn,
 };
+// Engine-disabled builds still carry the String.prototype builtin entries
+// (`object::builtin_proto_entries`) that name these boxed bodies. A program
+// that uses regex forces the engine on, so they are unreachable there; they
+// answer as the engine-off `native_call_method` arms do: no match.
+#[cfg(not(feature = "regex-engine"))]
+#[no_mangle]
+pub extern "C" fn js_string_match_js(_receiver: f64, _pattern: f64) -> f64 {
+    f64::from_bits(crate::value::JSValue::null().bits())
+}
+#[cfg(not(feature = "regex-engine"))]
+#[no_mangle]
+pub extern "C" fn js_string_match_all_js(_receiver: f64, _pattern: f64) -> f64 {
+    f64::from_bits(crate::value::JSValue::null().bits())
+}
+#[cfg(not(feature = "regex-engine"))]
+#[no_mangle]
+pub extern "C" fn js_string_search_js(_receiver: f64, _pattern: f64) -> f64 {
+    -1.0
+}
 #[cfg(feature = "regex-engine")]
 mod exec;
 #[cfg(feature = "regex-engine")]
@@ -193,21 +212,10 @@ pub fn regexp_data_of(value: f64) -> Option<*const RegExpData> {
 /// Raw-receiver ABI retained for the typed HIR calls until S5.
 pub type RegExpHeader = ObjectHeader;
 pub(crate) const REGEXP_MATCHER: &str = "[[RegExpMatcher]]";
-const MATCHER_READ: crate::object::IntrinsicPrivateReadSite =
-    crate::object::IntrinsicPrivateReadSite::new(REGEXP_MATCHER);
-
-/// The slot of the intrinsic private matcher in a shape's key list: the
-/// brand as a fact of that shape.
-///
-/// # Safety
-/// `keys` is a live canonical key list with `count` logical keys.
-#[cfg(feature = "regex-engine")]
-pub(crate) unsafe fn matcher_slot(
-    keys: *const crate::array::ArrayHeader,
-    count: u32,
-) -> Option<u32> {
-    MATCHER_READ.slot_in(keys, count)
-}
+static MATCHER_READ: crate::object::IntrinsicPrivateReadSite =
+    crate::object::IntrinsicPrivateReadSite::new(
+        &crate::object::runtime_layouts::intrinsic_private_atoms::REGEXP_MATCHER,
+    );
 
 /// Read an already branded receiver's immutable data before the next
 /// collecting action. Handles must be re-read after such an action.

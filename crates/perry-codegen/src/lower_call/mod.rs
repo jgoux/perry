@@ -96,6 +96,8 @@ mod native;
 #[cfg(test)]
 mod native_abi_tests;
 mod native_module_dispatch;
+pub(crate) use early_branches::native_receiver_module;
+pub(crate) use native_module_dispatch::native_lookup_runtime;
 #[cfg(test)]
 mod native_module_rooting_tests;
 mod native_table;
@@ -192,7 +194,8 @@ pub(crate) use new_ctor_args::{
 // super-must-be-called.
 pub(crate) use new_helpers::{
     ctor_body_calls_super, ctor_body_closure_calls_super, ctor_body_has_value_return,
-    ctor_body_uses_this, ctor_chain_can_replace_this, default_ctor_dynamic_parent_owner,
+    ctor_body_lexically_contains_arrow, ctor_body_uses_this, ctor_chain_can_replace_this,
+    default_ctor_dynamic_parent_owner,
 };
 // #6325 / #6326: the class-chain walk to a native base whose surface perry
 // stamps onto the instance, plus its init emitter. Shared by the implicit

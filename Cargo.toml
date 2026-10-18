@@ -14,6 +14,7 @@ members = [
     "crates/perry-transform",
     "crates/perry-codegen",
     "crates/perry-dispatch",
+    "crates/perry-runtime-manifest",
     "crates/perry-abi",
     "crates/perry-runtime",
     "crates/perry-ffi",
@@ -69,6 +70,7 @@ members = [
     "crates/perry-ui-testkit",
     "crates/perry-doc-tests",
     "crates/perry-updater",
+    "crates/perry-update-manifest",
     "crates/perry-runtime-static",
     "crates/perry-stdlib-static",
     "docs/examples/_fixtures/native-libraries/my-bindings",
@@ -91,12 +93,38 @@ exclude = [
     "third_party/windows-winui",
 ]
 
-# Build only the host-independent product set by default.
+# Build only the host-independent product set by default: the compiler and
+# every archive it links (runtime, stdlib, the WebAssembly host and the routed
+# `perry-ext-*` wrappers of `crates/perry/well_known_bindings.toml`). perry
+# never builds an archive while compiling a program, and the archives must
+# come from ONE Cargo graph (#7358), so they are built with the compiler.
+# `cargo build-perry` (.cargo/config.toml) is the same set for a command line
+# that adds packages; `default_members_match_the_build_perry_alias` keeps the
+# two in step.
 # Platform UI manifests keep their source and dependencies behind target cfgs.
 # Build each platform package explicitly for its applicable target.
 default-members = [
     "crates/perry",
     "crates/perry-container-compose",
+    "crates/perry-runtime-static",
+    "crates/perry-stdlib-static",
+    "crates/perry-wasm-host",
+    "crates/perry-ext-ads",
+    "crates/perry-ext-argon2",
+    "crates/perry-ext-bcrypt",
+    "crates/perry-ext-better-sqlite3",
+    "crates/perry-ext-cheerio",
+    "crates/perry-ext-ethers",
+    "crates/perry-ext-http",
+    "crates/perry-ext-net",
+    "crates/perry-ext-nodemailer",
+    "crates/perry-ext-parcel-watcher",
+    "crates/perry-ext-pdf",
+    "crates/perry-ext-sharp",
+    "crates/perry-ext-typescript",
+    "crates/perry-ext-undici",
+    "crates/perry-ext-ws",
+    "crates/perry-ext-zlib",
 ]
 
 # Aggressive release optimizations for small, fast binaries
@@ -339,7 +367,7 @@ codegen-units = 1
 codegen-units = 1
 
 [workspace.package]
-version = "0.5.1659"
+version = "0.5.1661"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/PerryTS/perry"
@@ -402,24 +430,13 @@ regex = "1.12"
 aho-corasick = "1.1"
 memchr = "2"
 # The single regular-expression engine, through crates/perry-perex.
-# 0.1.13 adds perex::dfa, a lazy deterministic automaton over host-owned cache
-# storage that answers whether and where a program matches without
-# backtracking (program format 15: word 7 bit 25 marks eligible programs;
-# release commit c13fdc92af, per the crate's .cargo_vcs_info.json). Perry keeps
-# one cache in each program cell (regex/perex_owner.rs) and asks it for a
-# match's bounds before the evaluator runs (regex/perex_runtime.rs). It is
-# younger than the 7-day `global-min-publish-age` soak (.cargo/config.toml), so
-# Cargo.lock was resolved once with CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow
-# under an owner-approved one-time publish-age override (2026-10-09), for this
-# version only; the window itself is unchanged. No public API change from
-# 0.1.12 beyond the program format.
-# sha256 cce9fa3a84ee8c8c49873b937167a284f5446a67ace8eeac986bf9a97592f01e — the
-# checksum Cargo.lock records, verified against
-# https://crates.io/api/v1/crates/perex/0.1.13. As with turnloop above, the
-# opt-out is a committed, reviewable change, never a silent one, and the lock
-# pins the exact artifact. The override lapses on its own on 2026-10-16, when
-# 0.1.13 clears the window.
-perex = "0.1.13"
+# 0.1.14 adds exact bounded start-anchored literal execution (format 16):
+# immutable program instructions are compared with the original subject,
+# without a DFA cache, matcher scratch, or generated per-pattern native code.
+# Resolved once on 2026-10-18 with CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow
+# before this release clears the 7-day publish-age window. Cargo.lock pins the
+# verified registry artifact; the global window is unchanged.
+perex = "0.1.14"
 # turnloop P0/P1: the per-agent event-loop wait driver and, since P1, Perry's
 # stream sockets (docs/turnloop/p0-report.md, crates/perry-runtime/src/turnloop_net).
 # 0.1.0-alpha.3 switched turnloop's own dependency requirements from exact pins
@@ -431,6 +448,11 @@ perex = "0.1.13"
 # rated it API-compatible, so every alpha.7 -> alpha.8 change is additive. The
 # RELEASING.md exception wants the release source commit:
 # d72fea0b4644af0b13376bf62b3b8181206d359e (turnloop release PR #109).
+# alpha.9 (turnloop#114, release PR #110 at adc7918faf20b15e95c6cff635f059b5bf1b61f0)
+# only fixes the Android build (Bionic __errno instead of __errno_location;
+# inotify_rm_watch descriptor type) and takes rustls 0.23.46; it is locked once
+# with the owner-approved publish-age override (2026-10-16), which lapses on its
+# own when alpha.9 clears the 7-day window on 2026-10-23.
 # What reaches Perry: `TcpOpts` gains `connect_timeout` and `PoolConfig` gains
 # `max_undelivered`, so both need `..Default::default()` in a struct literal;
 # `Backend::poll` takes a `Budget` (invisible here — Perry implements no
@@ -446,7 +468,7 @@ perex = "0.1.13"
 # against the publishing workflow going green. The soak skill's rule holds:
 # opting out is a committed, reviewable change and never a silent one, so the
 # override lives here in the diff and the lock pins the exact artifact.
-turnloop = "0.1.0-alpha.8"
+turnloop = "0.1.0-alpha.9"
 # turnloop P5 (DESIGN §5b, §12 "P5"): the sans-I/O protocol crates that
 # replace hyper's HTTP/1.1 parser and framer on Perry's server path, and
 # `tokio_rustls` on every TLS path the loop owns. Default features only — the
@@ -472,8 +494,8 @@ turnloop = "0.1.0-alpha.8"
 # rustls process-default provider, failing at RUNTIME ("no rustls crypto
 # provider") rather than at compile time. So this line restores exactly what
 # alpha.6 gave Perry; it does not opt into anything new.
-turnloop-http = { version = "0.1.0-alpha.8", default-features = false }
-turnloop-tls = { version = "0.1.0-alpha.8", default-features = false, features = [
+turnloop-http = { version = "0.1.0-alpha.9", default-features = false }
+turnloop-tls = { version = "0.1.0-alpha.9", default-features = false, features = [
     "ring",
 ] }
 # turnloop WS lane: the sans-I/O WebSocket protocol + HTTP-upgrade helpers that
@@ -481,13 +503,13 @@ turnloop-tls = { version = "0.1.0-alpha.8", default-features = false, features =
 # the `turnloop` feature pulls turnloop-io's LocalExecutor, which Perry cannot
 # adopt for the same reason P5 recorded (it builds its own Driver and drops
 # every completion it did not issue). See docs/turnloop/ws-report.md.
-turnloop-websocket = { version = "0.1.0-alpha.8", default-features = false }
+turnloop-websocket = { version = "0.1.0-alpha.9", default-features = false }
 # turnloop P6 (DESIGN §12 "P6"): the sans-I/O SMTP client and MIME builder that
 # replaces `lettre`'s tokio transport on the outbound mail path. Its `message`
 # module re-exports the same `lettre` 0.11 builder Perry's nodemailer surface
 # already uses, so only the transport changes
 # (docs/turnloop/p6-report.md).
-turnloop-smtp = { version = "0.1.0-alpha.8", default-features = false }
+turnloop-smtp = { version = "0.1.0-alpha.9", default-features = false }
 # turnloop P7 (docs/turnloop/p7-report.md): the sans-I/O database protocol
 # cores that replace sqlx on the
 # paths Perry's bindings own. Default features only, for the same reason as the
@@ -527,6 +549,12 @@ http = "1"
 # ring; rustls's DEFAULT features would add aws-lc-rs (+aws-lc-sys) as a second
 # provider (~1.3 MB stripped, ~1 MB RSS). Keep default-features off; deny.toml
 # bans aws-lc-rs so it can't creep back.
+# rustls 0.23.46 (Cargo.lock) fixes RUSTSEC-2026-0346, -0347, -0348 and -0349 in
+# 0.23.45 (TLS secrets in Debug impls, buffered data after ECH rejection, brotli
+# certificate decompression allocating before authentication, ServerHello key
+# exchange downgrade). Published 2026-10-14, inside the 7-day soak; locked once
+# with the owner-approved one-time publish-age override (2026-10-16). The
+# override lapses on its own on 2026-10-21, when 0.23.46 clears the window.
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "logging", "ring"] }
 rustls-pemfile = "2"
 socket2 = "0.6"
@@ -555,6 +583,7 @@ perry-wpfacts = { path = "crates/perry-wpfacts" }
 perry-transform = { path = "crates/perry-transform" }
 perry-codegen = { path = "crates/perry-codegen" }
 perry-dispatch = { path = "crates/perry-dispatch" }
+perry-runtime-manifest = { path = "crates/perry-runtime-manifest" }
 perry-abi = { path = "crates/perry-abi", version = "0.5.1654" }
 # #1112: `perry-ffi` is published for external native wrappers. Its optional
 # `runtime-link` edge supplies runtime symbols to in-tree adapter tests.
@@ -562,7 +591,7 @@ perry-abi = { path = "crates/perry-abi", version = "0.5.1654" }
 # runtime wrappers can share identities without depending on perry-ffi.
 # `default-features = false` so dependency EDGES (perry-stdlib, ext crates, the
 # perry binary) don't force perry-runtime's heavy default features (`full`,
-# `regex-engine`, `temporal`, `url-engine`, `string-normalize`, `intl-segmenter`)
+# `regex-engine`, `temporal`, `url-engine`)
 # back on. The auto-optimize build selects perry-runtime with
 # `--no-default-features` and re-adds only what a given program needs (see
 # optimized_libs.rs), so an edge requesting defaults would defeat that (cargo
@@ -603,6 +632,8 @@ perry-native-registration = { path = "crates/perry-native-registration", version
 perry-ext-bcrypt = { path = "crates/perry-ext-bcrypt" }
 perry-ext-argon2 = { path = "crates/perry-ext-argon2" }
 perry-perex = { path = "crates/perry-perex" }
+# The sidecar format only (no analyzer): see crates/perry-gc-effects/Cargo.toml.
+perry-gc-effects = { path = "crates/perry-gc-effects", default-features = false }
 perry-ext-better-sqlite3 = { path = "crates/perry-ext-better-sqlite3" }
 perry-ext-zlib = { path = "crates/perry-ext-zlib" }
 perry-ext-cheerio = { path = "crates/perry-ext-cheerio" }
@@ -631,6 +662,7 @@ perry-codegen-wasm = { path = "crates/perry-codegen-wasm" }
 perry-ui-testkit = { path = "crates/perry-ui-testkit" }
 perry-audio-miniaudio = { path = "crates/perry-audio-miniaudio" }
 perry-updater = { path = "crates/perry-updater" }
+perry-update-manifest = { path = "crates/perry-update-manifest" }
 
 # Release codegen with debug assertions ON, for the GC root-scanning guards
 # that only exist under `cfg(debug_assertions)` — above all

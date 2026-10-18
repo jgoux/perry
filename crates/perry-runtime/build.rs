@@ -1,7 +1,7 @@
 //! Auto-generate no-op `perry_ui_*` / `perry_system_*` / `perry_updater_*`
-//! FFI stubs for the harmonyos build (#395 + #399), and the stub
-//! manifest consumed by the runtime's first-call diagnostic + the
-//! `perry check` static scan (#464).
+//! FFI stubs for the harmonyos build (#395 + #399) from the stub list in
+//! perry-runtime-manifest, which the `perry check` static scan (#464)
+//! reads too.
 //!
 //! HarmonyOS goes through the `perry-codegen-arkts` harvest model — the
 //! `App({body: VStack([...])})` literal is destructively rewritten into
@@ -27,7 +27,7 @@
 //! launch with `Error relocating ... perry_X: symbol not found` and
 //! the program never reaches `main`.
 //!
-//! We drive the stub list off `perry-dispatch`'s four tables —
+//! The stub list is driven off `perry-dispatch`'s four tables —
 //! PERRY_UI_TABLE + PERRY_UI_INSTANCE_TABLE + PERRY_SYSTEM_TABLE +
 //! PERRY_UPDATER_TABLE — the same single-source-of-truth the LLVM
 //! codegen consumes — so a new dispatch row automatically gets a stub
@@ -47,38 +47,35 @@
 //! first invocation per process per symbol prints a `[perry] warning`
 //! line — see `src/stub_diag.rs` for the env-var policy.
 
-use perry_dispatch::{ArgKind, MethodRow, ReturnKind};
+use perry_dispatch::{ArgKind, ReturnKind};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
-/// Source trees that define the compiler <-> runtime contract. A clean git
-/// checkout uses the commit as its build id; dirty/source-only builds hash
-/// these inputs so rebuilding the compiler without rebuilding the archive is
-/// still detected even though the package version did not change.
+/// The source trees an archive is built from: the workspace manifest and lock
+/// file, and every local crate perry-runtime builds with (its normal, optional
+/// and build dependencies; `runtime_build_inputs_cover_the_runtime_closure` in
+/// crates/perry checks this list against `cargo metadata`). Dirty or
+/// source-only builds hash these, so a compiler built against one runtime
+/// source rejects an archive built from another. Compiler-only trees are not
+/// inputs: editing codegen must not rebuild and re-stamp identical archives.
 const RUNTIME_BUILD_INPUTS: &[&str] = &[
     "Cargo.toml",
     "Cargo.lock",
+    "crates/perry-abi/Cargo.toml",
+    "crates/perry-abi/src",
     "crates/perry-base64/Cargo.toml",
     "crates/perry-base64/src",
-    "crates/perry-hex/Cargo.toml",
-    "crates/perry-hex/src",
-    "crates/perry-uuid/Cargo.toml",
-    "crates/perry-uuid/src",
-    "crates/perry-cli-support/Cargo.toml",
-    "crates/perry-cli-support/src",
+    "crates/perry-diagnostics/Cargo.toml",
+    "crates/perry-diagnostics/src",
     "crates/perry-dispatch/Cargo.toml",
     "crates/perry-dispatch/src",
-    "crates/perry/Cargo.toml",
-    "crates/perry/src",
-    "crates/perry-codegen/Cargo.toml",
-    "crates/perry-codegen/src",
-    "crates/perry-hir/Cargo.toml",
-    "crates/perry-hir/src",
-    "crates/perry-transform/Cargo.toml",
-    "crates/perry-transform/src",
+    "crates/perry-hex/Cargo.toml",
+    "crates/perry-hex/src",
+    "crates/perry-parser/Cargo.toml",
+    "crates/perry-parser/src",
+    "crates/perry-runtime-manifest/Cargo.toml",
+    "crates/perry-runtime-manifest/src",
     "crates/perry-runtime/Cargo.toml",
     "crates/perry-runtime/build.rs",
     "crates/perry-runtime/src",
@@ -88,19 +85,6 @@ const RUNTIME_BUILD_INPUTS: &[&str] = &[
 /// workspace siblings above. Hash the packaged runtime itself in that layout;
 /// the compiler and static wrapper both consume this same crate artifact.
 const PACKAGED_RUNTIME_BUILD_INPUTS: &[&str] = &["Cargo.toml", "build.rs", "src"];
-
-fn command_stdout(root: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(args)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Some(String::from_utf8(output.stdout).ok()?.trim().to_string())
-}
 
 fn sanitize_build_id(value: &str) -> String {
     value
@@ -188,38 +172,16 @@ fn emit_runtime_build_id() {
     };
     let root = root.canonicalize().unwrap_or(root);
 
-    // Make branch/commit changes rerun this build script even when the source
-    // files themselves are byte-identical (for example after a rebase).
-    if workspace_layout {
-        if let Some(git_head) = command_stdout(&root, &["rev-parse", "--git-path", "HEAD"]) {
-            println!("cargo:rerun-if-changed={}", root.join(git_head).display());
-        }
-        if let Some(symbolic_ref) = command_stdout(&root, &["symbolic-ref", "-q", "HEAD"]) {
-            if let Some(git_ref) =
-                command_stdout(&root, &["rev-parse", "--git-path", &symbolic_ref])
-            {
-                println!("cargo:rerun-if-changed={}", root.join(git_ref).display());
-            }
-        }
-    }
-
     let explicit = std::env::var("PERRY_BUILD_COMMIT")
         .ok()
         .filter(|value| !value.trim().is_empty())
         .map(|value| format!("git:{}", sanitize_build_id(value.trim())));
 
+    // The id names the source, not the commit: a commit, rebase or checkout
+    // that leaves these inputs byte-identical keeps the archives fresh.
+    // Release builds pass PERRY_BUILD_COMMIT.
     let source_id = source_build_id(&root, inputs);
-    let clean_commit = workspace_layout
-        .then(|| command_stdout(&root, &["rev-parse", "--verify", "HEAD"]))
-        .flatten()
-        .filter(|_| {
-            let mut args = vec!["status", "--porcelain", "--untracked-files=normal", "--"];
-            args.extend_from_slice(inputs);
-            command_stdout(&root, &args).is_some_and(|status| status.is_empty())
-        })
-        .map(|commit| format!("git:{}", sanitize_build_id(&commit)));
-
-    let build_id = explicit.or(clean_commit).unwrap_or(source_id);
+    let build_id = explicit.unwrap_or(source_id);
     println!("cargo:rustc-env=PERRY_RUNTIME_BUILD_ID={build_id}");
 }
 
@@ -239,29 +201,6 @@ fn return_kind(k: ReturnKind) -> (Option<&'static str>, &'static str) {
         | ReturnKind::I64AsBool => (Some("i64"), "0"),
         ReturnKind::F64 => (Some("f64"), "0.0"),
         ReturnKind::Void => (None, ""),
-    }
-}
-
-/// Per-table reason text + tracking issue. Surfaced in the stub
-/// manifest and printed by `perry_stub_warn` on first call.
-fn metadata_for(symbol: &str) -> (&'static str, Option<&'static str>) {
-    if symbol.starts_with("perry_ui_") || symbol == "perry_get_device_idiom" {
-        (
-            "harmonyos perry/ui FFI: lowered code outside the ArkUI harvest target's App body has no real backing",
-            Some("#395"),
-        )
-    } else if symbol.starts_with("perry_system_") {
-        (
-            "harmonyos perry/system FFI: not implemented on this build",
-            Some("#399"),
-        )
-    } else if symbol.starts_with("perry_updater_") {
-        (
-            "harmonyos perry/updater FFI: not implemented on this build",
-            Some("#399"),
-        )
-    } else {
-        ("no-op stub on this build", None)
     }
 }
 
@@ -543,31 +482,44 @@ fn generate_single_byte_encodings(out_dir: &str) {
     .expect("write single_byte_encodings.rs");
 }
 
-/// The GC/diagnostic instruments (`diagnostics`, `gc-instruments`, `hot-diag`)
-/// compile under the `perry_diagnostics` / `perry_gc_instruments` /
-/// `perry_hot_diag` cfgs, set here when the feature is on — unless
-/// `PERRY_RELEASE_STRIP_INSTRUMENTS=1`. The release workflow sets that for
-/// every build in its jobs, so the shipped archives carry no instruments while
-/// every other build (dev, CI, auto-optimize) is unchanged. An env var rather
-/// than a feature: a feature can only be added by Cargo's unification, and the
-/// release co-builds each ext crate with the runtime (#6303/#7358), whose
-/// `default` would switch the instruments back on; the build script sees the
-/// variable in every one of those invocations alike. A shipped runtime asked
-/// for an instrument knob refuses it with the existing
-/// "instruments not compiled in" diagnostic.
-fn emit_instrument_cfgs() {
-    println!("cargo:rerun-if-env-changed=PERRY_RELEASE_STRIP_INSTRUMENTS");
-    let strip = std::env::var("PERRY_RELEASE_STRIP_INSTRUMENTS").is_ok_and(|v| v == "1");
+/// The GC/diagnostic instruments (`diagnostics`, `gc-instruments`, `hot-diag`:
+/// census, from-space quarantine and scan, seeded schedule, verifiers,
+/// telemetry and trace JSON, hot-path mutator probes) compile under the
+/// `perry_diagnostics` / `perry_gc_instruments` / `perry_hot_diag` cfgs.
+/// They are OFF in a release or production build and ON when
+/// `PERRY_RUNTIME_INSTRUMENTS=1` (the instrumented prebuilt variant,
+/// `scripts/build_instr_runtime.sh`) or when the build is a debug-profile one
+/// (`cargo build` / `cargo test`, whose unit tests exercise them).
+///
+/// An env var rather than a feature: a feature can only be added by Cargo's
+/// unification, and the ext crates co-built with the runtime (#6303/#7358)
+/// enable `default`, which would switch the instruments back on; the build
+/// script sees the variable in every one of those invocations alike. The
+/// instrumented variant implies the contract-check cfgs, so its archives also
+/// serve a `PERRY_CHECK_CONTRACTS=1` compile.
+///
+/// A binary built without the instruments and asked for an instrument knob at
+/// run time refuses it at startup ("built without the GC instruments");
+/// perry picks the instrumented archives itself when a knob is set while
+/// compiling.
+///
+/// Returns whether this is the instrumented variant.
+fn emit_instrument_cfgs() -> bool {
+    println!("cargo:rerun-if-env-changed=PERRY_RUNTIME_INSTRUMENTS");
+    let variant = std::env::var("PERRY_RUNTIME_INSTRUMENTS").is_ok_and(|v| v == "1");
+    let debug_profile = std::env::var("PROFILE").is_ok_and(|p| p == "debug");
+    let on = variant || debug_profile;
     for (feature_env, cfg) in [
         ("CARGO_FEATURE_DIAGNOSTICS", "perry_diagnostics"),
         ("CARGO_FEATURE_GC_INSTRUMENTS", "perry_gc_instruments"),
         ("CARGO_FEATURE_HOT_DIAG", "perry_hot_diag"),
     ] {
         println!("cargo:rustc-check-cfg=cfg({cfg})");
-        if std::env::var_os(feature_env).is_some() && !strip {
+        if std::env::var_os(feature_env).is_some() && on {
             println!("cargo:rustc-cfg={cfg}");
         }
     }
+    variant
 }
 
 /// Compile the runtime-catch shim `src/ffi/perry_trap.ll` (ehfree 2b) into
@@ -639,8 +591,13 @@ fn build_trap_shim() {
 fn main() {
     println!("cargo:rerun-if-env-changed=PERRY_CHECK_CONTRACTS");
     println!("cargo:rustc-check-cfg=cfg(perry_check_contracts)");
-    if std::env::var("PERRY_CHECK_CONTRACTS").as_deref() == Ok("1") {
+    println!("cargo:rustc-check-cfg=cfg(perry_contract_checks)");
+    let instrumented_variant = emit_instrument_cfgs();
+    if std::env::var("PERRY_CHECK_CONTRACTS").as_deref() == Ok("1") || instrumented_variant {
         println!("cargo:rustc-cfg=perry_check_contracts");
+    }
+    if std::env::var_os("CARGO_FEATURE_CONTRACT_CHECKS").is_some() || instrumented_variant {
+        println!("cargo:rustc-cfg=perry_contract_checks");
     }
     // Keep page backing outside the Rust CGU. Its unreferenced object is not
     // extracted by ordinary links, preserving their code and literal layout.
@@ -664,7 +621,6 @@ fn main() {
         println!("cargo:rustc-cfg=perry_native_stack_maps");
     }
 
-    emit_instrument_cfgs();
     println!("cargo:rerun-if-changed=src/ffi/perry_memory_profile.c");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux")
         && std::env::var("CARGO_CFG_TARGET_POINTER_WIDTH").as_deref() == Ok("64")
@@ -679,7 +635,6 @@ fn main() {
             .compile("perry_memory_profile");
     }
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=src/node_api_host/symbols.txt");
     println!("cargo:rerun-if-changed=../perry-dispatch/src/lib.rs");
     println!("cargo:rerun-if-env-changed=TARGET");
 
@@ -711,15 +666,9 @@ fn main() {
     emit_runtime_build_id();
 
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR not set");
-    let symbols = std::fs::read_to_string("src/node_api_host/symbols.txt")
-        .expect("read Node-API symbol inventory");
-    let names = symbols
-        .lines()
-        .map(str::trim)
-        .filter(|name| !name.is_empty() && !name.starts_with('#'))
-        .collect::<Vec<_>>();
+    let names = perry_runtime_manifest::node_api_host_symbols().collect::<Vec<_>>();
     let mut anchors = format!(
-        "#[used]\nstatic NODE_API_HOST_SYMBOL_ANCHORS: [NodeApiSymbol; {}] = [\n",
+        "static NODE_API_HOST_SYMBOL_ANCHORS: [NodeApiSymbol; {}] = [\n",
         names.len()
     );
     for name in names {
@@ -733,252 +682,69 @@ fn main() {
     .expect("write Node-API symbol anchors");
     generate_single_byte_encodings(&out_dir);
     let stubs_dest = std::path::Path::new(&out_dir).join("perry_ui_harmonyos_stubs.rs");
-    let manifest_dest = std::path::Path::new(&out_dir).join("perry_stub_manifest.rs");
 
     let mut stubs_out = String::new();
     stubs_out.push_str("// AUTO-GENERATED by perry-runtime/build.rs from perry-dispatch tables.\n");
     stubs_out.push_str("// Do not edit. See build.rs and crates/perry-dispatch/src/lib.rs.\n\n");
 
-    let mut manifest_entries: Vec<String> = Vec::new();
-
     // The stub *function* file is only populated for the harmonyos
     // build — on every other target the platform UI crate
     // (perry-ui-macos / perry-ui-android / perry-ui-gtk4 /
     // perry-ui-windows / perry-ui-ios / etc.) owns the perry_ui_*
-    // symbols and emitting them here would collide. The stub
-    // *manifest* by contrast is always generated: `perry check` runs
-    // on the host but needs to surface harmonyos stub warnings to
-    // a developer cross-checking a harmonyos build, so the manifest
-    // describes what *would* be stubbed for that target regardless
-    // of the host's feature flags.
+    // symbols and emitting them here would collide. The stub list itself
+    // lives in perry-runtime-manifest, where `perry check` reads it too.
     let ohos_napi = std::env::var("CARGO_FEATURE_OHOS_NAPI").is_ok();
-    if !ohos_napi {
-        stubs_out.push_str(
-            "// (No stub function bodies — `ohos-napi` feature not enabled.\n\
-             //  Manifest is still populated for `perry check` consumption.)\n",
-        );
-    }
-
-    let tables: &[&[MethodRow]] = &[
-        perry_dispatch::PERRY_UI_TABLE,
-        perry_dispatch::PERRY_UI_INSTANCE_TABLE,
-        perry_dispatch::PERRY_SYSTEM_TABLE,
-        perry_dispatch::PERRY_UPDATER_TABLE,
-    ];
-    let table_modules: &[&str] = &["perry/ui", "perry/ui", "perry/system", "perry/updater"];
-
-    // Symbols owned by other modules in perry-runtime — stubbing here
-    // would be a duplicate-symbol error at link time. Keep this list in
-    // sync with `crates/perry-runtime/src/i18n.rs` +
-    // `crates/perry-runtime/src/media_playback.rs`. The `perry_i18n_` /
-    // `perry_media_` prefixes don't appear in the four tables above so
-    // this is belt-and-braces — the actual filter is the table list.
-    fn is_stubbable(runtime: &str) -> bool {
-        runtime.starts_with("perry_ui_")
-            || runtime.starts_with("perry_system_")
-            || runtime.starts_with("perry_updater_")
-            // `perry_get_device_idiom` is the one outlier in
-            // PERRY_SYSTEM_TABLE that doesn't carry a `perry_system_`
-            // prefix. Allow it explicitly.
-            || runtime == "perry_get_device_idiom"
-    }
-
-    let mut seen: HashSet<&str> = HashSet::new();
-    let mut count = 0usize;
-
-    for (table, module) in tables.iter().zip(table_modules.iter()) {
-        for row in table.iter() {
-            if !is_stubbable(row.runtime) {
-                continue;
-            }
-            // Some dispatch rows reuse the same runtime symbol (e.g.
-            // `scrollViewSetChild` and `scrollviewSetChild` both →
-            // `perry_ui_scrollview_set_child`). Emit each symbol once.
-            if !seen.insert(row.runtime) {
-                continue;
-            }
-
-            emit_stub(
-                &mut stubs_out,
-                row.runtime,
-                row.args,
-                row.ret,
-                Some(row.method),
-                module,
-                &mut manifest_entries,
-                ohos_napi,
-            );
-            count += 1;
+    let stubs = perry_runtime_manifest::stubs();
+    if ohos_napi {
+        for stub in &stubs {
+            emit_stub(&mut stubs_out, stub);
         }
+    } else {
+        stubs_out.push_str("// (No stub function bodies — `ohos-napi` feature not enabled.)\n");
     }
-
-    // Direct-call FFI symbols that bypass the dispatch tables — codegen
-    // emits these for the simple constructor shapes (`VStack(items)`,
-    // `HStack(items)`, `Button(label, onPress)`) in
-    // `crates/perry-codegen/src/lower_call/native.rs`, and for the
-    // trigger-shape-switched `notificationSchedule({trigger:{type,...}})`
-    // in `crates/perry-codegen/src/lower_call.rs::lower_notification_schedule`.
-    // They aren't in any PERRY_*_TABLE so the table walk above misses
-    // them; we list them explicitly here. Keep in sync with the
-    // hardcoded callsites — `grep -h '"perry_(ui|system|updater)_' \
-    // crates/perry-codegen/src/**/*.rs | sort -u`.
-    //
-    // The `ts_name` column carries the user-facing TS function name when
-    // it survives codegen as-is (`VStack`, `HStack`, `Button`). For the
-    // notificationSchedule fan-out the TS-level name is the same
-    // (`notificationSchedule`) for all three runtime variants — the
-    // trigger-shape switch happens at lowering, not in source — so the
-    // static scan dedupes on `ts_name` per module.
-    let direct_call_stubs: &[(&str, &[ArgKind], ReturnKind, Option<&str>, &str)] = &[
-        (
-            "perry_ui_vstack_create",
-            &[ArgKind::F64],
-            ReturnKind::Widget,
-            Some("VStack"),
-            "perry/ui",
-        ),
-        (
-            "perry_ui_hstack_create",
-            &[ArgKind::F64],
-            ReturnKind::Widget,
-            Some("HStack"),
-            "perry/ui",
-        ),
-        (
-            "perry_ui_button_create",
-            &[ArgKind::Str, ArgKind::Closure],
-            ReturnKind::Widget,
-            Some("Button"),
-            "perry/ui",
-        ),
-        // notificationSchedule(...) — three trigger variants, dispatched
-        // at compile time on `trigger.type`. Args are (id, title, body)
-        // string ptrs as I64 then trigger-specific f64 fields. None of
-        // these appear in PERRY_SYSTEM_TABLE (the table only carries the
-        // simpler `notificationSend` shape).
-        (
-            "perry_system_notification_schedule_interval",
-            &[
-                ArgKind::Str,
-                ArgKind::Str,
-                ArgKind::Str,
-                ArgKind::F64,
-                ArgKind::F64,
-            ],
-            ReturnKind::Void,
-            Some("notificationSchedule"),
-            "perry/system",
-        ),
-        (
-            "perry_system_notification_schedule_calendar",
-            &[ArgKind::Str, ArgKind::Str, ArgKind::Str, ArgKind::F64],
-            ReturnKind::Void,
-            Some("notificationSchedule"),
-            "perry/system",
-        ),
-        (
-            "perry_system_notification_schedule_location",
-            &[
-                ArgKind::Str,
-                ArgKind::Str,
-                ArgKind::Str,
-                ArgKind::F64,
-                ArgKind::F64,
-                ArgKind::F64,
-            ],
-            ReturnKind::Void,
-            Some("notificationSchedule"),
-            "perry/system",
-        ),
-    ];
-    for (name, args, ret, ts_name, module) in direct_call_stubs {
-        if !seen.insert(name) {
-            continue;
-        }
-        emit_stub(
-            &mut stubs_out,
-            name,
-            args,
-            *ret,
-            *ts_name,
-            module,
-            &mut manifest_entries,
-            ohos_napi,
-        );
-        count += 1;
-    }
-
-    writeln!(stubs_out, "\n// {} stub(s) generated.", count).unwrap();
+    writeln!(
+        stubs_out,
+        "\n// {} stub(s) generated.",
+        if ohos_napi { stubs.len() } else { 0 }
+    )
+    .unwrap();
     std::fs::write(&stubs_dest, stubs_out).expect("failed to write stub file");
-
-    let mut manifest_out = String::new();
-    manifest_out
-        .push_str("// AUTO-GENERATED by perry-runtime/build.rs from perry-dispatch tables.\n");
-    manifest_out.push_str("// Do not edit. See build.rs.\n\n");
-    manifest_out.push_str("pub const STUB_MANIFEST: &[StubEntry] = &[\n");
-    for entry in &manifest_entries {
-        manifest_out.push_str(entry);
-    }
-    manifest_out.push_str("];\n");
-    std::fs::write(&manifest_dest, manifest_out).expect("failed to write manifest");
 }
 
-#[allow(clippy::too_many_arguments)]
-fn emit_stub(
-    out: &mut String,
-    name: &str,
-    args: &[ArgKind],
-    ret: ReturnKind,
-    ts_name: Option<&str>,
-    module: &str,
-    manifest_entries: &mut Vec<String>,
-    emit_body: bool,
-) {
-    let (reason, issue) = metadata_for(name);
+fn emit_stub(out: &mut String, stub: &perry_runtime_manifest::Stub) {
+    let args_str: String = stub
+        .args
+        .iter()
+        .enumerate()
+        .map(|(i, k)| format!("_a{}: {}", i, arg_kind_rust_type(*k)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let (ret_ty, default) = return_kind(stub.ret);
 
-    if emit_body {
-        let args_str: String = args
-            .iter()
-            .enumerate()
-            .map(|(i, k)| format!("_a{}: {}", i, arg_kind_rust_type(*k)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let (ret_ty, default) = return_kind(ret);
+    let warn_call = format!(
+        "    crate::stub_diag::perry_stub_warn({}, {}, {});\n",
+        rust_str_lit(stub.symbol),
+        rust_str_lit(stub.reason),
+        rust_opt_str_lit(stub.issue),
+    );
 
-        let warn_call = format!(
-            "    crate::stub_diag::perry_stub_warn({}, {}, {});\n",
-            rust_str_lit(name),
-            rust_str_lit(reason),
-            rust_opt_str_lit(issue),
-        );
-
-        writeln!(out, "#[no_mangle]").unwrap();
-        match ret_ty {
-            Some(ty) => {
-                writeln!(
-                    out,
-                    "pub extern \"C\" fn {}({}) -> {} {{",
-                    name, args_str, ty
-                )
-                .unwrap();
-                out.push_str(&warn_call);
-                writeln!(out, "    {}", default).unwrap();
-                writeln!(out, "}}").unwrap();
-            }
-            None => {
-                writeln!(out, "pub extern \"C\" fn {}({}) {{", name, args_str).unwrap();
-                out.push_str(&warn_call);
-                writeln!(out, "}}").unwrap();
-            }
+    writeln!(out, "#[no_mangle]").unwrap();
+    match ret_ty {
+        Some(ty) => {
+            writeln!(
+                out,
+                "pub extern \"C\" fn {}({}) -> {} {{",
+                stub.symbol, args_str, ty
+            )
+            .unwrap();
+            out.push_str(&warn_call);
+            writeln!(out, "    {}", default).unwrap();
+            writeln!(out, "}}").unwrap();
+        }
+        None => {
+            writeln!(out, "pub extern \"C\" fn {}({}) {{", stub.symbol, args_str).unwrap();
+            out.push_str(&warn_call);
+            writeln!(out, "}}").unwrap();
         }
     }
-
-    manifest_entries.push(format!(
-        "    StubEntry {{ symbol: {}, ts_name: {}, module: {}, reason: {}, issue: {} }},\n",
-        rust_str_lit(name),
-        rust_opt_str_lit(ts_name),
-        rust_str_lit(module),
-        rust_str_lit(reason),
-        rust_opt_str_lit(issue),
-    ));
 }

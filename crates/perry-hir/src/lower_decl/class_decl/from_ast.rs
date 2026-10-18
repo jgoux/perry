@@ -15,6 +15,10 @@ pub(crate) fn lower_class_from_ast(
 ) -> Result<Class> {
     // Consume the flag before any nested class in this body is lowered.
     let fresh_class_expr = std::mem::take(&mut ctx.pending_fresh_class_expr);
+    let synthesized =
+        crate::lower_decl::class_field_assign::with_synthesized_constructor(ctx, class);
+    let class = synthesized.as_ref().unwrap_or(class);
+    let field_inits = crate::lower_decl::class_field_assign::assigned_field_inits(ctx, class);
     validate_legacy_decorator_surface(class, name)?;
     validate_class_element_early_errors(class, name)?;
     let class_id = match ctx.lookup_class(name) {
@@ -350,7 +354,7 @@ pub(crate) fn lower_class_from_ast(
     for (member_index, member) in class.body.iter().enumerate() {
         match member {
             ast::ClassMember::Constructor(ctor) => {
-                constructor = Some(lower_constructor(ctx, name, ctor)?);
+                constructor = Some(lower_constructor(ctx, name, ctor, &field_inits)?);
             }
             ast::ClassMember::Method(method) => {
                 // Skip TypeScript overload declarations (no body)
@@ -479,6 +483,28 @@ pub(crate) fn lower_class_from_ast(
                             computed_members.push(ClassComputedMember {
                                 key_expr: lower_expr(ctx, &computed.expr)?,
                                 function,
+                                is_static: false,
+                                kind: ClassComputedMemberKind::Method,
+                                source_order: member_index,
+                            });
+                            continue;
+                        }
+                        // `[Symbol.asyncIterator]()` (plain or `async *`) — the
+                        // same computed-symbol registration: the prototype holds
+                        // the method under its symbol, so `obj[Symbol.asyncIterator]`
+                        // reads it (React Flight's async-iterable test on Next.js's
+                        // VaryParamsAccumulator), and the registration installs the
+                        // `@@asyncIterator` dispatch alias `for await` uses.
+                        // Registered under the string name it was an own
+                        // "@@asyncIterator" key the source never declared, and the
+                        // symbol read found nothing.
+                        if prop_name == "@@asyncIterator" && !method.is_static {
+                            let ast::PropName::Computed(computed) = &method.key else {
+                                unreachable!("@@asyncIterator key must be computed");
+                            };
+                            computed_members.push(ClassComputedMember {
+                                key_expr: lower_expr(ctx, &computed.expr)?,
+                                function: func,
                                 is_static: false,
                                 kind: ClassComputedMemberKind::Method,
                                 source_order: member_index,
@@ -685,6 +711,8 @@ pub(crate) fn lower_class_from_ast(
         }
         ctx.register_class_accessor_names(name.to_string(), accessor_names);
     }
+
+    crate::lower_decl::class_field_assign::settle_reservations(ctx, class, &mut fields);
 
     // Issue #740: synthesize __perry_cap_* capture machinery for class
     // expressions that reference enclosing-fn locals (e.g. `const Inner =

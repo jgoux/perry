@@ -42,7 +42,9 @@ mod deferred_requires;
 pub(crate) mod detect;
 mod extract_exports;
 mod extract_requires;
+pub(super) mod family_syntax;
 mod hoist_classes;
+mod run_once_syntax;
 mod wrap;
 
 #[cfg(test)]
@@ -75,7 +77,7 @@ use extract_requires::{
     identifier_is_reassigned,
 };
 use hoist_classes::{
-    extract_top_level_class_decls, rewrite_module_exports_class_expression,
+    extract_top_level_class_decls_with_exports, rewrite_module_exports_class_expression,
     source_has_top_level_return, top_level_class_names,
 };
 

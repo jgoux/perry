@@ -175,7 +175,7 @@ fn push_module(elem: Type, value: Expr, classes: Vec<Class>) -> Module {
                 name: "keep".to_string(),
                 ty: Type::Array(Box::new(elem)),
                 mutable: false,
-                init: Some(Expr::Array(Vec::new())),
+                init: Some(Expr::Array(Vec::new(), None)),
             },
             Stmt::For {
                 init: Some(Box::new(Stmt::Let {
@@ -680,7 +680,7 @@ fn a_field_push_writes_the_field_back_on_a_handle_bits_change_behind_a_plain_obj
     // store site (#12483): its inline shape-checked store, and the
     // descriptor-aware `[[Set]]` miss behind it.
     assert!(
-        body.contains("put.pic.") && body.contains("@js_put_value_set_packed_miss("),
+        body.contains("@perry_probe_set(") && body.contains("@js_put_value_set("),
         "the write-back arm must be the class-field store:\n{body}"
     );
     // Between the header gate and the store: `this.items` is re-read and its
@@ -778,7 +778,7 @@ fn private_module_init_field_receiver_does_not_repeat_lookup_after_argument() {
             name: "__field_push_receiver".into(),
             ty: Type::Array(Box::new(Type::Number)),
             mutable: true,
-            init: Some(Expr::Array(vec![])),
+            init: Some(Expr::Array(vec![], None)),
         },
         Stmt::Expr(Expr::NativeMethodCall {
             module: "array".into(),

@@ -170,8 +170,9 @@ jobs:
           # without them links a stale archive and makes the whole measurement
           # vacuous. The package set is fixed here so cargo feature unification
           # is identical to the set used to capture the baseline.
-          cargo build --release -p perry -p perry-runtime-static -p perry-stdlib-static
-          for artifact in perry libperry_runtime.a libperry_stdlib.a; do
+          cargo build-perry --release
+          scripts/gc_call_effects/sidecars.sh target/release
+          for artifact in perry libperry_runtime.a libperry_stdlib.a libperry_runtime.a.gc-effects; do
             test -s "target/release/$artifact" \
               || { echo "::error::target/release/$artifact was not produced"; exit 1; }
           done
@@ -407,10 +408,10 @@ jobs:
           # without them links a stale archive and makes the whole measurement
           # vacuous. The package set matches gc-stress exactly so cargo feature
           # unification — and therefore the cache — is identical.
-          cargo build --release \
-            -p perry -p perry-runtime -p perry-stdlib \
-            -p perry-runtime-static -p perry-stdlib-static
-          for artifact in perry libperry_runtime.a libperry_stdlib.a; do
+          cargo build-perry --release
+          scripts/gc_call_effects/sidecars.sh target/release
+          scripts/build_instr_runtime.sh
+          for artifact in perry libperry_runtime.a libperry_stdlib.a libperry_runtime.a.gc-effects; do
             test -s "target/release/$artifact" \
               || { echo "::error::target/release/$artifact was not produced"; exit 1; }
           done
@@ -610,8 +611,10 @@ jobs:
           shared-key: gc-native-roots
       - name: Build compiler and static runtime (perry-dev profile)
         run: |
-          export RUSTFLAGS="-C force-frame-pointers=yes -C force-unwind-tables=yes"
-          cargo build --profile perry-dev -p perry -p perry-runtime-static -p perry-stdlib-static
+          export RUSTFLAGS="-C force-unwind-tables=yes"
+          cargo build-perry --profile perry-dev
+          scripts/gc_call_effects/sidecars.sh target/perry-dev
+          scripts/build_instr_runtime.sh "" perry-dev
       - name: Provider dylib host-boundary GC and Response
         if: ${{ !cancelled() && runner.os != 'Windows' }}
         run: scripts/gc_provider_dylib_gate.sh
@@ -619,7 +622,7 @@ jobs:
         if: ${{ !cancelled() && matrix.arch == 'aarch64' && runner.os != 'Windows' }}
         run: |
           set -euo pipefail
-          export RUSTFLAGS="-C force-frame-pointers=yes -C force-unwind-tables=yes"
+          export RUSTFLAGS="-C force-unwind-tables=yes"
           cargo test --profile perry-dev -p perry-runtime --lib gc::roots::stack_maps \
             -- --test-threads=1 | tee /tmp/walker-agreement.log
           # `--lib <filter>` is a substring match, so a rename makes it select
@@ -913,9 +916,9 @@ jobs:
           # Keep LLVM_SYS_221_PREFIX from setup-llvm22. The stock-toolchain
           # assertion removes the external opt/clang overrides; the in-process
           # backend itself still has to link the LLVM 22 ABI used by llvm-sys.
-          export RUSTFLAGS="-C force-frame-pointers=yes -C force-unwind-tables=yes"
-          cargo build --profile perry-dev -p perry -p perry-runtime-static \
-            -p perry-stdlib-static --features perry-codegen/llvm-inprocess
+          export RUSTFLAGS="-C force-unwind-tables=yes"
+          cargo build-perry --profile perry-dev --features perry-codegen/llvm-inprocess
+          scripts/gc_call_effects/sidecars.sh target/perry-dev
 
           # Probe 09 is the whole point: it carries `try`, so every call in it
           # is an `invoke`, which the explicit bridge refuses outright (#7330).
@@ -1092,11 +1095,12 @@ jobs:
           # the -static wrapper crates. The package set is fixed so cargo
           # feature unification matches every other job that builds the
           # compiler.
-          cargo build --release --features target-wasi -p perry -p perry-runtime-static -p perry-stdlib-static
+          cargo build-perry --release --features target-wasi
           for artifact in perry libperry_runtime.a libperry_stdlib.a; do
             test -s "target/release/$artifact" \
               || { echo "::error::target/release/$artifact was not produced"; exit 1; }
           done
+          scripts/gc_call_effects/sidecars.sh target/release
       - name: Verify the scanner sees every symbol the archives define
         run: |
           set -euo pipefail
@@ -1249,11 +1253,12 @@ jobs:
       - name: Build perry and the runtime archives
         run: |
           set -euo pipefail
-          cargo build --release --features target-wasi -p perry -p perry-runtime-static -p perry-stdlib-static
+          cargo build-perry --release --features target-wasi
           for artifact in perry libperry_runtime.a libperry_stdlib.a; do
             test -s "target/release/$artifact" \
               || { echo "::error::target/release/$artifact was not produced"; exit 1; }
           done
+          scripts/gc_call_effects/sidecars.sh target/release
       - name: Emit the NATIVE (statepoint) IR corpus
         run: ./scripts/gc_root_dominance_corpus.sh ir-corpus-native --lowering native
       - name: Check GC values across safepoints (native roots)
@@ -1603,10 +1608,10 @@ jobs:
           # come from the *-static wrapper crates. Building without them links
           # a stale archive and makes this whole gate vacuous in a way nothing
           # downstream can detect (CLAUDE.md's "Verifying a runtime change").
-          cargo build --release \
-            -p perry -p perry-runtime -p perry-stdlib \
-            -p perry-runtime-static -p perry-stdlib-static
-          for artifact in perry libperry_runtime.a libperry_stdlib.a; do
+          cargo build-perry --release
+          scripts/gc_call_effects/sidecars.sh target/release
+          scripts/build_instr_runtime.sh
+          for artifact in perry libperry_runtime.a libperry_stdlib.a libperry_runtime.a.gc-effects; do
             test -s "target/release/$artifact" \
               || { echo "::error::target/release/$artifact was not produced"; exit 1; }
           done
@@ -1735,10 +1740,10 @@ jobs:
           # without them links a stale archive and makes the whole run
           # vacuous (CLAUDE.md, "Verifying a runtime change"). Package set
           # matches gc-stress exactly so the cache is shared.
-          cargo build --release \
-            -p perry -p perry-runtime -p perry-stdlib \
-            -p perry-runtime-static -p perry-stdlib-static
-          for artifact in perry libperry_runtime.a libperry_stdlib.a; do
+          cargo build-perry --release
+          scripts/gc_call_effects/sidecars.sh target/release
+          scripts/build_instr_runtime.sh
+          for artifact in perry libperry_runtime.a libperry_stdlib.a libperry_runtime.a.gc-effects; do
             test -s "target/release/$artifact" \
               || { echo "::error::target/release/$artifact was not produced"; exit 1; }
           done

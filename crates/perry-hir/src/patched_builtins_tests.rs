@@ -19,6 +19,17 @@ fn pair(r: &str, m: &str) -> (String, String) {
     (r.to_string(), m.to_string())
 }
 
+// The scanner also carries array-iteration safety facts in a pseudo-namespace.
+// These are distinct from a patch to a named namespace/prototype member.
+fn assert_array_iteration_facts(set: &PatchedBuiltins, expected: &[&str]) {
+    let facts: Vec<_> = set
+        .iter()
+        .filter(|(namespace, _)| namespace == ARRAY_ITERATION)
+        .map(|(_, member)| member.as_str())
+        .collect();
+    assert_eq!(facts, expected, "{set:?}");
+}
+
 #[test]
 fn scans_member_writes_on_namespaces() {
     let s = scan(
@@ -35,7 +46,12 @@ fn scans_member_writes_on_namespaces() {
     assert!(s.contains(&pair("JSON", "stringify")));
     assert!(s.contains(&pair("Reflect", "ownKeys")));
     assert!(s.contains(&pair("Number", "isNaN")));
-    assert_eq!(s.len(), 5, "{s:?}");
+    assert_array_iteration_facts(&s, &["elements", "write"]);
+    assert_eq!(
+        s.iter().filter(|(ns, _)| ns != ARRAY_ITERATION).count(),
+        5,
+        "{s:?}"
+    );
 }
 
 #[test]
@@ -80,10 +96,18 @@ fn scans_builtin_prototype_method_writes() {
     assert!(s.contains(&pair("Map.prototype", "get")));
     assert!(s.contains(&pair("Function.prototype", "bind")));
     assert!(s.contains(&pair("Set.prototype", "add")));
-    assert_eq!(s.len(), 4, "{s:?}");
+    assert_array_iteration_facts(&s, &["elements", "write"]);
+    assert_eq!(s.len(), 6, "{s:?}");
     assert_eq!(
         patched_prototype_methods(&s),
-        vec!["add", "bind", "get", "push"]
+        vec![
+            "add",
+            "bind",
+            "get",
+            "push",
+            ARRAY_ITERATOR_WRITABLE,
+            ARRAY_ELEMENT_DESCRIPTORS
+        ]
     );
 }
 
@@ -109,7 +133,8 @@ fn numeric_key_prototype_write_is_an_index_not_every_method() {
         (Array.prototype as any)[3] = 1;
         "#,
     );
-    assert!(s.is_empty(), "{s:?}");
+    assert_array_iteration_facts(&s, &["elements", "write"]);
+    assert_eq!(s.len(), 2, "no named method was patched: {s:?}");
 }
 
 #[test]
@@ -121,7 +146,10 @@ fn dynamic_key_prototype_write_patches_every_method() {
         "#,
     );
     assert!(s.contains(&pair("Array.prototype", ANY_MEMBER)), "{s:?}");
-    assert_eq!(patched_prototype_methods(&s), vec![ANY_MEMBER]);
+    assert_eq!(
+        patched_prototype_methods(&s),
+        vec![ANY_MEMBER, ARRAY_ITERATOR_WRITABLE]
+    );
 }
 
 #[test]
@@ -138,7 +166,12 @@ fn reads_and_ordinary_objects_are_not_patches() {
         Object.assign(globalThis, { foo: 1 });
         "#,
     );
-    assert!(s.is_empty(), "{s:?}");
+    assert_array_iteration_facts(&s, &["elements", "proto", "write"]);
+    assert_eq!(
+        s.len(),
+        3,
+        "ordinary writes add no namespace/prototype patch: {s:?}"
+    );
 }
 
 fn lower_with_patches(src: &str) -> crate::Module {
@@ -238,8 +271,8 @@ fn patched_prototype_method_call_lowers_dynamically() {
     assert!(is_dynamic_member_call(&r, "push"), "{r}");
     let g = init_of(&m, 3);
     assert!(
-        g.starts_with("MapGet"),
-        "an unpatched method keeps its intrinsic: {g}"
+        is_dynamic_member_call(&g, "get"),
+        "the reified Map prototype is read by ordinary property lookup: {g}"
     );
 }
 
@@ -270,7 +303,12 @@ fn scans_member_writes_through_a_namespace_alias() {
     );
     assert!(s.contains(&pair("Math", "min")), "{s:?}");
     assert!(s.contains(&pair("console", "info")), "{s:?}");
-    assert_eq!(s.len(), 2, "{s:?}");
+    assert_array_iteration_facts(&s, &["write"]);
+    assert_eq!(
+        s.iter().filter(|(ns, _)| ns != ARRAY_ITERATION).count(),
+        2,
+        "{s:?}"
+    );
 }
 
 /// #11772: patching `Symbol.iterator` is not patching `push`/"any member".
@@ -304,7 +342,8 @@ fn lower_with_global_reach(src: &str) -> crate::Module {
             let parsed = parse_typescript_with_cache(&src, "test.ts", &mut cache).expect("parse");
             let mut set = PatchedBuiltins::new();
             scan_module(&parsed.module, &mut set);
-            set.dynamic_code_reach.record_global("new Function(...) @ test".to_string());
+            set.dynamic_code_reach
+                .record_global("new Function(...) @ test".to_string());
             set_patched_builtins(Arc::new(set));
             let module = lower_module(&parsed.module, "test", "test.ts").expect("lower");
             clear_patched_builtins();
@@ -336,7 +375,10 @@ fn reachable_namespace_call_is_guarded() {
     let k = init_of(&m, 1);
     assert!(k.contains("NamespacePatched(\"Object\")"), "{k}");
     let t = init_of(&m, 2);
-    assert!(t.contains("NamespacePatched(\"JSON\")") && t.contains("TypeOf"), "{t}");
+    assert!(
+        t.contains("NamespacePatched(\"JSON\")") && t.contains("TypeOf"),
+        "{t}"
+    );
 }
 
 /// A definition in the arguments exists once: such a call is the one

@@ -1,15 +1,7 @@
-//! Auto-rebuild perry-runtime + perry-stdlib with the smallest matching
-//! Cargo feature set so the compiled `.o` only links the runtime APIs
-//! the user's TS code actually uses.
-//!
-//! Tier 2.1 follow-up (v0.5.341) — extracts `OptimizedLibs` + the
-//! `build_optimized_libs` driver from `compile.rs`. ~390 LOC of
-//! self-contained library-build orchestration. Both `runtime` and
-//! `stdlib` halves fall back to the prebuilt libraries gracefully on
-//! any failure (no source on disk, no cargo, build error). Cargo's
-//! incremental cache is keyed per (target dir, feature set), and we
-//! use a hash-keyed target dir so consecutive runs with the same
-//! profile are no-ops after the first build.
+//! The runtime/stdlib/wrapper archives a program links (`OptimizedLibs`) and
+//! the optional features its generated installer installs. perry links the
+//! prebuilt archives and never builds them while compiling a program; the
+//! driver (`build_optimized_libs`) only selects archives and installs.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::OsStr;
@@ -18,70 +10,40 @@ use std::path::PathBuf;
 use super::CompilationContext;
 
 mod driver;
-mod freshness;
-mod no_auto;
+mod features;
 mod paths;
-mod prebuilt_core;
+mod wrapper_libs;
 
 pub(crate) use driver::build_optimized_libs;
-pub(crate) use freshness::{
-    auto_optimized_archives_are_fresh, auto_optimized_build_stamp, auto_optimized_cache_key,
-    auto_optimized_cross_features, auto_optimized_source_fingerprint, binding_cobuilds_with_stdlib,
-    effective_size_panic_immediate_abort, gc_instruments_requested, gc_trace_requested,
-    hot_diag_requested, resolve_auto_well_known_libs, retain_workspace_declared_features,
-    size_lto_fat, size_opt_level,
+pub(crate) use features::{
+    auto_optimized_cross_features, gc_instruments_requested, gc_trace_requested,
+    hot_diag_requested, instrumented_variant_requested, variant_archive_name,
 };
-pub(crate) use no_auto::{resolve_no_auto_optimized_libs, resolve_prebuilt_ext_libs};
-pub(crate) use paths::{
-    android_global_dynamic_tls_rustflag, auto_target_dir_paths, cargo_target_dir_path,
-};
+
+pub(crate) use paths::android_global_dynamic_tls_rustflag;
 
 #[cfg(test)]
 mod tests;
 
 pub struct OptimizedLibs {
-    /// Path to the rebuilt `libperry_runtime.a` (or `perry_runtime.lib`).
-    /// `None` means "fall back to the prebuilt one in target/release/".
-    pub runtime: Option<PathBuf>,
-    /// Path to the rebuilt `libperry_stdlib.a`. `None` means "fall back
-    /// to the prebuilt full stdlib".
-    pub stdlib: Option<PathBuf>,
-    /// LLVM bitcode (`.bc`) for perry-runtime (Phase J).
-    pub runtime_bc: Option<PathBuf>,
-    /// LLVM bitcode (`.bc`) for perry-stdlib (Phase J).
-    pub stdlib_bc: Option<PathBuf>,
-    /// LLVM bitcode (`.bc`) for additional crates (UI, geisterhand).
-    pub extra_bc: Vec<PathBuf>,
-    /// Extra `.a` archives to add to the link line — one per
-    /// well-known native binding (#466 Phase 4) that the compile
-    /// pipeline routed away from the perry-stdlib copy. Whenever an
-    /// entry is added here, the corresponding perry-stdlib feature
-    /// is *also* stripped from the rebuild so the link line stays
-    /// free of duplicate `_js_*` symbols.
+    /// The prebuilt wrapper archives (#466 Phase 4), one per well-known native
+    /// binding the program's routed modules link.
     pub well_known_libs: Vec<PathBuf>,
-    /// True when the stdlib archive is the prebuilt full archive rather
-    /// than an optimized rebuild with well-known features stripped. In that
-    /// fallback shape, wrapper archives must appear before stdlib so their
-    /// duplicate Node binding symbols satisfy the object files first.
+    /// Wrapper archives go before the stdlib, so their symbols satisfy the
+    /// program's objects first (the stdlib also defines some of the Node
+    /// binding symbols a wrapper replaces).
     pub prefer_well_known_before_stdlib: bool,
     /// Which stdlib feature installs the generated
     /// `perry_stdlib_feature_installer` calls (see `stdlib_installs.rs`).
-    /// `Compiled` unless the link uses the prebuilt full-feature stdlib.
     pub stdlib_installs: crate::commands::stdlib_installs::FeatureInstalls,
     /// Which runtime feature installs the generated installer calls; the
-    /// runtime counterpart of `stdlib_installs`. `Compiled` unless the link
-    /// uses a prebuilt full-feature runtime archive.
+    /// runtime counterpart of `stdlib_installs`.
     pub runtime_installs: crate::commands::stdlib_installs::FeatureInstalls,
 }
 
 impl OptimizedLibs {
     pub(super) fn empty() -> Self {
         OptimizedLibs {
-            runtime: None,
-            stdlib: None,
-            runtime_bc: None,
-            stdlib_bc: None,
-            extra_bc: Vec::new(),
             well_known_libs: Vec::new(),
             prefer_well_known_before_stdlib: false,
             stdlib_installs: crate::commands::stdlib_installs::FeatureInstalls::Compiled,
@@ -204,7 +166,7 @@ pub(crate) fn missing_ext_archive_diagnostics(
     resolved_ext_libs: &[PathBuf],
     target: Option<&str>,
 ) -> Vec<String> {
-    let mut missing: BTreeMap<String, (&str, &str, bool)> = BTreeMap::new();
+    let mut missing: BTreeMap<String, (&str, &str)> = BTreeMap::new();
     for symbol in emitted_undefined {
         if linked_definitions.contains(symbol) {
             continue;
@@ -215,39 +177,26 @@ pub(crate) fn missing_ext_archive_diagnostics(
         let Some(binding) = super::well_known::lookup_well_known(owner) else {
             continue;
         };
-        let filename = super::well_known::ext_staticlib_filename(
+        let filename = variant_archive_name(&super::well_known::ext_staticlib_filename(
             &binding.lib,
             super::rust_target_triple(target),
-        );
+        ));
         if resolved_ext_libs
             .iter()
             .any(|path| path.file_name() == Some(OsStr::new(&filename)))
         {
             continue;
         }
-        missing.entry(filename).or_insert((
-            symbol,
-            &binding.krate,
-            binding_cobuilds_with_stdlib(owner),
-        ));
+        missing.entry(filename).or_insert((symbol, &binding.krate));
     }
     missing
         .into_iter()
-        .map(|(filename, (symbol, krate, cobuilt))| {
-            let build = if cobuilt {
-                format!(
-                    "cargo build --release -p perry -p perry-runtime-static \
-                     -p perry-stdlib-static -p {krate}"
-                )
-            } else {
-                format!("cargo build --release -p {krate}")
-            };
+        .map(|(filename, (symbol, krate))| {
             format!(
                 "`{symbol}` needs {filename}, but that archive is not linked. \
-                 From a Perry source checkout, build it with: {build}. For an \
-                 installed Perry, install the matching extension archive in \
-                 PERRY_RUNTIME_DIR or PERRY_LIB_DIR, or set PERRY_WORKSPACE_ROOT \
-                 to a matching source checkout to build it on demand."
+                 From a Perry source checkout, build it with: cargo build \
+                 --release -p {krate}. For an installed Perry, install the \
+                 matching extension archive in PERRY_RUNTIME_DIR or PERRY_LIB_DIR."
             )
         })
         .collect()

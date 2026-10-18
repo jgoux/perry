@@ -49,6 +49,7 @@ fn concat_probe_ir(property: &str) -> String {
     let module = Module {
         name: "alias_string_concat.ts".to_string(),
         imports: Vec::new(),
+        requested_modules: Vec::new(),
         exports: Vec::new(),
         classes: Vec::new(),
         interfaces: Vec::new(),
@@ -112,6 +113,7 @@ fn concat_probe_ir(property: &str) -> String {
         async_generator_funcs: std::collections::HashSet::new(),
         local_source_spans: std::collections::HashMap::new(),
         gen_param_prologue_len: HashMap::new(),
+        class_family_syntax: None,
     };
     let opts = CompileOptions {
         emit_ir_only: true,

@@ -19,9 +19,12 @@
 //! keeps its cost. No cache and no side table: the slot is the authority.
 //!
 //! **Order.** Present keys enumerate in the layout's key sequence order,
-//! holes skipped. A hole filled after birth therefore enumerates at its key
-//! position, not in fill order (a later step may append out-of-order fills
-//! to the ordered overflow; not decided here).
+//! holes skipped. A store that fills a hole is an add of the key
+//! (`layout_desc::family_store`, `layout_desc::family_create`): it fills the
+//! slot in place only when no key after it in the sequence is present, so the
+//! key position is the insertion order; any other fill (and a definition,
+//! `layout_desc::prepare_hole_define`) first gives the object its overflow,
+//! which then orders it.
 //!
 //! **Overflow.** Once an object has an ordered overflow table (§3.4), the
 //! table is the order and presence authority: `overflow::ensure` records a
@@ -202,4 +205,32 @@ unsafe fn own_key_is_hole_slow(obj: *const ObjectHeader, key: JSValue) -> bool {
     (0..view.keys.count())
         .find(|&position| view.keys.get(position).bits() == key.bits())
         .is_some_and(|position| !view.present(position))
+}
+
+/// Create the own data property whose layout slot `slot` holds the hole, the
+/// way `[[DefineOwnProperty]]` creates a new key: it enumerates LAST. When
+/// every key after it in the layout's sequence is a hole and the object has
+/// no overflow, its key position already is the end, and the value goes into
+/// the slot. Otherwise the ordered overflow becomes the order authority and
+/// the key is appended to it as a reference to the slot (§3.2 "delete, then
+/// re-add"). The caller has already settled `[[Set]]`'s semantics (no
+/// inherited setter or read-only data, the object is extensible).
+///
+/// # Safety
+/// `obj` is a live ordinary object whose layout holds `slot`, which holds the
+/// hole. Can collect when the overflow is created.
+pub(crate) unsafe fn fill_hole(obj: *mut ObjectHeader, slot: u32, value: u64) {
+    let keys = super::object_keys(obj);
+    let position = (0..keys.count()).find(|&p| keys.storage_slot(p) == slot);
+    let at_end = !super::overflow::has_overflow(obj)
+        && position.is_some_and(|position| {
+            !super::layout_desc::later_late_key_present(obj, keys.arr(), keys.count(), position)
+        });
+    match position {
+        Some(position) if !at_end => {
+            let key = keys.get(position);
+            super::overflow::store_routed(obj, key.as_string_ptr(), f64::from_bits(value));
+        }
+        _ => super::store_object_field_slot(obj, slot as usize, value),
+    }
 }

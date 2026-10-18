@@ -121,6 +121,7 @@ pub(crate) fn module_with_init(name: &str, init: Vec<Stmt>) -> Module {
     Module {
         name: name.to_string(),
         imports: Vec::new(),
+        requested_modules: Vec::new(),
         exports: Vec::new(),
         classes: Vec::new(),
         interfaces: Vec::new(),
@@ -153,6 +154,7 @@ pub(crate) fn module_with_init(name: &str, init: Vec<Stmt>) -> Module {
         async_generator_funcs: std::collections::HashSet::new(),
         local_source_spans: std::collections::HashMap::new(),
         gen_param_prologue_len: std::collections::HashMap::new(),
+        class_family_syntax: None,
     }
 }
 
@@ -288,11 +290,14 @@ fn a_non_allocating_element_list_pays_for_no_temp_root() {
     under_both_lowerings(|lowering| {
         let ir = main_ir_for(
             "array_literal_no_gc.ts",
-            vec![Stmt::Expr(Expr::Array(vec![
-                Expr::String("a".to_string()),
-                Expr::String("b".to_string()),
-                Expr::Number(1.0),
-            ]))],
+            vec![Stmt::Expr(Expr::Array(
+                vec![
+                    Expr::String("a".to_string()),
+                    Expr::String("b".to_string()),
+                    Expr::Number(1.0),
+                ],
+                None,
+            ))],
         );
         assert_no_temp_rooting(&ir, lowering);
     });
@@ -312,7 +317,10 @@ fn an_array_literal_roots_elements_before_an_allocating_element() {
             "array_literal_gc.ts",
             // Element 0 is itself a heap value (a literal would be skipped: it
             // loads from a module global that is already a registered GC root).
-            vec![Stmt::Expr(Expr::Array(vec![allocating(), allocating()]))],
+            vec![Stmt::Expr(Expr::Array(
+                vec![allocating(), allocating()],
+                None,
+            ))],
         );
         assert!(
             !crate::testing::temp_slots::temp_root_slots(&ir).is_empty(),

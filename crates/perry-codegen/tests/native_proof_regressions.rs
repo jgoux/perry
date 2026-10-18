@@ -120,6 +120,7 @@ fn module_with_classes_and_params(
     body: Vec<Stmt>,
 ) -> Module {
     Module {
+        requested_modules: Vec::new(),
         name: name.to_string(),
         imports: Vec::new(),
         exports: Vec::new(),
@@ -169,6 +170,8 @@ fn module_with_classes_and_params(
         async_generator_funcs: std::collections::HashSet::new(),
         local_source_spans: std::collections::HashMap::new(),
         gen_param_prologue_len: std::collections::HashMap::new(),
+        class_family_syntax: None,
+        requested_modules: Vec::new(),
     }
 }
 
@@ -626,7 +629,7 @@ fn number_array_let(id: u32, name: &str, values: Vec<i64>) -> Stmt {
         name: name.to_string(),
         ty: Type::Array(Box::new(Type::Number)),
         mutable: true,
-        init: Some(Expr::Array(values.into_iter().map(int).collect())),
+        init: Some(Expr::Array(values.into_iter().map(int).collect(), None)),
     }
 }
 
@@ -636,7 +639,7 @@ fn int32_array_let(id: u32, name: &str, values: Vec<i64>) -> Stmt {
         name: name.to_string(),
         ty: Type::Array(Box::new(Type::Int32)),
         mutable: true,
-        init: Some(Expr::Array(values.into_iter().map(int).collect())),
+        init: Some(Expr::Array(values.into_iter().map(int).collect(), None)),
     }
 }
 
@@ -646,7 +649,7 @@ fn u32_array_let(id: u32, name: &str, values: Vec<i64>) -> Stmt {
         name: name.to_string(),
         ty: Type::Array(Box::new(Type::Named("PerryU32".to_string()))),
         mutable: true,
-        init: Some(Expr::Array(values.into_iter().map(int).collect())),
+        init: Some(Expr::Array(values.into_iter().map(int).collect(), None)),
     }
 }
 
@@ -908,14 +911,14 @@ fn array_isarray_reassigned_local_uses_runtime_predicate() {
             mutable: true,
             init: Some(int(0)),
         },
-        Stmt::Expr(Expr::LocalSet(1, Box::new(Expr::Array(vec![int(1)])))),
+        Stmt::Expr(Expr::LocalSet(1, Box::new(Expr::Array(vec![int(1)], None)))),
         Stmt::Expr(Expr::ArrayIsArray(Box::new(local(1)))),
         Stmt::Let {
             id: 2,
             name: "array_to_number".to_string(),
             ty: Type::Any,
             mutable: true,
-            init: Some(Expr::Array(vec![int(1)])),
+            init: Some(Expr::Array(vec![int(1)], None)),
         },
         Stmt::Expr(Expr::LocalSet(2, Box::new(int(0)))),
         Stmt::Expr(Expr::ArrayIsArray(Box::new(local(2)))),
@@ -924,7 +927,7 @@ fn array_isarray_reassigned_local_uses_runtime_predicate() {
             name: "unchanged_array".to_string(),
             ty: Type::Any,
             mutable: false,
-            init: Some(Expr::Array(vec![int(1)])),
+            init: Some(Expr::Array(vec![int(1)], None)),
         },
         Stmt::Expr(Expr::ArrayIsArray(Box::new(local(3)))),
         Stmt::Return(Some(int(0))),
@@ -7625,7 +7628,7 @@ fn boxed_local_capture_module(name: &str) -> Module {
                 name: "cell".to_string(),
                 ty: Type::Any,
                 mutable: true,
-                init: Some(Expr::Array(Vec::new())),
+                init: Some(Expr::Array(Vec::new(), None)),
             },
             Stmt::Let {
                 id: 11,
@@ -7637,7 +7640,7 @@ fn boxed_local_capture_module(name: &str) -> Module {
                     params: Vec::new(),
                     return_type: Type::Any,
                     body: vec![
-                        Stmt::Expr(Expr::LocalSet(10, Box::new(Expr::Array(Vec::new())))),
+                        Stmt::Expr(Expr::LocalSet(10, Box::new(Expr::Array(Vec::new(), None)))),
                         Stmt::Return(Some(local(10))),
                     ],
                     captures: vec![10],
@@ -7746,7 +7749,7 @@ fn abrupt_captured_local_assignment_does_not_emit_orphan_write_barrier() {
     let replacement = abrupt_operand();
     let mut module = boxed_local_storage_module(
         "abrupt_captured_local_set_barrier.ts",
-        Expr::Array(Vec::new()),
+        Expr::Array(Vec::new(), None),
         replacement,
     );
     module.classes = abrupt_derived_classes();
@@ -7868,7 +7871,7 @@ fn abrupt_constructor_argument_stops_anonymous_object_construction() {
         Type::Any,
         vec![Stmt::Return(Some(Expr::New {
             class_name: "__AnonShape_abrupt_constructor_arg".to_string(),
-            args: vec![abrupt_operand(), Expr::Array(Vec::new())],
+            args: vec![abrupt_operand(), Expr::Array(Vec::new(), None)],
             type_args: Vec::new(),
             byte_offset: 0,
             cap_args_appended: 0,
@@ -8770,6 +8773,7 @@ fn typed_f64_clone_test_module(use_any_param: bool) -> Module {
         Type::Number
     };
     Module {
+        requested_modules: Vec::new(),
         name: "typed_f64_function_abi.ts".to_string(),
         imports: Vec::new(),
         exports: Vec::new(),
@@ -8862,6 +8866,8 @@ fn typed_f64_clone_test_module(use_any_param: bool) -> Module {
         async_generator_funcs: std::collections::HashSet::new(),
         local_source_spans: std::collections::HashMap::new(),
         gen_param_prologue_len: std::collections::HashMap::new(),
+        class_family_syntax: None,
+        requested_modules: Vec::new(),
     }
 }
 
@@ -8952,6 +8958,7 @@ fn typed_i1_clone_test_module() -> Module {
 
 fn typed_i1_clone_test_module_named(name: &str) -> Module {
     Module {
+        requested_modules: Vec::new(),
         name: name.to_string(),
         imports: Vec::new(),
         exports: Vec::new(),
@@ -9040,6 +9047,8 @@ fn typed_i1_clone_test_module_named(name: &str) -> Module {
         async_generator_funcs: std::collections::HashSet::new(),
         local_source_spans: std::collections::HashMap::new(),
         gen_param_prologue_len: std::collections::HashMap::new(),
+        class_family_syntax: None,
+        requested_modules: Vec::new(),
     }
 }
 
@@ -9055,6 +9064,7 @@ fn typed_i1_rejected_signature_module(case: &str) -> Module {
 
 fn typed_string_clone_test_module(case: &str) -> Module {
     let mut module = Module {
+        requested_modules: Vec::new(),
         name: "typed_string_function_abi.ts".to_string(),
         imports: Vec::new(),
         exports: Vec::new(),
@@ -9136,6 +9146,8 @@ fn typed_string_clone_test_module(case: &str) -> Module {
         async_generator_funcs: std::collections::HashSet::new(),
         local_source_spans: std::collections::HashMap::new(),
         gen_param_prologue_len: std::collections::HashMap::new(),
+        class_family_syntax: None,
+        requested_modules: Vec::new(),
     };
     match case {
         "positive" => {}
@@ -9165,6 +9177,7 @@ fn typed_i1_mixed_callsite_module() -> Module {
 
 fn typed_i1_numeric_predicate_module() -> Module {
     Module {
+        requested_modules: Vec::new(),
         name: "typed_i1_numeric_predicate.ts".to_string(),
         imports: Vec::new(),
         exports: Vec::new(),
@@ -9254,11 +9267,14 @@ fn typed_i1_numeric_predicate_module() -> Module {
         async_generator_funcs: std::collections::HashSet::new(),
         local_source_spans: std::collections::HashMap::new(),
         gen_param_prologue_len: std::collections::HashMap::new(),
+        class_family_syntax: None,
+        requested_modules: Vec::new(),
     }
 }
 
 fn typed_i1_i32_predicate_module() -> Module {
     Module {
+        requested_modules: Vec::new(),
         name: "typed_i1_i32_predicate.ts".to_string(),
         imports: Vec::new(),
         exports: Vec::new(),
@@ -9335,6 +9351,8 @@ fn typed_i1_i32_predicate_module() -> Module {
         async_generator_funcs: std::collections::HashSet::new(),
         local_source_spans: std::collections::HashMap::new(),
         gen_param_prologue_len: std::collections::HashMap::new(),
+        class_family_syntax: None,
+        requested_modules: Vec::new(),
     }
 }
 
@@ -9393,6 +9411,7 @@ fn typed_i32_return_module(case: &str) -> Module {
     };
 
     Module {
+        requested_modules: Vec::new(),
         name: format!("typed_i32_return_{case}.ts"),
         imports: Vec::new(),
         exports: Vec::new(),
@@ -9465,6 +9484,8 @@ fn typed_i32_return_module(case: &str) -> Module {
         async_generator_funcs: std::collections::HashSet::new(),
         local_source_spans: std::collections::HashMap::new(),
         gen_param_prologue_len: std::collections::HashMap::new(),
+        class_family_syntax: None,
+        requested_modules: Vec::new(),
     }
 }
 
@@ -15551,7 +15572,7 @@ fn put_value_set_index_keeps_the_numeric_array_fast_path() {
             name: "arr".to_string(),
             ty: Type::Array(Box::new(Type::Number)),
             mutable: false,
-            init: Some(Expr::Array(vec![])),
+            init: Some(Expr::Array(vec![], None)),
         },
         // The array escapes into a call — this is what `const arr = build()`
         // lowers to (the callee fills the array through a return slot). It is
@@ -15982,7 +16003,7 @@ fn nested_same_shape_object_writes_version_one_through_four_fields() {
                 name: "objects".to_string(),
                 ty: Type::Array(Box::new(Type::Any)),
                 mutable: false,
-                init: Some(Expr::Array(vec![])),
+                init: Some(Expr::Array(vec![], None)),
             },
             Stmt::For {
                 init: Some(Box::new(Stmt::Let {
@@ -16267,7 +16288,7 @@ fn element_to_element_numeric_store_takes_the_inline_guard_tier() {
             name: "arr".to_string(),
             ty: Type::Array(Box::new(Type::Number)),
             mutable: false,
-            init: Some(Expr::Array(vec![int(1), int(2), int(3)])),
+            init: Some(Expr::Array(vec![int(1), int(2), int(3)], None)),
         },
         array_set(arr, int(0), index_get(arr, int(2))),
     ];

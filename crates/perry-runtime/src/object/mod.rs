@@ -66,8 +66,7 @@ pub use alloc::{
 #[cfg(feature = "regex-engine")]
 pub(crate) use alloc_basic::object_alloc_plain_born;
 pub(crate) use alloc_basic::{
-    object_alloc_born, object_alloc_branded, object_alloc_filled_birth, object_alloc_plain,
-    object_alloc_unpublished,
+    object_alloc_born, object_alloc_branded, object_alloc_plain, object_alloc_unpublished,
 };
 pub(crate) use alloc_basic::{object_alloc_prototype_old, object_alloc_prototype_old_null_proto};
 #[allow(unused_imports)]
@@ -147,9 +146,7 @@ pub(crate) use gc_slots::{
 };
 pub(crate) mod global_fetch;
 pub(crate) use global_fetch::scan_pending_fetch_signal_root_mut;
-mod global_this;
-pub(crate) use global_this::proto_room::BUILTIN_PROTOTYPE_ROOM;
-pub(crate) mod shape_chain;
+pub(crate) mod global_this;
 /// Lane 3: the (receiver shape, key) -> (holder, slot) cache that gives an
 /// INHERITED read an inline-cache hit. See the module docs for the guard and
 /// the GC contract.
@@ -163,8 +160,9 @@ pub(crate) use global_this::{
     temporal_kind_prototype as global_this_temporal_kind_prototype,
     temporal_subclass_super as global_this_temporal_subclass_super,
 };
-pub mod builtin_proto;
+mod builtin_method;
 pub(crate) mod builtin_namespace;
+pub mod builtin_proto;
 mod builtin_proto_entries;
 pub mod handle_expando;
 pub(crate) mod owned_state_bag;
@@ -210,6 +208,7 @@ mod class_birth_rep_tests;
 mod field_rep_store_tests;
 pub(crate) mod iterator_prototypes;
 pub(crate) mod map_set_subclass;
+pub mod method_call;
 pub mod method_site;
 mod slot_store;
 pub(crate) use slot_store::{store_object_field_slot, store_object_field_slot_layout_deferred};
@@ -242,6 +241,7 @@ pub(crate) use native_module_registry::{
 mod literal_constructor;
 mod native_module_stream;
 pub(crate) mod native_this_alias;
+pub(crate) mod node_http_prototypes;
 mod object_literal_ops;
 pub(crate) mod object_ops;
 pub(crate) mod own_override;
@@ -267,6 +267,7 @@ pub(crate) mod shape_carriers;
 // `#[cfg(any(test, feature = "shape-mint-diag"))]` at the mint funnel (the
 // other hooks are feature-only), so a stock non-test build never
 // reaches it and the linker drops it: the shipped runtime pays nothing.
+mod class_family_birth;
 pub mod layout_desc;
 pub(crate) use shapes::layout_probe;
 #[cfg(test)]
@@ -284,8 +285,6 @@ mod reserved_floor;
 pub(crate) use reserved_floor::{
     ensure_reserved_floor_keys, reserved_slot_floor_for_class_id, reserved_slot_floor_for_object,
 };
-#[cfg(all(test, feature = "regex-engine"))]
-mod regex_direct_test_tests;
 pub(crate) mod regex_proto_thunks;
 #[cfg(feature = "regex-engine")]
 pub(crate) mod regex_read_sites;
@@ -962,13 +961,6 @@ unsafe impl crate::zeroed_cache::ZeroEmpty for TransitionEntry {}
 pub const TRANSITION_HASH_MUL_SHAPE: u64 = 0x9E3779B97F4A7C15;
 pub const TRANSITION_HASH_MUL_KEY: u64 = 0xC6BC279692B5C323;
 pub const TRANSITION_ENTRY_SIZE: usize = 32;
-
-/// Base pointer of the CURRENT thread's transition cache, for the emitted
-/// probe. Cheap (one TLS access); the emitted code hoists it to a preheader.
-#[no_mangle]
-pub extern "C" fn perry_transition_cache_base() -> *mut u8 {
-    with_transition_cache(|t| t as *mut u8)
-}
 
 /// #9287 probe plumbing: the emitted hit path bumps this when compiled with
 /// `PERRY_TRANSITION_IC_PROBE=1`. A broken inline hit falls through to the
@@ -1752,6 +1744,12 @@ unsafe fn set_object_keys_with_live_rep(
     // `is_shape_id` says so, for class instances too, so an instance still
     // carrying its allocation-time `parent_class_id` (never in the ShapeId
     // range) is left alone.
+    // Case 2c: a static family object keeps its layout word for life; the
+    // first key its layout does not hold goes to its overflow
+    // (`layout_desc::route_family_add`).
+    if layout_desc::route_family_add(obj, keys, live_inline_slot_count) {
+        return;
+    }
     let predecessor = shapes::object_shape_descriptor(obj);
     // #8067/#8113: every visible ShapeId resolves to the exact rooted
     // ordered-keys/live-slot descriptor. Same-pointer appends are versioned
@@ -1771,6 +1769,7 @@ unsafe fn set_object_keys_with_live_rep(
         && object_is_regular(obj)
         && shapes::object_shape_descriptor(obj).is_some_and(|d| d.hole_count == 0)
     {
+        layout_desc::note_install_cause(layout_desc::install_cause::UNIQUE_RUN);
         overflow::ensure(obj);
         canonical_keys::note_latched_away(keys);
     }

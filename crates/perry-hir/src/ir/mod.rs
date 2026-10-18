@@ -13,6 +13,7 @@ mod constants;
 mod decl;
 mod expr;
 mod module;
+mod object_literal;
 mod ops;
 mod stmt;
 mod widget;
@@ -41,7 +42,7 @@ pub use constants::{is_bare_prefix_only_builtin, is_native_module_specifier};
 pub use constants::is_buffer_backed_builtin_name;
 
 // ---- module.rs ----
-pub use module::{FunctionSourceMetadata, LocalSourceSpan, Module};
+pub use module::{ClassFamilySyntax, FunctionSourceMetadata, LocalSourceSpan, Module};
 
 // ---- widget.rs ----
 pub use widget::{
@@ -63,8 +64,8 @@ pub use stmt::{CatchClause, Stmt, SwitchCase};
 
 // ---- expr.rs ----
 pub use expr::{
-    ArrayLikeSource, BoxedPrimitiveKind, ClassFreshStaticInit, Expr, PathWin32Method,
-    ProcessStdinLifecycleMethod, WithSetFallback,
+    ArrayBirthLayout, ArrayLikeSource, BirthLayout, BoxedPrimitiveKind, ClassFreshStaticInit, Expr,
+    PathWin32Method, ProcessStdinLifecycleMethod, WithSetFallback,
 };
 
 // ---- ops.rs ----

@@ -11,8 +11,8 @@
 
 use std::collections::BTreeSet;
 
-/// Dynamic stream dispatch must use the same provider as the routed wrapper.
-/// Shared by automatic specialization and the coherent no-auto build.
+/// Dynamic stream dispatch must use the same provider as the routed wrapper:
+/// the stdlib adapter installs for a routed `http` / `https`.
 pub fn routed_stream_dispatch_features(module: &str) -> &'static [&'static str] {
     match module.strip_prefix("node:").unwrap_or(module) {
         "http" | "https" => &["external-http-client-pump"],
@@ -220,12 +220,6 @@ pub fn compute_required_features(
         features.insert("crypto");
     }
     features
-}
-
-/// Render a feature set as the comma-separated string Cargo expects on
-/// `--features`.
-pub fn features_to_cargo_arg(features: &BTreeSet<&'static str>) -> String {
-    features.iter().copied().collect::<Vec<_>>().join(",")
 }
 
 #[cfg(test)]

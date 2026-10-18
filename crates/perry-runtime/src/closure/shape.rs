@@ -38,6 +38,48 @@ pub(crate) const INTRINSIC_SERIAL_ASYNC_GENERATOR_FUNCTION: u64 = 4;
 /// object is ever assigned this serial; a class constructor's real
 /// [[Prototype]] lives on the object (dictionary kind: "ask the object").
 pub(crate) const INTRINSIC_SERIAL_CLASS_CONSTRUCTOR_MARKER: u64 = 5;
+/// Runtime prototypes that runtime layout descriptors name
+/// (`runtime_layouts::*_PROTO_FAMILY`).
+pub(crate) const INTRINSIC_SERIAL_URL: u64 = 6;
+pub(crate) const INTRINSIC_SERIAL_READABLE_STATE: u64 = 7;
+pub(crate) const INTRINSIC_SERIAL_WRITABLE_STATE: u64 = 8;
+pub(crate) const INTRINSIC_SERIAL_TIMEOUT: u64 = 9;
+pub(crate) const INTRINSIC_SERIAL_IMMEDIATE: u64 = 10;
+/// `%Array.prototype%`'s named-property holder (`ArrayHeader.named`, born on
+/// `runtime_layouts::ARRAY_PROTOTYPE_NAMED`): its identity word is how an
+/// array read reaches it.
+pub(crate) const INTRINSIC_SERIAL_ARRAY_PROTOTYPE: u64 = 11;
+/// `%URLSearchParams.prototype%`, which `runtime_layouts::URL_SEARCH_PARAMS`
+/// names through its prototype family.
+pub(crate) const INTRINSIC_SERIAL_URL_SEARCH_PARAMS: u64 = 12;
+/// The prototypes of node:events, node:stream and node:http, born on their
+/// static layouts (`runtime_layouts::node_prototypes`): each layout names its
+/// [[Prototype]] through the parent's identity word.
+pub(crate) const INTRINSIC_SERIAL_EVENT_EMITTER_PROTOTYPE: u64 = 13;
+pub(crate) const INTRINSIC_SERIAL_STREAM_PROTOTYPE: u64 = 14;
+pub(crate) const INTRINSIC_SERIAL_READABLE_PROTOTYPE: u64 = 15;
+pub(crate) const INTRINSIC_SERIAL_WRITABLE_PROTOTYPE: u64 = 16;
+pub(crate) const INTRINSIC_SERIAL_DUPLEX_PROTOTYPE: u64 = 17;
+pub(crate) const INTRINSIC_SERIAL_TRANSFORM_PROTOTYPE: u64 = 18;
+pub(crate) const INTRINSIC_SERIAL_OUTGOING_MESSAGE_PROTOTYPE: u64 = 19;
+pub(crate) const INTRINSIC_SERIAL_SERVER_RESPONSE_PROTOTYPE: u64 = 20;
+pub(crate) const INTRINSIC_SERIAL_INCOMING_MESSAGE_PROTOTYPE: u64 = 21;
+pub(crate) const INTRINSIC_SERIAL_PASSTHROUGH_PROTOTYPE: u64 = 22;
+/// The sealed own-property bags of native constructors (not the closures).
+pub(crate) const INTRINSIC_SERIAL_NATIVE_CTOR_EVENT_EMITTER: u64 = 23;
+pub(crate) const INTRINSIC_SERIAL_NATIVE_CTOR_STREAM: u64 = 24;
+pub(crate) const INTRINSIC_SERIAL_NATIVE_CTOR_READABLE: u64 = 25;
+pub(crate) const INTRINSIC_SERIAL_NATIVE_CTOR_WRITABLE: u64 = 26;
+pub(crate) const INTRINSIC_SERIAL_NATIVE_CTOR_DUPLEX: u64 = 27;
+pub(crate) const INTRINSIC_SERIAL_NATIVE_CTOR_TRANSFORM: u64 = 28;
+pub(crate) const INTRINSIC_SERIAL_NATIVE_CTOR_PASSTHROUGH: u64 = 29;
+pub(crate) const INTRINSIC_SERIAL_NATIVE_CTOR_OUTGOING_MESSAGE: u64 = 30;
+pub(crate) const INTRINSIC_SERIAL_NATIVE_CTOR_SERVER_RESPONSE: u64 = 31;
+pub(crate) const INTRINSIC_SERIAL_NATIVE_CTOR_INCOMING_MESSAGE: u64 = 32;
+const _: () = assert!(
+    INTRINSIC_SERIAL_NATIVE_CTOR_INCOMING_MESSAGE
+        < crate::object::proto_validity::FIRST_DYNAMIC_PROTOTYPE_SERIAL
+);
 
 /// Which intrinsic prototype a function BODY's closures inherit from.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -239,6 +281,26 @@ pub(crate) unsafe fn closure_on_base_shape(closure: *const ClosureHeader) -> boo
     id != function_dictionary_shape() && !is_class_info((*closure).info)
 }
 
+/// Is `closure` on a described Function shape of a plain function body: its
+/// own properties are its bag plus the synthesized intrinsic ones, and its
+/// [[Prototype]] is `%Function.prototype%`? Not FunctionDictionary, a class
+/// constructor, a bound function or method (whose reads have their own
+/// dispatch), or an async or generator body (another intrinsic prototype).
+///
+/// # Safety
+/// `closure` is a proven, live closure cell.
+#[inline(always)]
+pub(crate) unsafe fn closure_on_plain_function_shape(closure: *const ClosureHeader) -> bool {
+    let info = (*closure).info;
+    if info.is_null() || (*closure).shape_id == function_dictionary_shape() || is_class_info(info) {
+        return false;
+    }
+    let code = (*info).code;
+    code != super::BOUND_FUNCTION_FUNC_PTR
+        && code != super::BOUND_METHOD_FUNC_PTR
+        && (*info).flags & (super::FN_ASYNC | super::FN_GENERATOR | super::FN_ASYNC_GENERATOR) == 0
+}
+
 /// Record that `closure` now answers something its base shape does not:
 /// a non-intrinsic own property, a delete, a descriptor, or a recorded
 /// [[Prototype]]. Idempotent; the ShapeId word is not a pointer, so the
@@ -248,6 +310,10 @@ pub(crate) unsafe fn closure_on_base_shape(closure: *const ClosureHeader) -> boo
 /// `closure` is a live `GC_TYPE_CLOSURE` cell (forwarding already resolved).
 #[inline]
 pub(crate) unsafe fn closure_become_dictionary(closure: *mut ClosureHeader) {
+    // A sealed native constructor's own bag also describes its parent
+    // link. Accessors, symbols, deletes and relinks all reach this funnel,
+    // including constructors already on FunctionDictionary.
+    crate::object::builtin_proto::note_write((*closure).props, "function own state");
     let dict = function_dictionary_shape();
     let id = (*closure).shape_id;
     // A class function object keeps its (sticky, dictionary-kind) class shape.
@@ -362,18 +428,43 @@ pub(crate) fn function_shape_inherits_from_function_prototype(id: u32, key: &[u8
         b"apply" => VERDICT_APPLY,
         _ => return keyed_shape_lacks_key(id, key),
     };
-    keyed_shape_verdict(id) & bit != 0
+    let want = bit | VERDICT_FUNCTION_PROTOTYPE;
+    keyed_shape_verdict(id) & want == want
 }
 
-/// The intrinsic Function and dictionary ids: facts of their fixed layouts.
-#[inline(always)]
-pub(crate) fn function_base_and_dictionary_shapes() -> (u32, u32) {
-    (base_slot(0), base_slot(4))
+/// The body kind whose intrinsic prototype the base or keyed (never
+/// dictionary) Function ShapeId `id` names, when its own keys lack `key`, one
+/// of `Function.prototype`'s `bind`, `call` and `apply`. An async, generator
+/// or async-generator function inherits those through its kind's intrinsic
+/// prototype, which defines none of them itself.
+pub(crate) fn function_shape_kind_lacking(id: u32, key: &[u8]) -> Option<FunctionProtoKind> {
+    let kinds = [
+        FunctionProtoKind::Function,
+        FunctionProtoKind::AsyncFunction,
+        FunctionProtoKind::Generator,
+        FunctionProtoKind::AsyncGenerator,
+    ];
+    if let Some(kind) = kinds.into_iter().find(|k| function_base_shape(*k) == id) {
+        return Some(kind);
+    }
+    if id == function_dictionary_shape() {
+        return None;
+    }
+    let bit = match key {
+        b"bind" => VERDICT_BIND,
+        b"call" => VERDICT_CALL,
+        b"apply" => VERDICT_APPLY,
+        _ => return None,
+    };
+    let verdict = keyed_shape_verdict(id);
+    (verdict & VERDICT_FUNCTION_KIND != 0 && verdict & bit != 0)
+        .then(|| kinds[usize::from(verdict >> VERDICT_KIND_SHIFT)])
 }
 
 /// The verdict mask of a keyed ShapeId: whether it is a Function shape over
-/// `Function.prototype`, and which of the three intrinsics it lacks as own
-/// keys. A fact of the (immutable) ShapeId, cached per agent.
+/// one of the four function kinds' intrinsic prototypes (and which, and
+/// whether that is `Function.prototype`), and which of the three intrinsics
+/// it lacks as own keys. A fact of the (immutable) ShapeId, cached per agent.
 fn keyed_shape_verdict(id: u32) -> u8 {
     let slot = (id as usize).wrapping_mul(0x9E37_79B9) >> 26 & (VERDICT_CACHE_LEN - 1);
     // Index in place: `Cell::get` would copy the whole 64-entry array.
@@ -382,29 +473,40 @@ fn keyed_shape_verdict(id: u32) -> u8 {
     if cached.0 == id {
         return cached.1;
     }
-    let over_function_prototype = shapes::shape_descriptor_by_id(id).is_some_and(|d| {
-        d.object_kind.is_function_layout() && d.proto_id == INTRINSIC_SERIAL_FUNCTION
+    // The four kinds' serials are 1..=4, in `FunctionProtoKind` order.
+    let kind = shapes::shape_descriptor_by_id(id).and_then(|d| {
+        (d.object_kind.is_function_layout()
+            && (INTRINSIC_SERIAL_FUNCTION..=INTRINSIC_SERIAL_ASYNC_GENERATOR_FUNCTION)
+                .contains(&d.proto_id))
+        .then(|| (d.proto_id - INTRINSIC_SERIAL_FUNCTION) as u8)
     });
-    let mask = if over_function_prototype {
-        VERDICT_KNOWN
-            | VERDICT_FUNCTION_PROTOTYPE
-            | if keyed_shape_lacks_key(id, b"bind") {
-                VERDICT_BIND
-            } else {
-                0
-            }
-            | if keyed_shape_lacks_key(id, b"call") {
-                VERDICT_CALL
-            } else {
-                0
-            }
-            | if keyed_shape_lacks_key(id, b"apply") {
-                VERDICT_APPLY
-            } else {
-                0
-            }
-    } else {
-        VERDICT_KNOWN
+    let mask = match kind {
+        Some(kind) => {
+            VERDICT_KNOWN
+                | VERDICT_FUNCTION_KIND
+                | (kind << VERDICT_KIND_SHIFT)
+                | if kind == 0 {
+                    VERDICT_FUNCTION_PROTOTYPE
+                } else {
+                    0
+                }
+                | if keyed_shape_key_list_lacks(id, b"bind") {
+                    VERDICT_BIND
+                } else {
+                    0
+                }
+                | if keyed_shape_key_list_lacks(id, b"call") {
+                    VERDICT_CALL
+                } else {
+                    0
+                }
+                | if keyed_shape_key_list_lacks(id, b"apply") {
+                    VERDICT_APPLY
+                } else {
+                    0
+                }
+        }
+        None => VERDICT_KNOWN,
     };
     // SAFETY: as above; a single-entry store in place.
     VERDICT_CACHE.with(|c| unsafe { (*c.as_ptr())[slot] = (id, mask) });
@@ -416,6 +518,9 @@ const VERDICT_BIND: u8 = 2;
 const VERDICT_CALL: u8 = 4;
 const VERDICT_APPLY: u8 = 8;
 const VERDICT_FUNCTION_PROTOTYPE: u8 = 16;
+/// Over one of the four kinds' prototypes; the kind is bits 6..8.
+const VERDICT_FUNCTION_KIND: u8 = 32;
+const VERDICT_KIND_SHIFT: u8 = 6;
 const VERDICT_CACHE_LEN: usize = 64;
 
 crate::perry_thread_local! {
@@ -428,14 +533,16 @@ crate::perry_thread_local! {
 
 /// A keyed Function shape naming Function.prototype whose key list lacks `key`.
 fn keyed_shape_lacks_key(id: u32, key: &[u8]) -> bool {
+    shapes::shape_descriptor_by_id(id).is_some_and(|d| {
+        d.object_kind.is_function_layout() && d.proto_id == INTRINSIC_SERIAL_FUNCTION
+    }) && keyed_shape_key_list_lacks(id, key)
+}
+
+/// A shape whose key list lacks `key`.
+fn keyed_shape_key_list_lacks(id: u32, key: &[u8]) -> bool {
     let Some(descriptor) = shapes::shape_descriptor_by_id(id) else {
         return false;
     };
-    if !descriptor.object_kind.is_function_layout()
-        || descriptor.proto_id != INTRINSIC_SERIAL_FUNCTION
-    {
-        return false;
-    }
     if descriptor.keys == 0 || descriptor.logical_key_count == 0 {
         return true;
     }
@@ -666,6 +773,55 @@ mod tests {
             Some(INTRINSIC_SERIAL_ASYNC_FUNCTION)
         );
         assert_ne!(id, unsafe { (*fresh(&PLAIN_BODY)).shape_id });
+    }
+
+    /// An async function (base or keyed) inherits `Function.prototype`'s
+    /// methods through `%AsyncFunction.prototype%`: its ShapeId names that
+    /// kind while its own keys lack the method, and never answers the
+    /// Function.prototype-only predicate.
+    #[test]
+    fn an_async_shape_names_its_kind_for_the_function_prototype_methods() {
+        let _lock = crate::gc::global_side_table_test_lock();
+        let _t = crate::gc::GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+        let a = fresh(&ASYNC_BODY);
+        let base = unsafe { (*a).shape_id };
+        assert_eq!(
+            function_shape_kind_lacking(base, b"apply"),
+            Some(FunctionProtoKind::AsyncFunction)
+        );
+        closure_set_dynamic_prop(a as usize, "tag", 7.0);
+        let keyed = unsafe { (*a).shape_id };
+        assert_ne!(keyed, base);
+        for key in [&b"apply"[..], b"call", b"bind"] {
+            assert_eq!(
+                function_shape_kind_lacking(keyed, key),
+                Some(FunctionProtoKind::AsyncFunction)
+            );
+            assert!(!function_shape_inherits_from_function_prototype(keyed, key));
+        }
+        assert_eq!(function_shape_kind_lacking(keyed, b"tag"), None);
+        closure_set_dynamic_prop(a as usize, "call", 1.0);
+        let own_call = unsafe { (*a).shape_id };
+        assert_eq!(function_shape_kind_lacking(own_call, b"call"), None);
+        assert_eq!(
+            function_shape_kind_lacking(own_call, b"apply"),
+            Some(FunctionProtoKind::AsyncFunction)
+        );
+        let plain = fresh(&PLAIN_BODY);
+        closure_set_dynamic_prop(plain as usize, "tag", 7.0);
+        let plain_keyed = unsafe { (*plain).shape_id };
+        assert_eq!(
+            function_shape_kind_lacking(plain_keyed, b"apply"),
+            Some(FunctionProtoKind::Function)
+        );
+        assert!(function_shape_inherits_from_function_prototype(
+            plain_keyed,
+            b"apply"
+        ));
+        assert_eq!(
+            function_shape_kind_lacking(function_dictionary_shape(), b"apply"),
+            None
+        );
     }
 
     /// An own string key moves a function to a KEYED Function shape: the

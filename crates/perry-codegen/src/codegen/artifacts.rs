@@ -103,6 +103,13 @@ pub(super) fn emit_module_artifacts(
         }
     }
     for (fid, expr) in closures {
+        // Await lowering rewrites the body and clears Expr::Closure.is_async;
+        // its retained source-kind set still describes the function object.
+        if hir.async_step_closures.contains(fid) {
+            llmod.note_fn_info(&format!("perry_closure_{module_prefix}__{fid}"), |info| {
+                info.set_async();
+            });
+        }
         if let perry_hir::Expr::Closure { params, body, .. } = expr {
             let flags = super::arguments::arguments_object_flags(params, body);
             if flags != 0 {
@@ -1129,6 +1136,7 @@ pub(super) fn emit_module_artifacts(
         class_ids,
         class_table,
         &hir.classes,
+        &cross_module.program_layouts,
         &hir.class_display_names,
         &class_source_text,
         &ctor_arity_overrides,

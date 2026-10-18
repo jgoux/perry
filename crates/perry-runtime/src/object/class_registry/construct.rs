@@ -44,6 +44,9 @@ pub(crate) use compiled_function::{
     forget_birth_record_of_class, ordinary_compiled_function_has_instance, OrdinaryInstanceof,
 };
 mod builtin;
+pub(in crate::object) use builtin::{
+    web_text_construct, web_url_construct, web_webcrypto_construct, web_webfetch_construct,
+};
 mod collections;
 mod native_receiver;
 mod rooted_arguments;
@@ -694,7 +697,12 @@ unsafe fn construct_registered_class_ref_entry(
     args_len: usize,
     entry: Option<(usize, u32, u32)>,
 ) -> f64 {
-    let inst = allocate_class_instance(instance_cid).0;
+    let birth_args = if args_ptr.is_null() {
+        &[][..]
+    } else {
+        std::slice::from_raw_parts(args_ptr, args_len)
+    };
+    let inst = allocate_class_instance(instance_cid, birth_args).0;
     // #2768: a registered-class constructor reached through this path — static
     // `new ClassName()`, a first-class ClassRef `new`, or `Reflect.construct`
     // with a distinct newTarget — must observe `new.target` inside its body.

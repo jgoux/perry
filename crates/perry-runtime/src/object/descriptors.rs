@@ -1443,17 +1443,23 @@ fn js_object_get_own_property_names_shape(obj_value: f64) -> f64 {
                         names.push(intrinsic.to_string());
                     }
                 }
-                if !in_bag("prototype")
-                    && crate::closure::closure_has_own_dynamic_prop(ptr, "prototype")
-                    && !crate::closure::closure_is_key_deleted(ptr, "prototype")
-                {
-                    names.push("prototype".to_string());
-                }
                 for name in bag_keys.iter() {
                     if crate::closure::closure_is_key_deleted(ptr, name) {
                         continue;
                     }
                     push_unique_name(&mut names, name.clone());
+                }
+                // A constructor's (or a generator's) `prototype` is own from
+                // birth, materialized or not: created right after `length`
+                // and `name` (the bag's birth keys), before every later key.
+                if !in_bag("prototype")
+                    && crate::object::has_own_helpers::closure_own_key_present(ptr, "prototype")
+                {
+                    let at = names
+                        .iter()
+                        .take_while(|n| *n == "length" || *n == "name")
+                        .count();
+                    names.insert(at, "prototype".to_string());
                 }
                 // Accessors a function keeps outside its bag (the descriptor
                 // side table) follow the bag keys.
@@ -1796,7 +1802,7 @@ pub extern "C" fn js_object_get_own_property_descriptors(obj_value: f64) -> f64 
 /// `TypeError: Object prototype may only be an Object or null`.
 #[no_mangle]
 pub extern "C" fn js_object_create_with_props(proto_value: f64, props_value: f64) -> f64 {
-    #[cfg(feature = "contract-checks")]
+    #[cfg(perry_contract_checks)]
     crate::contracts::object_create(proto_value);
     // #2816: apply the descriptor bag, if one was supplied.
     let props_jv = crate::value::JSValue::from_bits(props_value.to_bits());

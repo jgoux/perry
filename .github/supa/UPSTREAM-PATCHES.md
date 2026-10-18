@@ -16,6 +16,7 @@ Conventions in this file:
 - "Cherry-pick" results come from `git cherry-pick -n <sha>` onto upstream main `1fd8ca2ae` (2026-10-17) in a throwaway worktree. Nothing was built or run, so "applies clean" means a clean textual merge only.
 - "Upstream touched" lists upstream commits after the fork's last sync (`43a40d056`, 38 upstream commits) that changed the non-test source files the patch edits.
 - "Upstream also affected" is "likely" when the patched pre-image is unchanged on upstream main but the bug was not reproduced there, and "unknown" when that inference is weak.
+- A "Merge of upstream `2bbab8aff`" bullet in an entry records what the 2026-10-18 merge (`supa/upstream-merge-1018`, 231 upstream commits since `43a40d056`) did to it: "superseded" (upstream fixed the same thing, the fork's code was dropped, any test stays as a regression test), "adapted" (the fork's intent was re-applied on upstream's new code; no new id) or "absorbed". Status text above those bullets describes the tree at `1fd8ca2ae`.
 - Tests live in the same commit as their fix (the fork has no separate `test:` commits). Test paths are under `crates/` unless noted.
 
 ## Summary table
@@ -25,19 +26,19 @@ Conventions in this file:
 | P01 | 3a1bd4cd8 | fix(codegen): refresh guarded class-env slots after a CJS binding's initializer | codegen | all | integration | clean | PR-I |
 | P02 | fc9f6cb62 | fix(codegen): register computed-member methods with the entry they define | codegen | all | integration | clean | PR-J |
 | P03 | 78f00dedd | fix(codegen): load regex literal handles in worker programs | codegen, runtime | all (programs using Worker) | integration | clean | PR-L |
-| P04 | 2d333eac4 | fix(codegen): accept the zero-width .alt_entry directive in stack-map blocks | codegen (gc_map) | Mach-O only | integration | clean | PR-O |
-| P05 | 800781f0b | fix(runtime): accept image strings at the padded size codegen emits | runtime | all | integration + unit fixtures | CONFLICT (fixed upstream) | none: superseded |
-| P06 | 2f01c61c4 | fix(runtime): reach the URLSearchParams probe for type-erased receivers | runtime | all | integration | CONFLICT (fixed upstream) | none: superseded |
+| P04 | 2d333eac4 | fix(codegen): accept the zero-width .alt_entry directive in stack-map blocks | codegen (gc_map) | Mach-O only | integration | superseded by upstream `c4bf643f6` (merged) | none: superseded |
+| P05 | 800781f0b | fix(runtime): accept image strings at the padded size codegen emits | runtime | all | integration + unit fixtures | superseded by upstream `4ed616f5e` (merged) | none: superseded |
+| P06 | 2f01c61c4 | fix(runtime): reach the URLSearchParams probe for type-erased receivers | runtime | all | integration | superseded by upstream `79aae9aa7` (merged) | none: superseded |
 | P07 | 83e19b5b8 | fix(codegen): keep linkonce_odr coalescing for helpers promoted under codegen units | codegen | all (PERRY_CODEGEN_UNITS>1) | integration | clean | PR-M |
 | P08 | 150fc3c39 | fix(root_reload): stop declining large require closures on the cost cap | codegen (root_reload) | all | unit | clean | PR-P |
 | P09 | 76d54d44a | fix(codegen): mark the hot-TLS thread-pointer read gc-leaf where it is emitted | codegen | Apple aarch64 only | unit (IR) | clean | PR-N |
-| P10 | 7b5f84c69 | fix(hir): materialize a TypeScript enum used as a value | hir | all | hir + parity file | clean | PR-G |
+| P10 | 7b5f84c69 | fix(hir): materialize a TypeScript enum used as a value | hir | all | hir + parity file | superseded by upstream `09e7861b4` (merged) | none: superseded |
 | P11 | 066f57f15 | fix(hir): label a CommonJS module body frame with its file path | hir, runtime | all | hir + unit | clean | PR-K |
 | P12 | 5e1f3ee20 | fix(codegen): register startup stubs through .init_array on ELF | codegen (stubs) | ELF/Linux only | unit | clean (`.github` hunks conflict) | PR-A |
 | P13 | 0bbb806bf | fix(hir): construct undici agents through a require()d namespace local | hir | all | hir | clean | PR-H |
 | P14 | 81525ce5d | fix(cjs-wrap): bind a required ES module package as its namespace | compile (cjs_wrap) | all | integration | clean | PR-E |
-| P15 | 3f823e190 | fix(runtime): the unknown-receiver probe declines native URLSearchParams | runtime | all | unit | clean (fixed upstream) | none: superseded |
-| P16 | 5ee46bdb0 | fix(compile): lower modules outside the entry directory under a unique name | compile | all | integration | clean | PR-F |
+| P15 | 3f823e190 | fix(runtime): the unknown-receiver probe declines native URLSearchParams | runtime | all | unit | superseded by upstream `79aae9aa7` (merged) | none: superseded |
+| P16 | 5ee46bdb0 | fix(compile): lower modules outside the entry directory under a unique name | compile | all | integration | superseded by upstream `c1671d39d` (merged) | none: superseded |
 | P17 | 15c3bb6b7 | fix(runtime): keep subclasses of http.Agent as their own instances | runtime | all | integration | clean | PR-B |
 | P18 | 8b5573edf | feat(runtime): PERRY_TRACE_THROW reports every thrown value at js_throw | runtime, compile env | all | integration | clean | PR-Q |
 | P19 | 8fe4deaf2 | fix(runtime): give http.Agent subclass instances Node's options record | runtime | all | integration | clean after P17 (alone: test-file conflict) | PR-B |
@@ -84,8 +85,8 @@ Ordered by value and independence. Each PR carries its patches' tests.
 3. **PR-C `IncomingMessage.pipe` on the server request** (P21, P22). `req.pipe(dest)` forwarded nothing and left the request hanging. Squash P22 into P21: P22 is the entry-point fix the P21 test needs. Prerequisite: none.
 4. **PR-D `stream.pipeline` into an `fs.createWriteStream`** (P20). Every upload through `pipeline(src, fs.createWriteStream(path))` threw `ERR_INVALID_ARG_TYPE`. Prerequisite: none.
 5. **PR-E `require()` of an ES module package returns its namespace** (P14). Matches Node 22 require(esm) for packages with named exports plus `export default`. Prerequisite: none.
-6. **PR-F Unique module names outside the entry directory** (P16). Tagged-template call-site ids collided across same-named `index.js` files in `node_modules`. Prerequisite: none.
-7. **PR-G Bare TypeScript enum in value position** (P10). `Object.values(E)`, `const e = E` threw `ReferenceError`. Prerequisite: none.
+6. **PR-F Unique module names outside the entry directory** (P16). Superseded by upstream `c1671d39d`; do not send. Tagged-template call-site ids collided across same-named `index.js` files in `node_modules`. Prerequisite: none.
+7. **PR-G Bare TypeScript enum in value position** (P10). Superseded by upstream `09e7861b4`; do not send. `Object.values(E)`, `const e = E` threw `ReferenceError`. Prerequisite: none.
 8. **PR-H `new <require("undici")>.Agent(...)`** (P13). esbuild CJS output threw `undefined is not a constructor`. Prerequisite: none.
 9. **PR-I Guarded class-env refresh after a later `const`** (P01). Prerequisite: none.
 10. **PR-J Computed-member registration links** (P02). One-predicate fix for an undefined `..._eclo$info` symbol. Prerequisite: none.
@@ -93,7 +94,7 @@ Ordered by value and independence. Each PR carries its patches' tests.
 12. **PR-L Regex literals in programs that use `Worker`** (P03). Prerequisite: none.
 13. **PR-M `weak_odr` for promoted `linkonce_odr` helpers under codegen units** (P07). Prerequisite: none.
 14. **PR-N Mark the Apple arm64 hot-TLS asm gc-leaf where emitted** (P09). Prerequisite: none.
-15. **PR-O `.alt_entry` in the stack-map rewriter on Mach-O** (P04). Prerequisite: none.
+15. **PR-O `.alt_entry` in the stack-map rewriter on Mach-O** (P04). Superseded by upstream `c4bf643f6`; do not send. Prerequisite: none.
 16. **PR-P root_reload cost cap** (P08). Last because the cap value was tuned from fork measurements and upstream reworked nearby code (`291142de3`). Prerequisite: none.
 17. **PR-Q `PERRY_TRACE_THROW`** (P18). Judged generally useful, see its section. Low priority. Prerequisite: none.
 18. **PR-R wasm32-wasip1 runtime builds** (P23, P24, P25, P26, P30, P32). The runtime and the stdlib subset compile for `wasm32-wasip1` and register their tables through `.init_array`. Prerequisite: none in the series, but PR-S and later need it. wasm/WASI-specific.
@@ -112,7 +113,7 @@ Ordered by value and independence. Each PR carries its patches' tests.
 31. **PR-AE `stream.pipeline(streams..., fn)` gives the function the live stream** (P48). Prerequisite: none.
 32. **PR-AF `Readable.toWeb(req)` yields the request body** (P49). Prerequisite: PR-AD, PR-AE for the probe's roundtrip and pipeline routes.
 
-Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616f5e` for P05, `79aae9aa7` for P06 and P15); drop them at the next upstream sync and take upstream's versions.
+Not proposed: P04, P05, P06, P10, P15, P16. Upstream fixed the same bugs independently (`c4bf643f6` for P04, `4ed616f5e` for P05, `79aae9aa7` for P06 and P15, `09e7861b4` for P10, `c1671d39d` for P16); the 2026-10-18 merge took upstream's versions and kept the fork's tests as regression tests.
 
 ## Patches
 
@@ -176,6 +177,7 @@ Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616
 - Fix: add `.alt_entry` to the zero-width list. Files: `perry-codegen/src/gc_map.rs` (1 line).
 - Test: same commit, `perry/tests/layout_family_alias_stack_map.rs::family_layout_alias_with_stack_map_compiles_and_runs`.
 - Upstream: cherry-pick clean. Upstream touched: none; `gc_map.rs` still has `is_zero_width_directive` without `.alt_entry`, and the `internal alias` is still emitted (`layout_desc.rs:635,673`). Also affected: likely on macOS.
+- Merge of upstream `2bbab8aff` (2026-10-18): superseded. Upstream `c4bf643f6` (2026-10-17, "the stack-map rewriter knows every symbol attribute (Mach-O .alt_entry)") fixes the same rewriter bug, so the fork's `gc_map.rs` change was dropped and upstream's taken. `perry/tests/layout_family_alias_stack_map.rs` stays as a regression test. PR-O is not sent.
 - Depends on: none. PR-O.
 - Repro:
   ```ts
@@ -195,6 +197,7 @@ Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616
 - Fix: compute the expected size with `image_size()` (body rounded up to 8, plus 8). Files: `perry-runtime/src/value/addr_class/image.rs`, `image_tests.rs`.
 - Test: same commit, `perry/tests/image_string_literal_native_args.rs::literal_arguments_reach_validating_natives`, plus updated fixtures in `image_tests.rs`.
 - Upstream: cherry-pick CONFLICT in `image.rs` and `image_tests.rs`. Upstream fixed the same bug independently in `4ed616f5e` (2026-10-16, "Next.js startup: string images with the atom-hash trailer"): it checks `gc.size == image_string_gc_size(byte_len)` and the full image extent. That commit is not in the fork. Also affected: no.
+- Merge of upstream `2bbab8aff` (2026-10-18): superseded. Upstream `4ed616f5e`'s `image.rs` and `image_tests.rs` were taken; the fork's `image_string_literal_native_args.rs` integration test stays as a regression test. P32's wasm32 `bounds` was re-applied on top of upstream's check.
 - Depends on: none. Not for upstream (superseded); drop at the next sync.
 
 ### P06 2f01c61c4 fix(runtime): reach the URLSearchParams probe for type-erased receivers
@@ -204,6 +207,7 @@ Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616
 - Fix: exclude the URLSearchParams layout from the Ordinary fast arm. Files: `perry-runtime/src/object/field_get_set/exotic_named_read.rs`.
 - Test: same commit, `perry/tests/url_search_params_type_erased_methods.rs::type_erased_url_search_params_methods_are_callable` (runs pg-connection-string's parse and a type-erased `get()`).
 - Upstream: cherry-pick CONFLICT in `exotic_named_read.rs`. Upstream fixed the same symptom in `79aae9aa7` (#12697, 2026-10-17): the URLSearchParams layout now names `%URLSearchParams.prototype%`, and `search_params_read`, its bound-method thunks and `NamedReadKind::Ordinary` are deleted. Upstream's gap test is `test-files/test_gap_12697_urlsearchparams_size_and_methods_inherited.ts`. Not in the fork.
+- Merge of upstream `2bbab8aff` (2026-10-18): superseded. Upstream `79aae9aa7` deleted `search_params_read` and its thunks, so the fork's `exotic_named_read.rs` change was dropped and upstream's taken. `perry/tests/url_search_params_type_erased_methods.rs` stays as a regression test.
 - Depends on: none. Not for upstream (superseded).
 
 ### P07 83e19b5b8 fix(codegen): keep linkonce_odr coalescing for helpers promoted under codegen units
@@ -223,6 +227,7 @@ Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616
 - Fix: measure the cap only against groups with a use outside the root load's own block (answer unchanged, walk skipped for the rest) and raise the bound to 64M; the commit measures the walk at tens of ms. Files: `perry-codegen/src/root_reload.rs`, `root_reload_tests.rs`.
 - Test: same commit, `root_reload_tests.rs::the_cap_does_not_count_groups_that_never_walk` (unit; no end-to-end repro).
 - Upstream: cherry-pick clean. Upstream touched: `291142de3`. `MAX_BLOCK_LOAD_PRODUCT` is still `8_000_000` upstream (`root_reload.rs:299`). Also affected: unknown (needs a large closure and GC timing).
+- Merge of upstream `2bbab8aff` (2026-10-18): adapted, no new id. Upstream `914a51a86` ("root reload past the block x load cap for entry-stored roots") added an entry-store fallback for functions over the cap, which conflicts with this patch's intent. Both are kept: the cap is measured against `walking_groups` (groups read from another block than their load), the bound is 64M (`MAX_BLOCK_LOAD_PRODUCT`), and a function over it takes upstream's fallback. The register-use index is built ahead of the cap. `root_reload_tests.rs` keeps the fork's large-closure test next to upstream's.
 - Depends on: none. PR-P. The 64M value is a fork measurement; expect review discussion.
 - Repro: none small; the trigger is a function with more than ~14k blocks.
 
@@ -242,6 +247,7 @@ Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616
 - Fix: the bare identifier builds the same object through the shared `enum_runtime_object_fields` (forward members plus numeric reverse entries). Each reference builds a fresh object, so `E === E` is false (stated in the commit). Files: `perry-hir/src/lower/expr_member.rs`, `lower_expr.rs`, `lower_expr/arm_ident.rs`, `lower_expr/helpers.rs`, `lower/mod.rs`.
 - Test: same commit, `perry-hir/tests/enum_as_value_lowering.rs::bare_enum_identifier_materializes_the_enum_object` and `test-files/test_parity_enum_as_value.ts`.
 - Upstream: cherry-pick clean. Upstream touched: none. Upstream still inlines the field construction in `expr_member.rs` and has no `enum_runtime_object_fields`. Also affected: likely.
+- Merge of upstream `2bbab8aff` (2026-10-18): superseded. Upstream `09e7861b4` ("compile TypeScript from its own sources") makes enums runtime values, so the fork's `perry-hir` change (`enum_runtime_object_fields`) was dropped. `perry-hir/tests/enum_as_value_lowering.rs` stays and passes on upstream's lowering. PR-G is not sent.
 - Depends on: none. PR-G.
 - Repro: `enum S { A = "a", B = "b" }; console.log(Object.values(S));` (expected `[ 'a', 'b' ]`).
 
@@ -252,6 +258,7 @@ Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616
 - Fix: the factory's display name is `Object.<anonymous> (<source path>)` (set where the nested declaration lowers) and the frame renderer prints a name that already carries a location verbatim instead of appending `(<anonymous>)`. Line and column are still not provided. Files: `perry-hir/src/lower_decl/body_stmt/nested_fn_decl.rs`, `perry-runtime/src/error_stack_frames.rs`.
 - Test: same commit, `perry-hir/tests/cjs_factory_frame_label.rs::the_module_body_frame_is_labelled_with_the_module_path` and `error_stack_frames.rs::a_module_body_frame_renders_its_own_location`.
 - Upstream: cherry-pick clean. Upstream touched: `f063a7d29` ("Error.stack walks runtime frames by unwind table"), which edits `error_stack_frames.rs`; the merge is textually clean but the new frame walker may change what the test sees, so re-run it. Also affected: likely.
+- Merge of upstream `2bbab8aff` (2026-10-18): adapted, no new id. The hir and `render_frames` hunks merged as they were; the unit test `a_module_body_frame_renders_its_own_location` now calls `render_frames(blob, RENDER_LIMIT)`, the signature upstream `f063a7d29` introduced.
 - Depends on: none. PR-K.
 - Repro: in a CommonJS module, `console.log(new Error().stack)`; the top-level frame should read `Object.<anonymous> (<abs path>)`.
 
@@ -262,6 +269,7 @@ Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616
 - Fix: on ELF targets emit a pointer in `.init_array` (global so the section is writable, kept alive through `@llvm.used`). Files: `perry-codegen/src/stubs.rs`. The commit also changed `.github/supa/probes.sh` and `regressions.sh` (fork CI only; not for upstream).
 - Test: same commit, unit tests in `stubs.rs`: `elf_startup_registration_lands_in_init_array` (both units, aarch64 and x86_64 ELF sections) and `non_elf_startup_registration_keeps_global_ctors`.
 - Upstream: cherry-pick conflicts only in the two `.github/supa` files (they do not exist upstream); the `stubs.rs` hunk applies clean, including over upstream `37a30b076`, which adds a `registrations` parameter to the same file. Upstream `stubs.rs` still emits `@llvm.global_ctors` (lines 209 and 322) and `perry-codegen` has no `.init_array` handling. Also affected: yes. We verified upstream's Fastify README example fails on Linux without this patch (task brief; the fork CI probes `fastify-readme.js` and `fastify-npm.js` exercise it).
+- Merge of upstream `2bbab8aff` (2026-10-18): adapted, no new id. `stubs.rs` merged over upstream `37a30b076` and `bc84a76f0`; the unit test `elf_startup_registration_lands_in_init_array` passes the new `registrations` argument of `generate_feature_installer_object` (`&[]`).
 - Depends on: none. PR-A, first in the order. Cherry-pick with the `.github` paths excluded.
 - Repro: build any program that calls `new Function('return 1')` for Linux without the patch.
 
@@ -302,6 +310,7 @@ Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616
 - Fix: decline the declared URLSearchParams layout record (`native_method_layout`). Files: `perry-runtime/src/object/layout_probe.rs`.
 - Test: same commit, `exotic_named_read_tests.rs::unknown_receiver_probe_declines_url_search_params_but_not_ordinary_objects` (unit).
 - Upstream: cherry-pick clean textually. Upstream touched: `291142de3`, `1ff0343a1`, and `79aae9aa7` (not touching `layout_probe.rs`) which removes the mechanism this patch refers to (`exotic_named_read::search_params_read`, named in its doc comment). Fixed upstream, so also affected: no.
+- Merge of upstream `2bbab8aff` (2026-10-18): superseded together with P06 (upstream `79aae9aa7`): the probe mechanism this patch adjusted no longer exists (URLSearchParams is born on an ordinary layout and its methods come from its prototype), so its change and its unit test `unknown_receiver_probe_declines_url_search_params_but_not_ordinary_objects` were dropped. P06's integration test covers the behavior.
 - Depends on: P06 (same symptom, same fix family). Not for upstream (superseded).
 
 ### P16 5ee46bdb0 fix(compile): lower modules outside the entry directory under a unique name
@@ -311,6 +320,7 @@ Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616
 - Fix: name such modules by their path relative to the entry directory with `..` segments (unique, independent of checkout location). Files: `perry/src/commands/compile/collect_modules.rs`, `collect_modules_helpers.rs` (`collection_module_name`).
 - Test: same commit, `perry/tests/tagged_template_sites_outside_entry_dir.rs::first_tagged_template_of_same_named_modules_outside_the_entry_dir_stays_distinct`.
 - Upstream: cherry-pick clean. Upstream touched: `790ac5eea`. Upstream `collect_modules.rs` still falls back to the bare `file_name()`. Also affected: likely.
+- Merge of upstream `2bbab8aff` (2026-10-18): superseded. Upstream `c1671d39d` (2026-10-18, "preserve external module identities before lowering") fixes the same collision, so the fork's `collect_modules.rs` change (and its now-unused `PathBuf` import in `collect_modules_helpers.rs`) was dropped. `perry/tests/tagged_template_sites_outside_entry_dir.rs` stays as a regression test. PR-F is not sent.
 - Depends on: none. PR-F.
 - Repro: entry `src/main.js` importing `../lib/a/index.js` and `../lib/b/index.js`, each exporting a different tagged template result such as ``tag`alpha-${1}-end` ``; the second prints the first's strings.
 
@@ -321,6 +331,7 @@ Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616
 - Fix: construct the agent through the http dispatcher up front and alias the subclass instance to the handle, as `http.ServerResponse` already is. Files: `perry-runtime/src/object/native_this_alias.rs`.
 - Test: same commit, `perry/tests/http_agent_subclass_keeps_its_own_surface.rs::two_level_subclass_of_aliased_http_agent_keeps_methods_and_fields`.
 - Upstream: cherry-pick clean. Upstream touched: none. Also affected: likely.
+- Merge of upstream `2bbab8aff` (2026-10-18): adapted, no new id. Upstream `e7476115a` moved the http native classes onto static layouts and removed the by-name alias fallback; `native_this_alias.rs` was re-applied on upstream's version with `Agent` joining the bound exports that reach `super(...)` (see P19 for the options record).
 - Depends on: none (P02 is a separate link fix needed to compile agentkeepalive's class). PR-B.
 - Repro (expected `function {"n":1,"sockets":0} https: 5`):
   ```js
@@ -340,6 +351,7 @@ Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616
 - Mechanism: `PERRY_TRACE_THROW=1` (also `on`, `true`) prints the thrown value (an Error's own stack included) and the native call chain resolved to JS function names, before any transport runs. Parsed once; with the knob off a throw pays one cached load. Files: `perry-runtime/src/exception.rs`, `perry/src/commands/compile/compile_env.rs` (adds the knob to `COMPILE_ENV_EXCLUSIONS`).
 - Test: same commit, `perry/tests/trace_throw_reports_origin.rs::a_caught_throw_is_reported_only_when_the_knob_is_on`.
 - Upstream: cherry-pick clean over five upstream commits touching the same files (`291142de3`, `bc84a76f0`, `80fce2644`, `37a30b076`, `e8f781e59`). Upstream has no `PERRY_TRACE_THROW`; it has the related knobs `PERRY_EH_TRACE` (personality invocations, `eh.rs`) and `PERRY_TRACE_ASYNC`. Not a bug fix, so "also affected" does not apply.
+- Merge of upstream `2bbab8aff` (2026-10-18): adapted, no new id. The `compile_env.rs` entry was dropped because upstream retired `COMPILE_ENV_EXCLUSIONS`; the runtime knob is unchanged.
 - Judgement: generally useful and small; it follows the existing `PERRY_TRACE_*` pattern, so propose it upstream as a separate low-priority PR.
 - Depends on: none. PR-Q.
 
@@ -350,6 +362,7 @@ Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616
 - Fix: install an own `options` object on the instance after the native handle is constructed, copied from the constructor arguments (`install_agent_options`). Files: `perry-runtime/src/object/native_this_alias.rs`.
 - Test: same commit, `http_agent_subclass_keeps_its_own_surface.rs::subclass_of_aliased_http_agent_exposes_node_options_and_socket_tables`.
 - Upstream: cherry-pick alone conflicts in the test file (created by P17); clean after P17. Upstream touched: none. Also affected: likely.
+- Merge of upstream `2bbab8aff` (2026-10-18): adapted with P17. `install_agent_options` lives in the re-applied `native_this_alias.rs`.
 - Depends on: P17. PR-B.
 - Repro (expected `0 8000 true null true 0 0 0`):
   ```js
@@ -407,6 +420,7 @@ Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616
 - Fix: the runtime registers its layouts, atoms and image ranges from `.init_array` entries on wasm. Files: `perry-runtime/src/object/{layout_desc,layout_probe,mod,runtime_layouts,shapes_store,static_registry}.rs`, `runtime_layouts/stream_prototypes.rs`, `value/addr_class/image.rs`.
 - Test: none of its own; every wasi probe depends on it.
 - Upstream: not cherry-picked. Depends on: none. PR-R.
+- Merge of upstream `2bbab8aff` (2026-10-18): adapted, no new id. Upstream changed `PerryLayoutDesc.proto` to `*const PerryProtoFamily` and moved layouts, atoms and image ranges behind `static_registry.rs`; the wasm `.init_array` constructors and the ILP32 `BandDir` offsets (`FLAT_IDS_OFFSET`, `PROTO_CELL_OFFSET`, `WORD_DIR_OFFSET` in `shapes_store.rs`, used by `layout_probe.rs`) were re-applied on that layout.
 
 ### P24 bd6269a6b fix(runtime): make the wasm32 runtime compile for wasip1
 - Area / platform: runtime, updater / wasm32.
@@ -415,6 +429,7 @@ Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616
 - Fix: cfg-gated stubs and a wasm pool (`turnloop_pool_wasm.rs`), plus `wasi_net` transport scaffolding; 20 files.
 - Test: the wasip1 runtime build in `wasi-linux`.
 - Upstream: not cherry-picked. Depends on: none. PR-R.
+- Merge of upstream `2bbab8aff` (2026-10-18): partly absorbed. Upstream turned the `mod-*` cargo features into runtime Hook slots (`module_hooks.rs`) and gates `dgram` and `dgram_reactor` on `not(target_arch = "wasm32")`, so the fork's `not(target_os = "wasi")` cfgs on them were dropped. `socket2` stays in the non-wasi dependency table and `turnloop_pool_wasm.rs` is unchanged.
 
 ### P25 20d4dc2cd feat(stdlib): build a wasm32-wasip1 subset without openssl, zlib-ng or threads
 - Area / platform: stdlib, ext-zlib / wasm32.
@@ -429,6 +444,7 @@ Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616
 - Fix: compare as `u64` in `builtin_proto_entries.rs` (1 line).
 - Test: the wasm32 release build.
 - Upstream: not cherry-picked. Depends on: none. PR-R.
+- Merge of upstream `2bbab8aff` (2026-10-18): adapted, no new id. Upstream added the same `addr >= 1 << 47` check at three sites in the new `object/builtin_method.rs`; the wasm32 release build failed with `arithmetic_overflow` there, so they compare as `u64` too.
 
 ### P27 2f4a2a4f4 feat(compile): add a wasip1 target that links a WASI preview1 core module
 - Area / platform: compile, codegen / wasm32.
@@ -443,6 +459,7 @@ Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616
 - Fix: regenerated with `scripts/runtime_abi_check.py`.
 - Test: `scripts/runtime_abi_check.py`.
 - Upstream: not cherry-picked; the table churns, so regenerate on the upstream base instead of cherry-picking. Depends on: none. PR-S.
+- Merge of upstream `2bbab8aff` (2026-10-18): `runtime_abi.tsv` was not merged by hand. It was regenerated on the merged tree with `scripts/runtime_abi_check.py --emit-wasm-abi` (5199 symbols) and checked with `--check-wasm-abi`.
 
 ### P29 c546aab14 fix(codegen): cover macro-defined runtime entry points in the wasm32 ABI table
 - Area / platform: codegen (wasm32), scripts / wasm32.
@@ -450,6 +467,7 @@ Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616
 - Fix: `scan_macro_entries` in `scripts/runtime_abi_check.py` reads each macro family's fixed shape, and the table gains the rows.
 - Test: `scripts/runtime_abi_check.py`.
 - Upstream: not cherry-picked. Depends on: P28. PR-S.
+- Merge of upstream `2bbab8aff` (2026-10-18): covered by the P28 regeneration.
 
 ### P30 f7c9d2b0b fix(runtime): declare the array builtin entries at pointer width so wasm32 calls resolve
 - Area / platform: runtime / wasm32 (no change on 64-bit).
@@ -464,6 +482,7 @@ Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616
 - Fix: new `perry-runtime-static` crate, and a generated `.init_array` object registers the feature installers; `wasi_build_runtime.py` and the link step use it. 22 files.
 - Test: wasi probes for crypto, zlib, events, streams, fs, path/url/util/os, AsyncLocalStorage, network modules and process basics.
 - Upstream: not cherry-picked. Depends on: P25, P27. PR-S.
+- Merge of upstream `2bbab8aff` (2026-10-18): adapted, no new id. The wasi block of `run_pipeline.rs` passes `&[]` for the new `registrations` argument of `generate_feature_installer_object`; `scripts/wasi_build_runtime.py` keeps the `{"alloc-mimalloc"}` exclusion and the `external-*-pump` stdlib features.
 
 ### P32 0dac0c454 fix(runtime): admit program-emitted image strings on wasm32
 - Area / platform: runtime / wasm32.
@@ -472,6 +491,7 @@ Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616
 - Fix: bound the candidate range by `__data_end`; the header validation is unchanged. File: `value/addr_class/image.rs`.
 - Test: wasi probes `path-url-util-os`, `fs`.
 - Upstream: not cherry-picked. Depends on: P23. PR-R.
+- Merge of upstream `2bbab8aff` (2026-10-18): adapted, no new id. Re-applied on upstream `4ed616f5e`'s image check (the atom-hash trailer): `bounds(addr)` asks `static_registry::image_range` first and then falls back to `__data_end` on wasm.
 
 ### P33 202df7335 feat(wasi): serve and connect over the host's supa_net sockets on wasip1
 - Area / platform: runtime (wasi_net, signals, event pump) / wasm32.
@@ -542,6 +562,7 @@ Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616
 - Fix: the prototype getter and `js_node_stream_method_readable_ended` read `Slot::EndEmitted`, and constructors initialise it to false. `Slot::ReadableEnded` keeps its internal meaning (EOF pushed). Files: `perry-runtime/src/node_stream.rs`, `node_stream/proto_methods.rs`, `node_stream_constructors.rs`.
 - Test: the unit test `readable_lifecycle_flags_reflect_ended_state` now expects `false` after `push(null)` (it asserted the old behaviour); probe `.github/supa/wasi-probes/stream-readable-ended.js` (port to `crates/perry/tests` for upstream).
 - Upstream: not cherry-picked. Depends on: none. PR-X.
+- Merge of upstream `2bbab8aff` (2026-10-18): adapted, no new id. Upstream's `node_stream/proto_methods.rs` became a slot table; the fix is `Slot::EndEmitted` there instead of a new method entry.
 - Not covered: a server `IncomingMessage` still reports `readableEnded` as `complete` and `closed` as undefined (perry-ext-http `handle_dispatch.rs`).
 
 ### P42 743236204 fix(gc): trace an array's named-property holder as a pointer
@@ -576,6 +597,7 @@ Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616
 - Fix: `dns::dispatch_export` (`dns/ffi.rs`) maps each lookup/lookupService/resolve*/reverse export, callback and `dns/promises` form, to the same `js_dns_*` FFI the static table uses; `nm_dispatch_dns` calls it with the packed arguments before falling through to undefined. The router is reached through a pointer that `js_dns_install_exports` sets, which the entry prologue calls only when the program imports, requires or names (`getBuiltinModule`) `dns` / `dns/promises` (`ctx.uses_dns`, set in `collect_modules.rs`, emitted in `run_pipeline.rs`). Every CommonJS program pins all dispatch buckets through `createRequire`, so a direct reference would link the lookup FFIs, and with them the host's `supa_net.resolve` import, into every CommonJS module; the first attempt did, and `wasi-linux` failed its import hygiene check on `fs`, `fs-stdio-fd`, `path-url-util-os`, `stream-readable-ended` and `streams`. Docs: the "`dns` in CommonJS" limitation is removed from `docs/WASI_SUPPORT.md` and `wasi-probes.sh`.
 - Test: wasi probe `.github/supa/wasi-probes/cjs-dns.js` (run as CommonJS: callback and promise lookup, `{ all: true }`, an IP literal, ENOTFOUND, `net.connect` by name; before the fix it prints only its first line and exits 0, after it matches node line for line); port to `crates/perry/tests` for upstream. It is compile-only in CI (needs a resolver) and runs locally under supa-host with `--listen 127.0.0.1:47123`.
 - Upstream: not cherry-picked. Depends on: none. PR-AB.
+- Merge of upstream `2bbab8aff` (2026-10-18): adapted, no new id. Upstream moved stdlib-module detection into `collect_modules/source_prep.rs` (`PreparedSource`); `uses_dns` is computed there and OR'd into the context in `collect_modules.rs`, next to the import-based check.
 - Not covered: instance methods of `new dns.Resolver()` reached through a CommonJS namespace were not re-tested.
 
 ### P46 19c26c6a9 fix(hir): construct the global when a program class shares a name with a globalThis alias
@@ -644,4 +666,5 @@ Merge commits (not counted): `1f3c775af` (merge of upstream main) and `03ef52d0f
 - Last upstream sync merge: `1f3c775af` (2026-10-16 15:12 +0200, "Merge PerryTS/perry main into supa/storage-ci"), whose second parent is `43a40d056`. `03ef52d0f` (2026-10-16 17:25 +0200) merged the fork's own `supa/upstream-sync` branch.
 - Original fork point of the earlier patches (P01-P14): `5b76f8acc` (2026-10-15, "gc effects: regenerate macOS table for Object.create families"). The older branch `supa/storage` (an older tip) is an ancestor of `supa/storage-ci`.
 - Fork tip: `supa/storage-ci` (tip, 2026-10-16); 68 fork-only commits, 66 non-merge.
+- Upstream merge (2026-10-18): `supa/upstream-merge-1018` merges upstream `2bbab8aff` (2026-10-18, "docs(changelog): record V8 heap snapshot stream crash fix") into `supa/wasip1`; merge-base `43a40d056`, 231 upstream commits. Superseded by it: P04, P05, P06, P10, P15, P16. Adapted: P08, P11, P12, P17, P18, P19, P23, P24, P28, P29, P31, P32, P41, P45.
 - Ledger written: 2026-10-17.

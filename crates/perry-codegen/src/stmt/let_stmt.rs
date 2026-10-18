@@ -386,6 +386,18 @@ pub(crate) fn lower_let(
     // reuse guard must consider the rep map too, or a redeclaration would
     // re-run the allocation path and leave the local with two slots.
     if ctx.locals.contains_key(&id) || ctx.local_slot_reps.contains_key(&id) {
+        // A birth table already bore this declaration's closure and stored it
+        // in the binding's scope slot (`closure_births`). Record what the
+        // store records; the binding is a preallocated cell, so its type
+        // stays the cell's.
+        if ctx.born_let == Some(id) {
+            ctx.born_let = None;
+            if let Some(init_expr) = init {
+                ctx.tdz_boxes.remove(&id);
+                crate::expr::note_born_local_write(ctx, id, init_expr);
+            }
+            return Ok(());
+        }
         // #10048: materialize a missing continuation cell before its initializer.
         super::boxed_local_init::ensure_reused_box_is_initialized(ctx, id);
         if let Some(init_expr) = init {
@@ -699,7 +711,7 @@ pub(crate) fn lower_let(
     // load directly from the corresponding slot. See the
     // `collect_non_escaping_arrays` pass in collectors.rs for the
     // escape criteria.
-    if let Some(perry_hir::Expr::Array(elements)) = init {
+    if let Some(perry_hir::Expr::Array(elements, _)) = init {
         if ctx.non_escaping_arrays.contains_key(&id) {
             let n = elements.len();
             let mut slots: Vec<String> = Vec::with_capacity(n);

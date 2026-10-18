@@ -154,7 +154,7 @@ unsafe fn define_property_on_handle(
 /// Object validates and coerces the key before decoding the descriptor once.
 #[no_mangle]
 pub extern "C" fn js_object_define_property(obj: f64, key: f64, bag: f64) -> f64 {
-    #[cfg(feature = "contract-checks")]
+    #[cfg(perry_contract_checks)]
     crate::contracts::hard_value(obj, "Object.defineProperty");
     unsafe {
         if !definition_target_is_object(obj) {
@@ -226,6 +226,12 @@ pub(crate) unsafe fn define_own_property_decoded(
     key: &crate::gc::RuntimeHandle<'_>,
     descriptor: &DescView<'_>,
 ) -> bool {
+    // Object model §3.2: defining an optional layout key whose slot holds the
+    // hole defines a new property (`layout_desc::prepare_hole_define`).
+    crate::object::layout_desc::prepare_hole_define(
+        receiver.get_nanbox_u64(),
+        key.get_nanbox_u64(),
+    );
     let current = f64::from_bits(receiver.get_nanbox_u64());
     if crate::array::subclass_elements::backed_value(current).is_some()
         && crate::array::subclass_elements::key_of_value(key.get_nanbox_f64()).is_some()

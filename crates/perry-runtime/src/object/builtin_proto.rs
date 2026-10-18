@@ -41,6 +41,11 @@
 //! `[[Prototype]]` funnels, and the Array-prototype named-property set and
 //! delete. Nothing is paid until a sealed prototype is written.
 //!
+//! [`seal_runtime_prototype`] seals a prototype the runtime builds (URL,
+//! timers) under family [`RUNTIME_FAMILY`]: a write sets that prototype's own
+//! shadow bit and nothing else. [`name_runtime_prototype`] only gives one its
+//! reserved identity.
+//!
 //! The runtime's own definitions (`own_override::as_builtin_definition`, the
 //! lazy populations) do not count: they install the builtin itself.
 
@@ -218,6 +223,68 @@ pub(crate) fn seal_built_intrinsic(family: BuiltinProto, proto: *mut ObjectHeade
     });
 }
 
+/// The meta family field of a sealed RUNTIME prototype (one the runtime
+/// builds, such as `%URL.prototype%` or a timer prototype; not a
+/// [`BuiltinProto`]). A write marks only that prototype.
+pub(crate) const RUNTIME_FAMILY: usize = super::builtin_namespace::GLOBAL_FAMILY + 1;
+const _: () = assert!(
+    RUNTIME_FAMILY as u64 <= super::meta_flags::OBJECT_META_SEALED_FAMILY_MASK,
+    "the meta family field holds every sealed family"
+);
+
+/// Seal a runtime prototype the moment its builder completes it, before any
+/// program code can reach it (§3.6: builtin prototypes are families with
+/// runtime-defined layouts). It takes its reserved intrinsic `serial`, the
+/// identity a layout descriptor names through its prototype family, and
+/// writes that identity's word, which every shape of the identity reads as its
+/// [[Prototype]]: a layout-born object needs no link. From now on every
+/// mutation of the prototype sets its own shadow bit, so an unshadowed word
+/// proves it still holds exactly the runtime's definitions and [[Prototype]].
+///
+/// # Safety
+/// `proto` is a live, fully built ordinary object with no serial yet.
+#[inline(never)]
+#[optimize(size)]
+pub(crate) unsafe fn seal_runtime_prototype(proto: *mut ObjectHeader, serial: u64) {
+    let _no_move = crate::gc::GcSuppressScope::new();
+    super::proto_validity::assign_intrinsic_prototype_serial(proto as usize, serial);
+    let Some(meta) = name_runtime_prototype(proto, serial) else {
+        return;
+    };
+    // GC_STORE_AUDIT(POINTER_FREE): scalar flag bits, never a reference.
+    (*meta).flags |= super::meta_flags::OBJECT_META_FLAG_SEALED_INTRINSIC
+        | ((RUNTIME_FAMILY as u64) << super::meta_flags::OBJECT_META_SEALED_FAMILY_SHIFT);
+}
+
+/// Give a runtime prototype its reserved intrinsic `serial` as its identity
+/// and write the identity's word, without marking it or changing its shape:
+/// a prototype born on its own declared layout keeps that layout (the
+/// stream-state prototypes). Its layout word then proves nothing about
+/// writes; only [`seal_runtime_prototype`] adds that. Returns its meta record.
+///
+/// # Safety
+/// `proto` is a live ordinary object whose serial is 0 or `serial`.
+#[inline(never)]
+#[optimize(size)]
+pub(crate) unsafe fn name_runtime_prototype(
+    proto: *mut ObjectHeader,
+    serial: u64,
+) -> Option<*mut super::ObjectMeta> {
+    let _no_move = crate::gc::GcSuppressScope::new();
+    let meta = super::object_meta_ensure(proto);
+    if meta.is_null() {
+        return None;
+    }
+    debug_assert!((*meta).proto_serial == 0 || (*meta).proto_serial == serial);
+    // GC_STORE_AUDIT(POINTER_FREE): a scalar serial, never a reference.
+    (*meta).proto_serial = serial;
+    super::shapes::write_identity_word(
+        serial,
+        crate::value::js_nanbox_pointer(proto as i64).to_bits(),
+    );
+    Some(meta)
+}
+
 /// Seal every family's intrinsic prototype of THIS thread's realm. Called once
 /// at the end of `populate_global_this_builtins`, after every runtime-owned
 /// install, link and the prototype-address priming.
@@ -336,9 +403,23 @@ fn sealed_family(flags: u64) -> usize {
         & super::meta_flags::OBJECT_META_SEALED_FAMILY_MASK) as usize
 }
 
-/// A write reached a sealed intrinsic: a prototype family's own bit, or a
-/// namespace holder or the realm global (`builtin_namespace`). `field` is
-/// the inline or spill slot a value store is about to write, when known.
+/// Is the sealed intrinsic whose meta flags are `flags` a builtin prototype
+/// born on a complete static layout (`runtime_layouts::builtin_prototypes`):
+/// `%Object.prototype%`, `%Function.prototype%` or `%Array.prototype%`'s
+/// holder? Its own keys are then exactly its list and overflow, like an
+/// ordinary object's. A compare against a fixed set of families.
+#[inline(always)]
+pub(crate) fn on_static_layout(flags: u64) -> bool {
+    const OBJECT: usize = BuiltinProto::Object as usize;
+    const FUNCTION: usize = BuiltinProto::Function as usize;
+    const ARRAY: usize = BuiltinProto::Array as usize;
+    matches!(sealed_family(flags), OBJECT | FUNCTION | ARRAY)
+}
+
+/// A write reached a sealed intrinsic: a prototype family's own bit, a
+/// runtime prototype's own shadow bit, or a namespace holder or the realm
+/// global (`builtin_namespace`). `field` is the inline or spill slot a value
+/// store is about to write, when known.
 #[cold]
 #[inline(never)]
 #[optimize(size)]
@@ -351,6 +432,10 @@ unsafe fn note_sealed_write(
     let family = sealed_family(flags);
     if family < FAMILIES {
         note_family_write(family, site);
+    } else if family == RUNTIME_FAMILY {
+        if !super::own_override::in_builtin_definition() {
+            super::shadow::set_bit(obj.cast_mut());
+        }
     } else {
         super::builtin_namespace::note_write(obj as *mut ObjectHeader, family, field, site);
     }
@@ -389,6 +474,7 @@ unsafe fn note_prototype_value_store(
     site: &'static str,
 ) {
     let flags = (*meta).flags;
+    crate::dyn_eval_hooks::note_proto_write();
     if flags & super::meta_flags::OBJECT_META_FLAG_SEALED_INTRINSIC != 0 {
         note_sealed_write(obj, flags, Some(field_index), site);
     }
@@ -412,6 +498,12 @@ pub(crate) fn note_write_addr(addr: usize, site: &'static str) {
     match header.obj_type {
         crate::gc::GC_TYPE_OBJECT => unsafe { note_write(addr as *const ObjectHeader, site) },
         crate::gc::GC_TYPE_ARRAY => note_array_prototype_write(addr, site),
+        crate::gc::GC_TYPE_CLOSURE => unsafe {
+            note_write(
+                (*(addr as *const crate::closure::ClosureHeader)).props,
+                site,
+            );
+        },
         _ => {}
     }
 }
@@ -447,6 +539,7 @@ fn note_family_write(family: usize, site: &'static str) {
     if super::own_override::in_builtin_definition() {
         return;
     }
+    crate::dyn_eval_hooks::note_proto_write();
     let set = |k: usize| -> bool {
         let p = crate::agent_ptrs::intrinsic_proto(k) as *mut ObjectHeader;
         // SAFETY: a live intrinsic of this agent, or the static stand-in
@@ -510,21 +603,26 @@ fn trace_withdrawal(family: usize, site: &'static str) {
 
 /// The builtin family and receiver-owned custom-link fact, obtained from
 /// one classification of the value and (for a heap receiver) its header.
+enum ReceiverFact {
+    Builtin(BuiltinProto, bool),
+    Proxy,
+}
+
 #[inline]
-fn receiver_fact(recv: f64) -> Option<(BuiltinProto, bool)> {
+fn receiver_fact(recv: f64) -> Option<ReceiverFact> {
     let bits = recv.to_bits();
     let v = crate::value::JSValue::from_bits(bits);
     if v.is_any_string() {
-        return Some((BuiltinProto::String, false));
+        return Some(ReceiverFact::Builtin(BuiltinProto::String, false));
     }
     if v.is_number() || v.is_int32() {
-        return Some((BuiltinProto::Number, false));
+        return Some(ReceiverFact::Builtin(BuiltinProto::Number, false));
     }
     if v.is_bool() {
-        return Some((BuiltinProto::Boolean, false));
+        return Some(ReceiverFact::Builtin(BuiltinProto::Boolean, false));
     }
     if v.is_bigint() {
-        return Some((BuiltinProto::BigInt, false));
+        return Some(ReceiverFact::Builtin(BuiltinProto::BigInt, false));
     }
     let mut header = crate::value::addr_class::pointer_value_header(bits)?;
     if matches!(
@@ -541,6 +639,7 @@ fn receiver_fact(recv: f64) -> Option<(BuiltinProto, bool)> {
         header = unsafe { crate::value::addr_class::honest_header(array as usize) };
     }
     let family = match header.obj_type {
+        crate::gc::GC_TYPE_PROXY => return Some(ReceiverFact::Proxy),
         crate::gc::GC_TYPE_ARRAY | crate::gc::GC_TYPE_LAZY_ARRAY => BuiltinProto::Array,
         crate::gc::GC_TYPE_MAP => BuiltinProto::Map,
         crate::gc::GC_TYPE_SET => BuiltinProto::Set,
@@ -548,7 +647,7 @@ fn receiver_fact(recv: f64) -> Option<(BuiltinProto, bool)> {
         crate::gc::GC_TYPE_CLOSURE => BuiltinProto::Function,
         _ => return None,
     };
-    Some((
+    Some(ReceiverFact::Builtin(
         family,
         family == BuiltinProto::Array && header._reserved & crate::gc::GC_ARRAY_CUSTOM_PROTO != 0,
     ))
@@ -556,7 +655,10 @@ fn receiver_fact(recv: f64) -> Option<(BuiltinProto, bool)> {
 
 /// The family whose prototype a by-name builtin dispatch on `recv` reads.
 pub(crate) fn receiver_family(recv: f64) -> Option<BuiltinProto> {
-    receiver_fact(recv).map(|(family, _)| family)
+    match receiver_fact(recv) {
+        Some(ReceiverFact::Builtin(family, _)) => Some(family),
+        _ => None,
+    }
 }
 
 /// The intrinsic's shadow bit and the receiver's own prototype link are
@@ -564,8 +666,8 @@ pub(crate) fn receiver_family(recv: f64) -> Option<BuiltinProto> {
 #[inline]
 pub(crate) fn receiver_pristine(recv: f64) -> bool {
     match receiver_fact(recv) {
-        Some((_, true)) => false,
-        Some((family, false)) => pristine(family),
+        Some(ReceiverFact::Proxy | ReceiverFact::Builtin(_, true)) => false,
+        Some(ReceiverFact::Builtin(family, false)) => pristine(family),
         None => true,
     }
 }
@@ -632,8 +734,13 @@ unsafe fn select_and_call(
         &[]
     };
     let arg_handles = scope.root_nanbox_f64_slice(original);
-    let selected = super::method_site::spec_get_value(holder, name);
-    if !call_builtin && is_builtin_method(selected) {
+    let selected = super::method_call::spec_get_value(holder, name);
+    // A Proxy cannot run a dense builtin body: even the original builtin
+    // must keep the receiver intact and perform its operations through traps.
+    if !call_builtin
+        && is_builtin_method(selected)
+        && crate::proxy::js_proxy_is_proxy(this_h.get_nanbox_f64()) == 0
+    {
         if let Some((recv, out)) = refresh {
             *recv = this_h.get_nanbox_f64();
             out.copy_from_slice(&crate::gc::RuntimeHandleScope::refreshed_nanbox_f64_slice(
@@ -650,7 +757,7 @@ unsafe fn select_and_call(
         // undefined, null, a number, a boolean …: not callable.
         crate::closure::throw_not_callable();
     }
-    Some(super::method_site::js_method_site_call_value(
+    Some(super::method_call::js_method_call_value(
         selected_h.get_nanbox_f64(),
         this_h.get_nanbox_f64(),
         values.as_ptr(),
@@ -873,17 +980,17 @@ pub extern "C-unwind" fn js_borrowed_object_lookup_setter(this: f64, key: f64) -
 /// called from a wrapper over it cannot re-enter this lookup.
 #[no_mangle]
 pub extern "C" fn js_array_pop_f64_site(arr: *mut crate::array::ArrayHeader) -> f64 {
-    if !pristine(BuiltinProto::Array) {
-        let live = crate::array::clean_arr_ptr_mut(arr);
-        if !live.is_null() {
-            let recv = crate::value::js_nanbox_pointer(live as i64);
-            // SAFETY: no arguments.
-            if let Some(value) = unsafe { redirect_call(recv, b"pop", std::ptr::null(), 0) } {
-                return value;
-            }
+    let mut recv = crate::value::js_nanbox_pointer(arr as i64);
+    if !receiver_pristine(recv) {
+        // The same receiver proof and generic call as every checked entry;
+        // a Proxy is never a plain ArrayHeader, even in a pristine realm.
+        if let Some(value) = unsafe { redirect_or_refresh(&mut recv, b"pop", &mut []) } {
+            return value;
         }
     }
-    crate::array::js_array_pop_f64(arr)
+    crate::array::js_array_pop_f64(
+        (recv.to_bits() & crate::value::POINTER_MASK) as *mut crate::array::ArrayHeader,
+    )
 }
 
 /// A Map/Set method name the by-name natives do not implement (#11915): the

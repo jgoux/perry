@@ -164,12 +164,11 @@ use imported_array_methods::try_imported_array_methods;
 use inline_array_methods::try_inline_array_methods;
 use intrinsics::{
     check_eval_function_call, try_bare_regexp_call, try_builtin_prototype_method_apply_call,
-    try_dynamic_require, try_embed_wasm, try_function_return_this, try_iife_call_rewrite,
-    try_import_meta_require, try_iterator_from, try_namespace_static_method_apply_call_bind,
-    try_native_arena_intrinsics, try_native_arena_public_api, try_native_memory_public_api,
-    try_native_module_method_apply_call, try_pod_layout_constants, try_precompile,
-    try_require_literal, try_strict_eval_arguments_assignment,
-    validate_native_scalar_conversion_call,
+    try_dynamic_require, try_embed_wasm, try_function_return_this, try_import_meta_require,
+    try_iterator_from, try_namespace_static_method_apply_call_bind, try_native_arena_intrinsics,
+    try_native_arena_public_api, try_native_memory_public_api, try_native_module_method_apply_call,
+    try_pod_layout_constants, try_precompile, try_require_literal,
+    try_strict_eval_arguments_assignment, validate_native_scalar_conversion_call,
 };
 use local_array_methods::try_local_array_methods;
 use module_class_static::try_module_class_static;
@@ -344,29 +343,13 @@ fn lower_call_inner(
         return Ok(expr);
     }
     validate_native_scalar_conversion_call(ctx, call, has_spread)?;
-    if let Some(expr) = try_iife_call_rewrite(ctx, call, has_spread)? {
-        return Ok(expr);
-    }
-    // #1722: `path.join.apply(null, [a, b])` / `.call(null, a, b)` and the
-    // same shape on any stdlib namespace — rewrite to the direct call so
-    // the dedicated per-method lowering runs (indirect invocation
-    // otherwise reads the method value as `undefined`).
-    if let Some(expr) = try_native_module_method_apply_call(ctx, call, has_spread)? {
-        return Ok(expr);
-    }
-    // #1777: `Array.prototype.slice.call(arguments, 1)` / `[].slice.call(…)` and
-    // the same on any builtin prototype — rewrite `Proto.method.{call,apply}(
-    // thisArg, …)` to `thisArg.method(…)` so the indirect prototype-borrow
-    // dispatches (the bare method value otherwise reads `undefined`).
-    if let Some(expr) = try_builtin_prototype_method_apply_call(ctx, call, has_spread)? {
-        return Ok(expr);
-    }
-    // #2143: `Promise.resolve.call(t, x)` / `Math.min.apply(t, [a,b])` /
-    // `(JSON.parse.bind(t, x))(y)` — drop the (unused) `thisArg` and call the
-    // namespace static directly. Built-in function values otherwise lower to a
-    // numeric fallback (no reified `Function.prototype`).
-    if let Some(expr) = try_namespace_static_method_apply_call_bind(ctx, call, has_spread)? {
-        return Ok(expr);
+    // The rewrites of `f.call(…)` / `f.apply(…)` / `f.bind(…)(…)` below run
+    // the intrinsic's semantics; a program that writes that method onto a
+    // builtin prototype calls whatever the property holds.
+    if !function_proto_method_written(call) {
+        if let Some(expr) = borrowed_call_folds(ctx, call, has_spread)? {
+            return Ok(expr);
+        }
     }
     if let Some(expr) = try_function_return_this(ctx, call, has_spread) {
         return Ok(expr);
@@ -855,23 +838,6 @@ fn lower_call_inner(
                 }
             }
 
-            // If inside a namespace, convert calls to namespace functions into StaticMethodCall
-            if let Expr::FuncRef(func_id) = &callee_expr {
-                if let Some(ref ns_name) = ctx.current_namespace {
-                    if let Some(func_name) = ctx.lookup_func_name(*func_id) {
-                        if ctx.has_static_method(ns_name, func_name) {
-                            let method_name = func_name.to_string();
-                            let class_name = ns_name.clone();
-                            return Ok(Expr::StaticMethodCall {
-                                class_name,
-                                method_name,
-                                args,
-                            });
-                        }
-                    }
-                }
-            }
-
             let callee = Box::new(callee_expr);
             // Extract explicit type arguments if present (e.g., identity<number>(x))
             let type_args = call
@@ -924,5 +890,60 @@ fn lower_call_inner(
                 synchronous: false,
             })
         }
+    }
+}
+
+/// The borrowed-method rewrites: `f.call(…)`, `f.apply(…)` and
+/// `f.bind(…)(…)` on a function the lowering knows, turned into the direct
+/// call.
+fn borrowed_call_folds(
+    ctx: &mut LoweringContext,
+    call: &ast::CallExpr,
+    has_spread: bool,
+) -> Result<Option<Expr>> {
+    // Literal IIFEs keep the ordinary guarded `.call` lookup and thisArg.
+    // #1722: `path.join.apply(null, [a, b])` / `.call(null, a, b)` and the
+    // same shape on any stdlib namespace — rewrite to the direct call so
+    // the dedicated per-method lowering runs (indirect invocation
+    // otherwise reads the method value as `undefined`).
+    if let Some(expr) = try_native_module_method_apply_call(ctx, call, has_spread)? {
+        return Ok(Some(expr));
+    }
+    // #1777: `Array.prototype.slice.call(arguments, 1)` / `[].slice.call(…)` and
+    // the same on any builtin prototype — rewrite `Proto.method.{call,apply}(
+    // thisArg, …)` to `thisArg.method(…)` so the indirect prototype-borrow
+    // dispatches (the bare method value otherwise reads `undefined`).
+    if let Some(expr) = try_builtin_prototype_method_apply_call(ctx, call, has_spread)? {
+        return Ok(Some(expr));
+    }
+    // #2143: `Promise.resolve.call(t, x)` / `Math.min.apply(t, [a,b])` /
+    // `(JSON.parse.bind(t, x))(y)` — drop the (unused) `thisArg` and call the
+    // namespace static directly. Built-in function values otherwise lower to a
+    // numeric fallback (no reified `Function.prototype`).
+    try_namespace_static_method_apply_call_bind(ctx, call, has_spread)
+}
+
+/// Does the program write the `Function.prototype` method this call borrows
+/// through (`f.call(…)`, `f.apply(…)`, `f.bind(…)(…)`; #11394's record)?
+fn function_proto_method_written(call: &ast::CallExpr) -> bool {
+    let ast::Callee::Expr(callee) = &call.callee else {
+        return false;
+    };
+    let member = match callee.as_ref() {
+        ast::Expr::Member(m) => m,
+        ast::Expr::Call(inner) => match &inner.callee {
+            ast::Callee::Expr(e) => match e.as_ref() {
+                ast::Expr::Member(m) => m,
+                _ => return false,
+            },
+            _ => return false,
+        },
+        _ => return false,
+    };
+    match &member.prop {
+        ast::MemberProp::Ident(p) if matches!(p.sym.as_ref(), "call" | "apply" | "bind") => {
+            crate::patched_builtins::prototype_method_patched(p.sym.as_ref())
+        }
+        _ => false,
     }
 }

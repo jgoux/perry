@@ -73,7 +73,7 @@ fn flush_left_label(line: &str) -> Option<&str> {
 /// May a call to `name` be emitted as a plain `call` inside a protected
 /// region? True only when the callee provably cannot unwind.
 ///
-/// A runtime symbol answers from the generated table's `throws` column
+/// A runtime symbol answers from the linked archive's table, `throws` column
 /// (`GcEffects::runtime_throws`, one solve over the linked archives; a
 /// symbol no table proves, such as user code, counts as throwing). That column
 /// is the only source of truth for runtime calls: there is no hand list of
@@ -111,20 +111,24 @@ mod tests {
             "js_object_get_field_nonptr",
             "js_object_get_field_value",
         ] {
-            assert_eq!(crate::module::helper_decl_attrs(name), " cold", "{name}");
+            assert_eq!(
+                crate::module::helper_decl_attrs(crate::gc_call_effects::test_effects(), name),
+                " cold",
+                "{name}"
+            );
             assert!(
-                !nothrow_callee(crate::gc_call_effects::committed_for_tests(), name),
+                !nothrow_callee(crate::gc_call_effects::test_effects(), name),
                 "{name}"
             );
         }
         assert!(!nothrow_callee(
-            crate::gc_call_effects::committed_for_tests(),
+            crate::gc_call_effects::test_effects(),
             "unknown_runtime_helper"
         ));
     }
 
     #[test]
-    fn semantic_nounwind_groups_keep_their_contract() {
+    fn nothrow_callee_reads_the_table_throws_column() {
         for name in [
             "js_nanbox_pointer",
             "js_is_truthy",
@@ -132,12 +136,12 @@ mod tests {
             "js_array_numeric_value_to_raw_f64",
         ] {
             assert!(
-                nothrow_callee(crate::gc_call_effects::committed_for_tests(), name),
+                nothrow_callee(crate::gc_call_effects::test_effects(), name),
                 "{name}"
             );
         }
         assert!(!nothrow_callee(
-            crate::gc_call_effects::committed_for_tests(),
+            crate::gc_call_effects::test_effects(),
             "js_string_compare_value"
         ));
     }
@@ -162,13 +166,13 @@ mod tests {
             "llvm.memcpy.p0.p0.i64",
         ] {
             assert!(
-                nothrow_callee(crate::gc_call_effects::committed_for_tests(), name),
+                nothrow_callee(crate::gc_call_effects::test_effects(), name),
                 "{name}"
             );
         }
         for name in ["js_throw", "js_closure_call0", "js_to_primitive"] {
             assert!(
-                !nothrow_callee(crate::gc_call_effects::committed_for_tests(), name),
+                !nothrow_callee(crate::gc_call_effects::test_effects(), name),
                 "{name}"
             );
         }

@@ -142,9 +142,7 @@ fn deprecate_lane(record: super::shapes::ShapeRecordRef, slot: u32) {
     } else {
         record.deprecate_rep_slot(slot)
     };
-    if changed {
-        crate::proxy::store_census(crate::proxy::C_REP_VALIDITY_BUMP);
-    }
+    if changed {}
 }
 
 /// Key-add convergence (DESIGN §1.5 step 4): a lineage slot that has seen
@@ -190,7 +188,6 @@ unsafe fn converge_key_add(obj: *mut ObjectHeader, id: u32, slot: u32, value_bit
         return id;
     };
     let f64_shape = if number { id } else { sibling };
-    crate::proxy::store_census(crate::proxy::C_REP_CONVERGE);
     if let Some(record) = shape_record_by_id(f64_shape) {
         deprecate_lane(record, slot);
     }
@@ -223,7 +220,6 @@ pub(crate) unsafe fn migrate_deprecated_receiver(obj: *mut ObjectHeader) -> bool
         return false;
     }
     stamp_object_shape_id_with_carrier_note(obj, target);
-    crate::proxy::store_census(crate::proxy::C_REP_MIGRATE);
     true
 }
 
@@ -706,7 +702,12 @@ pub(crate) unsafe fn birth_fill_f64_lanes(obj: *mut ObjectHeader) {
 /// deprecation changes future admission, never an existing carrier's body fact.
 /// Collector traversal may precede closure-slot rewriting, so SPECIAL checks
 /// resolve validated forwarding before examining closure payload metadata.
-#[cfg(any(debug_assertions, feature = "field-rep-assert", perry_gc_instruments))]
+#[cfg(any(
+    test,
+    debug_assertions,
+    feature = "field-rep-assert",
+    perry_gc_instruments
+))]
 pub(crate) unsafe fn assert_field_rep_lanes(
     obj: *const ObjectHeader,
     record: Option<super::shapes::ShapeRecordRef>,
@@ -741,7 +742,12 @@ pub(crate) unsafe fn assert_field_rep_lanes(
 
 /// Also used at the existing cold method-prime refusal: an unchecked store
 /// must be diagnosed even if no collection follows before generic dispatch.
-#[cfg(any(debug_assertions, feature = "field-rep-assert", perry_gc_instruments))]
+#[cfg(any(
+    test,
+    debug_assertions,
+    feature = "field-rep-assert",
+    perry_gc_instruments
+))]
 #[cold]
 #[inline(never)]
 pub(crate) unsafe fn assert_constfn_slot_body(

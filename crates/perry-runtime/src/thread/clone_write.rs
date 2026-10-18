@@ -74,7 +74,7 @@ pub unsafe fn serialize_message(
     transfer: &[usize],
     uncloneable: Option<&dyn Fn(u64) -> bool>,
 ) -> Result<SerializedValue, String> {
-    #[cfg(feature = "gc-instruments")]
+    #[cfg(perry_gc_instruments)]
     let _timer = super::clone_timing::CloneTimer::new("serialize");
     for (index, &buffer) in transfer.iter().enumerate() {
         if !crate::buffer::is_registered_buffer(buffer)
@@ -808,7 +808,8 @@ impl Writer<'_> {
             for i in 0..keys_view.count() {
                 let slots = crate::array::array_elements_ptr(keys) as *const u64;
                 let key_bits = *slots.add(i as usize);
-                if key_bits == TAG_HOLE || crate::object::key_view::position_is_hole(obj, keys_view, i)
+                if key_bits == TAG_HOLE
+                    || crate::object::key_view::position_is_hole(obj, keys_view, i)
                 {
                     continue;
                 }

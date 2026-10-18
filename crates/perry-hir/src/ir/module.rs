@@ -3,6 +3,29 @@
 use super::*;
 use crate::types::{FuncId, Type};
 
+/// Original CommonJS syntax, retained before wrapping erases binding kinds
+/// and export assignments. Only a closed export with one top-level class
+/// assignment can identify a layout parent. This is compile-time input;
+/// runtime class/parent/prototype checks still decide layout adoption.
+#[derive(Debug, Clone, Default)]
+pub struct ClassFamilySyntax {
+    /// Class declarations at original-source run-once positions. A CommonJS
+    /// module's body additionally needs whole-program factory non-reentry.
+    pub run_once_classes: std::collections::BTreeSet<String>,
+    /// Original-source uses that can expose a loader/cache or global code.
+    /// Generated CommonJS scaffolding is deliberately outside this census.
+    pub module_capability_uses: u32,
+
+    /// Child class name -> (literal require specifier, named export).
+    pub parents: std::collections::BTreeMap<String, (String, String)>,
+    /// Named export -> locally declared class (one top-level assignment).
+    pub exports: std::collections::BTreeMap<String, String>,
+    /// (None for this module's exports, otherwise a literal require
+    /// specifier, key). An empty key means the namespace escaped or was
+    /// replaced/computed-written and no key is closed.
+    pub writes: Vec<(Option<String>, String)>,
+}
+
 /// Source range of a user-visible local binding.
 ///
 /// Offsets use SWC's 1-based `BytePos` coordinates. Keeping this metadata in a
@@ -30,6 +53,7 @@ pub struct FunctionSourceMetadata {
 pub struct Module {
     /// Module name/path
     pub name: String,
+    pub class_family_syntax: Option<ClassFamilySyntax>,
     /// Imports from other modules
     pub imports: Vec<Import>,
     /// Exports from this module
@@ -218,6 +242,12 @@ pub struct Module {
     /// zero means no prologue (the common case — fully inert). Populated by
     /// lowering (`lower_fn_decl` / `lower_fn_expr`).
     pub gen_param_prologue_len: std::collections::HashMap<crate::types::FuncId, usize>,
+    /// ESM [[RequestedModules]]: the specifier of every static `import` and
+    /// `export ... from` declaration, in source order. Module evaluation
+    /// visits dependencies in this order across imports AND re-exports
+    /// (`export * from "./a"` above `import * as b from "./b"` evaluates `a`
+    /// first); `topo_sort_non_entry_modules` follows it.
+    pub requested_modules: Vec<String>,
 }
 
 impl Module {
@@ -226,6 +256,7 @@ impl Module {
             name: name.into(),
             imports: Vec::new(),
             exports: Vec::new(),
+            class_family_syntax: None,
             classes: Vec::new(),
             interfaces: Vec::new(),
             type_aliases: Vec::new(),
@@ -257,6 +288,7 @@ impl Module {
             async_generator_funcs: std::collections::HashSet::new(),
             local_source_spans: std::collections::HashMap::new(),
             gen_param_prologue_len: std::collections::HashMap::new(),
+            requested_modules: Vec::new(),
         }
     }
 

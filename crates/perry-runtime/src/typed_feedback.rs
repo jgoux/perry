@@ -394,7 +394,7 @@ fn registry() -> crate::gc::NonCollectingRootRegistryGuard<'static, TypedFeedbac
 /// already compile-gated. Now it produces nothing, which is the same amount of
 /// information and looks far more like success. The trace dump uses this to say
 /// so out loud rather than writing an empty file.
-#[cfg(perry_diagnostics)]
+#[cfg(any(perry_diagnostics, test))]
 pub(crate) fn no_sites_were_instrumented() -> bool {
     registry().sites.is_empty()
 }
@@ -1132,17 +1132,16 @@ pub extern "C" fn js_typed_feedback_object_set_field_by_name_fast(
 #[path = "typed_feedback/guards.rs"]
 mod guards;
 pub use guards::{
-    js_closure_exact_func_guard, js_object_own_method_cache_miss,
-    js_typed_feedback_class_field_get_guard, js_typed_feedback_closure_direct_call_guard,
-    js_typed_feedback_method_direct_call_guard, js_typed_feedback_native_call_method,
-    js_typed_feedback_native_call_method_apply, js_typed_feedback_native_call_method_by_id,
-    MethodPicCache, MethodPicCacheSlot, METHOD_PIC_WORDS,
+    js_closure_exact_func_guard, js_typed_feedback_class_field_get_guard,
+    js_typed_feedback_closure_direct_call_guard, js_typed_feedback_method_direct_call_guard,
+    js_typed_feedback_native_call_method, js_typed_feedback_native_call_method_apply,
+    js_typed_feedback_native_call_method_by_id,
 };
 
 #[path = "typed_feedback/trace.rs"]
 mod trace;
 pub use trace::typed_feedback_snapshot;
-#[cfg(perry_diagnostics)]
+#[cfg(any(perry_diagnostics, test))]
 pub use trace::{js_typed_feedback_maybe_dump_trace, typed_feedback_trace_json};
 
 fn hash_bytes(bytes: &[u8]) -> u64 {

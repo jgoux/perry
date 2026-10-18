@@ -98,6 +98,7 @@ fn object_type(fields: &[(&str, Type)]) -> Type {
 
 fn base_module(name: &str, body: Vec<Stmt>, interfaces: Vec<Interface>) -> Module {
     Module {
+        requested_modules: Vec::new(),
         name: name.to_string(),
         imports: Vec::new(),
         exports: Vec::new(),
@@ -147,6 +148,8 @@ fn base_module(name: &str, body: Vec<Stmt>, interfaces: Vec<Interface>) -> Modul
         async_generator_funcs: std::collections::HashSet::new(),
         local_source_spans: std::collections::HashMap::new(),
         gen_param_prologue_len: std::collections::HashMap::new(),
+        class_family_syntax: None,
+        requested_modules: Vec::new(),
     }
 }
 
@@ -217,15 +220,18 @@ fn scalar_array_literal_skips_pure_unobserved_initializers() {
                 name: "arr".to_string(),
                 ty: Type::Any,
                 mutable: false,
-                init: Some(Expr::Array(vec![
-                    Expr::Integer(7),
-                    Expr::Binary {
-                        op: BinaryOp::Add,
-                        left: Box::new(Expr::String("drop_".to_string())),
-                        right: Box::new(Expr::Integer(1)),
-                    },
-                    Expr::Integer(9),
-                ])),
+                init: Some(Expr::Array(
+                    vec![
+                        Expr::Integer(7),
+                        Expr::Binary {
+                            op: BinaryOp::Add,
+                            left: Box::new(Expr::String("drop_".to_string())),
+                            right: Box::new(Expr::Integer(1)),
+                        },
+                        Expr::Integer(9),
+                    ],
+                    None,
+                )),
             },
             Stmt::Return(Some(Expr::IndexGet {
                 object: Box::new(Expr::LocalGet(1)),
@@ -322,11 +328,10 @@ fn point_module(name: &str, body: Vec<Stmt>) -> Module {
 fn numeric_array_literal_avoids_layout_note_calls() {
     let module = base_module(
         "numeric_array_literal.ts",
-        vec![Stmt::Return(Some(Expr::Array(vec![
-            Expr::Number(1.0),
-            Expr::Number(2.0),
-            Expr::Number(3.0),
-        ])))],
+        vec![Stmt::Return(Some(Expr::Array(
+            vec![Expr::Number(1.0), Expr::Number(2.0), Expr::Number(3.0)],
+            None,
+        )))],
         Vec::new(),
     );
 
@@ -341,10 +346,10 @@ fn numeric_array_literal_avoids_layout_note_calls() {
 fn mixed_array_literal_emits_layout_note_calls() {
     let module = base_module(
         "mixed_array_literal.ts",
-        vec![Stmt::Return(Some(Expr::Array(vec![
-            Expr::Number(1.0),
-            Expr::String("heap".to_string()),
-        ])))],
+        vec![Stmt::Return(Some(Expr::Array(
+            vec![Expr::Number(1.0), Expr::String("heap".to_string())],
+            None,
+        )))],
         Vec::new(),
     );
 
@@ -367,7 +372,7 @@ fn number_typed_local_array_literal_keeps_runtime_layout_note() {
                 mutable: false,
                 init: Some(Expr::String("heap".to_string())),
             },
-            Stmt::Return(Some(Expr::Array(vec![Expr::LocalGet(1)]))),
+            Stmt::Return(Some(Expr::Array(vec![Expr::LocalGet(1)], None))),
         ],
         Vec::new(),
     );
@@ -396,7 +401,7 @@ fn number_typed_local_array_push_keeps_layout_note_and_barrier() {
                 name: "arr".to_string(),
                 ty: Type::Array(Box::new(Type::Number)),
                 mutable: true,
-                init: Some(Expr::Array(Vec::new())),
+                init: Some(Expr::Array(Vec::new(), None)),
             },
             Stmt::Expr(Expr::ArrayPush {
                 array_id: 2,
@@ -443,7 +448,7 @@ fn c262_array_spread_uses_strict_iterator_append_and_preserves_holes() {
                 name: "iter".to_string(),
                 ty: Type::Any,
                 mutable: false,
-                init: Some(Expr::Array(vec![Expr::Number(2.0)])),
+                init: Some(Expr::Array(vec![Expr::Number(2.0)], None)),
             },
             Stmt::Return(Some(Expr::ArraySpread(vec![
                 ArrayElement::Expr(Expr::Number(1.0)),
@@ -475,7 +480,7 @@ fn c262_array_has_own_property_uses_object_prototype_dispatch() {
                 name: "arr".to_string(),
                 ty: Type::Array(Box::new(Type::Any)),
                 mutable: false,
-                init: Some(Expr::Array(vec![Expr::Bool(true)])),
+                init: Some(Expr::Array(vec![Expr::Bool(true)], None)),
             },
             Stmt::Return(Some(Expr::Call {
                 callee: Box::new(Expr::PropertyGet {
@@ -539,11 +544,10 @@ fn bounded_integer_array_store_omits_layout_note_and_barrier() {
                 name: "arr".to_string(),
                 ty: Type::Array(Box::new(Type::Number)),
                 mutable: true,
-                init: Some(Expr::Array(vec![
-                    Expr::Number(0.0),
-                    Expr::Number(0.0),
-                    Expr::Number(0.0),
-                ])),
+                init: Some(Expr::Array(
+                    vec![Expr::Number(0.0), Expr::Number(0.0), Expr::Number(0.0)],
+                    None,
+                )),
             },
             Stmt::For {
                 init: Some(Box::new(Stmt::Let {
@@ -633,11 +637,10 @@ fn numeric_iota_fill_loop_uses_bulk_helper_without_barrier() {
                 name: "arr".to_string(),
                 ty: Type::Array(Box::new(Type::Number)),
                 mutable: true,
-                init: Some(Expr::Array(vec![
-                    Expr::Number(0.0),
-                    Expr::Number(0.0),
-                    Expr::Number(0.0),
-                ])),
+                init: Some(Expr::Array(
+                    vec![Expr::Number(0.0), Expr::Number(0.0), Expr::Number(0.0)],
+                    None,
+                )),
             },
             Stmt::For {
                 init: Some(Box::new(Stmt::Let {
@@ -702,7 +705,7 @@ fn integer_arithmetic_array_push_omits_inbounds_layout_note_and_barrier() {
                 name: "arr".to_string(),
                 ty: Type::Array(Box::new(Type::Number)),
                 mutable: true,
-                init: Some(Expr::Array(Vec::new())),
+                init: Some(Expr::Array(Vec::new(), None)),
             },
             Stmt::For {
                 init: Some(Box::new(Stmt::Let {
@@ -807,7 +810,7 @@ fn pointer_store_into_numeric_array_keeps_layout_note_and_barrier() {
                 name: "arr".to_string(),
                 ty: Type::Array(Box::new(Type::Number)),
                 mutable: true,
-                init: Some(Expr::Array(vec![Expr::Number(0.0)])),
+                init: Some(Expr::Array(vec![Expr::Number(0.0)], None)),
             },
             Stmt::Expr(Expr::IndexSet {
                 object: Box::new(Expr::LocalGet(2)),

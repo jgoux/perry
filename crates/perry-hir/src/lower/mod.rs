@@ -78,10 +78,12 @@ mod pre_scan;
 pub(crate) use pre_scan::*;
 mod closure_analysis;
 mod const_fold_fn;
+mod enum_image;
 mod eval_super_scan;
 pub(crate) mod fn_ctor_env;
 mod global_eval_hoist;
 mod run_once;
+pub use run_once::class_names as run_once_class_names;
 mod shared_mutable_capture;
 pub(crate) mod type_widening;
 pub(crate) mod unrebound_params;
@@ -128,8 +130,7 @@ pub use lower_module_fn::{
 
 mod lower_expr;
 pub(crate) use lower_expr::{
-    enum_runtime_object_fields, lower_expr, lower_expr_assignment,
-    strict_global_assign_existing_or_throw,
+    lower_expr, lower_expr_assignment, strict_global_assign_existing_or_throw,
     throw_reference_error_expr, try_desugar_reactive_text, unresolved_global_get_expr,
     with_implicit_unset_let, with_set_fallback_for_ident,
 };

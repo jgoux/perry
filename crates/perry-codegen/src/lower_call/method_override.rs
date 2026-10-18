@@ -13,10 +13,7 @@ use crate::nanbox::double_literal;
 use crate::native_value::LoweredValue;
 use crate::types::{DOUBLE, I1, I32, I64, I8};
 
-use super::direct_method_guard::{
-    emit_direct_method_site_word, emit_direct_method_site_word_with_memo,
-    emit_inline_direct_method_shape_guard, emit_learned_word_hit,
-};
+use super::direct_method_guard::emit_inline_direct_method_shape_guard;
 
 pub(super) const POINTER_TAG_HI16: &str = "32765"; // 0x7FFD
 pub(super) const GC_TYPE_OBJECT: &str = "2";
@@ -38,7 +35,6 @@ pub(super) const GC_OBJECT_METHOD_GUARD_MASK_I32: &str = "134250751"; // 0x0800_
                                                                       // exact word compare already subsumes the descriptor bit; the runtime only
                                                                       // learns a word whose key list lacks the method name, and an accessor or
                                                                       // attribute for that name would have to add the key.
-pub(super) const GC_OBJECT_LEARNED_GUARD_MASK_I32: &str = "33023"; // 0x0000_80ff
 pub(super) const SHAPE_ID_BASE_NEG_I32: &str = "-2147483648"; // subtract 0x8000_0000
 pub(super) const SHAPE_ID_RANGE_LEN: &str = "1073741824"; // 0x4000_0000
 
@@ -695,38 +691,25 @@ pub(super) fn emit_own_method_override_check(
     this_box: &str,
     override_user_args: &[String],
 ) -> String {
-    // Intern the property name so we can pass (ptr, len) directly to the
-    // override probe — saves an allocation vs synthesizing a StringHeader.
-    let key_idx = ctx.strings.intern(property);
-    let entry = ctx.strings.entry(key_idx);
-    let bytes_global = format!("@{}", entry.bytes_global);
-    let name_len_str = entry.byte_len.to_string();
+    // The override probe reads the receiver's own key by the site's
+    // property atom: the layout's own lookup, no by-bytes key compare.
+    let (dir, key_bits, hash) = crate::expr::method_site::emit_site_key(ctx, property);
 
-    // A receiver whose exact word the runtime already proved has no own
-    // property of this name skips the by-name probe (the probe scanned every
-    // own key on every call; an `EventEmitter` subclass carries ~30).
-    let site_word = emit_direct_method_site_word(ctx);
-    let learned_hit = emit_learned_word_hit(ctx, recv_box, &site_word);
-    let probe_idx = ctx.new_block("ovrcheck.probe");
     let override_idx = ctx.new_block("ovrcheck.override");
     let static_idx = ctx.new_block("ovrcheck.static");
     let merge_idx = ctx.new_block("ovrcheck.merge");
-    let probe_label = ctx.block_label(probe_idx);
     let override_label = ctx.block_label(override_idx);
     let static_label = ctx.block_label(static_idx);
     let merge_label = ctx.block_label(merge_idx);
-    ctx.block()
-        .cond_br(&learned_hit, &static_label, &probe_label);
 
-    ctx.current_block = probe_idx;
     let own_method = ctx.block().call(
         DOUBLE,
-        "js_object_get_own_field_or_undef_learn",
+        "perry_probe_own_method",
         &[
+            (crate::types::PTR, &dir),
             (DOUBLE, recv_box),
-            (crate::types::PTR, &bytes_global),
-            (I64, &name_len_str),
-            (crate::types::PTR, &site_word),
+            (I64, &key_bits),
+            (I64, &hash),
         ],
     );
     let own_bits = ctx.block().bitcast_double_to_i64(&own_method);
@@ -854,6 +837,39 @@ fn class_chain_may_declare_method_field(ctx: &FnCtx<'_>, class_name: &str, prope
         current = class.extends_name.clone();
     }
     true
+}
+
+/// The i32 family layout id instances of `class_name` carry when its
+/// compiled or runtime births use the family layout,
+/// loaded from the descriptor's `layout_id` word (written once at startup,
+/// before user code). `None` when births use the birth pair, for static
+/// methods, or when a family key spells `property` (then the word does not
+/// rule out an own method).
+fn family_method_word(
+    ctx: &mut FnCtx<'_>,
+    _class_name: &str,
+    class_id: u32,
+    property: &str,
+    direct_fn: &str,
+) -> Option<String> {
+    if direct_fn.starts_with("perry_static_") {
+        return None;
+    }
+    // Runtime construction also adopts a family's layout after validating
+    // the registered parent. The exact receiver word is the proof, regardless
+    // of which allocation path produced it.
+    if !crate::layout_desc::layouts_enabled("executable", ctx.target_triple) {
+        return None;
+    }
+    let fam = ctx.program_layouts.families.get(&class_id)?;
+    if fam.keys.iter().any(|(k, _)| k == property) {
+        return None;
+    }
+    let desc = crate::layout_desc::note_family_desc_use(class_id);
+    let offset = crate::layout_desc::DESC_LAYOUT_ID_OFFSET.to_string();
+    let blk = ctx.block();
+    let id_ptr = blk.gep(I8, &desc, &[(I64, &offset)]);
+    Some(blk.load(I32, &id_ptr))
 }
 
 /// Emit a typed-feedback runtime guard before a known class-method direct call.
@@ -1001,17 +1017,6 @@ pub(super) fn emit_guarded_direct_method_call(
             || typed_i32_direct_fn.is_some()
             || typed_i1_direct_fn.is_some()
             || typed_string_direct_fn.is_some());
-    let learned_site: Option<(String, usize)> = (certificate.is_none()
-        && (inline_single_arm || probe_before_runtime_guard || multi_arm))
-        .then(|| {
-            let word = emit_direct_method_site_word_with_memo(ctx);
-            (word, ctx.new_block("method_direct.learned"))
-        });
-    let learned_label = learned_site.as_ref().map(|(_, idx)| ctx.block_label(*idx));
-    let learned_arg = learned_site
-        .as_ref()
-        .zip(learned_label.as_ref())
-        .map(|((word, _), label)| (word.as_str(), label.as_str()));
     let mut layout_misses = Vec::new();
     let holder_ok = if multi_arm || certificate.is_some() {
         "true".to_string()
@@ -1091,6 +1096,28 @@ pub(super) fn emit_guarded_direct_method_call(
         }
         ctx.current_block = guard_idx;
     }
+    // Object model case 2c: a compiled `new C` births at C's family layout,
+    // so its instances carry the family layout id, never the birth pair
+    // above. Their arm calls the ordinary public body (what dispatch by name
+    // resolves to), not the fast arm's layout-specific clones.
+    let family_arm = if (inline_single_arm && certificate.is_none()) || probe_before_runtime_guard {
+        family_method_word(
+            ctx,
+            receiver_class_name,
+            expected_class_id,
+            property,
+            direct_fn,
+        )
+    } else {
+        None
+    };
+    let family_label = family_arm.as_ref().map(|_| {
+        let idx = ctx.new_block("method_direct.family_call");
+        (idx, ctx.block_label(idx))
+    });
+    let family_guard = family_arm
+        .as_deref()
+        .zip(family_label.as_ref().map(|(_, l)| l.as_str()));
     if inline_single_arm && certificate.is_none() {
         emit_inline_direct_method_shape_guard(
             ctx,
@@ -1101,7 +1128,7 @@ pub(super) fn emit_guarded_direct_method_call(
             &fast_label,
             &fallback_label,
             true,
-            learned_arg,
+            family_guard,
         );
     }
     if probe_before_runtime_guard {
@@ -1116,9 +1143,19 @@ pub(super) fn emit_guarded_direct_method_call(
             &fast_label,
             &runtime_guard_label,
             false,
-            learned_arg,
+            family_guard,
         );
         ctx.current_block = runtime_guard_idx;
+    }
+    if let Some((family_idx, _)) = family_label {
+        let resume = ctx.current_block;
+        ctx.current_block = family_idx;
+        let value = ctx.block().call(DOUBLE, direct_fn, direct_arg_slices);
+        let truthy = truthy_result_kind.map(|_| total_value_truthy(ctx, &value));
+        let end = ctx.block().label.clone();
+        ctx.block().br(&merge_label);
+        layout_misses.push((value, truthy, end));
+        ctx.current_block = resume;
     }
     let guard_ok = if certificate.is_some() || multi_arm || inline_single_arm {
         // The chain above already terminated the guard block and every test
@@ -1842,26 +1879,6 @@ pub(super) fn emit_guarded_direct_method_call(
         sub_values.push((value, after));
     }
 
-    // The learned arm: the receiver is an instance of the declared class whose
-    // exact word the runtime proved shadows nothing (`learned_check` above),
-    // and the complete holder shapes were re-checked on the way in. The
-    // ordinary body runs its own receiver guards, so no layout is assumed.
-    let learned_value = learned_site.as_ref().and_then(|(_, idx)| {
-        ctx.current_block = *idx;
-        if learned_joins_fast_arm {
-            ctx.block().br(&fast_label);
-            return None;
-        }
-        let target = direct_call_fn.unwrap_or(direct_fn);
-        let value = ctx.block().call(DOUBLE, target, direct_arg_slices);
-        let truthy = truthy_result_kind.map(|kind| constructive_truthy(ctx, kind, &value));
-        let after = ctx.block().label.clone();
-        if !ctx.block().is_terminated() {
-            ctx.block().br(&merge_label);
-        }
-        Some((value, truthy, after))
-    });
-
     ctx.current_block = fallback_idx;
     let (args_ptr, args_len) = if fallback_user_args.is_empty() {
         ("null".to_string(), "0".to_string())
@@ -1889,6 +1906,10 @@ pub(super) fn emit_guarded_direct_method_call(
         );
     }
     let method_id = crate::strings::emit_static_dispatch_id(ctx.block(), &dispatch_global);
+    let _decision = crate::fallback_diag::decision(
+        "receiver/method-entry guard matched no compiled target arm",
+        "receiver layout and method-entry identity",
+    );
     let fallback_value = if let Some(cert) = certificate {
         match cert.lookup {
             Some((lookup, value)) => super::console_promise::emit_split_call_half(
@@ -1913,44 +1934,16 @@ pub(super) fn emit_guarded_direct_method_call(
             ),
         }
     } else {
-        match learned_site.as_ref() {
-            Some((word, _)) => {
-                // The learned word is consulted only behind the holder shape
-                // proof. After a holder changes, nothing the runtime could learn
-                // would be read: the miss edge then
-                // passes the site's address tagged with bit 0, and the runtime
-                // learns nothing. Either way the word is followed by the site's
-                // chain memo slot, from which a receiver the arms decline repeats
-                // its by-name answer instead of walking the prototype chain.
-                let prototype_ok =
-                    crate::proto_constants::holder_constant(ctx, receiver_class_name, property);
-                let blk = ctx.block();
-                let no_learn = blk.gep(I8, word, &[(I64, "1")]);
-                let site = blk.select(I1, &prototype_ok, crate::types::PTR, word, &no_learn);
-                ctx.block().call(
-                    DOUBLE,
-                    "js_native_call_method_by_id_learn",
-                    &[
-                        (DOUBLE, recv_box),
-                        (I64, &method_id),
-                        (crate::types::PTR, &args_ptr),
-                        (I64, &args_len),
-                        (crate::types::PTR, &site),
-                        (I32, &expected_class_id_str),
-                    ],
-                )
-            }
-            None => ctx.block().call(
-                DOUBLE,
-                "js_native_call_method_by_id",
-                &[
-                    (DOUBLE, recv_box),
-                    (I64, &method_id),
-                    (crate::types::PTR, &args_ptr),
-                    (I64, &args_len),
-                ],
-            ),
-        }
+        ctx.block().call(
+            DOUBLE,
+            "js_native_call_method_by_id",
+            &[
+                (DOUBLE, recv_box),
+                (I64, &method_id),
+                (crate::types::PTR, &args_ptr),
+                (I64, &args_len),
+            ],
+        )
     };
     let fallback_truthy = truthy_result_kind.map(|_| total_value_truthy(ctx, &fallback_value));
     let after_fallback = ctx.block().label.clone();
@@ -1962,9 +1955,6 @@ pub(super) fn emit_guarded_direct_method_call(
     let mut phi_inputs: Vec<(&str, &str)> = Vec::with_capacity(sub_values.len() + 2);
     phi_inputs.push((fast_value.as_str(), after_fast.as_str()));
     for (value, label) in &sub_values {
-        phi_inputs.push((value.as_str(), label.as_str()));
-    }
-    if let Some((value, _, label)) = learned_value.as_ref() {
         phi_inputs.push((value.as_str(), label.as_str()));
     }
     for (value, _, end) in &layout_misses {
@@ -1982,14 +1972,6 @@ pub(super) fn emit_guarded_direct_method_call(
         ));
         for (value, label) in &sub_truthy_values {
             truthy_inputs.push((value.as_str(), label.as_str()));
-        }
-        if let Some((_, truthy, label)) = learned_value.as_ref() {
-            truthy_inputs.push((
-                truthy
-                    .as_deref()
-                    .expect("truthy mode constructs a learned-arm truthiness value"),
-                label.as_str(),
-            ));
         }
         truthy_inputs.push((
             fallback_truthy

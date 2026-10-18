@@ -45,6 +45,20 @@ impl<F: Copy> Hook<F> {
         self.bits.store(bits, Ordering::Release);
     }
 
+    /// The slot's value, without the unit-test fallback of [`Hook::get`]:
+    /// for slots read while the runtime itself initializes (`gc_init`), where
+    /// installing everything would re-enter it.
+    #[inline]
+    pub fn peek(&self) -> Option<F> {
+        let bits = self.bits.load(Ordering::Acquire);
+        if bits == 0 {
+            None
+        } else {
+            // SAFETY: only `set` stores non-zero bits, and it stores an `F`.
+            Some(unsafe { std::mem::transmute_copy(&bits) })
+        }
+    }
+
     #[inline]
     pub fn get(&self) -> Option<F> {
         #[cfg_attr(not(test), allow(unused_mut))]
@@ -117,7 +131,8 @@ pub(crate) fn run_feature_installer() {
     js_runtime_install_compiled();
 }
 
-/// Install every optional runtime feature this archive was compiled with.
+/// Install every optional runtime feature this archive was compiled with
+/// (its Cargo features).
 #[no_mangle]
 pub extern "C" fn js_runtime_install_compiled() {
     #[cfg(feature = "dyn-eval")]
@@ -134,6 +149,79 @@ pub extern "C" fn js_runtime_install_compiled() {
     js_runtime_install_regex_engine();
     #[cfg(feature = "url-engine")]
     js_runtime_install_url_engine();
+    js_runtime_install_string_normalize();
+    js_runtime_install_intl_segmenter();
+    js_runtime_install_intl_locale();
+    js_runtime_install_global_math();
+    js_runtime_install_global_json();
+    js_runtime_install_global_reflect();
+    js_runtime_install_global_atomics();
+    js_runtime_install_global_url();
+    js_runtime_install_global_text();
+    js_runtime_install_global_websocket();
+    js_runtime_install_global_webcrypto();
+    js_runtime_install_global_webfetch();
+    js_runtime_install_proc_ipc();
+    js_runtime_install_mod_dgram();
+    js_runtime_install_mod_http2_constants();
+    js_runtime_install_mod_node_test();
+    // The user-facing diagnostics are always compiled; unit tests that reach
+    // them expect the real builders. A shipped archive's installer does not
+    // name them (the core archive would link the serializers).
+    #[cfg(test)]
+    js_runtime_install_diagnostics();
+    // The always-compiled hosts (Node-API, WebAssembly) are not Cargo
+    // features: perry installs them by name for the programs that need them,
+    // so installing "everything compiled" (the core archive's installer) must
+    // not pull them in.
+}
+
+/// Root scanners an optional feature contributes. The root-scanner registry
+/// is per thread: `gc_init` registers every filled slot on each thread it
+/// initializes, and the install registers its scanner on the installing
+/// thread (whose `gc_init` already ran).
+/// The user-facing diagnostics (`v8.getHeapSnapshot` / `writeHeapSnapshot`,
+/// `Bun.generateHeapSnapshot`, `process.report`): their JSON builders are
+/// reached only through these slots, which `js_runtime_install_diagnostics`
+/// fills, so a program that uses none of them links none of the serializers.
+pub(crate) static HEAP_SNAPSHOT_JSON: Hook<fn() -> String> = Hook::empty();
+pub(crate) static PROCESS_REPORT_JSON: Hook<fn(&str, Option<&str>) -> String> = Hook::empty();
+
+pub(crate) static NODE_API_ROOT_SCANNER: Hook<crate::gc::MutableRootScanner> = Hook::empty();
+pub(crate) static WASM_ROOT_SCANNER: Hook<crate::gc::MutableRootScanner> = Hook::empty();
+pub(crate) static DGRAM_ROOT_SCANNER: Hook<crate::gc::MutableRootScanner> = Hook::empty();
+pub(crate) static NODE_TEST_ROOT_SCANNER: Hook<crate::gc::MutableRootScanner> = Hook::empty();
+
+/// Node-API addon hosting (#8523): `process.dlopen`, `require` of an
+/// allowlisted `.node` addon, and the addon environment's pump, roots and
+/// shutdown. perry installs it for a program with an approved native addon.
+#[no_mangle]
+pub extern "C" fn js_runtime_install_node_api_host() {
+    perry_install_once!({
+        crate::node_api_host::install();
+    });
+}
+
+/// The WebAssembly engine (#76). Installs only when a `perry-wasm-host`
+/// archive registered its entry points (`js_runtime_set_wasm_host_ops`), which
+/// perry links for a program that uses WebAssembly; otherwise the namespace
+/// keeps its graceful-failure behavior.
+#[no_mangle]
+pub extern "C" fn js_runtime_install_wasm_host() {
+    perry_install_once!({
+        crate::webassembly::install();
+    });
+}
+
+/// The heap-snapshot and `process.report` builders. Always compiled: they
+/// are user APIs, not instruments, so every archive carries them and perry
+/// installs them for a program that references one.
+#[no_mangle]
+pub extern "C" fn js_runtime_install_diagnostics() {
+    perry_install_once!({
+        HEAP_SNAPSHOT_JSON.set(crate::gc::gc_build_v8_heap_snapshot_json);
+        PROCESS_REPORT_JSON.set(crate::process::report::process_report_json_string);
+    });
 }
 
 #[cfg(feature = "dyn-eval")]
@@ -191,4 +279,134 @@ pub extern "C" fn js_runtime_install_url_engine() {
     perry_install_once!({
         crate::url::install_engine();
     });
+}
+
+#[no_mangle]
+pub extern "C" fn js_runtime_install_string_normalize() {
+    perry_install_once!({
+        crate::string::normalize_hooked::install();
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn js_runtime_install_intl_segmenter() {
+    perry_install_once!({
+        crate::intl::install_intl_segmenter_feature();
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn js_runtime_install_intl_locale() {
+    perry_install_once!({
+        crate::intl::install_intl_locale_feature();
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn js_runtime_install_global_math() {
+    perry_install_once!({
+        crate::object::global_this::web_hooks::install_math();
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn js_runtime_install_global_json() {
+    perry_install_once!({
+        crate::object::global_this::web_hooks::install_json();
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn js_runtime_install_global_reflect() {
+    perry_install_once!({
+        crate::object::global_this::web_hooks::install_reflect();
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn js_runtime_install_global_atomics() {
+    perry_install_once!({
+        crate::object::global_this::web_hooks::install_atomics();
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn js_runtime_install_global_url() {
+    perry_install_once!({
+        crate::object::global_this::web_hooks::install_url();
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn js_runtime_install_global_text() {
+    perry_install_once!({
+        crate::object::global_this::web_hooks::install_text();
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn js_runtime_install_global_websocket() {
+    perry_install_once!({
+        crate::object::global_this::web_hooks::install_websocket();
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn js_runtime_install_global_webcrypto() {
+    perry_install_once!({
+        crate::object::global_this::web_hooks::install_webcrypto();
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn js_runtime_install_global_webfetch() {
+    perry_install_once!({
+        crate::object::global_this::web_hooks::install_webfetch();
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn js_runtime_install_proc_ipc() {
+    perry_install_once!({
+        crate::process::ipc::install();
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn js_runtime_install_mod_dgram() {
+    perry_install_once!({
+        crate::module_hooks::install_dgram();
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn js_runtime_install_mod_http2_constants() {
+    perry_install_once!({
+        crate::module_hooks::install_http2_constants();
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn js_runtime_install_mod_node_test() {
+    perry_install_once!({
+        crate::node_submodules::install_node_test();
+    });
+}
+
+#[cfg(test)]
+mod diagnostics_install_tests {
+    /// The heap-snapshot and `process.report` builders are user APIs, not
+    /// instruments: after the install they answer in every build, with or
+    /// without the `perry_diagnostics` instrument cfg.
+    #[test]
+    fn the_diagnostics_install_fills_the_user_api_builders() {
+        super::js_runtime_install_diagnostics();
+        assert!(super::PROCESS_REPORT_JSON.peek().is_some());
+        let json = crate::node_v8::heap_snapshot_json();
+        assert!(
+            json.starts_with("{\"snapshot\""),
+            "{}",
+            &json[..json.len().min(80)]
+        );
+    }
 }

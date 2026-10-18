@@ -128,6 +128,7 @@ fn entry_opts() -> CompileOptions {
 
 fn module_with_init(name: &str, init: Vec<Stmt>) -> Module {
     Module {
+        requested_modules: Vec::new(),
         name: name.to_string(),
         imports: Vec::new(),
         exports: Vec::new(),
@@ -162,6 +163,8 @@ fn module_with_init(name: &str, init: Vec<Stmt>) -> Module {
         async_generator_funcs: std::collections::HashSet::new(),
         local_source_spans: std::collections::HashMap::new(),
         gen_param_prologue_len: std::collections::HashMap::new(),
+        class_family_syntax: None,
+        requested_modules: Vec::new(),
     }
 }
 
@@ -337,7 +340,11 @@ fn scalar_replaced_array_element_holding_a_heap_value_is_bound() {
     let ir = ir_for(
         "scalar_array_element_root.ts",
         vec![
-            let_stmt(1, "a", Expr::Array(vec![heap_value(), Expr::Number(2.0)])),
+            let_stmt(
+                1,
+                "a",
+                Expr::Array(vec![heap_value(), Expr::Number(2.0)], None),
+            ),
             console_log(vec![
                 Expr::IndexGet {
                     object: Box::new(Expr::LocalGet(1)),
@@ -368,7 +375,7 @@ fn numeric_only_scalar_replaced_array_emits_no_rooting() {
             let_stmt(
                 1,
                 "a",
-                Expr::Array(vec![Expr::Number(1.0), Expr::Number(2.0)]),
+                Expr::Array(vec![Expr::Number(1.0), Expr::Number(2.0)], None),
             ),
             console_log(vec![Expr::IndexGet {
                 object: Box::new(Expr::LocalGet(1)),
@@ -680,7 +687,11 @@ fn scalar_replaced_array_element_slots_are_initialized_before_the_bind() {
     let ir = ir_for(
         "scalar_array_element_init.ts",
         vec![
-            let_stmt(1, "a", Expr::Array(vec![heap_value(), Expr::Number(2.0)])),
+            let_stmt(
+                1,
+                "a",
+                Expr::Array(vec![heap_value(), Expr::Number(2.0)], None),
+            ),
             console_log(vec![
                 Expr::IndexGet {
                     object: Box::new(Expr::LocalGet(1)),

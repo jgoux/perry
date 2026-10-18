@@ -55,6 +55,7 @@ fn set_type() -> Type {
 
 fn module_with(body: Vec<Stmt>) -> Module {
     Module {
+        requested_modules: Vec::new(),
         name: "typed_collection_receiver_guard.ts".to_string(),
         imports: Vec::new(),
         exports: Vec::new(),
@@ -104,6 +105,8 @@ fn module_with(body: Vec<Stmt>) -> Module {
         async_generator_funcs: std::collections::HashSet::new(),
         local_source_spans: std::collections::HashMap::new(),
         gen_param_prologue_len: std::collections::HashMap::new(),
+        class_family_syntax: None,
+        requested_modules: Vec::new(),
     }
 }
 

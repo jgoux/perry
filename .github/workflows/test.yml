@@ -387,20 +387,6 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo fmt --all -- --check
 
-      # RFC deferred collection S1: codegen's GC call effects come from the
-      # generated tables in crates/perry-codegen/src/gc_effects/. The self-test
-      # compiles a C fixture to ELF, Mach-O and COFF objects and runs the real
-      # classifier over them, including a planted js_proxy_get call in a Leaf
-      # helper that must come back Reenters and be reported as UNSAFE drift, so
-      # a green archive check means something. `lint` checks that the rules and
-      # the three committed tables parse. The archive comparison itself runs in
-      # gc-call-effects-linux and gc-call-effects (macOS aarch64, Windows).
-      - name: GC call-effects classifier self-test and table lint
-        if: ${{ !cancelled() }}
-        run: |
-          python3 scripts/gc_call_effects/callgraph.py --self-test
-          python3 scripts/gc_call_effects/callgraph.py lint
-
       # The CI tier policy (scripts/ci_plan.py) is code; its self-test asserts
       # the invariants CLAUDE.md cares about (gc-stress main-line reachable,
       # docs-only PRs skip the compile tier, an empty file listing is treated
@@ -1115,6 +1101,12 @@ jobs:
           python3 scripts/check_test_registration.py
           python3 scripts/node_suite_run.py --self-test
 
+      - name: Coverage classifier regression tests
+        if: ${{ !cancelled() }}
+        run: |
+          python3 -m unittest discover -s tests -p 'test_node_core_subset.py' -v
+          python3 -m unittest discover -s tests -p 'test_visual_test_check.py' -v
+
       # #7672: the GC test guards CLEAR ~20 process-global side tables from
       # whatever libtest thread constructs a guard, and nothing requires a
       # READER to take the clearing lock. Three flakes in two days came from
@@ -1623,6 +1615,7 @@ jobs:
               # their own full-tier shards.
               cargo build --release -p perry-runtime -p perry-stdlib \
                 -p perry-runtime-static -p perry-stdlib-static
+              scripts/gc_call_effects/sidecars.sh target/release
               export PERRY_RUNTIME_DIR="$PWD/target/release"
             fi
             find target/debug/deps -maxdepth 1 -type f -perm -111 ! -name '*.so' -delete 2>/dev/null || true
@@ -1822,7 +1815,7 @@ jobs:
 
       - name: Run perry integration shard ${{ matrix.shard }}
         env:
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C linker-features=-lld -C force-unwind-tables=yes -C force-frame-pointers=yes"
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C linker-features=-lld -C force-unwind-tables=yes"
           CARGO_PROFILE_TEST_DEBUG: "0"
           CARGO_PROFILE_DEV_DEBUG: "0"
           SHARD: ${{ matrix.shard }}
@@ -1856,14 +1849,16 @@ jobs:
             # ten-minute timeout, as the scoped integration job does.
             # Otherwise fresh full-tier shards rebuild the perry-dev graph
             # inside a bounded Node fixture and fail before running it.
-            cargo build --release -p perry -p perry-runtime -p perry-stdlib \
-              -p perry-runtime-static -p perry-stdlib-static \
-              -p perry-ext-http -p perry-ext-net \
-              -p perry-ext-typescript -p perry-ext-ws -p perry-ext-zlib
+            cargo build-perry --release
+            scripts/gc_call_effects/sidecars.sh target/release
             export PERRY_TEST_RUNTIME_PREBUILT=1
           else
             cargo build --release -p perry-runtime -p perry-stdlib \
               -p perry-runtime-static -p perry-stdlib-static
+            scripts/gc_call_effects/sidecars.sh target/release
+            # Fixtures that set a GC/diagnostic instrument knob while compiling
+            # link the instrumented archives (runtime and stdlib only here).
+            PERRY_INSTR_PACKAGES=runtime scripts/build_instr_runtime.sh
           fi
           export PERRY_RUNTIME_DIR="$PWD/target/release"
           export CARGO_BUILD_JOBS=1
@@ -2046,7 +2041,7 @@ jobs:
         if: steps.scope.outputs.suites != ''
         env:
           # lld has repeatedly SIGBUS'd large test links on the shared runner.
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C linker-features=-lld -C force-unwind-tables=yes -C force-frame-pointers=yes"
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C linker-features=-lld -C force-unwind-tables=yes"
           CARGO_PROFILE_TEST_DEBUG: "0"
           CARGO_PROFILE_DEV_DEBUG: "0"
           # Bound the heavy per-binary runtime link so the runner doesn't OOM.
@@ -2069,10 +2064,8 @@ jobs:
               # Prepare all require providers in one graph, outside the fixture's
               # timeout. A second perry-dev graph inside cargo test exceeded its
               # ten-minute bound on fresh runners (#9989/#9990/#10076).
-              cargo build --release -p perry -p perry-runtime -p perry-stdlib \
-                -p perry-runtime-static -p perry-stdlib-static \
-                -p perry-ext-http -p perry-ext-net \
-                -p perry-ext-typescript -p perry-ext-ws -p perry-ext-zlib
+              cargo build-perry --release
+              scripts/gc_call_effects/sidecars.sh target/release
               export PERRY_TEST_RUNTIME_PREBUILT=1
             else
               runtime_packages=(-p perry-runtime -p perry-stdlib -p perry-runtime-static -p perry-stdlib-static)
@@ -2082,6 +2075,7 @@ jobs:
                 runtime_packages+=(-p perry-ext-net)
               fi
               cargo build --release "${runtime_packages[@]}"
+              scripts/gc_call_effects/sidecars.sh target/release
             fi
             export PERRY_RUNTIME_DIR="$PWD/target/release"
           fi
@@ -2250,7 +2244,10 @@ jobs:
       # below), and both Windows UI crates — the ones cargo-test's ubuntu
       # runner must exclude and therefore never compiles.
       - name: Build compiler + runtime + Windows UI crates (dev)
-        run: cargo build --profile dev -p perry -p perry-runtime -p perry-stdlib -p perry-runtime-static -p perry-stdlib-static -p perry-ui-windows -p perry-ui-windows-winui
+        shell: bash
+        run: |
+          cargo build-perry --profile dev -p perry-ui-windows -p perry-ui-windows-winui
+          scripts/gc_call_effects/sidecars.sh target/debug
 
       # #7356: the full perry-runtime --lib suite is green on Windows for the
       # first time (the SEH/longjmp transport, setjmp alignment, TZ, trim and
@@ -2372,7 +2369,10 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build ARM64 compiler and static libraries (dev)
-        run: cargo build --profile dev -p perry -p perry-runtime-static -p perry-stdlib-static
+        shell: bash
+        run: |
+          cargo build-perry --profile dev
+          scripts/gc_call_effects/sidecars.sh target/debug
 
       - name: Run ARM64 setjmp ABI tests
         run: 'cargo test --profile dev --lib -p perry-runtime ffi::setjmp::tests:: -- --test-threads=1'
@@ -2386,6 +2386,7 @@ jobs:
           # target selection, SDK discovery, final PE link, and execution.
           New-Item -ItemType Directory -Force 'target/windows-arm64-smoke-libs' | Out-Null
           Copy-Item 'target/debug/perry_runtime.lib' 'target/windows-arm64-smoke-libs/'
+          Copy-Item 'target/debug/perry_runtime.lib.gc-effects' 'target/windows-arm64-smoke-libs/'
           $env:PERRY_RUNTIME_DIR = (Resolve-Path 'target/windows-arm64-smoke-libs').Path
           target/debug/perry.exe compile tests/release/link_smoke/fixture.ts `
             --target windows-aarch64 `
@@ -2475,9 +2476,9 @@ jobs:
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C linker-features=-lld"
         run: |
-          cargo build --release \
-            -p perry -p perry-runtime -p perry-stdlib \
-            -p perry-runtime-static -p perry-stdlib-static
+          cargo build-perry --release
+          scripts/gc_call_effects/sidecars.sh target/release
+          scripts/build_instr_runtime.sh
       - name: Upload shared GC matrix build
         uses: ./.github/actions/perry/actions/upload-artifact # v7
         with:
@@ -2486,6 +2487,12 @@ jobs:
             target/release/perry
             target/release/libperry_runtime.a
             target/release/libperry_stdlib.a
+            target/release/libperry_runtime.a.gc-effects
+            target/release/libperry_runtime_instr.a
+            target/release/libperry_stdlib_instr.a
+            target/release/libperry_runtime_instr.a.gc-effects
+            target/release/libperry_wasm_host.a
+            target/release/libperry_ext_*.a
           if-no-files-found: error
           retention-days: 1
 
@@ -3442,7 +3449,10 @@ jobs:
       - name: Build compiler + runtime archives (fast mode, shared across shards)
         # Release profile, codegen-units=1: the parity harness's own build
         # command. cu=16 miscompiles the release runtime (see CLAUDE.md).
-        run: cargo build --release -p perry -p perry-runtime -p perry-stdlib -p perry-runtime-static -p perry-stdlib-static
+        run: |
+          cargo build-perry --release
+          scripts/gc_call_effects/sidecars.sh target/release
+          scripts/build_instr_runtime.sh
 
       # Only the three files the fast-mode harness actually links against
       # (PERRY_BIN / PERRY_RUNTIME_DIR below) -- not the rest of target/release,
@@ -3455,6 +3465,12 @@ jobs:
             target/release/perry
             target/release/libperry_runtime.a
             target/release/libperry_stdlib.a
+            target/release/libperry_runtime.a.gc-effects
+            target/release/libperry_runtime_instr.a
+            target/release/libperry_stdlib_instr.a
+            target/release/libperry_runtime_instr.a.gc-effects
+            target/release/libperry_wasm_host.a
+            target/release/libperry_ext_*.a
           if-no-files-found: error
           retention-days: 1
 
@@ -3651,18 +3667,19 @@ jobs:
   # await-tests keys on. If a standing failure must not block a release,
   # triage it into test-parity/known_failures.json — do not soften the job.
   # ---------------------------------------------------------------------------
-  # RFC deferred collection S1 (owner decision 4). The committed table
-  # crates/perry-codegen/src/gc_effects/<target>.tsv must equal the table
-  # scripts/gc_call_effects/callgraph.py derives from THIS commit's release
-  # runtime archives, and no symbol may be committed weaker than the archives
-  # prove (UNSAFE drift: codegen would skip a statepoint the runtime needs).
-  # On failure the regenerated table is uploaded as `gc-effects-<target>`:
-  # commit it (or run scripts/gc_call_effects/regen.sh <target> locally).
-  # On a PR only UNSAFE drift fails (new symbols from main read as Unknown,
-  # which is safe); on main-line tiers any drift fails, so it gets regenerated.
+  # RFC deferred collection S1, GC effects design §5. Nothing is checked in:
+  # perry reads the `.gc-effects` sidecar of the runtime archive it links,
+  # computed from the archive bytes by `perry-gc-effects sidecars`. These jobs
+  # run that step over freshly built archives of each checked target (the
+  # analyzer's hard rule checks: solves agree, forbid premises, no dead seed
+  # rules, the symbol floor), the analyzer's fixture self-test (a planted
+  # js_proxy_get call in a Leaf helper must come back Reenters), and the
+  # pinned facts over the fresh sidecar (`perry-gc-effects` test
+  # `workspace_sidecar`: hot helpers Leaf, #11522, #11523, polls, the
+  # root-dominance checker's authority).
   #
-  # Linux reuses gap-suite-build's archives (same build command as regen.sh);
-  # in the full tier, where gap-suite-build does not run, it builds them.
+  # Linux reuses gap-suite-build's archives; in the full tier, where
+  # gap-suite-build does not run, it builds them.
   gc-call-effects-linux:
     needs: [plan, gap-suite-build]
     if: >-
@@ -3711,27 +3728,19 @@ jobs:
           save-if: false
       - name: Build runtime archives (no shared build in this tier)
         if: fromJSON(needs.plan.outputs.plan).gap.mode != 'fast'
-        run: cargo build --release -p perry -p perry-runtime -p perry-stdlib -p perry-runtime-static -p perry-stdlib-static
-      - name: Committed table vs. the archives
-        env:
-          GC_EFFECTS_SKIP_BUILD: "1"
-          GC_EFFECTS_FRESH_OUT: gc-effects/linux-x86_64.tsv
-          GC_EFFECTS_ALLOW_SAFE_DRIFT: ${{ github.event_name == 'pull_request' && '1' || '' }}
         run: |
-          mkdir -p gc-effects
-          scripts/gc_call_effects/regen.sh linux-x86_64 --check
-      - name: Upload the regenerated table
-        if: always()
-        uses: ./.github/actions/perry/actions/upload-artifact # v7
-        with:
-          name: gc-effects-linux-x86_64
-          path: gc-effects/
-          if-no-files-found: warn
-          retention-days: 7
+          cargo build-perry --release
+          scripts/gc_call_effects/sidecars.sh target/release
+      - name: Sidecars, analyzer self-test and pinned facts
+        run: |
+          scripts/gc_call_effects/sidecars.sh target/release
+          cargo test -p perry-gc-effects
+          PERRY_GC_EFFECTS_SIDECAR=target/release/libperry_runtime.a.gc-effects \
+            cargo test -p perry-gc-effects --test workspace_sidecar -- --ignored
 
   # macOS aarch64 builds its own archives; Windows x86-64 cross-builds them
   # with cargo-xwin on Linux (the same toolchain lint's Windows type-check
-  # uses). Each leg compares only its own table.
+  # uses). Each leg writes its own sidecars and checks the pinned facts.
   gc-call-effects:
     needs: plan
     if: fromJSON(needs.plan.outputs.plan).jobs.gc_call_effects
@@ -3799,25 +3808,24 @@ jobs:
         with:
           path: ~/.cache/cargo-xwin
           key: cargo-xwin-${{ runner.os }}-0.23.0
-      - name: Build the archives and compare the committed table
+      - name: Build the archives, write their sidecars, check the pinned facts
         # cargo-xwin runs OpenSSL's Windows Configure script with Linux Perl.
         # OpenSSL's windows-checker rejects that host by default; CONFIGURE_INSIST
         # is its explicit override for cross-host configurations.
         env:
           CONFIGURE_INSIST: ${{ matrix.target == 'windows-x86_64' && '1' || '' }}
-          GC_EFFECTS_FRESH_OUT: gc-effects/${{ matrix.target }}.tsv
-          GC_EFFECTS_ALLOW_SAFE_DRIFT: ${{ github.event_name == 'pull_request' && '1' || '' }}
         run: |
-          mkdir -p gc-effects
-          scripts/gc_call_effects/regen.sh "${{ matrix.target }}" --check
-      - name: Upload the regenerated table
-        if: always()
-        uses: ./.github/actions/perry/actions/upload-artifact # v7
-        with:
-          name: gc-effects-${{ matrix.target }}
-          path: gc-effects/
-          if-no-files-found: warn
-          retention-days: 7
+          unset RUSTFLAGS
+          if [[ "${{ matrix.target }}" == windows-x86_64 ]]; then
+            cargo xwin build --release --target x86_64-pc-windows-msvc -p perry-runtime-static -p perry-stdlib-static
+            libdir=target/x86_64-pc-windows-msvc/release; runtime=perry_runtime.lib
+          else
+            cargo build --release -p perry-runtime-static -p perry-stdlib-static
+            libdir=target/release; runtime=libperry_runtime.a
+          fi
+          scripts/gc_call_effects/sidecars.sh "$libdir"
+          PERRY_GC_EFFECTS_SIDECAR="$libdir/$runtime.gc-effects" \
+            cargo test -p perry-gc-effects --test workspace_sidecar -- --ignored
 
   parity:
     # Sweep/full-tier only. Chained behind `check` so a sweep's fan-out does
@@ -3882,6 +3890,10 @@ jobs:
         run: npm ci --ignore-scripts --no-audit --no-fund
       - name: Build compiler
         run: cargo build --release
+      # Tests carrying `parity-env: PERRY_GC_SCHEDULE_SEED=...` compile with an
+      # instrument knob set, which links the instrumented archives.
+      - name: Build the instrumented archives
+        run: scripts/build_instr_runtime.sh
       - name: Run parity tests (shard ${{ matrix.shard }}/${{ fromJSON(needs.plan.outputs.plan).parity.total }})
         run: ./run_parity_tests.sh --shard ${{ matrix.shard }}/${{ fromJSON(needs.plan.outputs.plan).parity.total }}
       # Bidirectional since #7582: red on a failure that is not allowed here,
@@ -4101,7 +4113,9 @@ jobs:
         # a "no reactor running" panic. `test_issue_414_mysql_query_params`
         # was the single compile-smoke failure this caused. Same set the
         # doc-tests job already builds together.
-        run: cargo build --release -p perry -p perry-runtime -p perry-stdlib -p perry-runtime-static -p perry-stdlib-static -p perry-ext-nodemailer
+        run: |
+          cargo build-perry --release
+          scripts/gc_call_effects/sidecars.sh target/release
 
       - name: Issue #945 scalar method IR guard
         run: |
@@ -4629,7 +4643,9 @@ jobs:
           mysql -h 127.0.0.1 -P 3306 -u root -e "SELECT VERSION();"
 
       - name: Build perry compiler
-        run: cargo build --release -p perry-runtime -p perry-stdlib -p perry-runtime-static -p perry-stdlib-static -p perry
+        run: |
+          cargo build-perry --release
+          scripts/gc_call_effects/sidecars.sh target/release
 
       - name: Run drizzle-mysql fixture
         run: |
@@ -4699,7 +4715,9 @@ jobs:
           node-version-file: .node-version
 
       - name: Build perry compiler
-        run: cargo build --release -p perry-runtime -p perry-stdlib -p perry-runtime-static -p perry-stdlib-static -p perry
+        run: |
+          cargo build-perry --release
+          scripts/gc_call_effects/sidecars.sh target/release
 
       - name: Run Ink link fixture
         run: |
@@ -4773,7 +4791,9 @@ jobs:
           node-version-file: .node-version
 
       - name: Build perry compiler
-        run: cargo build --release -p perry-runtime -p perry-stdlib -p perry-runtime-static -p perry-stdlib-static -p perry
+        run: |
+          cargo build-perry --release
+          scripts/gc_call_effects/sidecars.sh target/release
 
       - name: Run Effect fixture
         run: |
@@ -5045,7 +5065,9 @@ jobs:
         # Build them in this SAME Cargo graph as perry-stdlib: otherwise each
         # no-auto fallback build bundles a distinct tokio TLS/runtime and the
         # linker rejects the unsafe pair (#507, #7629).
-        run: cargo build --release -p perry -p perry-runtime -p perry-stdlib -p perry-runtime-static -p perry-stdlib-static -p ${{ matrix.ui_backend }} -p perry-doc-tests -p perry-ext-nodemailer -p perry-ext-net
+        run: |
+          cargo build-perry --release -p ${{ matrix.ui_backend }} -p perry-doc-tests
+          scripts/gc_call_effects/sidecars.sh target/release
 
       - name: Verify macOS application bundle packaging
         if: matrix.os == 'macos-14'
@@ -5158,7 +5180,9 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build release binaries
-        run: cargo build --release -p perry -p perry-runtime -p perry-stdlib -p perry-runtime-static -p perry-stdlib-static
+        run: |
+          cargo build-perry --release
+          scripts/gc_call_effects/sidecars.sh target/release
 
       # What users ship is the dead-stripped LINKED program, not the archive:
       # compile a few small fixtures through the real pipeline, prove each

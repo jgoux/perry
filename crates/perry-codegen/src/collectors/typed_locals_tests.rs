@@ -241,7 +241,7 @@ fn hoisted_var_seeds_are_not_writes_but_reads_must_follow_a_real_write() {
 fn a_literal_array_local_stays_an_array_through_in_place_pushes() {
     let body = vec![
         let_(5, Some(Expr::Undefined)),
-        set(5, Expr::Array(Vec::new())),
+        set(5, Expr::Array(Vec::new(), None)),
         Stmt::Expr(Expr::ArrayPush {
             array_id: 5,
             value: Box::new(Expr::String("x".into())),
@@ -295,7 +295,7 @@ fn an_iife_that_always_returns_its_array_local_types_the_binding() {
         60,
         vec![
             let_(61, Some(Expr::Undefined)),
-            set(61, Expr::Array(Vec::new())),
+            set(61, Expr::Array(Vec::new(), None)),
             Stmt::Return(Some(get(61))),
         ],
     );
@@ -310,10 +310,120 @@ fn an_iife_that_always_returns_its_array_local_types_the_binding() {
         62,
         vec![Stmt::If {
             condition: get(7),
-            then_branch: vec![Stmt::Return(Some(Expr::Array(Vec::new())))],
+            then_branch: vec![Stmt::Return(Some(Expr::Array(Vec::new(), None)))],
             else_branch: None,
         }],
     );
     let body = vec![let_(5, Some(maybe)), Stmt::Return(Some(get(5)))];
     assert!(run(&body, &[]).arrays.is_empty());
+}
+
+fn arr_any() -> HirType {
+    HirType::Array(Box::new(HirType::Any))
+}
+
+#[test]
+fn outer_proofs_meet_capture_and_definite_facts() {
+    let mut definite = crate::collectors::DefiniteInit::default();
+    definite.kinds.insert(7, arr_any());
+    definite.kinds.insert(8, arr_any());
+    // 8 is declared by body 3: body 3 gets no definite fact for it.
+    definite
+        .declaring
+        .insert(8, [Some(3)].into_iter().collect());
+    let captures: HashMap<u32, HirType> = [
+        (7, HirType::Array(Box::new(HirType::String))),
+        (9, HirType::String),
+    ]
+    .into_iter()
+    .collect();
+    let seed = outer_proofs(Some(&captures), &definite, Some(3));
+    // Comparable facts: the narrower one wins.
+    assert_eq!(
+        seed.get(&7),
+        Some(&HirType::Array(Box::new(HirType::String)))
+    );
+    assert_eq!(seed.get(&9), Some(&HirType::String));
+    assert!(!seed.contains_key(&8));
+    // Another body sees 8; equal facts stand.
+    let seed = outer_proofs(None, &definite, Some(4));
+    assert_eq!(seed.get(&7), Some(&arr_any()));
+    assert_eq!(seed.get(&8), Some(&arr_any()));
+}
+
+#[test]
+fn incomparable_outer_facts_do_not_meet() {
+    assert_eq!(meet(&HirType::String, &arr_any()), None);
+    assert_eq!(meet(&arr_any(), &arr_any()), Some(arr_any()));
+}
+
+#[test]
+fn outer_seed_fills_only_unknown_oracle_slots_and_never_numbers() {
+    let outer: HashMap<u32, HirType> = [(1, arr_any()), (2, arr_any()), (3, HirType::Number)]
+        .into_iter()
+        .collect();
+    let mut local_types: HashMap<u32, HirType> =
+        [(1, HirType::Any), (2, HirType::Named("Foo".into()))]
+            .into_iter()
+            .collect();
+    seed_local_types(&outer, &mut local_types);
+    assert_eq!(local_types.get(&1), Some(&arr_any()));
+    assert_eq!(local_types.get(&2), Some(&HirType::Named("Foo".into())));
+    assert!(!local_types.contains_key(&3));
+    assert!(!outer_only(&outer).contains_key(&3));
+}
+
+#[test]
+fn a_char_code_of_a_proven_string_and_a_bounded_combination_is_a_code_unit() {
+    let t = run(&encode_body(), &[(1, HirType::String)]);
+    assert_eq!(t.code_units, HashSet::from([4]), "{t:?}");
+    assert!(run(&encode_body(), &[]).code_units.is_empty());
+}
+
+#[test]
+fn a_write_that_can_leave_int32_is_not_a_code_unit() {
+    // var c = s.charCodeAt(0); c = c / 2;   (a Number, not int32-or-NaN)
+    let body = vec![
+        let_(5, Some(Expr::String("ab".into()))),
+        let_(
+            6,
+            Some(method(get(5), "charCodeAt", vec![Expr::Integer(0)])),
+        ),
+        set(6, bin(BinaryOp::Div, get(6), Expr::Integer(2))),
+        Stmt::Return(Some(get(6))),
+    ];
+    let t = run(&body, &[]);
+    assert!(t.numbers.contains(&6) && t.code_units.is_empty(), "{t:?}");
+    // c++ can step out of int32 too.
+    let body = vec![
+        let_(5, Some(Expr::String("ab".into()))),
+        let_(
+            6,
+            Some(method(get(5), "charCodeAt", vec![Expr::Integer(0)])),
+        ),
+        Stmt::Expr(Expr::Update {
+            id: 6,
+            op: perry_hir::UpdateOp::Increment,
+            prefix: false,
+        }),
+        Stmt::Return(Some(get(6))),
+    ];
+    let t = run(&body, &[]);
+    assert!(t.numbers.contains(&6) && t.code_units.is_empty(), "{t:?}");
+}
+
+#[test]
+fn a_copy_of_a_code_unit_is_a_code_unit_and_an_unknown_receiver_is_not() {
+    let body = vec![
+        let_(5, Some(Expr::String("ab".into()))),
+        let_(6, Some(method(get(5), "charCodeAt", vec![get(7)]))),
+        let_(8, Some(get(6))),
+        let_(
+            9,
+            Some(method(get(7), "charCodeAt", vec![Expr::Integer(0)])),
+        ),
+        Stmt::Return(Some(bin(BinaryOp::Add, get(8), get(9)))),
+    ];
+    let t = run(&body, &[]);
+    assert_eq!(t.code_units, HashSet::from([6, 8]), "{t:?}");
 }

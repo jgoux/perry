@@ -206,9 +206,10 @@ fn expands_directory_files_matching_suffix() {
     let importing = base.join("main.ts");
     std::fs::write(&importing, "").unwrap();
 
-    let got = expand_dynamic_import_glob(importing.to_str().unwrap(), "./plugins/", ".ts", 64);
+    let got =
+        expand_dynamic_import_glob(importing.to_str().unwrap(), "./plugins/", ".ts", 64, false);
     assert_eq!(
-        got,
+        got.specifiers,
         vec![
             "./plugins/alpha.ts".to_string(),
             "./plugins/beta.ts".to_string()
@@ -216,8 +217,49 @@ fn expands_directory_files_matching_suffix() {
     );
 
     // A directory with no matches yields nothing (→ rejected promise).
-    let none = expand_dynamic_import_glob(importing.to_str().unwrap(), "./plugins/", ".mjs", 64);
-    assert!(none.is_empty());
+    let none =
+        expand_dynamic_import_glob(importing.to_str().unwrap(), "./plugins/", ".mjs", 64, false);
+    assert!(none.specifiers.is_empty());
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn require_glob_spells_files_and_directories_like_node() {
+    let base = std::env::temp_dir().join(format!("perry_require_glob_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(base.join("lib/dir")).unwrap();
+    std::fs::create_dir_all(base.join("lib/empty")).unwrap();
+    std::fs::write(base.join("lib/a.js"), "").unwrap();
+    std::fs::write(base.join("lib/b.json"), "").unwrap();
+    std::fs::write(base.join("lib/LICENSE"), "").unwrap();
+    std::fs::write(base.join("lib/dir/index.js"), "").unwrap();
+    let importing = base.join("main.js");
+    std::fs::write(&importing, "").unwrap();
+    let importing = importing.to_str().unwrap();
+
+    let got = expand_dynamic_import_glob(importing, "./lib/", "", 64, true);
+    assert_eq!(
+        got.specifiers,
+        [
+            "./lib/LICENSE",
+            "./lib/a",
+            "./lib/a.js",
+            "./lib/b",
+            "./lib/b.json",
+            "./lib/dir"
+        ]
+    );
+    // Four files and the directory with an index; the empty directory is not a module.
+    assert_eq!(got.entries, 4);
+    assert_eq!(got.files.len(), 3);
+
+    // `import()` takes the file name exactly: no extension probing, no directories.
+    let got = expand_dynamic_import_glob(importing, "./lib/", "", 64, false);
+    assert_eq!(
+        got.specifiers,
+        ["./lib/LICENSE", "./lib/a.js", "./lib/b.json"]
+    );
 
     let _ = std::fs::remove_dir_all(&base);
 }
@@ -822,6 +864,54 @@ export async function load() {
         "highlights.scm",
         b"(comment) @comment\n",
     );
+}
+
+#[test]
+fn missing_relative_reexport_fails_at_collection() {
+    // TypeScript's `_namespaces/ts.ts` re-exports the build-generated
+    // `diagnosticInformationMap.generated.js`. With the file absent, dropping
+    // the edge left `Diagnostics` as an undefined symbol at link time.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let entry = root.join("entry.ts");
+    std::fs::write(
+        &entry,
+        "export * from \"./missing.generated.js\";\nexport const ok = 1;\n",
+    )
+    .expect("write entry");
+    // A `.d.ts`-only target is type-only and still compiles.
+    std::fs::write(root.join("types.d.ts"), "export type T = number;\n").expect("write d.ts");
+    let typed = root.join("typed.ts");
+    std::fs::write(
+        &typed,
+        "export * from \"./types.js\";\nexport const ok = 1;\n",
+    )
+    .expect("write typed");
+
+    let collect = |path: &std::path::Path| {
+        let mut ctx = CompilationContext::new(root.to_path_buf());
+        ctx.entry_canonical = Some(path.canonicalize().unwrap());
+        let mut visited = HashSet::new();
+        let mut next_class_id: perry_hir::ClassId = 1;
+        let progress = VerboseProgress::new(OutputFormat::Json, 0);
+        collect_modules(
+            &path.to_path_buf(),
+            &mut ctx,
+            &mut visited,
+            OutputFormat::Json,
+            None,
+            &mut next_class_id,
+            false,
+            &progress,
+            None,
+        )
+        .map(|_| ())
+    };
+    let error = collect(&entry).unwrap_err().to_string();
+    assert!(error.contains("Could not resolve re-export"), "{error}");
+    assert!(error.contains("missing.generated.js"), "{error}");
+    assert!(error.contains("generated module"), "{error}");
+    collect(&typed).expect("a .d.ts-only re-export is type-only");
 }
 
 #[test]

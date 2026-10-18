@@ -93,6 +93,7 @@ fn fixture(records: usize, fields: usize) -> Module {
                     cap_args_appended: 0,
                 })
                 .collect(),
+            None,
         )),
     });
     module
@@ -325,7 +326,7 @@ fn method_fixture() -> Module {
     module.classes[0].constructor.as_mut().unwrap().params[1].ty = Type::Any;
     // An array element escapes scalar replacement; only method `this`
     // supplies capacity evidence for this literal.
-    module.init = vec![Stmt::Expr(Expr::Array(vec![init]))];
+    module.init = vec![Stmt::Expr(Expr::Array(vec![init], None))];
     module
 }
 
@@ -554,7 +555,7 @@ fn born_wide_array_element_evidence() {
             name: "objs".into(),
             ty: Type::Any,
             mutable: false,
-            init: Some(Expr::Array(vec![])),
+            init: Some(Expr::Array(vec![], None)),
         },
         Stmt::Expr(Expr::ArrayPush {
             array_id: 1002,
@@ -576,7 +577,7 @@ fn born_wide_array_element_evidence() {
             name: "objs".into(),
             ty: Type::Any,
             mutable: false,
-            init: Some(Expr::Array(vec![literal_new()])),
+            init: Some(Expr::Array(vec![literal_new()], None)),
         },
         added_store(
             Expr::IndexGet {
@@ -587,4 +588,84 @@ fn born_wide_array_element_evidence() {
         ),
     ];
     assert_literal_width(&module, 3);
+}
+
+/// The runtime finds atoms and layout descriptors by walking their sections;
+/// many have no reference from code. Mach-O's `-dead_strip` dropped them
+/// (ELF keeps a section its `__start_`/`__stop_` bounds name), so on macOS the
+/// program's key atoms were never seeded and a coloured read answered absent
+/// (zod: "Bind must be called on a function"). Every Mach-O record section
+/// must carry `no_dead_strip`; ELF spells the plain section.
+#[test]
+fn section_walked_records_survive_mach_o_dead_strip() {
+    for (target, plain, kept) in [
+        (
+            "aarch64-apple-darwin",
+            "\"__DATA,__perry_",
+            ",regular,no_dead_strip\"",
+        ),
+        ("x86_64-unknown-linux-gnu", "\"perry_", "\""),
+    ] {
+        let mut options = super::super::class_field_barrier_tests::ir_opts();
+        options.output_type = "executable".into();
+        options.target = Some(target.into());
+        let text =
+            String::from_utf8(crate::compile_module(&method_fixture(), options).unwrap()).unwrap();
+        let records: Vec<&str> = text
+            .lines()
+            .filter(|l| {
+                ["atoms", "layouts", "shnames", "shadow_names"]
+                    .iter()
+                    .any(|s| l.contains(&format!("section {plain}{s}")))
+            })
+            .collect();
+        assert!(
+            records.iter().any(|l| l.contains("perry_atoms")),
+            "{target}: the fixture must emit atom records"
+        );
+        assert!(
+            records.iter().any(|l| l.contains("perry_layouts")),
+            "{target}: the fixture must emit layout descriptors"
+        );
+        for line in records {
+            let section = &line[line.find("section ").unwrap() + 8..];
+            let section = &section[..section[1..].find('"').unwrap() + 2];
+            assert!(section.ends_with(kept), "{target}: {line}");
+            assert_eq!(
+                section.contains("no_dead_strip"),
+                target.contains("apple"),
+                "{target}: {line}"
+            );
+        }
+    }
+}
+
+/// #10399: a program that starts workers keeps its class keys and ShapeId
+/// slots per agent (thread-local), so no rodata may name them. Its descriptor
+/// builds the shape table in the frame from this agent's slot addresses.
+pub(crate) fn worker_program_ir() -> String {
+    let module = fixture(3200, 4);
+    let mut opts = super::super::class_field_barrier_tests::ir_opts();
+    opts.program_has_worker = true;
+    String::from_utf8(crate::compile_module(&module, opts).expect("lowers")).unwrap()
+}
+
+#[test]
+fn worker_program_descriptor_names_this_agents_slots() {
+    let ir = worker_program_ir();
+    assert_eq!(
+        ir.matches("call double @js_value_from_literal_descriptor(")
+            .count(),
+        1,
+        "the descriptor still serves a worker program"
+    );
+    assert!(
+        !ir.lines()
+            .any(|line| line.contains("_shapes = private constant")),
+        "no link-time shape table in a worker program"
+    );
+    assert!(
+        ir.contains("call ptr @llvm.threadlocal.address.p0(ptr @perry_class_keys_"),
+        "the keys slot is this agent's address"
+    );
 }

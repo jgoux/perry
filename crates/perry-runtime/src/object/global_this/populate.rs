@@ -22,14 +22,27 @@ fn finish_builtin_prototype(
     // object would. The declaration on the member decides, never the
     // prototype's name; a store or delete of the member revokes its
     // lane (a new ShapeId).
+    // A prototype born on its declared layout keeps that layout id: its
+    // members are its layout's slots, never lanes of a new id.
     // SAFETY: the live, just-populated prototype.
     unsafe {
-        crate::object::shapes::learn_object_constfn_lanes(proto_obj, |_, _| true);
+        let learn = |obj: *mut ObjectHeader| {
+            if !crate::object::runtime_layouts::on_declared_prototype_layout(obj) {
+                crate::object::shapes::learn_object_constfn_lanes(obj, |_, _| true);
+            }
+        };
+        if crate::value::addr_class::try_read_gc_header(proto_obj as usize)
+            .is_some_and(|h| h.obj_type == crate::gc::GC_TYPE_OBJECT)
+        {
+            learn(proto_obj);
+        } else {
+            crate::object::shapes::learn_object_constfn_lanes(proto_obj, |_, _| true);
+        }
         // Some native prototypes own symbol slots through an ordinary
         // descriptor holder. Its members carry the same declarations.
         if let Some(holder) = crate::object::shaped_symbols::owner(proto_obj as usize) {
             if holder != proto_obj {
-                crate::object::shapes::learn_object_constfn_lanes(holder, |_, _| true);
+                learn(holder);
             }
         }
     }
@@ -263,6 +276,16 @@ fn populate_global_this_builtins_inner(singleton_at_entry: *mut ObjectHeader) {
                 );
             }
             arr as *mut ObjectHeader
+        } else if name == "Function" {
+            // Born on its static layout (`runtime_layouts::FUNCTION_PROTOTYPE`,
+            // a callable ordinary kind); the population fills its slots.
+            // SAFETY: a registered runtime descriptor with the default prototype.
+            unsafe {
+                crate::object::layout_desc::alloc_layout_prototype(
+                    std::ptr::addr_of!(crate::object::runtime_layouts::FUNCTION_PROTOTYPE),
+                    0,
+                )
+            }
         } else {
             super::proto_room::alloc_builtin_prototype()
         };
@@ -371,7 +394,24 @@ fn populate_global_this_builtins_inner(singleton_at_entry: *mut ObjectHeader) {
                         proto_obj as usize,
                         serial,
                     );
+                    name_first_realm_prototype(proto_obj, serial);
                 }
+            }
+            if let Some(serial) = declaration.named_serial {
+                // SAFETY: `proto_obj` is the live intrinsic array; its holder
+                // of named properties is the object the serial names.
+                unsafe {
+                    let holder = crate::array::array_property_bag(
+                        proto_obj as *const crate::array::ArrayHeader,
+                    );
+                    if !holder.is_null() {
+                        name_first_realm_prototype(holder, serial);
+                    }
+                }
+            }
+            if let Some(serial) = declaration.sealed_serial {
+                // SAFETY: as above; runtime layouts name it by this serial.
+                unsafe { crate::object::builtin_proto::seal_runtime_prototype(proto_obj, serial) };
             }
             if name == "Function" {
                 crate::closure::shape::FUNCTION_PROTOTYPE_PTR
@@ -769,23 +809,19 @@ fn populate_global_this_builtins_inner(singleton_at_entry: *mut ObjectHeader) {
             // richer install that also exposes per-method name/length descriptors.
             match name {
                 "Math" => {
-                    #[cfg(feature = "global-math")]
-                    install_math_namespace(ns_obj);
+                    super::web_hooks::math_members(ns_obj);
                     set_intrinsic_to_string_tag(ns_obj, "Math");
                 }
                 "JSON" => {
-                    #[cfg(feature = "global-json")]
-                    install_json_namespace_members(ns_obj);
+                    super::web_hooks::json_members(ns_obj);
                     set_intrinsic_to_string_tag(ns_obj, "JSON");
                 }
                 "Reflect" => {
-                    #[cfg(feature = "global-reflect")]
-                    install_reflect_namespace_members(ns_obj);
+                    super::web_hooks::reflect_members(ns_obj);
                     set_intrinsic_to_string_tag(ns_obj, "Reflect");
                 }
                 "Atomics" => {
-                    #[cfg(feature = "global-atomics")]
-                    install_atomics_namespace_members(ns_obj);
+                    super::web_hooks::atomics_members(ns_obj);
                     set_intrinsic_to_string_tag(ns_obj, "Atomics");
                 }
                 "Intl" => crate::intl::install_intl_namespace(ns_obj),
@@ -1140,3 +1176,20 @@ fn install_error_static_fn(
 // installed there, so the read returned `undefined`. These thunks delegate
 // to the same runtime helpers the direct `Object.keys(x)` lowering uses.
 // =====================================================================
+
+/// Give the agent's first realm's builtin prototype `proto` its reserved
+/// intrinsic `serial` and write the serial's identity word, which names it
+/// for the agent's life (`builtin_proto::name_runtime_prototype`, the
+/// encoding of runtime prototype families): the unknown-receiver probe reaches
+/// `%Function.prototype%` and `%Array.prototype%`'s holder through it, as the
+/// slow reads reach the first realm's intrinsics (`array::prototype_addr`).
+///
+/// # Safety
+/// `proto` is a live ordinary object whose serial is 0 or `serial`.
+unsafe fn name_first_realm_prototype(proto: *mut ObjectHeader, serial: u64) {
+    if crate::object::shapes::identity_word_slot(serial).is_some_and(|slot| *slot != 0) {
+        return;
+    }
+    crate::object::proto_validity::assign_intrinsic_prototype_serial(proto as usize, serial);
+    let _ = crate::object::builtin_proto::name_runtime_prototype(proto, serial);
+}

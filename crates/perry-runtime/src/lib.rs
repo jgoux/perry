@@ -117,12 +117,12 @@ pub mod collection_iter;
 pub mod collection_iter_object;
 pub mod collection_receiver;
 pub mod color_parse;
-#[cfg(feature = "contract-checks")]
+#[cfg(perry_contract_checks)]
 pub(crate) mod contracts;
 pub mod date;
-#[cfg(all(feature = "mod-dgram", not(target_os = "wasi")))]
+#[cfg(not(target_arch = "wasm32"))]
 pub mod dgram;
-#[cfg(all(feature = "mod-dgram", not(target_os = "wasi")))]
+#[cfg(not(target_arch = "wasm32"))]
 pub mod dgram_reactor;
 pub mod disposable;
 pub mod dns;
@@ -152,11 +152,13 @@ pub mod hot_diag;
 pub mod intl;
 pub mod iter_result;
 pub mod iterator_helpers;
+pub mod loop_interrupt;
 pub mod macos_bundle;
 pub mod map;
 pub mod math;
 pub mod messaging;
 pub mod mimalloc_os_tag;
+pub mod module_hooks;
 pub mod module_require;
 pub mod native_abi;
 pub mod native_arena;
@@ -170,7 +172,6 @@ mod native_stack;
 pub mod native_value_profile;
 pub mod navigator;
 pub mod net_validate;
-#[cfg(feature = "node-api-host")]
 pub mod node_api_host;
 mod param_type_guard;
 pub(crate) mod runtime_state_key;
@@ -178,10 +179,8 @@ mod startup_memory_profile;
 /// wpfacts slice 2: run-time witness of each elided field access.
 pub mod wpfacts_check;
 // #6468: the `node:http2` constant tables are only reachable through the
-// `http2` native-module namespace, so a program that never imports `node:http2`
-// links none of them. The auto-optimizer enables `mod-http2-constants` on an
-// `http2` import; every callsite has a benign `None`/no-op fallback when off.
-#[cfg(feature = "mod-http2-constants")]
+// `http2` native-module namespace (via `module_hooks`), so a program that never
+// imports `node:http2` links none of them.
 pub mod node_http2_constants;
 pub mod node_inspector;
 pub mod node_repl;
@@ -284,21 +283,13 @@ pub mod v8;
 pub mod validators;
 pub mod value;
 pub mod wasi;
-/// WebAssembly host shims (issue #76). Forward-declares the
-/// `perry_wasm_host_*` C ABI; the wasmi-backed implementation lives in
-/// the separate `perry-wasm-host` crate and is linked in only when the
-/// user passes `--enable-wasm-runtime`.
-///
-/// Gated behind the `wasm-host` Cargo feature so non-wasm programs don't
-/// pull `js_webassembly_*` into libperry_runtime.a — those shims hold
-/// undefined references to `perry_wasm_host_*` which would fail to link
-/// without libperry_wasm_host.a on the line. The auto-optimize path
-/// (crates/perry/src/commands/compile/optimized_libs.rs) flips this
-/// feature on when `ctx.needs_wasm_runtime` is true.
-#[cfg(any(test, feature = "wasm-host"))]
 mod wasm_instance_state;
 pub mod web_storage;
-#[cfg(feature = "wasm-host")]
+/// WebAssembly host shims (issue #76). The wasmi-backed engine lives in the
+/// separate `perry-wasm-host` crate, which perry links only for a program
+/// that uses WebAssembly; it registers its entry points with the runtime
+/// (`webassembly::host`), so this module names none of its symbols, and
+/// `js_runtime_install_wasm_host` installs the engine into the namespace.
 pub mod webassembly;
 // Networking is provided by perry-ext-net; the retired synchronous provider
 // no longer contributes a second js_net_* export surface (#10678).
@@ -330,8 +321,7 @@ pub mod static_plugins;
 #[cfg(not(feature = "stdlib"))]
 pub mod stdlib_stubs;
 /// First-call runtime diagnostic for no-op FFI stubs (#464). Owns the
-/// `PERRY_STUB_DIAG` env-var policy and the auto-generated `STUB_MANIFEST`
-/// derived from `build.rs`'s dispatch-table walk.
+/// `PERRY_STUB_DIAG` env-var policy; the stub list is perry-runtime-manifest's.
 pub mod stub_diag;
 pub mod thread;
 pub mod tls;
@@ -855,8 +845,7 @@ pub(crate) mod stdlib_pump {
         // and keeps the result live for debug assertions/tests.
         debug_assert!(!outermost || ACTIVE_OUTER_PUMPS.load(Ordering::Acquire) > 0);
         crate::promise::js_native_async_process_pending();
-        #[cfg(feature = "node-api-host")]
-        crate::node_api_host::process_pending();
+        crate::node_api_host::hooks::process_pending();
         crate::os::js_process_signal_drain();
         // Drain the tty resize-pending flag (#347 Phase 3). Lives in
         // perry-runtime, not stdlib, so it runs even when stdlib isn't
@@ -872,8 +861,7 @@ pub(crate) mod stdlib_pump {
         // #4911: deliver queued UDP datagrams as `'message'` events. Lives in
         // perry-runtime so node:dgram works without perry-stdlib linked.
         // Zero-cost (one relaxed load) when no sockets are bound.
-        #[cfg(all(feature = "mod-dgram", not(target_os = "wasi")))]
-        crate::dgram_reactor::pump();
+        crate::module_hooks::dgram_pump();
         crate::process::js_process_ipc_drain();
         let f = STDLIB_PUMP_FN.load(Ordering::Acquire);
         if !f.is_null() {
@@ -909,8 +897,7 @@ pub(crate) mod stdlib_pump {
         if crate::event_pump::agent_loop_has_outstanding_work() {
             return 1;
         }
-        #[cfg(feature = "node-api-host")]
-        if crate::node_api_host::has_active_work() {
+        if crate::node_api_host::hooks::has_active_work() {
             return 1;
         }
         if crate::promise::js_native_async_has_active() != 0 {
@@ -939,8 +926,7 @@ pub(crate) mod stdlib_pump {
             return 1;
         }
         // #4911: a bound + `ref`'d node:dgram socket keeps the loop alive.
-        #[cfg(all(feature = "mod-dgram", not(target_os = "wasi")))]
-        if crate::dgram_reactor::has_active() {
+        if crate::module_hooks::dgram_has_active() {
             return 1;
         }
         // #9416: a `process.stdin` listener registered on the stdin OBJECT —

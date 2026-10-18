@@ -6,16 +6,17 @@
 //!   - Followed by captured values (as f64 or i64 pointers)
 
 mod alloc;
+pub(crate) mod births;
 pub(crate) mod body_call;
 mod dispatch;
-pub(crate) use dispatch::bound_intrinsic::try_native_apply;
+pub(crate) use dispatch::bound_intrinsic::{packed_apply_values, try_native_apply};
 mod dynamic_props;
+pub(crate) mod native_constructor;
 pub(crate) mod props;
 mod registry;
 pub(crate) mod shape;
 mod unbox;
 mod v8_stubs;
-#[cfg(any(feature = "wasm-host", test))]
 pub(crate) mod wasm_funcref;
 mod wide_call;
 

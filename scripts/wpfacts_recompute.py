@@ -136,6 +136,8 @@ class Solver:
         self.stopped = defaultdict(list)
         self.widened = set()
         self.escape_queue = []
+        self.bound_synth = set()
+        self.merged = {}
         self.cv_nodes = {}
         self.cp_nodes = {}
         self.stopped_shared = defaultdict(list)
@@ -407,7 +409,8 @@ class Solver:
                     self.accessor_hit(origin, t, k2, act)
         elif op == "protofrom":
             for t in toks:
-                if t != TOP:
+                # Object.prototype's [[Prototype]] is immutable.
+                if t != TOP and self.toks[t][0] != "objectproto":
                     self.edge(c[1], self.pnode(t))
         elif op == "protoof":
             for t in toks:
@@ -512,6 +515,21 @@ class Solver:
         return self.is_fact_unit(tm) and key in self.tmpls[tm]["definite"]
 
     def load_from(self, origin, t, key, dst):
+        # The iteration key: an array-like's elements, a runtime object's
+        # computed read, nothing from a program object/function.
+        if key != "*" and self.atoms.get(key) == "#iter":
+            k = self.toks[t]
+            runtime = t == TOP or k[0] in ("builtin", "builtinfn", "nativeproto", "primbox")
+            if not runtime and not (k[0] == "obj" and self.is_array_like(t)):
+                return
+            key = self.atom("#elem")
+        # The element key: an array-like's elements, else a computed read.
+        if key != "*" and self.atoms.get(key) == "#elem":
+            if t != TOP and self.is_array_like(t):
+                self.edge(self.fall(t), dst)
+                self.add(dst, [], UNDEF)
+                return
+            key = "*"
         if t == TOP:
             self.add(dst, [TOP])
             if key == "*" or self.atoms.get(key) == "constructor":
@@ -591,18 +609,23 @@ class Solver:
             if (holder, a) not in self.accessors:
                 continue
             getters, setters = self.accessors[(holder, a)]
+            # An accessor with a lexical `this` (arrow) never sees the
+            # receiver, as for a call (`call_tok`).
             if act[0] == "load":
                 for g in getters:
-                    self.add(self.funcs[g]["this"], [origin])
+                    if not self.funcs[g]["lexical"]:
+                        self.add(self.funcs[g]["this"], [origin])
                     self.edge(self.funcs[g]["ret"], act[1])
             elif act[0] == "store":
                 for s in setters:
-                    self.add(self.funcs[s]["this"], [origin])
+                    if not self.funcs[s]["lexical"]:
+                        self.add(self.funcs[s]["this"], [origin])
                     if self.funcs[s]["params"]:
                         self.edge(act[1], self.funcs[s]["params"][0])
             else:
                 for g in getters:
-                    self.add(self.funcs[g]["this"], [origin])
+                    if not self.funcs[g]["lexical"]:
+                        self.add(self.funcs[g]["this"], [origin])
                     self.bind_via(self.funcs[g]["ret"], act[1], origin)
 
     def bind_via(self, callee, call, origin):
@@ -675,7 +698,8 @@ class Solver:
                     self.edge(a, fi["params"][i])
                 elif fi["rest"] is not None:
                     self.edge(a, self.elems_into(fi["rest"]))
-                self.edge(a, fi["args"])
+                if fi["arguments"]:
+                    self.edge(a, fi["args"])
             for p in fi["params"][len(c["args"]):]:
                 self.add(p, [], UNDEF)
             for s in c["spread"]:
@@ -685,7 +709,8 @@ class Solver:
                     self.edge(el, p)
                 if fi["rest"] is not None:
                     self.edge(el, self.elems_into(fi["rest"]))
-                self.edge(el, fi["args"])
+                if fi["arguments"]:
+                    self.edge(el, fi["args"])
             if not fi["lexical"]:
                 if this_tok is not None:
                     self.add(fi["this"], [this_tok])
@@ -699,6 +724,9 @@ class Solver:
                         self.add(fi["this"], [], UNDEF)
             self.edge(fi["ret"], c["ret"])
         elif kind == "bound":
+            if call in self.bound_synth:
+                self.into_merged(call, arg, False)
+                return
             target, bthis, bargs = self.bound[arg]
             allargs = self.node()
             for a in bargs + c["args"] + c["spread"]:
@@ -707,7 +735,37 @@ class Solver:
             arr = self.node()
             self.add(arr, [t])
             c2 = self.new_call(("n", bthis), bargs + c["args"], c["spread"] + [arr], c["ret"])
+            self.bound_synth.add(c2)
             self.addcons(target, ("call", c2))
+
+    def bound_merged(self, b, new):
+        # A bound value's one merged call: what solver-made calls through a
+        # bound target go through (the target may hold bound values).
+        key = (b, new)
+        if key in self.merged:
+            return self.merged[key]
+        target, bthis, bargs = self.bound[b]
+        arr = self.node()
+        self.add(arr, [self.tok("bound", b)])
+        sp = self.node()
+        ret = self.node()
+        m = self.new_call(("u",) if new else ("n", bthis), list(bargs), [arr, sp], ret)
+        self.merged[key] = m
+        self.bound_synth.add(m)
+        self.addcons(target, ("new" if new else "call", m))
+        return m
+
+    def into_merged(self, call, b, new):
+        m = self.bound_merged(b, new)
+        if m == call:
+            return
+        c = self.calls[call]
+        fa = self.fany(self.tok("bound", b))
+        for a in c["args"]:
+            self.edge(a, fa)
+        for sp in c["spread"]:
+            self.edge(sp, self.calls[m]["spread"][1])
+        self.edge(self.calls[m]["ret"], c["ret"])
 
     def elems_into(self, arr_node):
         relay = self.node()
@@ -739,8 +797,12 @@ class Solver:
                 self.edge(a, s)
             self.add(c["ret"], [TOP])
         elif kind == "bound":
+            if call in self.bound_synth:
+                self.into_merged(call, arg, True)
+                return
             target, bthis, bargs = self.bound[arg]
             c2 = self.new_call(("u",), bargs + c["args"], c["spread"], c["ret"])
+            self.bound_synth.add(c2)
             self.addcons(target, ("new", c2))
 
     def run_ctor_chain(self, call, tm, inst):
@@ -778,6 +840,14 @@ class Solver:
             self.adds[tm] += 1
         self.addcons(self.pnode(t), ("top",))
         self.implicit(t)
+        # Unknown code writes any key (setters on the chain run with an
+        # unknown value) and reads any key (getter results reach it).
+        w = self.node()
+        self.add(w, [TOP], ALL)
+        self.chain_from(t, t, "*", ("store", w))
+        r = self.node()
+        self.edge(r, self.sink())
+        self.chain_from(t, t, "*", ("load", r))
         kind, arg = self.toks[t]
         if kind == "func":
             fi = self.funcs[arg]
@@ -814,6 +884,8 @@ class Solver:
 
     def mark_hard(self, t, code):
         if t == TOP or t in self.hard:
+            return
+        if code == "E6" and self.toks[t][0] == "objectproto":
             return
         self.hard[t] = code
         if self.toks[t][0] == "proto":
@@ -906,6 +978,7 @@ def load(path):
                     ints = lambda v: [] if v == "-" else [int(x) for x in v.split(",")]
                     s.funcs[f] = dict(tok=int(kv["tok"]), this=int(kv["this"]), ret=int(kv["ret"]),
                                       args=int(kv["args"]),
+                                      arguments=kv.get("arguments", "1") == "1",
                                       rest=None if kv["rest"] == "-" else int(kv["rest"]),
                                       lexical=kv["lexical"] == "1", params=ints(kv["params"]))
                     s.func_by_tok[int(kv["tok"])] = f
@@ -1115,10 +1188,9 @@ def derive(s, objproto_hard):
                 star_on_chain = True
         if star_on_chain:
             escape = True
-        e14 = (not s.whatif) and (s.dynamic_reach or (s.interp is not None and (s.dyn_eval is not None or s.top_calls > 0)))
-        if e14:
-            escape = True
-        if objproto_hard or e14 or s.objproto_accessor:
+        # Decision 150: interpreted code is the ⊤ summary node (its data flow
+        # is already in the relations), never a kill; see interp_guard().
+        if objproto_hard or s.objproto_accessor:
             chain_bad = True
         if star in acc or (tp["computed"] and not tp["birth"] and tp["kind"] != "fninst"):
             chain_bad = True
@@ -1308,7 +1380,8 @@ def compare(rust, py, rust_sites, py_sites):
                 prec.append(f"{k}: compiler={rv} recompute={pv}")
             else:
                 sound.append(f"{k}: compiler={rv} recompute={pv}")
-        elif fact == "escape":
+        elif fact in ("escape", "interp_guard"):
+            # A missing escape or a missing guard claims too much.
             (sound if rv == "0" else prec).append(f"{k}: compiler={rv} recompute={pv}")
         else:
             (sound if rv == "1" else prec).append(f"{k}: compiler={rv} recompute={pv}")
@@ -1326,11 +1399,19 @@ def compare(rust, py, rust_sites, py_sites):
     return sound, prec, cover
 
 
+def interp_guard(s):
+    """The program can run interpreted code: every proof is guarded by the
+    runtime's PERRY_INTERP_PROTO_WRITTEN word (decision 150)."""
+    return s.dynamic_reach or (s.interp is not None and (s.dyn_eval is not None or s.top_calls > 0))
+
+
 def read_rust(dump):
     facts, sites, objproto_hard = {}, {}, False
     for line in open(dump):
         line = line.rstrip("\n")
-        if line.startswith("FACT "):
+        if line.startswith("# interp_guard "):
+            facts["G interp_guard"] = "0" if line == "# interp_guard none" else "1"
+        elif line.startswith("FACT "):
             body, val = line[5:].rsplit(" = ", 1)
             facts[body] = val
         elif line.startswith("S "):
@@ -1353,6 +1434,7 @@ def main():
     op = s.tok_of.get(("objectproto", "-"))
     objproto_hard = op in s.hard if op is not None else False
     py, tfacts = derive(s, objproto_hard)
+    py["G interp_guard"] = "1" if interp_guard(s) else "0"
     py_sites = site_verdicts(s, tfacts)
     sound, prec, cover = compare(rust, py, rust_sites, py_sites)
     print(f"recompute: {len(rust)} compiler facts, {len(py)} recomputed, "

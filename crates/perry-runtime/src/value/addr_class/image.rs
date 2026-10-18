@@ -94,15 +94,6 @@ fn section_bounds() -> (usize, usize) {
     }
 }
 
-/// The `GcHeader.size` of an image string whose header, string header and
-/// NUL-terminated bytes span `body` bytes: the body rounded up to 8, then the
-/// property-atom hash that follows it (`string_pool/image.rs` emits the same
-/// total, and `property_atom_hash` reads the hash at that offset).
-#[inline]
-const fn image_size(body: usize) -> usize {
-    body.next_multiple_of(8) + 8
-}
-
 /// Validate every byte range BEFORE reading it. An aligned forged pointer
 /// inside the section may name padding or string data, so bounds alone do not
 /// certify a header. Its marker, layout, length and complete payload must agree.
@@ -126,11 +117,13 @@ pub(super) unsafe fn header(addr: usize) -> Option<std::ptr::NonNull<GcHeader>> 
     }
     let string = &*(addr as *const StringHeader);
     let payload_end = data.checked_add(string.byte_len as usize)?.checked_add(1)?;
-    if payload_end > end
+    // The image extends past the NUL to its 8-aligned atom hash; the whole
+    // extent, not just the payload, must lie in the section.
+    let image_end = header_addr.checked_add(gc.size as usize)?;
+    if image_end > end
         || string.byte_len != string.capacity
         || string.utf16_len > string.byte_len
-        || gc.size as usize != image_size(payload_end - header_addr)
-        || header_addr + gc.size as usize > end
+        || gc.size as usize != crate::string::image_string_gc_size(string.byte_len)
         || *(payload_end as *const u8).sub(1) != 0
     {
         return None;

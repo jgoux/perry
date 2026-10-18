@@ -139,6 +139,7 @@ fn class_with_static(id: u32, value: f64) -> Class {
 
 fn duplicate_static_module() -> Module {
     Module {
+        requested_modules: Vec::new(),
         name: "marked_symbol_hygiene.ts".to_string(),
         imports: Vec::new(),
         exports: Vec::new(),
@@ -173,6 +174,8 @@ fn duplicate_static_module() -> Module {
         async_generator_funcs: std::collections::HashSet::new(),
         local_source_spans: std::collections::HashMap::new(),
         gen_param_prologue_len: std::collections::HashMap::new(),
+        class_family_syntax: None,
+        requested_modules: Vec::new(),
     }
 }
 
@@ -181,6 +184,7 @@ fn class_with_instance_and_static_method() -> Module {
     class.methods.push(instance_method(301, 1.0));
 
     Module {
+        requested_modules: Vec::new(),
         name: "static_instance_symbol_hygiene.ts".to_string(),
         imports: Vec::new(),
         exports: Vec::new(),
@@ -215,6 +219,8 @@ fn class_with_instance_and_static_method() -> Module {
         async_generator_funcs: std::collections::HashSet::new(),
         local_source_spans: std::collections::HashMap::new(),
         gen_param_prologue_len: std::collections::HashMap::new(),
+        class_family_syntax: None,
+        requested_modules: Vec::new(),
     }
 }
 

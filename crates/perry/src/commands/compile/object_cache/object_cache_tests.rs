@@ -125,22 +125,22 @@ fn key_changes_with_perry_version() {
 /// rows built twice are the same key.
 #[test]
 fn key_changes_with_gc_effects_table() {
-    let rows = |class: &str| {
-        format!("# target: t\njs_array_length_leaf\t{class}\tno\nother\tReenters\tyes\n")
-    };
-    let build = |class: &str| {
-        let text = rows(class);
-        std::sync::Arc::new(perry_codegen::GcEffects::from_tables(&[(
-            "t",
-            text.as_str(),
-        )]))
+    let build = |class: perry_gc_effects::Class| {
+        let table: perry_gc_effects::Table = [
+            ("js_array_length_leaf", class, false),
+            ("other", perry_gc_effects::Class::Reenters, true),
+        ]
+        .into_iter()
+        .map(|(sym, class, throws)| (sym.to_string(), perry_gc_effects::Entry { class, throws }))
+        .collect();
+        std::sync::Arc::new(perry_codegen::GcEffects::from_sidecar(&table))
     };
     let mut leaf = empty_opts();
-    leaf.gc_effects = build("Leaf");
+    leaf.gc_effects = build(perry_gc_effects::Class::Leaf);
     let mut again = empty_opts();
-    again.gc_effects = build("Leaf");
+    again.gc_effects = build(perry_gc_effects::Class::Leaf);
     let mut reenters = empty_opts();
-    reenters.gc_effects = build("Reenters");
+    reenters.gc_effects = build(perry_gc_effects::Class::Reenters);
     assert_eq!(
         compute_object_cache_key(&leaf, 1, "0.5.156"),
         compute_object_cache_key(&again, 1, "0.5.156"),
@@ -154,7 +154,7 @@ fn key_changes_with_gc_effects_table() {
     assert_ne!(
         compute_object_cache_key(&leaf, 1, "0.5.156"),
         compute_object_cache_key(&empty_opts(), 1, "0.5.156"),
-        "the committed tables differ from a one-row table"
+        "the all-unsafe default differs from a one-row table"
     );
 }
 
@@ -655,6 +655,7 @@ fn key_changes_with_imported_class_codegen_surface() {
         source_prefix: "adapter_js".into(),
         receiver_class_name: "__ImportedObject_adapter".into(),
         source_global_id: 17,
+        final_shape: None,
         methods: vec![perry_codegen::ImportedObjectLiteralMethod {
             name: "run".into(),
             func_id: 9,
@@ -788,7 +789,7 @@ fn key_changes_with_codegen_env_vars() {
     // helper calls, or a skipped verifier.
     //
     let opts = empty_opts();
-    for &var in COMPILE_ENV_VARS {
+    for &var in COMPILE_ENV_VARS.iter().filter(|&&var| var != "PATH") {
         // Sample state without the var, with the var, and with a different
         // value — all three keys must be distinct.
         let k_unset = compute_object_cache_key_with_env(&opts, 1, "0.5.156", |_| None);
@@ -1381,7 +1382,7 @@ fn key_changes_with_non_unicode_contract_mode() {
 #[test]
 fn every_compile_env_var_distinguishes_absent_empty_and_values() {
     let opts = empty_opts();
-    for &var in COMPILE_ENV_VARS {
+    for &var in COMPILE_ENV_VARS.iter().filter(|&&var| var != "PATH") {
         let key = |value: Option<&str>| {
             compute_object_cache_key_with_env(&opts, 1, "test", |name| {
                 (name == var).then(|| value.map(str::to_owned)).flatten()
@@ -1393,4 +1394,21 @@ fn every_compile_env_var_distinguishes_absent_empty_and_values() {
             .collect();
         assert_eq!(keys.len(), 4, "lossy environment key for {var}");
     }
+}
+
+#[test]
+fn path_reaches_the_object_key_only_through_the_tools_it_resolves() {
+    // `perf` and other wrappers prepend their own directories to PATH; the
+    // object key hashes the resolved `opt`/`clang` instead (`object_tools`).
+    let opts = empty_opts();
+    let key = |path: Option<&str>| {
+        compute_object_cache_key_with_env(&opts, 1, "test", |name| {
+            (name == "PATH").then(|| path.map(str::to_owned)).flatten()
+        })
+    };
+    assert_eq!(key(None), key(Some("/usr/bin")));
+    assert_eq!(
+        key(Some("/usr/bin")),
+        key(Some("/usr/libexec/perf-core:/usr/bin"))
+    );
 }

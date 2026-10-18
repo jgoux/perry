@@ -24,16 +24,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
-use crate::OutputFormat;
-
 // `rust_target_triple` and `find_perry_workspace_root` still live in
 // the compile.rs orchestrator. Pull them in as private parent-module
 // items so the search helpers below can reach them.
 #[cfg(target_os = "windows")]
 use super::is_native_windows_target;
 use super::{
-    android_target, find_perry_workspace_root, is_android_target, is_windows_target,
-    rust_target_triple, windows_target_arch, WindowsTargetArch,
+    android_target, is_android_target, is_windows_target, rust_target_triple, windows_target_arch,
+    WindowsTargetArch,
 };
 
 /// Resolve the host's Rust target triple by parsing `rustc -vV`.
@@ -912,6 +910,16 @@ pub(super) fn find_msvc_lib_paths(target: Option<&str>) -> Option<String> {
     Some(xwin_sysroot_lib_paths(&root, target_arch).join(";"))
 }
 
+/// A located archive: the path the linker gets, and the candidate path it was
+/// found at. They differ only for an npm `*.a.zst`, which links from its
+/// per-user decompression slot; files shipped beside the archive (its
+/// `.gc-effects` sidecar) sit beside the candidate, never in the slot.
+#[derive(Clone, Debug)]
+pub(super) struct LocatedLibrary {
+    pub link: PathBuf,
+    pub candidate: PathBuf,
+}
+
 /// Find a library by name, optionally searching cross-compilation target directories.
 ///
 /// Returns the located path, or a list of all searched candidate paths so the
@@ -920,10 +928,21 @@ pub(super) fn find_library_with_candidates(
     name: &str,
     target: Option<&str>,
 ) -> Result<PathBuf, Vec<PathBuf>> {
+    locate_library(name, target).map(|l| l.link)
+}
+
+/// [`find_library_with_candidates`], keeping the candidate path too.
+pub(super) fn locate_library(
+    name: &str,
+    target: Option<&str>,
+) -> Result<LocatedLibrary, Vec<PathBuf>> {
     let candidates = collect_library_candidates(name, target);
     for path in &candidates {
         if path.exists() {
-            return Ok(path.clone());
+            return Ok(LocatedLibrary {
+                link: path.clone(),
+                candidate: path.clone(),
+            });
         }
         // npm per-platform packages ship `*.a.zst` (the raw archives exceed
         // npm's tarball upload limit). When only the compressed sibling is
@@ -932,7 +951,12 @@ pub(super) fn find_library_with_candidates(
         if compressed.exists() {
             let lib_name = path.file_name().and_then(|s| s.to_str()).unwrap_or(name);
             match super::compressed_libs::decompressed_archive(&compressed, lib_name) {
-                Ok(decompressed) => return Ok(decompressed),
+                Ok(decompressed) => {
+                    return Ok(LocatedLibrary {
+                        link: decompressed,
+                        candidate: path.clone(),
+                    });
+                }
                 // A compressed archive is present but couldn't be expanded
                 // (corrupt download, out of disk, …). Surface the real cause
                 // loudly here — otherwise it's masked by the generic "library
@@ -1209,12 +1233,29 @@ pub(super) fn collect_library_candidates(name: &str, target: Option<&str>) -> Ve
 
 /// Find the runtime library for linking
 pub(super) fn find_runtime_library(target: Option<&str>) -> Result<PathBuf> {
-    let lib_name = if is_windows_target(target) {
+    locate_runtime_library(target).map(|l| l.link)
+}
+
+/// [`find_runtime_library`], keeping the candidate path (sidecar lookup).
+pub(super) fn locate_runtime_library(target: Option<&str>) -> Result<LocatedLibrary> {
+    let default_name = if is_windows_target(target) {
         "perry_runtime.lib"
     } else {
         "libperry_runtime.a"
     };
-    find_library_with_candidates(lib_name, target).map_err(|searched| {
+    // The instrumented variant (`libperry_runtime_instr.a`) when an instrument
+    // knob is set while compiling; see `instrumented_variant_requested`.
+    let lib_name_owned = super::optimized_libs::variant_archive_name(default_name);
+    let lib_name = lib_name_owned.as_str();
+    let instr_hint = if super::optimized_libs::instrumented_variant_requested() {
+        "\n- This compile sets a GC/diagnostic instrument knob (or PERRY_GC_TRACE / \
+         PERRY_CHECK_CONTRACTS), so it links the instrumented archives. Build them with \
+         scripts/build_instr_runtime.sh <target-triple> from the perry workspace, or unset \
+         the knob to link the default (instrument-free) archives."
+    } else {
+        ""
+    };
+    locate_library(lib_name, target).map_err(|searched| {
         let extra = if target.is_some() {
             format!(" (for target {:?})", target.unwrap())
         } else {
@@ -1232,9 +1273,11 @@ pub(super) fn find_runtime_library(target: Option<&str>) -> Result<PathBuf> {
             "Could not find {lib}{extra}.\n\
              Searched:\n{list}\n\n\
              Fixes:\n\
-             - From the perry workspace: cargo build --release -p perry-runtime-static{tf}\n\
+             - From the perry workspace: cargo build --release -p perry-runtime-static{tf}, then\n\
+               scripts/gc_call_effects/sidecars.sh <that target dir> (the GC effects sidecar)\n\
              - Out-of-tree install: set PERRY_RUNTIME_DIR to the directory containing {lib}\n\
-               (e.g. export PERRY_RUNTIME_DIR=/path/to/perry/target/release)",
+               (e.g. export PERRY_RUNTIME_DIR=/path/to/perry/target/release){hint}",
+            hint = instr_hint,
             lib = lib_name,
             extra = extra,
             list = searched_list,
@@ -1243,35 +1286,23 @@ pub(super) fn find_runtime_library(target: Option<&str>) -> Result<PathBuf> {
     })
 }
 
-/// Find the panic=abort prebuilt runtime variant (optional — shipped by
-/// release packaging for runtime-only apps; selected by the out-of-tree
-/// fallback in `optimized_libs.rs` when no `catch_unwind` callers are
-/// reachable and stdlib is not linked). Unix-only: Windows always links
-/// stdlib, which is built panic=unwind.
-pub(super) fn find_runtime_abort_library(target: Option<&str>) -> Option<PathBuf> {
-    if is_windows_target(target) {
-        return None;
-    }
-    find_library("libperry_runtime_abort.a", target)
-}
-
-/// Optional feature-trimmed runtime shipped for source-free Unix installs.
-/// The existing search also resolves `.a.zst` archives from npm packages.
-pub(super) fn find_runtime_core_library(target: Option<&str>) -> Option<PathBuf> {
-    if is_windows_target(target) {
-        return None;
-    }
-    find_library("libperry_runtime_core.a", target)
-}
-
 /// Find the stdlib library for linking (optional - only needed for native modules)
 pub(super) fn find_stdlib_library(target: Option<&str>) -> Option<PathBuf> {
+    locate_stdlib_library(target).map(|l| l.link)
+}
+
+/// [`find_stdlib_library`], keeping the candidate path (sidecar lookup).
+pub(super) fn locate_stdlib_library(target: Option<&str>) -> Option<LocatedLibrary> {
     let lib_name = if is_windows_target(target) {
         "perry_stdlib.lib"
     } else {
         "libperry_stdlib.a"
     };
-    find_library(lib_name, target)
+    locate_library(
+        &super::optimized_libs::variant_archive_name(lib_name),
+        target,
+    )
+    .ok()
 }
 
 /// Find the wasmi-based WebAssembly host library (optional — only needed
@@ -1283,110 +1314,6 @@ pub(super) fn find_wasm_host_library(target: Option<&str>) -> Option<PathBuf> {
         "libperry_wasm_host.a"
     };
     find_library(lib_name, target)
-}
-
-/// Auto-provision the wasmi WebAssembly host staticlib (issue #76 follow-up).
-///
-/// A bare `perry compile` of a program that references `WebAssembly.*` sets
-/// `ctx.needs_wasm_runtime`, which pulls `perry-runtime/wasm-host` (so the
-/// runtime carries the `perry_wasm_host_*` extern references) and links
-/// `libperry_wasm_host.a`. But nothing BUILT that staticlib: it lives in the
-/// standalone `perry-wasm-host` crate (isolated so non-wasm builds don't drag
-/// in wasmi), and the auto-optimize runtime/stdlib rebuild never touches it.
-/// The result was a hard `libperry_wasm_host.a not found` error that forced a
-/// manual `cargo build --release -p perry-wasm-host` prebuild.
-///
-/// This builds it on demand from workspace source — a plain leaf
-/// `cargo build --release -p perry-wasm-host` into `target/release` (the same
-/// mechanism `build_missing_prebuilt_ext_lib` uses for CPU-only ext wrappers),
-/// which is exactly where `find_wasm_host_library` then locates it (including
-/// via the `CARGO_MANIFEST_DIR/../../target/release` candidate when perry runs
-/// out-of-tree). Returns the resolved path, or `None` when there's no workspace
-/// source to build from or the build fails (the caller then surfaces the
-/// original not-found guidance). Callers may invoke this even when an archive
-/// exists: Cargo's freshness check is the guard against a stale host archive
-/// missing symbols required by a newly rebuilt runtime.
-pub(super) fn build_wasm_host_library(
-    target: Option<&str>,
-    format: OutputFormat,
-    verbose: u8,
-) -> Option<PathBuf> {
-    let workspace_root = find_perry_workspace_root()?;
-    let crate_dir = workspace_root.join("crates").join("perry-wasm-host");
-    if !crate_dir.is_dir() {
-        if matches!(format, OutputFormat::Text) && verbose > 0 {
-            eprintln!(
-                "  wasm-host: skipping auto-build — crate source not found at {}",
-                crate_dir.display()
-            );
-        }
-        return None;
-    }
-
-    if matches!(format, OutputFormat::Text) {
-        println!("  wasm-host: building perry-wasm-host from workspace source");
-    }
-
-    let mut cargo_cmd = Command::new("cargo");
-    cargo_cmd
-        .current_dir(&workspace_root)
-        .arg("build")
-        .arg("--release")
-        .arg("-p")
-        .arg("perry-wasm-host");
-    if let Some(triple) = rust_target_triple(target) {
-        cargo_cmd.arg("--target").arg(triple);
-    }
-
-    match super::tool_output::run_internal_tool(&mut cargo_cmd, verbose) {
-        Ok(status) if status.success() => {}
-        Ok(status) => {
-            if matches!(format, OutputFormat::Text) {
-                eprintln!("  wasm-host: cargo build failed ({status})");
-            }
-            return None;
-        }
-        Err(err) => {
-            if matches!(format, OutputFormat::Text) {
-                eprintln!("  wasm-host: failed to spawn cargo ({err})");
-            }
-            return None;
-        }
-    }
-
-    // Prefer the explicit output path cargo just wrote (respecting
-    // CARGO_TARGET_DIR + cross-target triple subdir) so the returned archive
-    // is unambiguously the one we built. Fall back to the standard search so a
-    // non-standard layout still resolves.
-    let lib_name = if is_windows_target(target) {
-        "perry_wasm_host.lib"
-    } else {
-        "libperry_wasm_host.a"
-    };
-    let mut release_dir = match std::env::var_os("CARGO_TARGET_DIR") {
-        Some(raw) if !raw.is_empty() => {
-            let path = PathBuf::from(raw);
-            if path.is_absolute() {
-                path
-            } else {
-                workspace_root.join(path)
-            }
-        }
-        _ => workspace_root.join("target"),
-    };
-    if let Some(triple) = rust_target_triple(target) {
-        release_dir = release_dir.join(triple);
-    }
-    let built = release_dir.join("release").join(lib_name);
-    if built.exists() {
-        return Some(built);
-    }
-
-    let found = find_wasm_host_library(target);
-    if found.is_none() && matches!(format, OutputFormat::Text) && verbose > 0 {
-        eprintln!("  wasm-host: cargo finished but {lib_name} was not located");
-    }
-    found
 }
 
 /// Find the UI library for linking (optional - only needed when perry/ui is imported).

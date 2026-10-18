@@ -5,7 +5,7 @@
 //! (no shared state with the collection walk) so the split is behaviour-free.
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 fn object_string_property<'a>(
     object: &'a swc_ecma_ast::ObjectLit,
@@ -144,46 +144,4 @@ pub(super) fn looks_like_generated_module(specifier: &str) -> bool {
     filename.contains(".gen.")
         || filename.contains(".generated.")
         || filename.starts_with("generated-")
-}
-
-/// The module name the HIR is lowered under, before `recompute_common_project_root`
-/// renames modules against the final root.
-///
-/// During collection the root is only the entry file's directory, so modules
-/// outside it (every `node_modules` dependency of a `dist/start/*.js` entry)
-/// cannot be expressed as a path below it. They used to fall back to their bare
-/// file name, which is shared by every `index.js`: the per-module salt that
-/// keys tagged-template call sites (and capture names) then collided, and a
-/// template literal's strings array came back from another module's site.
-/// A root-relative path with `..` segments is unique per file and does not
-/// depend on the checkout location.
-pub(super) fn collection_module_name(canonical: &Path, project_root: &Path) -> String {
-    use std::path::Component;
-    let normalize = |path: &Path| path.to_string_lossy().replace('\\', "/");
-    if let Ok(relative) = canonical.strip_prefix(project_root) {
-        return normalize(relative);
-    }
-    let target: Vec<Component> = canonical.components().collect();
-    let base: Vec<Component> = project_root.components().collect();
-    let shared = target
-        .iter()
-        .zip(base.iter())
-        .take_while(|(a, b)| a == b)
-        .count();
-    if shared == 0 {
-        // No common ancestor (different drives): keep the file name, which is
-        // what the previous behaviour produced.
-        return canonical
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "input.ts".to_string());
-    }
-    let mut relative = PathBuf::new();
-    for _ in shared..base.len() {
-        relative.push("..");
-    }
-    for component in &target[shared..] {
-        relative.push(component.as_os_str());
-    }
-    normalize(&relative)
 }

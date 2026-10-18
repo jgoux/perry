@@ -34,7 +34,9 @@ mod collect_modules_helpers;
 mod compressed_libs;
 mod embed;
 mod env_fold;
+mod fallback_diag;
 mod fn_infer;
+mod gc_effects_sidecar;
 mod geisterhand;
 mod harmonyos_shim;
 mod host_config;
@@ -44,6 +46,7 @@ mod library_search;
 mod link;
 mod lock_scan;
 mod lowering_report;
+mod module_schedule;
 mod native_addon_sidecar;
 mod object_cache;
 mod object_staging;
@@ -86,6 +89,7 @@ use bootstrap::harvest_harmonyos_index_ets;
 use build_cache::BuildCacheProbe;
 use bundle_apple::{bundle_for_tvos, bundle_for_visionos, bundle_for_watchos};
 use bundle_ios::build_ios_app_bundle;
+#[cfg(test)]
 use collect_modules::collect_modules;
 use harmonyos_shim::emit_harmonyos_arkts_stubs;
 use host_config::apply_pkg_and_toml_config;
@@ -94,11 +98,10 @@ use init_order::{classify_eager_modules, topo_sort_non_entry_modules};
 pub use library_search::find_library;
 pub(crate) use library_search::host_target_triple;
 use library_search::{
-    build_wasm_host_library, find_harmonyos_sdk, find_lld_link, find_llvm_tool,
-    find_msvc_lib_paths, find_msvc_link_exe, find_perry_windows_sdk, find_runtime_library,
-    find_stdlib_library, find_ui_library, find_wasm_host_library, find_windows_archiver,
-    windows_archiver_command, windows_default_output_extension, windows_pe_subsystem_flag,
-    windows_subsystem_needs_ui,
+    find_harmonyos_sdk, find_lld_link, find_llvm_tool, find_msvc_lib_paths, find_msvc_link_exe,
+    find_perry_windows_sdk, find_runtime_library, find_stdlib_library, find_ui_library,
+    find_wasm_host_library, find_windows_archiver, windows_archiver_command,
+    windows_default_output_extension, windows_pe_subsystem_flag, windows_subsystem_needs_ui,
 };
 use link::{build_and_run_link, write_link_cache_manifest};
 pub use lock_scan::collect_native_archives_for_lock;

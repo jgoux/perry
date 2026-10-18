@@ -57,7 +57,7 @@ pub(crate) fn lower_jsx_element(ctx: &mut LoweringContext, jsx: &ast::JSXElement
             props_parts.push((Some("children".to_string()), children.remove(0)));
         }
         _ => {
-            props_parts.push((Some("children".to_string()), Expr::Array(children)));
+            props_parts.push((Some("children".to_string()), Expr::Array(children, None)));
         }
     }
 
@@ -66,7 +66,7 @@ pub(crate) fn lower_jsx_element(ctx: &mut LoweringContext, jsx: &ast::JSXElement
     } else if has_spread_attr {
         Expr::ObjectSpread { parts: props_parts }
     } else {
-        Expr::Object(
+        Expr::object_literal(
             props_parts
                 .into_iter()
                 .map(|(key, value)| (key.expect("non-spread JSX prop"), value))
@@ -156,7 +156,7 @@ pub(crate) fn lower_jsx_fragment(
             props_fields.push(("children".to_string(), children.remove(0)));
         }
         _ => {
-            props_fields.push(("children".to_string(), Expr::Array(children)));
+            props_fields.push(("children".to_string(), Expr::Array(children, None)));
         }
     }
 

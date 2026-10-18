@@ -468,6 +468,13 @@ pub(super) fn compile_method(
     for p in &method.params {
         local_types.insert(p.id, p.ty.clone());
     }
+    // The body's one seed set (`typed_locals::outer_proofs`); no captures.
+    let outer_proofs = crate::collectors::typed_locals::outer_proofs(
+        None,
+        &cross_module.definite_init,
+        Some(method.id),
+    );
+    crate::collectors::typed_locals::seed_local_types(&outer_proofs, &mut local_types);
     if let Some(index) = guarded_clone_param.filter(|_| guarded_undefined_clone) {
         local_types.insert(method.params[index].id, perry_hir::types::Type::Void);
     }
@@ -505,13 +512,15 @@ pub(super) fn compile_method(
         &cross_module.module_global_proven_types,
     );
     // Closed World 5d: the body's typed locals (no entry proofs here).
+    let mut code_unit_locals = std::collections::HashSet::new();
     let typed_locals = crate::collectors::typed_locals::apply(
         method_body,
         &std::collections::HashMap::new(),
-        None,
+        &outer_proofs,
         &method_boxed_vars,
         module_globals,
         &mut native_facts.representation.number_by_construction_locals,
+        &mut code_unit_locals,
     );
     super::helpers::drop_number_local_root_slots(
         &mut shadow_slot_map,
@@ -590,6 +599,9 @@ pub(super) fn compile_method(
         local_types,
         proven_local_types: guarded_param_proofs,
         typed_locals,
+        code_unit_locals,
+        confined_arrays: &cross_module.definite_init.confined,
+        confined_array_read: false,
         guarded_discriminant_aliases: std::collections::HashMap::new(),
         module_global_proven_types: &cross_module.module_global_proven_types,
         module_global_transfers: &cross_module.module_global_transfers,
@@ -616,11 +628,15 @@ pub(super) fn compile_method(
         program_layouts: cross_module.program_layouts.clone(),
         wpfacts_sites: 0,
         wpfacts_tested: Vec::new(),
+        wpfacts_off: false,
+        inline_new_leaf: Vec::new(),
+        ctor_receiver: None,
+        ctor_receiver_selector: None,
         wpfacts_this: vec![(this_slot.clone(), method.id)],
         this_stack: vec![this_slot],
         super_called_stack: Vec::new(),
         shared_super_scope_active: false,
-        lexical_this_uses_derived_binding: false,
+        lexical_this_uses_derived_binding: None,
         inline_ctor_return: Vec::new(),
         new_target_stack: Vec::new(),
         class_stack: vec![class.name.clone()],
@@ -736,7 +752,6 @@ pub(super) fn compile_method(
         i32_counter_slots: index_i32_param_slots,
         record_packed_admissions: std::collections::HashMap::new(),
         numeric_accumulator_f64_slots: HashMap::new(),
-        transition_cache_base_slot: None,
         receiver_descriptors: Default::default(),
         poll_stride_counter_slot: None,
         deferred_integer_update_accumulators: HashSet::new(),
@@ -759,6 +774,7 @@ pub(super) fn compile_method(
         spec_i32_params: index_param_ids.clone(),
         spec_bool_params: std::collections::HashSet::new(),
         typed_element_locals: std::collections::HashSet::new(),
+        create_families: Default::default(),
         class_guard_window: None,
         i1_local_slots: HashMap::new(),
         index_used_locals: native_facts.index_used_locals(),
@@ -773,7 +789,6 @@ pub(super) fn compile_method(
         imported_vars: &cross_module.imported_vars,
         imported_object_literals: &cross_module.imported_object_literals,
         short_spread_method_candidates: &cross_module.short_spread_method_candidates,
-        program_class_accessor_names: cross_module.program_class_accessor_names.as_deref(),
         object_literal_method_candidates: &cross_module.object_literal_method_candidates,
         compile_time_constants: native_facts.compile_time_constants(),
         target_triple: &cross_module.target_triple,
@@ -847,6 +862,7 @@ pub(super) fn compile_method(
         was_unrolled: method.was_unrolled,
         ic_site_counter: ic_base,
         ic_globals: Vec::new(),
+        born_let: None,
         typed_parse_rodata: Vec::new(),
         buffer_data_slots: HashMap::new(),
         native_arena_owner_aliases: HashMap::new(),
@@ -936,6 +952,10 @@ pub(super) fn compile_method(
     // as uninitialized register values (read as NaN-boxed undefined).
     let is_constructor_method = method.name == format!("{}_constructor", class.name);
     if is_constructor_method {
+        ctx.ctor_receiver = ctx
+            .this_stack
+            .first()
+            .map(|slot| (slot.clone(), class.name.clone()));
         crate::lower_call::defer_dynamic_derived_fields(&mut ctx, class);
         // #9043: a default-derived chain can reach a dynamic parent through a
         // constructor-free static ancestor (`Leaf -> Mid -> <captured Base>`).
@@ -1560,6 +1580,8 @@ pub(super) fn compile_method(
                 || class.extends_name.is_some()
                 || class.native_extends.is_some()
                 || class.extends_expr.is_some(),
+            family_run: None,
+            bind_watch: None,
         };
         ctx.inline_ctor_return.push(target.clone());
         Some((target, after_idx))

@@ -27,19 +27,11 @@ mod has_delete;
 pub(crate) use has_delete::reflect_ordinary_delete_property_key;
 pub use has_delete::{js_proxy_delete, js_proxy_has};
 mod invariants;
+mod set_interceptor;
+pub(crate) use set_interceptor::set_interceptor;
 mod put_value;
-pub(crate) use put_value::note_packed_add_carriers;
-pub(crate) use put_value::scan_packed_add_roots_mut;
-pub(crate) use put_value::scan_setter_site_roots_mut;
-pub use put_value::{js_proxy_set, js_put_value_set};
-pub(crate) use put_value::{
-    js_put_value_set_ic_miss, proxy_set_with_receiver, IC_SLOT_OVERFLOW_BIT,
-};
-#[cfg(any(test, feature = "regex-engine"))]
-pub(crate) use put_value::{js_put_value_set_packed_fast, store_and_prime, PackedSetWays};
-pub use put_value::{js_put_value_set_packed_miss, PackedSetSite, PACKED_SET_EMPTY};
-pub(crate) use put_value::{store_census, C_REP_CONVERGE, C_REP_MIGRATE, C_REP_VALIDITY_BUMP};
-pub use put_value::{write_pic_way_entry, WritePicCache, WritePicCacheSlot, WRITE_PIC_WORDS};
+pub use put_value::{js_proxy_set, js_put_value_set, js_put_value_set_dynamic};
+pub(crate) use put_value::{proxy_set_with_receiver, IC_SLOT_OVERFLOW_BIT};
 mod json;
 pub(crate) mod metadata;
 mod own_keys;
@@ -205,7 +197,7 @@ fn target_callable_at_creation(target: f64) -> bool {
 
 #[no_mangle]
 pub extern "C" fn js_proxy_new(target: f64, handler: f64) -> f64 {
-    #[cfg(feature = "contract-checks")]
+    #[cfg(perry_contract_checks)]
     crate::contracts::hard_value(target, "new Proxy");
     // #2846: validate both arguments are objects before allocating.
     if !proxy_arg_is_object(target) || !proxy_arg_is_object(handler) {
@@ -1054,6 +1046,18 @@ fn own_set_descriptor(target: f64, key: f64) -> Option<OwnSetDescriptor> {
     if small_handle_from_value(target).is_some() {
         return None;
     }
+    // Object model §3.2: an optional layout key whose slot holds the hole is
+    // absent (`key_view`), so the walk goes on to the prototype chain.
+    if target.to_bits() & !POINTER_MASK == POINTER_TAG
+        && unsafe {
+            crate::object::key_view::own_key_is_hole(
+                extract_pointer(target.to_bits()) as *const crate::ObjectHeader,
+                crate::JSValue::from_bits(key.to_bits()),
+            )
+        }
+    {
+        return None;
+    }
 
     // Ordinary prototype holders answer from their shape's key index. A
     // missing key is an indexed absence, not a byte scan of every builtin
@@ -1590,6 +1594,9 @@ fn create_or_update_receiver_property(receiver: f64, key: f64, value: f64) -> bo
         }
     } else if crate::object::obj_value_no_extend(receiver) {
         return false;
+    } else if unsafe { crate::object::layout_desc::family_create(receiver, key, value) } {
+        // Case 2c: a family object's late key, or a key outside its layout.
+        return true;
     }
     target_set(receiver, key, value);
     true
@@ -1860,159 +1867,8 @@ fn ordinary_set_with_receiver(target: f64, key: f64, value: f64, receiver: f64) 
         }
     }
 
-    let mut current = target;
-    for _ in 0..64 {
-        // A Proxy hop in the prototype chain: `OrdinarySetWithOwnDescriptor`
-        // step 2.a-b dispatches the full `[[Set]]` on the parent with the
-        // ORIGINAL `receiver`, not the raw own-descriptor walk below (which
-        // would misread the small proxy id as a heap pointer).
-        if lookup(current).is_some() {
-            return crate::value::js_is_truthy(proxy_set_with_receiver(
-                current, key, value, receiver,
-            )) != 0;
-        }
-        // Integer-Indexed exotic [[Set]] (§10.4.5.5): a typed array in the
-        // chain intercepts a canonical numeric index key — the prototype
-        // chain is NEVER consulted for it. `SameValue(O, Receiver)` writes
-        // the element; a different receiver with a valid index falls to the
-        // ordinary data-descriptor flow (create on receiver); an invalid
-        // canonical index is a silent no-op `true`.
-        let cur_addr = extract_pointer(current.to_bits()) as usize;
-        if crate::typedarray_props::is_typed_array_owner(cur_addr) {
-            if let Some(name) = property_key_to_rust_string(key) {
-                match crate::typedarray_props::typed_array_canonical_index_validity(cur_addr, &name)
-                {
-                    Some(valid) => {
-                        let recv_addr = extract_pointer(receiver.to_bits()) as usize;
-                        if recv_addr == cur_addr {
-                            return unsafe {
-                                crate::typedarray_props::typed_array_set_property_by_name(
-                                    cur_addr, &name, value,
-                                )
-                            };
-                        }
-                        if !valid {
-                            return true;
-                        }
-                        // The receiver may itself be a typed array: the
-                        // CreateDataProperty lands in ITS [[DefineOwnProperty]],
-                        // which rejects an index that is invalid FOR THE
-                        // RECEIVER (`Reflect.set(ta, "0", v, emptyTa)` → false).
-                        if crate::typedarray_props::is_typed_array_owner(recv_addr) {
-                            return match crate::typedarray_props::
-                                typed_array_canonical_index_validity(recv_addr, &name)
-                            {
-                                Some(true) => unsafe {
-                                    crate::typedarray_props::typed_array_set_property_by_name(
-                                        recv_addr, &name, value,
-                                    )
-                                },
-                                Some(false) => false,
-                                None => create_or_update_receiver_property(receiver, key, value),
-                            };
-                        }
-                        return create_or_update_receiver_property(receiver, key, value);
-                    }
-                    // Ordinary key on a TA in the chain: stop the walk (Perry's
-                    // TA prototype methods are served natively, not as data
-                    // descriptors visible to `own_set_descriptor`) and define
-                    // on the receiver.
-                    None => {
-                        return create_or_update_receiver_property(receiver, key, value);
-                    }
-                }
-            }
-        }
-        if let Some(desc) = own_set_descriptor(current, key) {
-            return match desc {
-                OwnSetDescriptor::Data { writable } => {
-                    if !writable {
-                        false
-                    } else {
-                        create_or_update_receiver_property(receiver, key, value)
-                    }
-                }
-                OwnSetDescriptor::Accessor { setter_bits } => {
-                    call_setter_with_receiver(setter_bits, receiver, value)
-                }
-            };
-        }
-        // #11201: a class prototype (or class instance) on a class-id-0
-        // receiver's chain keeps its accessors in the class vtable, which
-        // `own_set_descriptor` does not model. See `class_link_accessor_set`.
-        if let Some(done) = class_link_accessor_set(current, key, value, receiver) {
-            return done;
-        }
-        // #6828/#10482: `%Object.prototype%.__proto__` is a legacy accessor
-        // whose setter performs `SetPrototypeOf(Receiver, value)`.
-        // `object/global_this/proto_methods.rs` now materializes it as a
-        // REAL accessor descriptor on `Object.prototype` (#10482), so
-        // `own_set_descriptor` just above finds it and dispatches through
-        // `call_setter_with_receiver` before the walk ever reaches here —
-        // this arm is kept as a fallback for a walk that reaches
-        // `Object.prototype` without ever consulting the descriptor table
-        // (defensive; not known to be reachable). Both arms must behave
-        // identically, so both call the one shared implementation.
-        //
-        // Keep this AFTER `own_set_descriptor`: a user-installed own
-        // `__proto__` data/accessor property on an object earlier in the chain
-        // must win. A null-prototype receiver never reaches the canonical
-        // Object.prototype and therefore still creates an ordinary own data
-        // property.
-        let current_addr = extract_pointer(current.to_bits()) as usize;
-        if current_addr != 0
-            && key_equals(key, b"__proto__")
-            && current_addr == crate::array::object_prototype_addr()
-        {
-            legacy_dunder_proto_set(receiver, value);
-            return true;
-        }
-        // A class function object is not a leaf of the walk: its [[Prototype]]
-        // (the parent class) may hold the accessor (#11521).
-        if crate::closure::is_closure_ptr(extract_pointer(current.to_bits()) as usize)
-            && crate::object::class_value::class_closure_id(
-                extract_pointer(current.to_bits()) as usize
-            )
-            .is_none()
-        {
-            // ECMAScript poison pill: `fn.caller = v` / `fn.arguments = v` on
-            // a strict-mode function throws via %ThrowTypeError%. A plain
-            // non-strict function instead rejects the inherited setter-less
-            // property with `false`; PutValue's `Throw` flag decides whether
-            // that rejection stays silent or becomes a TypeError. A genuine
-            // own data prop (defineProperty round-trip) still wins via the
-            // descriptor arm above.
-            let cur_ptr = extract_pointer(current.to_bits()) as usize;
-            if let Some(name) = key_to_rust_string(key) {
-                if matches!(name.as_str(), "caller" | "arguments")
-                    && !crate::closure::closure_has_own_dynamic_prop(cur_ptr, &name)
-                {
-                    let closure = cur_ptr as *const crate::closure::ClosureHeader;
-                    let is_non_strict_ordinary_function = crate::closure::closure_info(closure)
-                        .is_some_and(|info| {
-                            if info.flags & crate::codegen_abi::FN_HAS_SOURCE != 0 {
-                                info.flags & crate::codegen_abi::FN_NON_STRICT_ORDINARY != 0
-                            } else {
-                                crate::builtins::function_is_non_strict_ordinary_for_ptr(
-                                    info.code as usize,
-                                )
-                            }
-                        });
-                    if is_non_strict_ordinary_function {
-                        return false;
-                    }
-                    throw_type_error("Restricted function property assignment");
-                }
-            }
-            // Functions continue through the same descriptor walk: a
-            // handled readonly write is a failure, not a successful store.
-        }
-        let Some(proto) = prototype_of_for_set(current) else {
-            return create_or_update_receiver_property(receiver, key, value);
-        };
-        current = proto;
-    }
-    false
+    set_interceptor(target, key, value, receiver)
+        .unwrap_or_else(|| create_or_update_receiver_property(receiver, key, value))
 }
 
 /// #11201: `[[Set]]` reaching a class-backed link — a declared or
@@ -2696,17 +2552,16 @@ mod tests {
         let src = br#"{"x":0,"y":0}"#;
         let key_ptr = crate::string::js_string_from_bytes(b"y".as_ptr(), 1);
         let key_y = f64::from_bits(crate::value::STRING_TAG | (key_ptr as u64 & POINTER_MASK));
-        // Object model step 4: a JSON.parse record keeps its fields in its
-        // overflow (§3.4), which this layout proof does not serve until step
-        // 5; the nest goes to ordinary [[Set]].
+        // A JSON.parse record keeps its fields as fixed slots (no overflow),
+        // so the layout proof serves it like any other record.
         let parsed: Vec<f64> = (0..4)
             .map(|_| put_value::record_fixture::json(src))
             .collect();
         let parsed_array = crate::array::js_array_from_f64(parsed.as_ptr(), parsed.len() as u32);
         assert_eq!(
             object_array_numeric_write_guard(boxed_object(parsed_array.cast()), &[key_y], 4),
-            0,
-            "JSON.parse records (overflow receivers) take ordinary [[Set]]"
+            2,
+            "JSON.parse records keep fixed slots and are admitted like any record"
         );
         // The admission itself, on the same records built with fixed slots.
         let mut receivers = Vec::new();
@@ -2775,65 +2630,6 @@ mod tests {
                 "restoring the mark restores eligibility"
             );
         }
-    }
-
-    /// #8098: the same admission on the per-site static write PIC, which is the
-    /// path scattered `record.field = …` writes take (the whole-loop clone only
-    /// covers a constant-counted nest). A miss that refuses to prime leaves the
-    /// site on the runtime path forever.
-    #[test]
-    fn record_receivers_prime_the_static_write_pic() {
-        // Object model step 4: a JSON.parse record keeps its fields in its
-        // overflow and primes no site until step 5; this pins the admission
-        // on the same record built with fixed slots.
-        // The key is interned before anything mints an atom for its spelling
-        // (a JSON.parse or a canonical key list would): only an interned
-        // string is admitted as a write site's key.
-        let name: &[u8] = b"n8098";
-        let key_ptr = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
-        let key_ptr = crate::string::js_string_intern(key_ptr, fnv1a(name));
-        let plain_record = || {
-            let obj = crate::object::js_object_alloc_plain(0);
-            crate::object::js_object_set_field_by_name(obj, key_ptr, 1.0);
-            f64::from_bits(crate::value::js_nanbox_pointer(obj as i64).to_bits())
-        };
-        let target = plain_record();
-        let object = (target.to_bits() & POINTER_MASK) as *mut crate::ObjectHeader;
-
-        let mut cache: put_value::WritePicCache = [0; put_value::WRITE_PIC_WORDS];
-        let mut cache_slot: put_value::WritePicCacheSlot = &mut cache;
-        let stored =
-            put_value::js_put_value_set_ic_miss(target, key_ptr, 7.0, 0, &mut cache_slot, 0);
-        assert_eq!(stored, 7.0);
-        let expected_token = unsafe {
-            crate::object::shapes::PIC_ID_TOKEN_BIT
-                | crate::object::shapes::object_shape_id(object) as u64
-        };
-        assert_eq!(
-            cache[0] as u64, expected_token,
-            "a parsed receiver must prime the way with its own ShapeId token"
-        );
-        assert_eq!(cache[1], 0, "`n` is the receiver's first own slot");
-
-        // Discriminating half: an otherwise identical parsed receiver with the
-        // ordinary mark cleared must NOT prime.
-        let value = plain_record();
-        let unmarked = (value.to_bits() & POINTER_MASK) as *mut crate::ObjectHeader;
-        unsafe {
-            let header =
-                (unmarked as *mut u8).sub(crate::gc::GC_HEADER_SIZE) as *mut crate::gc::GcHeader;
-            (*header)._reserved &= !crate::gc::OBJ_FLAG_PLAIN_ORDINARY;
-            crate::object::shapes::store_kind::restamp_object_store_kind(unmarked);
-        }
-        let mut cache2: put_value::WritePicCache = [0; put_value::WRITE_PIC_WORDS];
-        let mut cache2_slot: put_value::WritePicCacheSlot = &mut cache2;
-        let stored =
-            put_value::js_put_value_set_ic_miss(value, key_ptr, 9.0, 0, &mut cache2_slot, 0);
-        assert_eq!(stored, 9.0, "the write itself still succeeds");
-        assert_eq!(
-            cache2[0], 0,
-            "an unmarked class-less receiver must stay on the miss path"
-        );
     }
 
     /// #7531: `create_list_from_array_like` backs `Reflect.apply(target,

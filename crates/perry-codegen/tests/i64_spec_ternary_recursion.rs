@@ -138,6 +138,7 @@ fn ternary_recursive_fn(id: u32, name: &str, base: Expr) -> Function {
 
 fn module_with(functions: Vec<Function>) -> Module {
     Module {
+        requested_modules: Vec::new(),
         name: "i64_spec_ternary.ts".to_string(),
         imports: Vec::new(),
         exports: Vec::new(),
@@ -172,6 +173,8 @@ fn module_with(functions: Vec<Function>) -> Module {
         async_generator_funcs: std::collections::HashSet::new(),
         local_source_spans: std::collections::HashMap::new(),
         gen_param_prologue_len: std::collections::HashMap::new(),
+        class_family_syntax: None,
+        requested_modules: Vec::new(),
     }
 }
 

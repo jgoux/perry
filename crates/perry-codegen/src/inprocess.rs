@@ -18,6 +18,7 @@
 #[cfg(test)]
 mod dead_statepoint_tests;
 mod function_layout;
+mod loop_interrupt;
 mod nanbox_operands;
 mod native_homes;
 mod optimize_emit;
@@ -111,6 +112,8 @@ static ANNOUNCE: Once = Once::new();
 fn global_init(mllvm: &[String]) {
     LLVM_GLOBAL_INIT.call_once(|| {
         let mut mllvm = mllvm.to_vec();
+        // #12633: the options of the loop interrupt poll placement.
+        mllvm.extend(loop_interrupt::PLACE_SAFEPOINTS_OPTIONS.map(String::from));
         // These options affect only the WebAssembly backend. Initialize
         // them even if a native unit happens to be compiled first.
         #[cfg(feature = "target-wasi")]
@@ -182,7 +185,7 @@ fn announce() {
 /// normally, two when the fast-emit budget split its offenders out (#10586).
 /// `linker::finish_native_pieces` turns them into the single linker input.
 pub fn compile_ll_to_object_inprocess(
-    ll_text: &str,
+    ll_text: impl AsRef<str>,
     effective_target: &str,
     clang_style_args: &[String],
     module_name: &str,
@@ -194,12 +197,13 @@ pub fn compile_ll_to_object_inprocess(
     // pass runs inside THIS process — the crash would take the compiler down
     // with it, not just a child.
     if native_roots {
-        if let Some(refusal) = crate::linker::rs4gc_funclet_refusal(ll_text) {
+        if let Some(refusal) = crate::linker::rs4gc_funclet_refusal(ll_text.as_ref()) {
             return Err(anyhow!(refusal));
         }
     }
     let context = Context::create();
-    let module = parse_ir_text(&context, ll_text, module_name)?;
+    let module = parse_ir_text(&context, ll_text.as_ref(), module_name)?;
+    drop(ll_text);
     optimize_and_emit(
         &module,
         effective_target,

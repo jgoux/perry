@@ -152,7 +152,7 @@ pub fn try_lower_native_chain_method_call(
 ///   its chains are already rewritten to nested `NativeMethodCall`s by the
 ///   HIR `fix_local_native_instances` pass, so its receiver is matched by the
 ///   `NativeMethodCall` arm directly.
-fn native_receiver_module(expr: &Expr) -> Option<&str> {
+pub(crate) fn native_receiver_module(expr: &Expr) -> Option<&str> {
     match expr {
         Expr::NativeMethodCall { module, .. } => Some(module.as_str()),
         Expr::Call { callee, .. } => {
@@ -276,17 +276,15 @@ pub fn try_lower_index_get_call(
                 Key::Value(index),
                 Args::List(args),
                 |ctx, p| {
-                    let memo_slot = super::direct_method_guard::emit_chain_memo_slot(ctx);
                     let key = p.key.as_deref().expect("computed key");
                     ctx.block().call(
                         DOUBLE,
-                        "js_native_call_method_value_memo",
+                        "js_native_call_method_value",
                         &[
                             (DOUBLE, &p.recv),
                             (DOUBLE, key),
                             (crate::types::PTR, &p.args_ptr),
                             (I64, &p.argc),
-                            (crate::types::PTR, &memo_slot),
                         ],
                     )
                 },
@@ -314,16 +312,14 @@ pub fn try_lower_index_get_call(
             let recv_box = group.reread(ctx, recv_idx)?;
             let key_box = group.reread(ctx, key_idx)?;
             let (args_ptr, args_len) = build_dispatch_args_buffer(ctx, group, &arg_idxs)?;
-            let memo_slot = super::direct_method_guard::emit_chain_memo_slot(ctx);
             Ok(Some(ctx.block().call(
                 DOUBLE,
-                "js_native_call_method_value_memo",
+                "js_native_call_method_value",
                 &[
                     (DOUBLE, &recv_box),
                     (DOUBLE, &key_box),
                     (crate::types::PTR, &args_ptr),
                     (I64, &args_len),
-                    (crate::types::PTR, &memo_slot),
                 ],
             )))
         });

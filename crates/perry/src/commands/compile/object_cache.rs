@@ -59,6 +59,11 @@ fn pinned_build_id(raw: Option<String>) -> Option<u64> {
 /// or any dep that gets baked into the perry executable) produces a new
 /// build id and the cache invalidates correctly.
 ///
+/// The executable links no runtime code (`tests/runtime_decoupled.rs` gates
+/// it), so a runtime-only edit leaves this id unchanged. What codegen reads
+/// from the runtime is the GC effects table, whose digest is its own key
+/// field (`gc_effects`): such an edit misses exactly when a table row changes.
+///
 /// Failure modes degrade silently: if `current_exe()` or the read fails,
 /// returns 0 and we fall back to the version-only behavior — at worst the
 /// user is back to the pre-fix status quo, never worse.
@@ -244,6 +249,9 @@ fn stable_type_key(ty: &perry_hir::types::Type) -> String {
 /// We also mix in environment inputs read at compile time that are not part
 /// of `CompileOptions`. `compile_env::COMPILE_ENV_VARS` is the authority
 /// shared with the build cache, including contract and proof negative controls.
+/// PATH is the one exception: the object key hashes the `opt` and `clang` it
+/// resolves to (`object_tools`), while the build cache, whose linker finds
+/// more tools on PATH, still hashes PATH itself.
 ///
 /// NOT captured in the key: the host CPU. By default (`PERRY_TARGET_CPU`
 /// unset) `compile_ll_to_object` passes `-mcpu=native`/`-march=native` to
@@ -308,9 +316,7 @@ fn compute_object_cache_key_with_env(
 ) -> u64 {
     let mut h = Djb2Hasher::new();
 
-    // Perry version + bitcode_link gate (we shouldn't be called when
-    // emit_ir_only=true, but include it so key-space is disjoint if the
-    // caller ever forgets to check).
+    // Perry version.
     h.field("v", perry_version);
     // Build id of the running perry binary (issue #544). Hashed once per
     // process; see `perry_build_id` for rationale. The version field above
@@ -411,6 +417,7 @@ fn compute_object_cache_key_with_env(
     // Object model step 3: method calls bind the prototype constants the
     // whole program's write census proves.
     h.field("proto_census", &perry_codegen::program_proto_census_key());
+    h.field("proto_exports", &perry_codegen::program_proto_exports_key());
     // A module's native-module namespaces and wrapper calls lower differently
     // depending on which library the compile routes each module to.
     h.field(
@@ -899,6 +906,7 @@ fn compute_object_cache_key_with_env(
                     object.receiver_class_name,
                     object.source_global_id,
                 ));
+                buf.push_str(&format!("layout={:?}:", object.final_shape));
                 let mut methods = object.methods.clone();
                 methods.sort_by(|left, right| left.name.cmp(&right.name));
                 for method in methods {
@@ -1148,7 +1156,17 @@ fn compute_object_cache_key_with_env(
     // cannot hit. Hash names and distinguish absence from a present empty value.
     h.field("compile_env_format", "shared-lossless-v1");
     h.field("nanbox_canon_contract", "required-handle-tag-v1");
+    // Object emission reads PATH only to find `opt` and `clang`; the key
+    // hashes the tools found instead, so a wrapper that prepends its own
+    // directories (`perf`, `time`) reuses every object.
+    h.field(
+        "object_tools",
+        perry_codegen::linker::object_toolchain_key(),
+    );
     for name in COMPILE_ENV_VARS {
+        if *name == "PATH" {
+            continue;
+        }
         let value = env_var(name);
         let encoded = match value {
             Some(value) => format!("set:{value}"),
@@ -1222,7 +1240,7 @@ fn serialize_namespace_entry_kind(kind: &perry_codegen::NamespaceEntryKind, out:
 /// source hash). Atomic counters track hit/miss/store for verbose reporting.
 pub struct ObjectCache {
     /// Where to read/write cached objects. `None` when the cache is
-    /// disabled (via `--no-cache`, bitcode-link mode, or non-writable
+    /// disabled (via `--no-cache`, or a non-writable
     /// project root).
     cache_dir: Option<PathBuf>,
     hits: AtomicUsize,
@@ -1467,7 +1485,7 @@ impl ObjectCache {
     }
 
     /// Whether the cache is actually writing to disk. `false` when
-    /// disabled by `--no-cache`, by bitcode-link mode, or by a
+    /// disabled by `--no-cache`, or by a
     /// create-dir failure.
     pub fn is_enabled(&self) -> bool {
         self.cache_dir.is_some()

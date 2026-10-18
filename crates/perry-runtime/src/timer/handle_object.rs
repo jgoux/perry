@@ -482,18 +482,23 @@ fn build_timer_prototypes() {
         }
         // No `Symbol.toStringTag`: node brands both as `[object Object]`.
         slot.store(proto as i64, Ordering::Release);
-        let desc = if is_immediate {
-            std::ptr::addr_of!(crate::object::runtime_layouts::IMMEDIATE)
+        // Built: the TIMEOUT / IMMEDIATE layouts name this prototype.
+        let serial = if is_immediate {
+            crate::closure::shape::INTRINSIC_SERIAL_IMMEDIATE
         } else {
-            std::ptr::addr_of!(crate::object::runtime_layouts::TIMEOUT)
+            crate::closure::shape::INTRINSIC_SERIAL_TIMEOUT
         };
-        unsafe {
-            crate::object::runtime_layouts::bind_builtin_prototype(
-                desc,
-                crate::value::js_nanbox_pointer(proto as i64).to_bits(),
-            );
-        }
+        unsafe { crate::object::builtin_proto::seal_runtime_prototype(proto, serial) };
     }
+}
+
+/// `Timeout.prototype` and `Immediate.prototype`, built on first use.
+#[cfg(test)]
+pub(crate) fn timer_prototypes_for_tests() -> [*mut crate::object::ObjectHeader; 2] {
+    [
+        timer_prototype(CallbackTimerKind::Timeout),
+        timer_prototype(CallbackTimerKind::Immediate),
+    ]
 }
 
 fn timer_prototype(kind: CallbackTimerKind) -> *mut crate::object::ObjectHeader {

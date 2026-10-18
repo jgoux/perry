@@ -373,9 +373,10 @@ fn require_base_filename(closure: *const ClosureHeader) -> String {
 // host realpath/symlink behavior when a file exists, and normalize only absent
 // absolute candidates before consulting the registry (#11448).
 fn resolve_file_candidate(path: &std::path::Path) -> Option<std::path::PathBuf> {
-    #[cfg(feature = "node-api-host")]
     if path.extension().and_then(|ext| ext.to_str()) == Some("node") {
-        if let Ok(payload) = crate::node_api_host::resolve_addon_request(&path.to_string_lossy()) {
+        if let Some(payload) =
+            crate::node_api_host::hooks::resolve_addon_request(&path.to_string_lossy())
+        {
             return Some(payload);
         }
     }
@@ -499,11 +500,8 @@ fn resolve_request(
     if specifier.starts_with("./") || specifier.starts_with("../") {
         return resolve_file(&base.join(specifier)).ok_or(ResolveError::NotFound);
     }
-    #[cfg(feature = "node-api-host")]
-    {
-        if let Ok(payload) = crate::node_api_host::resolve_addon_request(specifier) {
-            return Ok(payload);
-        }
+    if let Some(payload) = crate::node_api_host::hooks::resolve_addon_request(specifier) {
+        return Ok(payload);
     }
     let (package, subpath) = package_parts(specifier);
     for ancestor in base.ancestors() {
@@ -723,9 +721,11 @@ fn require_path(cache: f64, path: &std::path::Path, parent_filename: &str) -> f6
         link_parent(cache_handle.get_nanbox_f64(), record, parent_filename);
         return exports_handle.get_nanbox_f64();
     }
-    #[cfg(feature = "node-api-host")]
-    if path.extension().and_then(|ext| ext.to_str()) == Some("node") {
-        let exports = scope.root_nanbox_f64(crate::node_api_host::load_addon_or_throw(&filename));
+    if let Some(exports) = (path.extension().and_then(|ext| ext.to_str()) == Some("node"))
+        .then(|| crate::node_api_host::hooks::load_addon(&filename))
+        .flatten()
+    {
+        let exports = scope.root_nanbox_f64(exports);
         let record = cache_exports(
             cache_handle.get_nanbox_f64(),
             &filename,
@@ -1272,6 +1272,43 @@ pub unsafe extern "C" fn js_run_module_init_catching(init_addr: i64) {
     }
 }
 
+/// Execute one compiled module evaluation using the existing module registry.
+/// Its code address identifies this program's evaluation record independently
+/// of CommonJS partial-export publication (an ESM or parse-error stub may
+/// throw before publishing anything). Successful reentries retain the emitted
+/// one-byte guard; a failure clears that guard and remains in the registry.
+///
+/// # Safety
+/// `init_addr` names an `extern "C" fn()` evaluation body; `guard_addr` names
+/// its stable generated i8 global, thread-local for worker programs.
+#[no_mangle]
+pub unsafe extern "C" fn js_run_module_init_guarded(init_addr: i64, guard_addr: i64) {
+    let key = format!("\0module-init:{init_addr:x}");
+    let outcome = MODULE_PATH_REGISTRY.with(|registry| {
+        assert!(registry.register_init(key.clone(), init_addr as usize));
+        registry.require_with(&key, &run_path_initializer)
+    });
+    match outcome {
+        Ok(_) => {}
+        Err(error) => {
+            // A failed evaluation is never "done". The next wrapper entry
+            // reaches the same record and rethrows its rooted failure.
+            *(guard_addr as *mut u8) = 0;
+            match error {
+                PathModuleRequireError::Initializer(error) => {
+                    crate::exception::js_throw(f64::from_bits(error));
+                }
+                PathModuleRequireError::OwnershipConflict => {
+                    crate::fs::validate::throw_error_with_code(
+                        "Perry rejected module evaluation from a non-owner initializer",
+                        "ERR_PERRY_PATH_MODULE_OWNER",
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn directory_module_candidates(key: &str) -> Vec<String> {
     let dir = std::path::Path::new(&key);
     if !dir.is_dir() {
@@ -1399,8 +1436,7 @@ pub(crate) fn test_remove_path_module_root(key: &str) {
 pub extern "C" fn js_require_resolve_node_modules(from_dir: f64, specifier: f64) -> f64 {
     let from = value_to_string(from_dir, "from");
     let spec = value_to_string(specifier, "specifier");
-    #[cfg(feature = "node-api-host")]
-    {
+    if crate::node_api_host::hooks::installed() {
         let request = if spec.starts_with("./") || spec.starts_with("../") {
             std::path::Path::new(&from)
                 .join(&spec)
@@ -1409,7 +1445,7 @@ pub extern "C" fn js_require_resolve_node_modules(from_dir: f64, specifier: f64)
         } else {
             spec.clone()
         };
-        if let Ok(payload) = crate::node_api_host::resolve_addon_request(&request) {
+        if let Some(payload) = crate::node_api_host::hooks::resolve_addon_request(&request) {
             return string_value(&payload.to_string_lossy());
         }
     }

@@ -21,20 +21,24 @@
 //! - `PERRY_FACTS_PROFILE=1`: per-constraint-kind solve profile in the dump;
 //! - `PERRY_FACTS_EXPLAIN=1`: diagnostics — each ⊤ site verdict names
 //!   where ⊤ first entered (the precision report groups by it);
-//! - `PERRY_FACTS_ONLY=1`: stop after writing the dump (analysis-only runs);
-//! - `PERRY_FACTS_WHATIF_NO_E14=1`: REPORT ONLY, unsound — ignore the
-//!   program-wide E14 kill to measure what it costs (the dump says so).
+//! - `PERRY_FACTS_ONLY=1`: stop after writing the dump (analysis-only runs).
+//!
+//! Interpreted code (`new Function`, `eval`, `vm`) is no program-wide kill
+//! (decision 150): the analysis models it as the ⊤ summary node, and when it
+//! can run every proof is guarded by the runtime's interpreted-prototype-write
+//! word (`ElisionFacts::interp_guard`).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Solve-work bound (see `perry_wpfacts::FactsConfig::max_work`), sized so
-/// the whole pass costs a few seconds at most. Programs the analysis cannot
-/// finish within it (tsc, Effect, fastify) get no facts anyway. 16M is about
-/// 2 s of solve on the build host; zod needs 6.2M, commander 2.0M, the
-/// class-local kernels under 400.
-const DEFAULT_MAX_WORK: u64 = 16_000_000;
+/// the whole pass costs a few seconds at most. With `this` bound per
+/// (receiver, key), shared accessor walks and groups, and edges into
+/// widened sets cut at the source, tsc needs 45M, fastify 59M, Effect 27M,
+/// zod 3.9M, commander 1.8M; the Next.js server (~3G) still stops at the
+/// bound and gets no facts.
+const DEFAULT_MAX_WORK: u64 = 200_000_000;
 
 pub(crate) fn contracts_requested() -> bool {
     std::env::var("PERRY_CHECK_CONTRACTS")
@@ -70,7 +74,6 @@ pub(crate) fn run(
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(DEFAULT_MAX_WORK),
         ),
-        whatif_no_e14: std::env::var("PERRY_FACTS_WHATIF_NO_E14").is_ok_and(|v| v == "1"),
         profile: std::env::var("PERRY_FACTS_PROFILE").is_ok_and(|v| v == "1"),
         // Widening: a points-to set past this many tokens becomes ⊤ and its
         // members escape (sound; bounds memory on merged generic helpers).
@@ -87,7 +90,8 @@ pub(crate) fn run(
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(400_000_000),
         ),
-        explain: std::env::var("PERRY_FACTS_EXPLAIN").is_ok_and(|v| v == "1"),
+        explain: std::env::var("PERRY_FACTS_EXPLAIN").is_ok_and(|v| v == "1")
+            || perry_codegen::fallback_diag::enabled(),
         dynamic_code_reach: dynamic_code_reach.clone(),
         dynamic_code: dynamic_code.then(|| {
             "E14 the program can run interpreted code (deferred new Function/eval or node:vm)"
@@ -134,6 +138,12 @@ pub(crate) fn run(
     }
     if std::env::var("PERRY_FACTS_REPORT").is_ok_and(|v| v == "1") {
         let s = &pf.stats;
+        eprintln!(
+            "perry: wpfacts: Function.prototype.bind {}",
+            pf.fnproto_bind_written
+                .as_deref()
+                .map_or("unwritten".to_string(), |r| format!("may be written: {r}"))
+        );
         let t0 = pf
             .sites
             .iter()
@@ -168,16 +178,16 @@ pub(crate) fn run(
 
 /// Whether any class is prefix-stable with its facts usable for elision
 /// (step 5b: the only classes a typed body's receiver proof can use).
+/// Object-literal classes (`litclass`, `__AnonShape_*`) count: a literal is
+/// born with its class id in the header like any `new C()`.
 pub(crate) fn has_stable_classes(pf: &Option<Arc<perry_wpfacts::ProgramFacts>>) -> bool {
     pf.as_ref().is_some_and(|pf| {
         elide_enabled()
-            && pf.global.is_none()
             && !pf.stats.aborted
-            && !pf.whatif_no_e14
             && pf
                 .templates
                 .iter()
-                .any(|t| t.prefix_stable && t.kind == "class" && t.class_id.is_some())
+                .any(|t| t.prefix_stable && t.class_id.is_some())
     })
 }
 
@@ -190,10 +200,6 @@ pub(crate) fn view_for(
     let Some(pf) = pf else {
         return Default::default();
     };
-    if pf.whatif_no_e14 {
-        // A report-only what-if run never reaches codegen.
-        return Default::default();
-    }
     let key = path.display().to_string();
     let section = if contracts_requested() {
         pf.contract_section(&key)
@@ -206,7 +212,7 @@ pub(crate) fn view_for(
             elision.receiver_params = r.clone();
         }
     }
-    let digest = if elision.is_empty() {
+    let digest = if elision.is_empty() && !elision.fnproto_bind_unwritten {
         pf.digest_for(&key)
     } else {
         use std::hash::{Hash, Hasher};
@@ -216,6 +222,7 @@ pub(crate) fn view_for(
         h.finish()
     };
     perry_codegen::ProgramFactsView {
+        fallback: super::fallback_diag::facts_for(pf, &key),
         digest,
         dynamic_code_reach: pf.dynamic_code_reach.clone(),
         contract_section: Arc::new(section),
@@ -235,11 +242,15 @@ fn elide_enabled() -> bool {
 /// Slice 2: the receiver facts of `path`'s bindings that the zero-guard tier
 /// can act on, and the layout facts of the classes they can hold.
 ///
-/// A binding gets an entry only when every value it can hold is an instance
-/// of a prefix-stable class (F3, F4), or null/undefined (`nullable`: the
-/// site keeps its receiver test). ⊤, literals, builtins, functions and any
-/// other primitive give no entry. A program-wide kill (E14) or an over-budget
-/// solve already left no template prefix-stable.
+/// A binding gets an entry when it can hold an instance of a prefix-stable
+/// class, a user class or an object-literal class (F3, F4). When it holds
+/// nothing else but null/undefined (`nullable`: the site keeps its receiver
+/// test), the proof is unchecked (§3.7 case 1/2). When it can also hold ⊤
+/// (interpreted code, unmodeled code), a literal, a builtin, a function, any
+/// other primitive or an instance of a class that is not prefix-stable, it is
+/// CHECKED (`checked`): the site compares the receiver's class id against
+/// the prefix-stable classes and takes its complete generic operation
+/// otherwise. An over-budget solve gives no entry at all.
 fn elision_for(pf: &perry_wpfacts::ProgramFacts, path: &str) -> perry_codegen::ElisionFacts {
     use perry_codegen::{ElisionFacts, FactsClass, FactsField, FactsRecv};
     use perry_wpfacts::model::prim;
@@ -247,28 +258,45 @@ fn elision_for(pf: &perry_wpfacts::ProgramFacts, path: &str) -> perry_codegen::E
         contracts: contracts_requested(),
         ..Default::default()
     };
-    if !elide_enabled() || pf.global.is_some() || pf.stats.aborted {
+    if !elide_enabled() || pf.stats.aborted {
         return out;
     }
+    // `PERRY_FACTS_SABOTAGE=unchecked`: the negative control of decision 150
+    // (every guarded or checked proof is emitted unchecked; the dynamic-code
+    // gap tests must then fail).
+    let unchecked = pf.sabotage.as_deref() == Some("unchecked");
+    out.interp_guard = pf.interp_guard.is_some() && !unchecked;
+    // `PERRY_FACTS_SABOTAGE=fnproto-unwritten`: claim the fact for every
+    // program (the bind gap tests that write Function.prototype must fail).
+    out.fnproto_bind_unwritten =
+        pf.fnproto_bind_written.is_none() || pf.sabotage.as_deref() == Some("fnproto-unwritten");
     let Some(mb) = pf.bindings_for(path) else {
         return out;
     };
     let stable: std::collections::HashMap<u32, &perry_wpfacts::TemplateFacts> = pf
         .templates
         .iter()
-        .filter(|t| t.prefix_stable && t.kind == "class")
+        .filter(|t| t.prefix_stable)
         .filter_map(|t| Some((t.class_id?, t)))
         .collect();
     let recv = |b: &perry_wpfacts::BindingFacts| -> Option<FactsRecv> {
-        if b.other || b.class_ids.is_empty() || b.prims & !(prim::NULL | prim::UNDEF) != 0 {
+        let class_ids: Vec<u32> = b
+            .class_ids
+            .iter()
+            .copied()
+            .filter(|c| stable.contains_key(c))
+            .collect();
+        if class_ids.is_empty() {
             return None;
         }
-        if !b.class_ids.iter().all(|c| stable.contains_key(c)) {
-            return None;
-        }
+        let checked = !unchecked
+            && (b.other
+                || class_ids.len() != b.class_ids.len()
+                || b.prims & !(prim::NULL | prim::UNDEF) != 0);
         Some(FactsRecv {
-            class_ids: b.class_ids.clone(),
-            nullable: b.prims != 0,
+            class_ids,
+            nullable: b.prims & (prim::NULL | prim::UNDEF) != 0,
+            checked,
         })
     };
     for (id, b) in &mb.locals {

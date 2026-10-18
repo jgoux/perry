@@ -7,7 +7,7 @@
 //! the struct via `crate::lower::LoweringContext`.
 
 use crate::types::{FuncId, GlobalId, LocalId, Type, TypeParam};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::ir::*;
 use crate::ClassAccessorNames;
@@ -517,6 +517,11 @@ pub struct LoweringContext {
     /// Module-level variable names pre-registered in the forward-declaration pass.
     /// Used to avoid duplicate define_local calls when the actual declaration is lowered.
     pub(crate) pre_registered_module_vars: HashSet<String>,
+    /// Module-level enums bound to their runtime object (`enum_value_binding`):
+    /// a later declaration of the same name merges into that local.
+    pub(crate) enum_object_locals: HashMap<String, LocalId>,
+    /// Implicit enum-member lexical scope and the start of nested local bindings.
+    pub(crate) enum_initializer_scope: Option<(String, usize)>,
     /// Subset of `pre_registered_module_vars` that came from syntactic `var`
     /// declarations. Sloppy assignments before a later `var` need an early
     /// backing slot; `let`/`const` should not use that path.
@@ -565,11 +570,13 @@ pub struct LoweringContext {
     /// `inside_block_scope == 0`; `const captured = i` inside a top-level for
     /// loop must still be per-iteration box, not a shared global slot.
     pub(crate) inside_block_scope: usize,
-    /// Namespace exported variables: (namespace_name, member_name, local_id)
-    /// Used to resolve Namespace.member access to module-level LocalGet
-    pub(crate) namespace_vars: Vec<(String, String, LocalId)>,
-    /// Current namespace being lowered (for resolving internal function calls as StaticMethodCall)
-    pub(crate) current_namespace: Option<String>,
+    /// The names each namespace's blocks export, by qualified namespace name
+    /// (`Outer.Inner`). A block reaches another block's exports as
+    /// properties of the shared namespace object.
+    pub(crate) namespace_exports: HashMap<String, BTreeSet<String>>,
+    /// The locals that bind a namespace object of their own (not a class,
+    /// function or enum the namespace merges into).
+    pub(crate) namespace_locals: HashSet<LocalId>,
     /// Module-level native instances that survive scope exits.
     /// Used for variables assigned from native calls inside functions (e.g., `mongoClient = await MongoClient.connect(uri)`).
     ///
@@ -806,12 +813,6 @@ pub struct LoweringContext {
     /// Local names whose value is a `FinalizationRegistry` instance (so
     /// `x.register(...)` / `x.unregister(...)` route to the dedicated HIR variants).
     pub(crate) finreg_locals: HashSet<String>,
-    /// Local names whose value is a `WeakMap` instance — used to route
-    /// `x.set/get/has/delete` to the existing Map HIR variants and to throw
-    /// on primitive keys.
-    pub(crate) weakmap_locals: HashSet<String>,
-    /// Local names whose value is a `WeakSet` instance.
-    pub(crate) weakset_locals: HashSet<String>,
     /// Local names bound by a wildcard namespace import (`import * as X from
     /// "mod"`). These are module namespaces, NOT classes — so `X.member(args)`
     /// must resolve+call the namespace member, never lower to a
@@ -1056,6 +1057,9 @@ pub struct LoweringContext {
     /// Spans of the class definitions evaluated at most once
     /// (`lower::run_once`), computed once per module before lowering.
     pub(crate) run_once_class_spans: HashSet<(u32, u32)>,
+    /// Enum IIFEs whose object is fresh (`lower::enum_image`), keyed by the
+    /// call's span, computed once per module before lowering.
+    pub(crate) enum_image_sites: HashMap<(u32, u32), super::enum_image::EnumImagePlan>,
     /// Classes whose captures live in the class environment
     /// (`Expr::ClassEnvGet`/`ClassEnvSet`) rather than on instances.
     pub(crate) class_env_classes: HashSet<String>,
@@ -1223,6 +1227,10 @@ pub struct LoweringContext {
     /// `@perryts/redis` deliberately use `require(literal)` to defer
     /// cycle-breaking imports inside method bodies that may never execute.
     pub(crate) is_external_module: bool,
+    /// `useDefineForClassFields: false` governs this module: instance fields
+    /// are constructor-store reservations and initializers are assignments
+    /// in the constructor (`lower_decl::class_field_assign`).
+    pub(crate) assign_class_fields: bool,
     /// Depth of nested `try { ... }` bodies currently being lowered.
     /// Optional platform modules in Electron-style code commonly use
     /// `try { var x = require("native-addon") } catch {}`. Let those sites

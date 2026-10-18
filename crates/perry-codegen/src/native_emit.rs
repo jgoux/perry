@@ -48,6 +48,9 @@ pub enum NativeMode {
 }
 
 pub fn native_mode() -> NativeMode {
+    if crate::fallback_diag::enabled() {
+        return NativeMode::Off;
+    }
     match std::env::var("PERRY_LLVM_INPROCESS").as_deref() {
         Ok("native") => NativeMode::Native,
         Ok("diff") => NativeMode::Diff,
@@ -60,6 +63,9 @@ pub fn native_mode() -> NativeMode {
 /// contexts provide useful parallelism. Small/single-unit modules retain the
 /// mature text transport unless `=native` is explicit.
 pub fn native_units_mode() -> NativeMode {
+    if crate::fallback_diag::enabled() {
+        return NativeMode::Off;
+    }
     match std::env::var("PERRY_LLVM_INPROCESS").as_deref() {
         Ok("0" | "off" | "false" | "1" | "on" | "true") => NativeMode::Off,
         Ok("diff") => NativeMode::Diff,
@@ -331,7 +337,7 @@ fn freeze_unit(
 fn stream_frozen_functions<'ctx>(
     context: &'ctx Context,
     module: &Module<'ctx>,
-    funcs: &[FrozenFunction],
+    funcs: Vec<FrozenFunction>,
 ) -> Result<(usize, usize)> {
     let (mut typed, mut raw) = (0usize, 0usize);
     for f in funcs {
@@ -345,9 +351,9 @@ fn stream_frozen_functions<'ctx>(
                 FrozenItem::Text(s) => stream.item(&FI::Text(s)),
                 FrozenItem::Inst(i) => stream.item(&FI::Inst(i)),
             };
-            res.map_err(|e| dump_dialect_failure(f, e))?;
+            res.map_err(|e| dump_dialect_failure(&f, e))?;
         }
-        let (t, r) = stream.finish().map_err(|e| dump_dialect_failure(f, e))?;
+        let (t, r) = stream.finish().map_err(|e| dump_dialect_failure(&f, e))?;
         typed += t;
         raw += r;
     }
@@ -486,7 +492,7 @@ fn compile_module_units_native_with_workers(
     let unit_cache = crate::unit_cache::UnitCache::current();
     #[cfg(test)]
     let test_budget = crate::inprocess::test_rs4gc_budget_cap();
-    let compile_one = |i: usize, unit: &FrozenUnit| -> Result<Vec<u8>> {
+    let compile_one = |i: usize, unit: FrozenUnit| -> Result<Vec<u8>> {
         let started = std::time::Instant::now();
         let (effective_target, args) = crate::linker::native_plan_args(target, native_roots);
         let checkpoint = unit_cache.as_ref().map(|cache| {
@@ -507,11 +513,17 @@ fn compile_module_units_native_with_workers(
                 return Ok(bytes);
             }
         }
+        let FrozenUnit {
+            skeleton,
+            functions,
+            function_count,
+        } = unit;
         let context = Context::create();
-        let module =
-            crate::inprocess::parse_ir_text(&context, &unit.skeleton, "perry_native_module")
-                .with_context(|| format!("unit {i} skeleton"))?;
-        let (t, r) = stream_frozen_functions(&context, &module, &unit.functions)
+        let module = crate::inprocess::parse_ir_text(&context, &skeleton, "perry_native_module")
+            .with_context(|| format!("unit {i} skeleton"))?;
+        // The parser owns its LLVM values. No input text is needed by LLVM.
+        drop(skeleton);
+        let (t, r) = stream_frozen_functions(&context, &module, functions)
             .with_context(|| format!("unit {i}"))?;
         debug_dump(&module, &format!("{module_prefix}.unit{i}"));
         let mut stats = crate::inprocess::UnitCodegenStats::default();
@@ -530,6 +542,9 @@ fn compile_module_units_native_with_workers(
         #[cfg(not(test))]
         let optimized = optimize();
         let unit_bytes = optimized.with_context(|| format!("unit {i}"))?;
+        // Assembly finishing and partial linking need only the emitted bytes.
+        drop(module);
+        drop(context);
         if unit_timings {
             let widest = |w: &Option<(String, usize)>| {
                 w.as_ref()
@@ -561,7 +576,7 @@ fn compile_module_units_native_with_workers(
         }
         log::debug!(
             "perry-codegen: native unit {i}: {} fns, {t} typed + {r} raw insts, {:.3}s",
-            unit.function_count,
+            function_count,
             started.elapsed().as_secs_f64()
         );
         Ok(obj)
@@ -587,6 +602,29 @@ fn compile_module_units_native_with_workers(
             "[perry] codegen: {module_prefix}: freeze/LLVM pipeline started: {unit_total} units, {jobs} workers, ~{estimated_mib:.1} MiB estimated IR"
         );
     }
+    // Under a compile budget (`crate::workers`), the first worker runs on the
+    // module job's own CPU slot; every other worker holds a slot and the
+    // largest unit's memory estimate while it compiles a unit, and stops
+    // waiting for one once every unit is claimed.
+    let budget = crate::workers::current_budget();
+    let extra_worker_memory = crate::workers::unit_memory_estimate(
+        parts
+            .iter()
+            .flatten()
+            .map(|part| {
+                (part.pre.len()
+                    + part.post.len()
+                    + part
+                        .funcs
+                        .iter()
+                        .map(|f| f.estimated_ir_bytes)
+                        .sum::<usize>()) as u64
+            })
+            .max()
+            .unwrap_or(0),
+    );
+    let unclaimed_units = std::sync::atomic::AtomicUsize::new(parts.len());
+    let memory_trace = crate::workers::memory_trace_enabled();
     let frozen = std::sync::atomic::AtomicUsize::new(0);
     let mut slots: Vec<Option<Result<Vec<u8>>>> = (0..parts.len()).map(|_| None).collect();
     // The producer assembles each unit's skeleton as a worker frees up, so
@@ -602,6 +640,8 @@ fn compile_module_units_native_with_workers(
             let result_sender = result_sender.clone();
             let receiver = &receiver;
             let compile_one = &compile_one;
+            let budget = budget.as_deref();
+            let unclaimed_units = &unclaimed_units;
             // LLVM recursion depth scales with function size, and a post-RS4GC
             // relocation-fan-out function reaches millions of instructions
             // (#8082) — Rust's default 2 MiB worker stack SIGBUSes on the
@@ -611,15 +651,46 @@ fn compile_module_units_native_with_workers(
                 .name(format!("perry-llvm-unit-{worker_index}"))
                 .stack_size(64 * 1024 * 1024)
                 .spawn_scoped(scope, move || loop {
-                    let received = receiver
-                        .lock()
-                        .expect("native freeze queue poisoned")
-                        .recv();
+                    let units_left =
+                        || unclaimed_units.load(std::sync::atomic::Ordering::SeqCst) > 0;
+                    let _grant = match budget {
+                        Some(budget) if worker_index > 0 => {
+                            match budget.acquire_while(extra_worker_memory, units_left) {
+                                Some(grant) => Some(grant),
+                                None => break,
+                            }
+                        }
+                        _ => None,
+                    };
+                    let received = {
+                        let queue = receiver.lock().expect("native freeze queue poisoned");
+                        if !units_left() {
+                            break;
+                        }
+                        unclaimed_units.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        queue.recv()
+                    };
                     let Ok((i, frozen_unit)) = received else {
                         break;
                     };
                     let unit_started = std::time::Instant::now();
-                    let out = frozen_unit.and_then(|unit| compile_one(i, &unit));
+                    let resident_before = if memory_trace {
+                        crate::workers::reset_peak_resident();
+                        crate::workers::resident_bytes()
+                    } else {
+                        None
+                    };
+                    let out = frozen_unit.and_then(|unit| compile_one(i, unit));
+                    if let Some(((rss, _), (_, hwm))) =
+                        resident_before.zip(crate::workers::resident_bytes())
+                    {
+                        eprintln!(
+                            "[perry] memtrace: {module_prefix}: unit {}/{unit_total}: resident {:.0} MiB before, peak +{:.0} MiB",
+                            i + 1,
+                            rss as f64 / 1_048_576.0,
+                            hwm.saturating_sub(rss) as f64 / 1_048_576.0
+                        );
+                    }
                     if result_sender
                         .send((i, unit_started.elapsed(), out))
                         .is_err()
@@ -806,11 +877,30 @@ pub fn compile_module_native(
     target: Option<&str>,
     module_prefix: &str,
 ) -> Result<Vec<u8>> {
+    compile_module_native_input(&*llmod, target, module_prefix)
+}
+
+pub fn compile_module_native_owned(
+    llmod: LlModule,
+    target: Option<&str>,
+    module_prefix: &str,
+) -> Result<Vec<u8>> {
+    compile_module_native_input(llmod, target, module_prefix)
+}
+
+fn compile_module_native_input(
+    input: impl std::borrow::Borrow<LlModule>,
+    target: Option<&str>,
+    module_prefix: &str,
+) -> Result<Vec<u8>> {
     let native_roots = crate::codegen::helpers::native_stack_roots_enabled();
     let (effective_target, args) = plan_for(target, native_roots);
     {
         let context = Context::create();
-        let module = build_native_module(&context, llmod)?;
+        let module = build_native_module(&context, input.borrow())?;
+        // An owned production input dies here; a borrowed diagnostic/retry
+        // input remains available to its caller, including on LLVM refusal.
+        drop(input);
         debug_dump(&module, module_prefix);
         // #7982: under the statepoint backends the plan asks for `-S`, so this
         // returns assembler TEXT. It must go through the compact-map rewrite
@@ -822,6 +912,8 @@ pub fn compile_module_native(
             native_roots,
         ) {
             Ok(pieces) => {
+                drop(module);
+                drop(context);
                 return crate::linker::finish_native_pieces(pieces, &effective_target, &args);
             }
             Err(error) => {
@@ -1236,6 +1328,21 @@ mod tests {
             })
             .collect::<Vec<_>>();
         crate::linker::merge_unit_objects(&objects).expect("trusted text units partial-link")
+    }
+
+    #[test]
+    fn owned_native_construction_matches_borrowed_object() {
+        let _native = crate::codegen::helpers::NativeRootsPin::native();
+        let mut borrowed = precise_root_fixture(false);
+        let expected = compile_module_native(&mut borrowed, None, "owned_native_fixture")
+            .expect("borrowed input emits");
+        let actual =
+            compile_module_native_owned(precise_root_fixture(false), None, "owned_native_fixture")
+                .expect("owned input emits");
+        assert_eq!(
+            actual, expected,
+            "releasing the input must preserve object bytes"
+        );
     }
 
     #[test]

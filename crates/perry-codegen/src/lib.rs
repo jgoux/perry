@@ -8,6 +8,7 @@ mod array_storage;
 pub mod block;
 pub(crate) mod boxed_vars;
 pub(crate) mod builtin_proto;
+pub(crate) mod closure_births;
 pub mod codegen;
 pub(crate) mod collectors;
 pub(crate) mod concat_site_cache;
@@ -17,6 +18,7 @@ pub(crate) mod dialect;
 pub(crate) mod eh_mode;
 pub mod expr;
 pub mod ext_registry;
+pub mod fallback_diag;
 pub(crate) mod fn_info;
 pub mod function;
 pub mod function_order;
@@ -29,6 +31,7 @@ pub mod inst;
 pub(crate) mod layout_desc;
 pub mod layout_families;
 pub(crate) mod proto_constants;
+pub use layout_desc::array_families::assign_birth_layouts;
 pub use layout_families::ProgramLayouts;
 pub mod linker;
 pub(crate) mod loop_purity;
@@ -61,6 +64,7 @@ pub(crate) mod native_value;
 pub(crate) use perry_abi as runtime_abi;
 pub mod native_routing;
 pub(crate) mod nm_install;
+pub mod providers;
 pub use native_routing::{
     program_native_routing_key, set_program_native_routing, NativeProvider, NativeRouting,
 };
@@ -99,12 +103,12 @@ mod wasm32;
 pub mod workers;
 
 pub use codegen::{
-    assign_static_shape_ids, compile_module, context_free_ctor_abi, context_free_ctor_param_count,
-    decode_static_seed, encode_static_seed, module_birth_shapes, namespace_member_class_key,
-    namespace_member_func_key, namespace_member_var_key, resolve_target_triple,
-    short_spread_method_capabilities, take_module_static_seeds, target_os_of, user_function_symbol,
-    AppMetadata, BirthProto, BirthShape, ClassAccessorNames, CompileOptions, ConstFnBirth,
-    ConstructorContracts, CtorAbi, DefinedClassShape, ElisionFacts,
+    assign_static_shape_ids, compile_module, compile_module_owned, context_free_ctor_abi,
+    context_free_ctor_param_count, decode_static_seed, encode_static_seed, module_birth_shapes,
+    namespace_member_class_key, namespace_member_func_key, namespace_member_var_key,
+    resolve_target_triple, short_spread_method_capabilities, take_module_static_seeds,
+    target_os_of, user_function_symbol, AppMetadata, BirthProto, BirthShape, ClassAccessorNames,
+    CompileOptions, ConstFnBirth, ConstructorContracts, CtorAbi, DefinedClassShape, ElisionFacts,
     ExportedObjectLiteralCapability, FactsClass, FactsField, FactsRecv, FpContractMode,
     ImportedClass, ImportedObjectLiteral, ImportedObjectLiteralMethod, ModuleBirth, NamespaceEntry,
     NamespaceEntryKind, ObjectLiteralMethodCandidate, ProgramClassShapeIds, ProgramFactsView,
@@ -127,6 +131,9 @@ pub use collectors::segview::{
     segview_diag_enabled, segview_lowering_enabled, segview_rewrite_module, SegViewDiag,
 };
 // Object model step 3: the program-wide prototype-write census.
+pub use layout_desc::create_families::{
+    program_proto_exports, program_proto_exports_key, set_program_proto_exports,
+};
 pub use proto_constants::{program_proto_census_key, set_program_proto_census};
 // #11394: whole-program set of methods written onto a builtin prototype.
 pub use lower_call::property_get::patched_proto::{
@@ -152,6 +159,16 @@ pub fn exported_object_literal_method_capabilities(
     hir: &perry_hir::Module,
 ) -> std::collections::HashMap<String, ExportedObjectLiteralCapability> {
     collectors::exported_object_literal_capabilities(hir)
+}
+
+/// Producer contents and static-key writes, harvested by the same final-literal visitor.
+pub fn exported_object_literal_method_facts(
+    hir: &perry_hir::Module,
+) -> (
+    std::collections::HashMap<String, ExportedObjectLiteralCapability>,
+    Vec<(String, String)>,
+) {
+    collectors::object_literal_facts(hir)
 }
 
 /// Return whether an instance method may publish the additive direct-call ABI

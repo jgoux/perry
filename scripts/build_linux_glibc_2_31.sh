@@ -74,9 +74,6 @@ CARGO_TARGET_DIR="$abort_target_dir" CARGO_PROFILE_PROD_PANIC=abort \
 cp "$abort_target_dir/$target/prod/libperry_runtime.a" \
    "$target_dir/$target/prod/libperry_runtime_abort.a"
 
-# Build the optional feature subset inside the same glibc 2.31 sysroot.
-bash scripts/build_core_runtime.sh "$target"
-
 # Match the ordinary release leg's best-effort extension-library build. #5716:
 # enumerate the explicit governance inventory rather than every matching
 # directory. Keep perry and both wrappers in each invocation so Cargo resolves
@@ -85,10 +82,15 @@ governed_ext_packages=$(./scripts/release_ext_packages.sh)
 while IFS= read -r package; do
   echo "::group::build $package"
   "${cargo_build[@]}" --profile prod --target "$target" \
-    -p perry -p perry-runtime-static -p perry-stdlib-static -p "$package" \
+    -p perry -p perry-runtime-static -p perry-stdlib-static -p perry-wasm-host -p "$package" \
     || echo "  (skipped $package -- failed to build on the glibc 2.31 sysroot)"
   echo "::endgroup::"
 done <<< "$governed_ext_packages"
+
+# GC effects sidecars (<archive>.gc-effects) over the final runtime bytes: the
+# ext loop above re-links the runtime, so this is the last write. The table
+# depends only on the bytes, so building it in the container changes nothing.
+bash scripts/gc_call_effects/sidecars.sh "$target_dir/$target/prod"
 
 compiler="$target_dir/$target/prod/perry"
 max_glibc=$(

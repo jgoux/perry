@@ -574,6 +574,52 @@ fn own_data_slot(
             return None;
         }
         let obj = addr as *const crate::object::ObjectHeader;
+        // On a node instance layout (born on it, or on its keys under a
+        // derived chain): its index names the key's slot, its keys are plain
+        // data, and a slot holding the hole is an absent key.
+        if let Some(found) =
+            crate::node_stream::instance_birth::instance_layout_slot(obj, name, None)
+        {
+            let meta = (*obj).meta;
+            if !meta.is_null() && (*meta).elements != 0 {
+                return None;
+            }
+            let live = crate::object::object_live_slot_count(obj);
+            return Some(found.and_then(|slot| {
+                (crate::object::field_get_set::object_field_at_with_live(obj, slot, live).bits()
+                    != crate::value::TAG_HOLE)
+                    .then_some((obj, slot, live))
+            }));
+        }
+        // An overflow holds every present own key with its attributes
+        // (object model step 4): a miss is an absent key, and a layout key's
+        // entry names its fixed slot. A value the table holds itself takes
+        // the generic path.
+        let table = crate::object::overflow::table(obj);
+        if !table.is_null() {
+            let meta = (*obj).meta;
+            if !meta.is_null() && (*meta).elements != 0 {
+                return None;
+            }
+            let Some(entry) = crate::object::overflow::find_bytes(table, name) else {
+                return Some(None);
+            };
+            let attrs =
+                crate::object::overflow::entry_attrs(table as *const crate::array::ArrayHeader, entry);
+            if !crate::object::key_attrs::entry_is_plain_writable_data(attrs) {
+                return None;
+            }
+            let slot = crate::object::overflow::fixed_slot_of(table, entry)?;
+            let live = crate::object::object_live_slot_count(obj);
+            if slot >= live {
+                return None;
+            }
+            return Some(
+                (crate::object::field_get_set::object_field_at_with_live(obj, slot, live).bits()
+                    != crate::value::TAG_HOLE)
+                    .then_some((obj, slot, live)),
+            );
+        }
         // A descriptor for THIS key (an attribute or an accessor) is the
         // descriptor tables' to answer; other keys' descriptors do not matter.
         if header._reserved & crate::gc::OBJ_FLAG_HAS_DESCRIPTORS != 0
@@ -594,6 +640,21 @@ fn own_data_slot(
         let shape = crate::object::shapes::object_shape_descriptor(obj)?;
         if !shape.object_kind.is_ordinary_layout() {
             return None;
+        }
+        // A family object (an `extends EventEmitter` class family leads with
+        // the state keys): its layout's index answers, and a slot holding the
+        // hole is an absent key.
+        if let Some(found) = crate::object::layout_desc::family_own_key(obj, name) {
+            return Some(found.and_then(|(_, slot)| {
+                (crate::object::field_get_set::object_field_at_with_live(
+                    obj,
+                    slot,
+                    shape.live_inline_slot_count,
+                )
+                .bits()
+                    != crate::value::TAG_HOLE)
+                    .then_some((obj, slot, shape.live_inline_slot_count))
+            }));
         }
         let keys = shape.keys as usize as *const crate::array::ArrayHeader;
         if keys.is_null() {
@@ -668,7 +729,7 @@ fn reset_events(target: f64) {
 
 fn adjust_events_count(target: f64, delta: f64) -> f64 {
     // An own plain `_eventsCount` (every emitter's): read and write its slot.
-    if let Some((obj, slot, flags)) = state_slot(target, &EVENTS_COUNT_SLOT, EVENTS_COUNT_KEY) {
+    if let Some((obj, slot, flags)) = state_slot(target, EVENTS_COUNT_KEY) {
         if flags & crate::gc::OBJ_FLAG_FROZEN == 0 {
             // SAFETY: `state_slot` resolved the key's own data position on
             // the live object; nothing below allocates.
@@ -697,6 +758,42 @@ fn events_of(target: f64) -> Option<f64> {
     is_object_value(events).then_some(events)
 }
 
+/// A native constructor's field store on `target` (object header `obj`),
+/// node's `this.<key> = value`: an
+/// overwrite of an own writable data slot, a plain add into its layout slot,
+/// else the ordinary `[[Set]]` (an inherited setter runs; a refused set
+/// throws, as in node's strict internals). Every native init stores its
+/// fields through this one operation.
+pub(crate) fn constructor_field_set(
+    target: f64,
+    obj: *mut crate::object::ObjectHeader,
+    key: crate::runtime_state_key::NamedStateKey,
+    value: f64,
+) {
+    state_set_object(target, obj, key, value);
+}
+
+/// May reading `_events` on `target` (with no own `_events`) run an
+/// inherited accessor? The store vet flags every accessor (and read-only
+/// data) for the key on the chain, so `false` proves the read is the
+/// prototype's data.
+fn inherited_events_may_be_accessor(target: f64) -> bool {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let target = scope.root_nanbox_f64(target);
+    let key = f64::from_bits(
+        JSValue::string_ptr(crate::string::intern_ascii_literal(EVENTS_KEY) as *mut _).bits(),
+    );
+    let receiver =
+        crate::object::field_get_set::runtime_read_site::object_receiver(target.get_nanbox_f64());
+    match receiver {
+        // SAFETY: `obj` is the live receiver, read after the key's intern.
+        Some(obj) => unsafe {
+            crate::object::plain_data_write_may_intercept(obj as usize, (*obj).class_id, key)
+        },
+        None => true,
+    }
+}
+
 /// node's `EventEmitter.init`: give the receiver its own `_events` (unless it
 /// already has one that is not merely inherited), `_eventsCount` and
 /// `_maxListeners`. Run by `super()` of a class extending EventEmitter and by
@@ -717,9 +814,11 @@ pub(crate) fn init_event_emitter_state_with_presence(
     let scope = crate::gc::RuntimeHandleScope::new();
     let target = scope.root_nanbox_f64(target);
     // node: reset when `this._events === undefined || this._events ===
-    // ObjectGetPrototypeOf(this)._events`. Without an own `_events` the read
-    // IS the prototype's, so both arms hold and the (slow, inherited) reads
-    // are skipped; only an own `_events` needs comparing.
+    // ObjectGetPrototypeOf(this)._events`. Without an own `_events` on a chain
+    // that holds no accessor for it (the birth proof, or the store vet, which
+    // flags every inherited accessor), the read IS the prototype's data, so
+    // both arms hold and the (slow, inherited) reads are skipped. Any other
+    // receiver performs node's reads: an inherited getter runs, as in node.
     let has_own = match own_data_lookup(target.get_nanbox_f64(), EVENTS_KEY) {
         Some(own) => own.is_some(),
         None => {
@@ -728,23 +827,29 @@ pub(crate) fn init_event_emitter_state_with_presence(
                 == super::TAG_TRUE
         }
     };
-    let reset = !has_own || {
-        let events = scope.root_nanbox_f64(get_named(
+    let reset = (!has_own
+        && (birth.is_some() || !inherited_events_may_be_accessor(target.get_nanbox_f64())))
+        || is_undefined(get_named(
             target.get_nanbox_f64(),
             crate::runtime_state_key!(EVENTS_KEY),
-        ));
-        is_undefined(events.get_nanbox_f64()) || {
-            let proto = crate::object::js_object_get_prototype_of(target.get_nanbox_f64());
-            is_object_value(proto)
-                && super::constructors::birth_memo::read_field(
-                    proto,
-                    crate::runtime_state_key!(EVENTS_KEY),
-                    birth,
-                )
-                .to_bits()
-                    == events.get_nanbox_f64().to_bits()
-        }
-    };
+        ))
+        || {
+            let events = scope.root_nanbox_f64(get_named(
+                target.get_nanbox_f64(),
+                crate::runtime_state_key!(EVENTS_KEY),
+            ));
+            {
+                let proto = crate::object::js_object_get_prototype_of(target.get_nanbox_f64());
+                is_object_value(proto)
+                    && super::constructors::birth_memo::read_field(
+                        proto,
+                        crate::runtime_state_key!(EVENTS_KEY),
+                        birth,
+                    )
+                    .to_bits()
+                        == events.get_nanbox_f64().to_bits()
+            }
+        };
     if reset {
         reset_events(target.get_nanbox_f64());
     }

@@ -16,6 +16,23 @@ pub(crate) const URL_SEARCH_PARAMS_ENTRIES: u32 = 0; // Array of [key, value] pa
 /// `new URLSearchParams(...)`.
 pub(crate) const URL_SEARCH_PARAMS_OWNER: u32 = 1;
 
+/// The spelling of the entries slot's key on `runtime_layouts::URL_SEARCH_PARAMS`.
+/// Both slots are private entries (like URL's components), so no own-key
+/// reader lists them and no script can name them.
+const URL_SEARCH_PARAMS_ENTRIES_KEY: &str = "#<perry:url-search-params-entries>";
+
+/// True when a keys array leads with the native params' private entries
+/// slot. Only the layout carries that key as a private entry, so an ordinary
+/// object whose first key has the same spelling never passes.
+///
+/// # Safety
+/// `keys` is a live eager keys array with at least one key.
+unsafe fn keys_lead_with_entries_slot(keys: *const ArrayHeader) -> bool {
+    crate::object::key_attrs::keys_entry(keys, 0) & crate::object::key_attrs::ENTRY_PRIVATE != 0
+        && get_string_content(crate::array::js_array_get_f64(keys, 0))
+            == URL_SEARCH_PARAMS_ENTRIES_KEY
+}
+
 /// Hidden field installed on a `class X extends URLSearchParams` instance by
 /// `js_url_search_params_subclass_init`, holding the native backing params
 /// object that the inherited method surface actually operates on.
@@ -331,6 +348,15 @@ fn coerce_search_param_arg(value: f64) -> String {
 
 /// Create a URLSearchParams object from entries
 pub(crate) fn create_url_search_params_object(entries: Vec<(String, String)>) -> *mut ObjectHeader {
+    // The layout's prototype family names `%URLSearchParams.prototype%`, which
+    // the realm builds with `globalThis`: build it before the first instance
+    // (#12697), or the instance's [[Prototype]] word would still be empty.
+    if crate::object::shapes::identity_prototype_word(
+        crate::closure::shape::INTRINSIC_SERIAL_URL_SEARCH_PARAMS,
+    ) == 0
+    {
+        crate::object::js_get_global_this();
+    }
     let obj = unsafe {
         crate::object::layout_desc::perry_alloc_layout(std::ptr::addr_of!(
             crate::object::runtime_layouts::URL_SEARCH_PARAMS
@@ -465,7 +491,7 @@ pub extern "C" fn js_url_search_params_new_any(init: f64) -> *mut ObjectHeader {
 
         let obj_ptr = ptr_i64 as *mut ObjectHeader;
 
-        // Detect another URLSearchParams: its `_entries` field holds the
+        // Detect another URLSearchParams: its entries slot holds the
         // ArrayHeader of [k, v] pair arrays. We can't tell apart by class
         // (both are class_id 0), so peek at the keys array's first entry.
         // Simpler heuristic: try to read it as an entries-table; fall back
@@ -544,10 +570,10 @@ pub(crate) fn try_read_as_search_params(
         // A genuine URLSearchParams is always allocated with `class_id == 0`
         // (an ordinary object, see `create_url_search_params`). Other native
         // classes — notably `util.MIMEParams` — ALSO store their data in a
-        // leading `_entries` slot but carry a distinct registered class id and
-        // a different field layout (no `_owner` slot). Without this guard such
+        // leading entries slot but carry a distinct registered class id and
+        // a different field layout (no owner slot). Without this guard such
         // an object is mis-detected below, then read with the URLSearchParams
-        // layout (an out-of-bounds `_owner` field read) → segfault when e.g.
+        // layout (an out-of-bounds owner field read) → segfault when e.g.
         // `String(mimeParams)` / `mimeParams.toString()` routes through
         // `js_jsvalue_to_string`. Bail for any non-zero class id.
         if (*params).class_id != 0 {
@@ -562,15 +588,9 @@ pub(crate) fn try_read_as_search_params(
             return None;
         }
         let keys_len = keys_arr_view.count();
-        // URLSearchParams objects carry the `_entries` slot (and now `_owner`
-        // for URL-adopted instances). The first slot is always `_entries`;
-        // any extra field beyond that is fine as long as `_entries` leads.
-        if keys_len == 0 {
-            return None;
-        }
-        let key0 = crate::array::js_array_get_f64(keys_arr, 0);
-        let key0_str = get_string_content(key0);
-        if key0_str != "_entries" {
+        // URLSearchParams objects lead with the private entries slot; any
+        // expando after the layout's keys is fine.
+        if keys_len == 0 || !keys_lead_with_entries_slot(keys_arr) {
             return None;
         }
     }
@@ -814,7 +834,7 @@ pub extern "C" fn js_url_search_params_delete2(
 
 /// Issue #650: `URLSearchParams.size` getter — returns the number of
 /// entries (key/value pairs) currently stored. Reads the length of the
-/// `_entries` ArrayHeader directly; null receiver / missing array
+/// entries ArrayHeader directly; null receiver / missing array
 /// returns 0.
 #[no_mangle]
 pub extern "C" fn js_url_search_params_size(params: *mut ObjectHeader) -> i32 {
@@ -966,21 +986,16 @@ pub extern "C" fn js_url_search_params_get_all(params: *mut ObjectHeader, name_v
     f64::from_bits(i64::cast_unsigned(result as i64))
 }
 
-// ---- #5961: dynamic method dispatch for type-erased receivers ----
+// ---- #5961: the method surface for type-erased receivers ----
 //
-// The native URLSearchParams is an ordinary object (class_id == 0, leading
-// `_entries` slot — see `create_url_search_params_object` /
-// `try_read_as_search_params`); its method surface normally exists only via
-// static type-directed lowering (perry-codegen url_main.rs). When the
-// receiver's static type is lost (`any`, heterogeneous containers, minified
-// bundles), the generic dynamic member read used to find nothing and
-// `sp.append(...)` threw "append is not a function". These bound-method
-// thunks mirror the webcrypto_method_value pattern
-// (object/global_this/ctor_thunks.rs) with the receiver carried in a
-// GC-traced nanboxed capture slot.
+// The native URLSearchParams is an ordinary object born on
+// `runtime_layouts::URL_SEARCH_PARAMS`, whose prototype family names
+// `%URLSearchParams.prototype%`: a read of `size` or a method finds the
+// prototype's accessor or method like any inherited property, and each of
+// them runs the dynamic dispatch below on its `this`.
 
 /// True when `obj` has the native URLSearchParams shape: an ordinary object
-/// (class_id == 0) whose leading own key is `_entries`. Mirrors the guard in
+/// (class_id == 0) whose leading key is the private entries slot. Mirrors the guard in
 /// [`try_read_as_search_params`] without materializing the entries.
 pub(crate) fn shape_is_url_search_params(obj: *const ObjectHeader) -> bool {
     if obj.is_null() {
@@ -1027,70 +1042,90 @@ pub(crate) fn shape_is_url_search_params(obj: *const ObjectHeader) -> bool {
         if keys_arr_view.count() == 0 {
             return false;
         }
-        let key0 = crate::array::js_array_get_f64(keys_arr, 0);
-        get_string_content(key0) == "_entries"
+        keys_lead_with_entries_slot(keys_arr)
     }
 }
 
-fn usp_thunk_receiver(closure: *const crate::closure::ClosureHeader) -> *mut ObjectHeader {
-    let recv = crate::closure::js_closure_get_capture_f64(closure, 0);
-    (recv.to_bits() & 0x0000_FFFF_FFFF_FFFF) as *mut ObjectHeader
-}
-
-extern "C" fn usp_append_thunk(
-    closure: *const crate::closure::ClosureHeader,
-    _this: crate::closure::JsThis,
-    name: f64,
-    value: f64,
-) -> f64 {
-    js_url_search_params_append(usp_thunk_receiver(closure), name, value);
-    f64::from_bits(crate::value::TAG_UNDEFINED)
-}
-
-extern "C" fn usp_set_thunk(
-    closure: *const crate::closure::ClosureHeader,
-    _this: crate::closure::JsThis,
-    name: f64,
-    value: f64,
-) -> f64 {
-    js_url_search_params_set(usp_thunk_receiver(closure), name, value);
-    f64::from_bits(crate::value::TAG_UNDEFINED)
-}
-
-extern "C" fn usp_get_thunk(
-    closure: *const crate::closure::ClosureHeader,
-    _this: crate::closure::JsThis,
-    name: f64,
-) -> f64 {
-    // js_url_search_params_get returns a raw `*mut StringHeader` for the
-    // static-lowering path; rebuild the boxed value here instead.
-    let wanted = coerce_search_param_arg(name);
-    let entries = get_url_search_params_entries(usp_thunk_receiver(closure));
-    match entries.into_iter().find(|(k, _)| *k == wanted) {
-        Some((_, v)) => create_string_f64(&v),
-        None => f64::from_bits(crate::value::TAG_NULL),
+/// The native params a URLSearchParams receiver carries: the object itself
+/// when it has the native shape, or the hidden backing of a
+/// `class X extends URLSearchParams` instance (#6710). Only a pointer-shaped
+/// receiver (NaN-boxed pointer above the handle band, or a raw untagged heap
+/// address) is shape-probed. A plain double must NOT have its low 48 bits read
+/// as an address: a Web Streams handle id (`1049102.0`) extracts to
+/// `(id - 2^20) * 2^32`, which passes the macOS 2 TB heap floor once ~512
+/// stream ids are live and the probe then dereferences unmapped memory (the
+/// gscmaster request-12 SIGSEGV; Linux's 0x1000 floor probes low memory from
+/// id 1).
+fn search_params_of(object: f64) -> Option<*mut ObjectHeader> {
+    let bits = object.to_bits();
+    let top16 = bits >> 48;
+    let payload = (bits & 0x0000_FFFF_FFFF_FFFF) as usize;
+    let pointer_shaped = (top16 == 0x7FFD
+        && crate::value::addr_class::is_above_handle_band(payload))
+        || (top16 == 0 && payload >= 0x10000);
+    if !pointer_shaped {
+        return None;
     }
-}
-
-extern "C" fn usp_has_thunk(
-    closure: *const crate::closure::ClosureHeader,
-    _this: crate::closure::JsThis,
-    name: f64,
-) -> f64 {
-    if js_url_search_params_has(usp_thunk_receiver(closure), name) != 0.0 {
-        f64::from_bits(crate::value::TAG_TRUE)
-    } else {
-        f64::from_bits(crate::value::TAG_FALSE)
+    let recv_ptr = payload as *mut ObjectHeader;
+    if shape_is_url_search_params(recv_ptr) {
+        return Some(recv_ptr);
     }
+    url_search_params_backing_of(object)
 }
 
-extern "C" fn usp_delete_thunk(
-    closure: *const crate::closure::ClosureHeader,
-    _this: crate::closure::JsThis,
-    name: f64,
+/// WebIDL's brand check failure for a `URLSearchParams.prototype` member
+/// (node: `ERR_INVALID_THIS`).
+fn throw_invalid_search_params_this() -> ! {
+    let message = "Value of \"this\" must be of type URLSearchParams";
+    let msg = js_string_from_bytes(message.as_ptr(), message.len() as u32);
+    let err = crate::error::js_typeerror_new(msg);
+    crate::exception::js_throw(crate::value::js_nanbox_pointer(err as i64));
+}
+
+fn search_params_proto_call(name: &str, this: crate::closure::JsThis, args: &[f64]) -> f64 {
+    let Some(params) = search_params_of(this.as_f64()) else {
+        throw_invalid_search_params_this();
+    };
+    url_search_params_dynamic_call(params, name, args.as_ptr(), args.len())
+        .unwrap_or(f64::from_bits(crate::value::TAG_UNDEFINED))
+}
+
+macro_rules! search_params_proto_method {
+    ($($fn_name:ident = $name:literal ($($arg:ident),*);)*) => {$(
+        pub(crate) extern "C" fn $fn_name(
+            _closure: *const crate::closure::ClosureHeader,
+            this: crate::closure::JsThis,
+            $($arg: f64,)*
+        ) -> f64 {
+            search_params_proto_call($name, this, &[$($arg),*])
+        }
+    )*};
+}
+
+search_params_proto_method! {
+    usp_proto_append = "append"(name, value);
+    usp_proto_delete = "delete"(name, value);
+    usp_proto_entries = "entries"();
+    usp_proto_for_each = "forEach"(callback, this_arg);
+    usp_proto_get = "get"(name);
+    usp_proto_get_all = "getAll"(name);
+    usp_proto_has = "has"(name, value);
+    usp_proto_keys = "keys"();
+    usp_proto_set = "set"(name, value);
+    usp_proto_sort = "sort"();
+    usp_proto_to_string = "toString"();
+    usp_proto_values = "values"();
+}
+
+/// `get URLSearchParams.prototype.size`.
+pub(crate) extern "C" fn usp_proto_size_getter(
+    _closure: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
 ) -> f64 {
-    js_url_search_params_delete(usp_thunk_receiver(closure), name);
-    f64::from_bits(crate::value::TAG_UNDEFINED)
+    let Some(params) = search_params_of(this.as_f64()) else {
+        throw_invalid_search_params_this();
+    };
+    f64::from(js_url_search_params_size(params))
 }
 
 /// Fused dynamic method call (`sp.append(...)` through `js_native_call_method`
@@ -1132,35 +1167,8 @@ pub(crate) fn try_url_search_params_dynamic_dispatch(
     ) {
         return None;
     }
-    // Only a pointer-shaped receiver (NaN-boxed pointer above the handle band,
-    // or a raw untagged heap address) may be shape-probed. A plain double must
-    // NOT have its low 48 bits read as an address: a Web Streams handle id
-    // (`1049102.0`) extracts to `(id - 2^20) * 2^32`, which passes the macOS
-    // 2 TB heap floor once ~512 stream ids are live and the probe then
-    // dereferences unmapped memory (the gscmaster request-12 SIGSEGV; Linux's
-    // 0x1000 floor probes low memory from id 1). Numeric stream receivers fall
-    // through to the primitive-methods stream dispatch that owns them.
-    let bits = object.to_bits();
-    let top16 = bits >> 48;
-    let payload = (bits & 0x0000_FFFF_FFFF_FFFF) as usize;
-    let pointer_shaped = (top16 == 0x7FFD
-        && crate::value::addr_class::is_above_handle_band(payload))
-        || (top16 == 0 && payload >= 0x10000);
-    if !pointer_shaped {
-        return None;
-    }
-    let recv_ptr = payload as *mut ObjectHeader;
-    if shape_is_url_search_params(recv_ptr) {
-        return url_search_params_dynamic_call(recv_ptr, method_name, args_ptr, args_len);
-    }
-    // #6710: a `class X extends URLSearchParams` instance — the native store
-    // lives on the hidden backing that `js_url_search_params_subclass_init`
-    // stashed at `super()`. Reuse the same dynamic dispatch (correct boolean/
-    // string/array boxing) the native-shape path uses.
-    if let Some(backing) = url_search_params_backing_of(object) {
-        return url_search_params_dynamic_call(backing, method_name, args_ptr, args_len);
-    }
-    None
+    let params = search_params_of(object)?;
+    url_search_params_dynamic_call(params, method_name, args_ptr, args_len)
 }
 
 pub(crate) fn url_search_params_dynamic_call(
@@ -1251,31 +1259,6 @@ pub(crate) fn url_search_params_dynamic_call(
         }
         _ => return None,
     })
-}
-
-/// Bound-method value for a dynamic property read on a native URLSearchParams
-/// object. Returns `None` for names outside the covered surface so unknown
-/// properties still read as `undefined`.
-pub(crate) fn url_search_params_method_value(obj: *const ObjectHeader, name: &str) -> Option<f64> {
-    let info = match name {
-        "append" => crate::fn_info!(usp_append_thunk, 2; with_declared(2)),
-        "set" => crate::fn_info!(usp_set_thunk, 2; with_declared(2)),
-        "get" => crate::fn_info!(usp_get_thunk, 1; with_declared(1)),
-        "has" => crate::fn_info!(usp_has_thunk, 1; with_declared(1)),
-        "delete" => crate::fn_info!(usp_delete_thunk, 1; with_declared(1)),
-        _ => return None,
-    };
-    let closure = crate::closure::js_closure_alloc(info, 1);
-    if closure.is_null() {
-        return Some(f64::from_bits(crate::value::TAG_UNDEFINED));
-    }
-    // Nanboxed (not raw-ptr) capture so the GC traces the receiver.
-    crate::closure::js_closure_set_capture_f64(
-        closure,
-        0,
-        crate::value::js_nanbox_pointer(obj as i64),
-    );
-    Some(crate::value::js_nanbox_pointer(closure as i64))
 }
 
 #[cfg(test)]

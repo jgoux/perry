@@ -1,14 +1,11 @@
 //! AST to HIR module-declaration lowering, with topical helpers split into
 //! sibling modules.
-
+use super::*;
+use crate::ir::*;
 use crate::types::{LocalId, Type};
 use anyhow::Result;
 use swc_common::Spanned;
 use swc_ecma_ast as ast;
-
-use super::*;
-use crate::ir::*;
-
 mod default_export_binding;
 mod namespace;
 pub(super) mod native_default_import;
@@ -21,7 +18,7 @@ mod typescript;
 // resolving. `lower_namespace_as_class` is also called from `lower/stmt.rs`.
 use default_export_binding::default_export_function_binding;
 pub(super) use default_export_binding::mark_exported_function_bodies;
-pub(crate) use namespace::lower_namespace_as_class;
+pub(crate) use namespace::{lower_namespace, pre_register_module_namespaces};
 use native_default_import::{
     canonicalize_native_import_source, is_cjs_style_native_default_import,
     node_submodule_default_export_key,
@@ -330,7 +327,7 @@ pub(crate) fn lower_module_decl(
                                         .into_iter()
                                         .map(|member| EnumMember {
                                             name: member.name.to_string(),
-                                            value: EnumValue::Number(member.value),
+                                            value: EnumValue::Number(member.value as f64),
                                         })
                                         .collect();
                                     let member_values = members
@@ -1383,6 +1380,13 @@ pub(crate) fn lower_module_decl(
                 ast::Decl::TsEnum(enum_decl) => {
                     let en = lower_enum_decl(ctx, enum_decl, true)?;
                     let enum_name = en.name.clone();
+                    if !enum_decl.declare {
+                        if let Some((_, bind)) =
+                            crate::lower_decl::enum_value_binding(ctx, &enum_name, true, &en.members, enum_decl)?
+                        {
+                            module.init.push(bind);
+                        }
+                    }
                     module.enums.push(en);
                     module.exported_objects.push(enum_name.clone());
                     module.exports.push(Export::Named {
@@ -1408,26 +1412,8 @@ pub(crate) fn lower_module_decl(
                         exported: alias_name,
                     });
                 }
-                ast::Decl::TsModule(ts_module)
-                    // export namespace X { ... } — lower as a synthetic class with static members
-                    if !ts_module.declare => {
-                        if let Some(ref body) = ts_module.body {
-                            let ns_name = match &ts_module.id {
-                                ast::TsModuleName::Ident(ident) => ident.sym.to_string(),
-                                ast::TsModuleName::Str(s) => {
-                                    s.value.as_str().unwrap_or("").to_string()
-                                }
-                            };
-                            let class =
-                                lower_namespace_as_class(ctx, module, &ns_name, body, true)?;
-                            let class_name = class.name.clone();
-                            push_class_dedup(module, class);
-                            module.exports.push(Export::Named {
-                                local: class_name.clone(),
-                                exported: class_name,
-                            });
-                        }
-                    }
+                // export namespace X { ... } — a plain object, as tsc emits it
+                ast::Decl::TsModule(ts_module) => lower_namespace(ctx, module, ts_module, true)?,
                 _ => {}
             }
         }

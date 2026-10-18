@@ -71,6 +71,7 @@ use super::{
 };
 
 pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
+    let _fallback = crate::fallback_diag::enter_expr(ctx, expr);
     // Object model step 1: a literal family's added key, one slot load.
     if let Expr::PropertyGet {
         object, property, ..
@@ -257,8 +258,8 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 let key_raw = ctx.block().and(I64, &key_bits, POINTER_MASK_I64);
                 return Ok(ctx.block().call(
                     DOUBLE,
-                    "js_value_length_property_key_ic_f64",
-                    &[(DOUBLE, &recv), (PTR, "null"), (I64, &key_raw)],
+                    "js_value_length_property_key_f64",
+                    &[(DOUBLE, &recv), (I64, &key_raw)],
                 ));
             }
             let native_idx = ctx.new_block("named.native");
@@ -342,8 +343,8 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             let key_raw = ctx.block().and(I64, &key_bits, POINTER_MASK_I64);
             let slow_len = ctx.block().call(
                 DOUBLE,
-                "js_value_length_property_key_ic_f64",
-                &[(DOUBLE, &recv), (PTR, "null"), (I64, &key_raw)],
+                "js_value_length_property_key_f64",
+                &[(DOUBLE, &recv), (I64, &key_raw)],
             );
             let slow_end = ctx.block().label.clone();
             ctx.block().br(&done_label);
@@ -691,9 +692,9 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             )
         }
         // Issue #650: `urlSearchParams.size` property — runtime returns
-        // i32 length of the internal _entries array. Pre-fix the access
+        // i32 length of the internal entries array. Pre-fix the access
         // fell through to the generic object-field lookup which returned
-        // undefined (URLSearchParams stores entries under "_entries", not
+        // undefined (URLSearchParams stores entries in a private slot, not
         // "size"). Routed via `is_url_search_params_expr` so it only
         // fires on receivers we can prove are URLSearchParams (immediate
         // ctor, typed locals, `url.searchParams` accessor).

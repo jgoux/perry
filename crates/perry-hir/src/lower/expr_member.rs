@@ -439,7 +439,7 @@ fn lower_member_inner(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Re
                     // the correct shape. Without this, the bare read
                     // returns a 0 sentinel and `Array.isArray(...)` /
                     // `.length` / iteration all explode.
-                    "execArgv" => return Ok(Expr::Array(Vec::new())),
+                    "execArgv" => return Ok(Expr::Array(Vec::new(), None)),
                     // #1348: process.release — object describing the
                     // current runtime release. Node returns at least
                     // `{ name, sourceUrl, headersUrl }`. Perry binaries
@@ -489,7 +489,7 @@ fn lower_member_inner(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Re
                     // that probes the shape (Array.isArray, .length,
                     // .includes(name)) now does the right thing instead
                     // of crashing on the 0.0 sentinel.
-                    "moduleLoadList" => return Ok(Expr::Array(vec![])),
+                    "moduleLoadList" => return Ok(Expr::Array(vec![], None)),
                     "finalization" => return Ok(process_native_property("finalization")),
                     // #1379: process.config — object describing build-time
                     // config (`{ variables, target_defaults }` in Node).
@@ -636,7 +636,7 @@ fn lower_member_inner(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Re
                     "version" => return Ok(Expr::ProcessVersion),
                     "versions" => return Ok(Expr::ProcessVersions),
                     "env" => return Ok(Expr::ProcessEnv),
-                    "execArgv" => return Ok(Expr::Array(Vec::new())),
+                    "execArgv" => return Ok(Expr::Array(Vec::new(), None)),
                     "release" => {
                         return Ok(Expr::Object(vec![
                             ("name".to_string(), Expr::String("node".to_string())),
@@ -655,7 +655,7 @@ fn lower_member_inner(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Re
                             args: Vec::new(),
                         })
                     }
-                    "moduleLoadList" => return Ok(Expr::Array(vec![])),
+                    "moduleLoadList" => return Ok(Expr::Array(vec![], None)),
                     "finalization" => return Ok(process_native_property("finalization")),
                     "config" => {
                         return Ok(Expr::Object(vec![
@@ -933,14 +933,25 @@ fn lower_member_inner(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Re
     // Check if this is an enum member access (e.g., Color.Red)
     if let ast::Expr::Ident(obj_ident) = member.obj.as_ref() {
         let obj_name = obj_ident.sym.to_string();
-        if ctx.lookup_enum(&obj_name).is_some() {
-            // This is an enum access
+        if let Some((_, members)) = ctx.lookup_enum(&obj_name) {
+            // This is an enum access. Any other name is a property of the
+            // enum object, such as one a merged namespace stores.
             if let ast::MemberProp::Ident(prop_ident) = &member.prop {
                 let member_name = prop_ident.sym.to_string();
-                return Ok(Expr::EnumMember {
-                    enum_name: obj_name,
-                    member_name,
-                });
+                if let Some((_, value)) = members.iter().find(|(name, _)| *name == member_name) {
+                    if matches!(value, crate::ir::EnumValue::Computed) {
+                        if let Some(id) = ctx.lookup_local(&obj_name) {
+                            return Ok(Expr::IndexGet {
+                                object: Box::new(Expr::LocalGet(id)),
+                                index: Box::new(Expr::String(member_name)),
+                            });
+                        }
+                    }
+                    return Ok(Expr::EnumMember {
+                        enum_name: obj_name,
+                        member_name,
+                    });
+                }
             }
         }
     }
@@ -977,9 +988,19 @@ fn lower_member_inner(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Re
                 .map(|(_, m)| m.to_vec());
             if let Some(members) = members {
                 let index = lower_expr(ctx, &computed.expr)?;
-                let fields = super::enum_runtime_object_fields(&members);
+                let object =
+                    if members
+                        .iter()
+                        .any(|(_, v)| matches!(v, crate::ir::EnumValue::Computed))
+                    {
+                        Expr::LocalGet(ctx.lookup_local(obj_ident.sym.as_ref()).ok_or_else(
+                            || anyhow::anyhow!("computed enum has no runtime binding"),
+                        )?)
+                    } else {
+                        crate::lower_decl::enum_runtime_object(&members)
+                    };
                 return Ok(Expr::IndexGet {
-                    object: Box::new(Expr::Object(fields)),
+                    object: Box::new(object),
                     index: Box::new(index),
                 });
             }
@@ -1012,17 +1033,6 @@ fn lower_member_inner(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Re
                         field_name,
                     });
                 }
-            }
-        }
-    }
-
-    // Check if this is a namespace variable access (e.g., Flag.OPENCODE_AUTO_SHARE)
-    if let ast::Expr::Ident(obj_ident) = member.obj.as_ref() {
-        let obj_name = obj_ident.sym.to_string();
-        if let ast::MemberProp::Ident(prop_ident) = &member.prop {
-            let member_name = prop_ident.sym.to_string();
-            if let Some(local_id) = ctx.lookup_namespace_var(&obj_name, &member_name) {
-                return Ok(Expr::LocalGet(local_id));
             }
         }
     }

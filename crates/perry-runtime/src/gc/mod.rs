@@ -193,7 +193,12 @@ use copying_first_cycle::*;
 // Named rather than glob-imported: a glob does not propagate through the
 // transitive re-exports the gc submodules reach these through.
 use copying_pointer_set::{plausible_gc_header, CopyingPointer, CopyingPointerKind};
-#[cfg(any(debug_assertions, feature = "field-rep-assert", perry_gc_instruments))]
+#[cfg(any(
+    test,
+    debug_assertions,
+    feature = "field-rep-assert",
+    perry_gc_instruments
+))]
 pub(crate) use forwarding::field_rep_live_address;
 use forwarding::*;
 use sticky_remembered::*;
@@ -299,12 +304,10 @@ pub use verify::*;
 /// Env-gated heap census (`PERRY_GC_CENSUS`); off by default.
 pub(crate) mod census;
 mod census_field_repr;
-#[cfg(perry_diagnostics)]
 mod heap_snapshot;
 mod heap_stats;
 mod regex_census;
 pub use census::{census_poll_signal, gc_census_enabled};
-#[cfg(perry_diagnostics)]
 pub use heap_snapshot::gc_build_v8_heap_snapshot_json;
 pub(crate) use heap_stats::heap_stats;
 
@@ -1140,17 +1143,6 @@ pub fn gc_init() {
     // or Proxy trap can re-enter after moving GC. Rewrite that temporary
     // identity so malformed prototype cycles remain bounded.
     reg_scanner!(crate::object::prototype_chain::scan_prototype_resolution_stack_roots_mut,);
-    reg_scanner!(crate::proxy::scan_packed_add_roots_mut);
-    reg_scanner!(crate::proxy::scan_setter_site_roots_mut);
-    // A site's chain memo names every prototype from the receiver's
-    // [[Prototype]] to the holder of the method it answers; it compares each
-    // one's header word on use, so each is a STRONG root.
-    reg_scanner!(crate::object::method_site::chain_memo::scan_chain_memo_roots_mut);
-    // Read and method sites' holder entries are NOT roots: they name only
-    // stable objects (old, never-move) that the receiver's ShapeId keeps
-    // alive (`gc::never_move`, `read_holder.rs` "Weak entries"). A keyed
-    // entry's KEY is still compared by identity and is rooted here until
-    // keys are immortal atoms.
     reg_scanner!(crate::perf_hooks::scan_perf_entries_roots_mut);
     reg_scanner!(crate::perf_histogram::scan_histogram_roots_mut);
     reg_scanner!(crate::v8::scan_v8_promise_hook_roots_mut);
@@ -1159,10 +1151,36 @@ pub fn gc_init() {
     reg_scanner!(crate::object::scan_arguments_object_roots_mut);
     // bun:ffi (#6562): the cached FFIType enum object.
     reg_scanner!(crate::bun_ffi::scan_bun_ffi_roots_mut);
-    #[cfg(feature = "node-api-host")]
-    reg_scanner!(crate::node_api_host::scan_node_api_roots_mut);
-    #[cfg(feature = "wasm-host")]
-    reg_scanner!(crate::webassembly::scan_active_wasm_call_roots_mut);
+    // Optional features' scanners, on every thread after the feature's
+    // install filled the slot (`feature_hooks`).
+    if let Some(scanner) = crate::feature_hooks::NODE_API_ROOT_SCANNER.peek() {
+        gc_register_named_mutable_root_scanner(crate::node_api_host::ROOT_SCANNER_NAME, scanner);
+    }
+    if let Some(scanner) = crate::feature_hooks::WASM_ROOT_SCANNER.peek() {
+        gc_register_named_mutable_root_scanner(crate::webassembly::ROOT_SCANNER_NAME, scanner);
+    }
+    // #4911: a bound node:dgram socket is reachable only from the dgram
+    // reactor's registry while its recv thread runs; scan + rewrite it so a GC
+    // between ticks doesn't reclaim the object whose `message` handlers fire.
+    if let Some(scanner) = crate::feature_hooks::DGRAM_ROOT_SCANNER.peek() {
+        gc_register_named_mutable_root_scanner(
+            crate::module_hooks::DGRAM_ROOT_SCANNER_NAME,
+            scanner,
+        );
+    }
+    // `node:test` runner state (the `mod-node-test` install).
+    if let Some(scanner) = crate::feature_hooks::NODE_TEST_ROOT_SCANNER.peek() {
+        gc_register_named_mutable_root_scanner(
+            crate::node_submodules::NODE_TEST_ROOT_SCANNER_NAME,
+            scanner,
+        );
+    }
+    // Unit tests reach the Node-API host without perry's installer: install it
+    // with the first initialized thread (which registers its scanner there;
+    // later threads take it from the slot above), as a build with the old
+    // `node-api-host` feature did for every thread.
+    #[cfg(test)]
+    crate::feature_hooks::js_runtime_install_node_api_host();
     reg_budgeted_scanner!(
         crate::object::scan_class_side_table_roots_mut,
         crate::object::scan_class_side_table_roots_mut_step,
@@ -1204,8 +1222,6 @@ pub fn gc_init() {
     // #4911: a bound node:dgram socket is reachable only from the dgram
     // reactor's registry while its recv thread runs; scan + rewrite it so a GC
     // between ticks doesn't reclaim the object whose `message` handlers fire.
-    #[cfg(all(feature = "mod-dgram", not(target_os = "wasi")))]
-    reg_scanner!(crate::dgram_reactor::scan_roots_mut);
     reg_scanner!(json_parse_mutable_root_scanner);
     reg_scanner!(crate::string::scan_utf16_index_roots_mut);
     // #7564: the per-thread `{ value, done }` / `{ done, value }` keys arrays
@@ -1247,8 +1263,6 @@ pub fn gc_init() {
     // (nothing else holds them — they live for the program's lifetime
     // via codegen `getter` calls, not via a user-visible JSValue root).
     reg_scanner!(crate::node_submodules::scan_node_submodule_singleton_roots_mut,);
-    #[cfg(feature = "mod-node-test")]
-    reg_scanner!(crate::node_submodules::test::runner::scan_node_test_runner_roots_mut,);
     // Iter-result scratch slot — the async-step fast path stows the
     // generator's most recent yield value here; it stays live until
     // the step driver reads it back.
@@ -1794,7 +1808,7 @@ mod tests;
 /// `CLOSURE_PROPS`) must hold this, or the gc test guards' global state reset
 /// on a parallel test thread can wipe its entries mid-test.
 #[cfg(test)]
-pub(crate) use tests::support::copying_nursery_isolation_lock as global_side_table_test_lock;
+pub(crate) use tests::support::global_side_table_test_lock;
 #[cfg(test)]
 pub(crate) use tests::support::{
     register_runtime_handle_root_scanner_for_tests, CopyingNurseryTestGuard,

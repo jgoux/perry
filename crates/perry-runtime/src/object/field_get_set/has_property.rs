@@ -214,8 +214,12 @@ unsafe fn class_ref_has_inherited_static_data(
 /// ⇒ TypeError).
 #[no_mangle]
 pub extern "C" fn js_in_operator(obj: f64, key: f64) -> f64 {
-    if let Some(present) = unsafe { shape_presence::try_shape_has_property(obj, key) } {
-        return f64::from_bits(JSValue::bool(present).bits());
+    // The probe's presence mode (`layout_probe::probe_has`), else the
+    // complete operation.
+    match unsafe { crate::object::layout_probe::probe_has(obj.to_bits(), key.to_bits(), false) } {
+        1 => return f64::from_bits(JSValue::bool(true).bits()),
+        0 => return f64::from_bits(JSValue::bool(false).bits()),
+        _ => {}
     }
     in_operator_generic(obj, key)
 }
@@ -232,8 +236,10 @@ pub(crate) fn in_operator_generic(obj: f64, key: f64) -> f64 {
 /// This implements the JavaScript 'in' operator: "key" in obj
 #[no_mangle]
 pub extern "C" fn js_object_has_property(obj: f64, key: f64) -> f64 {
-    if let Some(present) = unsafe { shape_presence::try_shape_has_property(obj, key) } {
-        return f64::from_bits(JSValue::bool(present).bits());
+    match unsafe { crate::object::layout_probe::probe_has(obj.to_bits(), key.to_bits(), false) } {
+        1 => return f64::from_bits(JSValue::bool(true).bits()),
+        0 => return f64::from_bits(JSValue::bool(false).bits()),
+        _ => {}
     }
     object_has_property_generic(obj, key)
 }
@@ -273,8 +279,12 @@ fn object_has_property_generic(obj: f64, key: f64) -> f64 {
             let obj = f64::from_bits(obj_handle.get_nanbox_u64());
             // Coercion can replace the key and mutate/move the receiver.
             // Consume the resulting shape before the exotic dispatch walk.
-            if let Some(present) = unsafe { shape_presence::try_shape_has_property(obj, key) } {
-                return f64::from_bits(JSValue::bool(present).bits());
+            match unsafe {
+                crate::object::layout_probe::probe_has(obj.to_bits(), key.to_bits(), false)
+            } {
+                1 => return f64::from_bits(JSValue::bool(true).bits()),
+                0 => return f64::from_bits(JSValue::bool(false).bits()),
+                _ => {}
             }
             (obj, JSValue::from_bits(obj.to_bits()), key)
         }
@@ -1118,10 +1128,14 @@ unsafe fn ordinary_has_property(
     // asking later is the same answer.
     let mut cur = obj_ptr;
     let mut last_valid = obj_ptr;
-    let mut guard = 0u32;
+    // Bounded by the chain, not a hop count (#12698: `"k" in o` was false
+    // past 1024 hops).
+    let mut cycle = super::super::prototype_chain::ChainCycle::new();
     loop {
-        guard += 1;
-        if guard > 1024 || cur.is_null() || !super::super::is_valid_obj_ptr(cur as *const u8) {
+        if cur.is_null()
+            || cycle.repeats(cur as usize)
+            || !super::super::is_valid_obj_ptr(cur as *const u8)
+        {
             break;
         }
         last_valid = cur;
@@ -1419,19 +1433,43 @@ pub(crate) unsafe fn closure_dynamic_prop_by_key(
     None
 }
 
-/// Inherited Function/Object prototype methods that reify into a BOUND_METHOD
-/// closure bound to the receiver function when read as a value.
+/// Whether [`closure_dynamic_prop_by_key`]'s miss on `obj` for `key` was the
+/// whole `[[Get]]`, so its `undefined` is the answer: `obj` is a plain
+/// (non-class) function and `key` is not a name the by-name tail
+/// (`get_field_by_name_object_tail_with_kind`) synthesizes for functions
+/// after running that same Get (the `caller`/`arguments` poison pill, the
+/// lazy `prototype`, the inherited `constructor`, `length`, `name`). For
+/// every other key the tail only repeats the Get: the own lookup, the
+/// `%Function.prototype%` walk, and any own getter a second time.
+///
+/// # Safety
+/// `key` is null or a live string header.
+pub(crate) unsafe fn closure_get_is_complete(obj: usize, key: *const crate::StringHeader) -> bool {
+    if key.is_null() || !crate::closure::is_closure_ptr(obj) {
+        return false;
+    }
+    if crate::closure::shape::is_class_info((*(obj as *const crate::closure::ClosureHeader)).info) {
+        return false;
+    }
+    let bytes = std::slice::from_raw_parts(
+        (key as *const u8).add(std::mem::size_of::<crate::StringHeader>()),
+        (*key).byte_len as usize,
+    );
+    !matches!(
+        bytes,
+        b"caller" | b"arguments" | b"prototype" | b"constructor" | b"length" | b"name"
+    )
+}
+
+/// The inherited `%Function.prototype%` methods a read off a function value
+/// resolves on its actual [[Prototype]] (`reify_function_method_value`).
+/// Every other inherited member (`toString`, `isPrototypeOf`, ...) is the
+/// prototype's own value, read like any property.
 pub(crate) fn reified_function_method_name(name: &str) -> Option<&'static [u8]> {
     match name {
         "bind" => Some(b"bind"),
         "call" => Some(b"call"),
         "apply" => Some(b"apply"),
-        "isPrototypeOf" => Some(b"isPrototypeOf"),
-        // `fn.toString` read as a VALUE (`original.toString.bind(original)` —
-        // Next.js's unhandled-rejection extension preserves patched-function
-        // toString this way). Previously read back `undefined`, so the
-        // subsequent `.bind` threw "Bind must be called on a function".
-        "toString" => Some(b"toString"),
         _ => None,
     }
 }

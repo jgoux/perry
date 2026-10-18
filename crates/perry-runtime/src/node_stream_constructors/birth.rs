@@ -21,42 +21,19 @@ impl Kind {
             Self::PassThrough => ("PassThrough", "stream\0PassThrough"),
         }
     }
-}
-thread_local! {
-    static R_SHELL: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-    static W_SHELL: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-    static D_SHELL: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-    static T_SHELL: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-    static P_SHELL: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-}
-pub(crate) fn alloc_initialized_stream_shell(proto: f64, kind: Kind) -> f64 {
-    let site = match kind {
-        Kind::Readable => &R_SHELL,
-        Kind::Writable => &W_SHELL,
-        Kind::Duplex => &D_SHELL,
-        Kind::Transform => &T_SHELL,
-        Kind::PassThrough => &P_SHELL,
-    };
-    if let Some(obj) = crate::object::object_alloc_recorded_birth(
-        site.with(std::cell::Cell::get),
-        proto.to_bits(),
-        0,
-        2,
-        false,
-    ) {
-        return box_pointer(obj.cast());
+
+    /// The instance layout a direct birth of this class is born on
+    /// (`runtime_layouts::stream_instances`).
+    pub(crate) fn layout(self) -> *const crate::object::layout_desc::PerryLayoutDesc {
+        use crate::object::runtime_layouts as rl;
+        match self {
+            Self::Readable => &raw const rl::READABLE,
+            Self::Writable => &raw const rl::WRITABLE,
+            Self::Duplex => &raw const rl::DUPLEX,
+            Self::Transform => &raw const rl::TRANSFORM,
+            Self::PassThrough => &raw const rl::PASSTHROUGH,
+        }
     }
-    let scope = crate::gc::RuntimeHandleScope::new();
-    let proto = scope.root_nanbox_f64(proto);
-    let object = scope.root_raw_mut_ptr(crate::object::js_object_alloc_plain(2));
-    object.with_mut_ptr::<crate::object::ObjectHeader, _>(|obj| {
-        crate::object::prototype_chain::object_link_created_prototype(
-            obj as usize,
-            proto.get_nanbox_u64(),
-        );
-        site.with(|memo| memo.set(unsafe { crate::object::shapes::object_shape_stamp(obj) }));
-        box_pointer(obj.cast())
-    })
 }
 /// A site remembers a transition, never a key list or heap pointer. Every
 /// use validates the receiver and each prototype's current ShapeId, as well
@@ -85,6 +62,10 @@ impl BirthWriteSite {
         let obj = crate::object::field_get_set::runtime_read_site::object_receiver(stream)
             .expect("stream receiver");
         if unsafe { key.write_existing(obj, value) } {
+            return;
+        }
+        // SAFETY: a live receiver.
+        if unsafe { super::instance_birth::layout_birth_store(obj, key.bytes, value) } {
             return;
         }
         let from = unsafe { crate::object::shapes::object_shape_stamp(obj) };
@@ -249,13 +230,20 @@ mod tests {
                 );
             }
             let obj = object_ptr_from_value(stream.get_nanbox_f64()).unwrap();
+            let kind = match name {
+                "Readable" => Kind::Readable,
+                "Writable" => Kind::Writable,
+                _ => Kind::Duplex,
+            };
             assert_eq!(
-                unsafe { crate::object::object_live_slot_count(obj) },
-                2,
-                "fixed births preserve the stream inline prefix"
+                unsafe { (*obj).parent_class_id },
+                unsafe { (*kind.layout()).layout_id },
+                "a direct birth is born on its instance layout"
             );
             let keys = unsafe { crate::object::object_keys(obj) };
+            // The present keys: an optional member's hole is absent.
             let own: Vec<_> = (0..keys.count())
+                .filter(|&i| unsafe { !crate::object::key_view::position_is_hole(obj, keys, i) })
                 .map(|i| {
                     crate::fs::validate::read_js_string_pub(f64::from_bits(unsafe {
                         keys.get(i).bits()

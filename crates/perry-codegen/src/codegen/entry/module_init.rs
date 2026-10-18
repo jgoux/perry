@@ -61,6 +61,7 @@ pub(super) fn compile_module_init(
     }
     let init_name = format!("{}__init", module_prefix);
     let init_body_name = format!("{}__init_body", module_prefix);
+    let evaluate_name = format!("{}__init_evaluate", module_prefix);
     {
         let wrap_fn = llmod.define_function(&init_name, VOID, vec![]);
         let _ = wrap_fn.create_block("entry");
@@ -81,6 +82,25 @@ pub(super) fn compile_module_init(
         {
             let blk = wrap_fn.block_mut(2).unwrap();
             blk.store(I8, "1", &format!("@{}", done_global));
+            // The registry owns failed evaluation records. On a throw the
+            // runtime clears this existing reentry guard before propagating it,
+            // so the next call replays the failure instead of returning early.
+            let evaluate_addr = format!("ptrtoint (ptr @{} to i64)", evaluate_name);
+            let guard_addr = format!("ptrtoint (ptr @{} to i64)", done_global);
+            blk.call_void(
+                "js_run_module_init_guarded",
+                &[(I64, &evaluate_addr), (I64, &guard_addr)],
+            );
+            blk.ret_void();
+        }
+    }
+    {
+        // Include dependency evaluation in the same failure boundary: a
+        // dependency can throw before this module reaches its own body.
+        let evaluate_fn = llmod.define_function(&evaluate_name, VOID, vec![]);
+        let _ = evaluate_fn.create_block("entry");
+        {
+            let blk = evaluate_fn.block_mut(0).unwrap();
             // A CommonJS program entry claims this thread's main-module
             // record in its wrapper preamble. Main publishes it before eager
             // imports; a worker also needs it before evaluating dependencies.
@@ -262,6 +282,9 @@ pub(super) fn compile_module_init(
         local_types: init_local_types,
         proven_local_types: HashMap::new(),
         typed_locals: std::collections::HashMap::new(),
+        code_unit_locals: std::collections::HashSet::new(),
+        confined_arrays: &cross_module.definite_init.confined,
+        confined_array_read: false,
         guarded_discriminant_aliases: HashMap::new(),
         module_global_proven_types: &cross_module.module_global_proven_types,
         module_global_transfers: &cross_module.module_global_transfers,
@@ -285,11 +308,15 @@ pub(super) fn compile_module_init(
         program_layouts: cross_module.program_layouts.clone(),
         wpfacts_sites: 0,
         wpfacts_tested: Vec::new(),
+        wpfacts_off: false,
+        inline_new_leaf: Vec::new(),
+        ctor_receiver: None,
+        ctor_receiver_selector: None,
         wpfacts_this: Vec::new(),
         this_stack: Vec::new(),
         super_called_stack: Vec::new(),
         shared_super_scope_active: false,
-        lexical_this_uses_derived_binding: false,
+        lexical_this_uses_derived_binding: None,
         inline_ctor_return: Vec::new(),
         new_target_stack: Vec::new(),
         class_stack: Vec::new(),
@@ -405,7 +432,6 @@ pub(super) fn compile_module_init(
         i32_counter_slots: HashMap::new(),
         record_packed_admissions: std::collections::HashMap::new(),
         numeric_accumulator_f64_slots: HashMap::new(),
-        transition_cache_base_slot: None,
         receiver_descriptors: Default::default(),
         poll_stride_counter_slot: None,
         deferred_integer_update_accumulators: HashSet::new(),
@@ -435,6 +461,7 @@ pub(super) fn compile_module_init(
         spec_i32_params: std::collections::HashSet::new(),
         spec_bool_params: std::collections::HashSet::new(),
         typed_element_locals: std::collections::HashSet::new(),
+        create_families: Default::default(),
         class_guard_window: None,
         i1_local_slots: HashMap::new(),
         index_used_locals: init_native_facts.index_used_locals(),
@@ -449,7 +476,6 @@ pub(super) fn compile_module_init(
         imported_vars: &cross_module.imported_vars,
         imported_object_literals: &cross_module.imported_object_literals,
         short_spread_method_candidates: &cross_module.short_spread_method_candidates,
-        program_class_accessor_names: cross_module.program_class_accessor_names.as_deref(),
         object_literal_method_candidates: &cross_module.object_literal_method_candidates,
         compile_time_constants: init_native_facts.compile_time_constants(),
         target_triple: &cross_module.target_triple,
@@ -514,6 +540,7 @@ pub(super) fn compile_module_init(
         was_unrolled: hir.init_was_unrolled,
         ic_site_counter: ic_base,
         ic_globals: Vec::new(),
+        born_let: None,
         typed_parse_rodata: Vec::new(),
         buffer_data_slots: HashMap::new(),
         native_arena_owner_aliases: HashMap::new(),

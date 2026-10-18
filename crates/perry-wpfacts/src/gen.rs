@@ -45,10 +45,6 @@ pub struct Gen<'a> {
     pub thrown: NodeId,
     pub cjs_registry: NodeId,
     pub read_sites: Vec<ReadSite>,
-    /// E14: the program may run interpreted code (non-constant
-    /// `new Function` / `eval` / `vm`): such code can patch
-    /// `Object.prototype`, so no template is prefix-stable.
-    pub global_hard: Option<String>,
     pub ctor_phase: FxHashMap<TmplId, CtorPhase>,
     pub fn_inst_of: FxHashMap<FnIdx, TmplId>,
     pub field_init_fn: FxHashMap<TmplId, FnIdx>,
@@ -140,7 +136,6 @@ impl<'a> Gen<'a> {
             thrown,
             cjs_registry,
             read_sites: Vec::new(),
-            global_hard: None,
             ctor_phase: FxHashMap::default(),
             fn_inst_of: FxHashMap::default(),
             field_init_fn: FxHashMap::default(),
@@ -355,6 +350,7 @@ impl<'a> Gen<'a> {
             this,
             ret,
             args_all,
+            has_arguments: params.iter().any(|p| p.arguments_object.is_some()),
             token: tok,
             ctor_of: None,
             lexical_this,
@@ -504,6 +500,7 @@ impl<'a> Gen<'a> {
             this,
             ret,
             args_all,
+            has_arguments: false,
             token: tok,
             ctor_of: None,
             lexical_this: false,
@@ -823,6 +820,10 @@ impl<'a> Gen<'a> {
             }
         }
         for (mi, (_, module)) in modules.iter().enumerate() {
+            // Over a bound: the program gets no facts; stop generating.
+            if self.m.aborted {
+                return;
+            }
             let mi = mi as u32;
             let init_fn = self.synthetic_fn(mi, "<init>");
             let this = self.m.funcs[init_fn as usize].this;
@@ -848,10 +849,16 @@ impl<'a> Gen<'a> {
             }
             self.stmts(&fx, &module.init);
             for f in &module.functions {
+                if self.m.aborted {
+                    return;
+                }
                 let fxi = self.mods[mi as usize].funcs[&f.id];
                 self.walk_fn(mi, fxi, f, None, None);
             }
             for c in &module.classes {
+                if self.m.aborted {
+                    return;
+                }
                 self.walk_class(mi, c, &fx);
             }
         }

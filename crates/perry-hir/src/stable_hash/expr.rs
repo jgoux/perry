@@ -72,7 +72,7 @@ impl SH for Expr {
             Expr::Object(fields) => { tag(h, 30); fields.hash(h); }
             Expr::ObjectSpread { parts } => { tag(h, 31); parts.hash(h); }
             Expr::ObjectAssign { target, sources } => { tag(h, 32); target.as_ref().hash(h); sources.hash(h); }
-            Expr::Array(items) => { tag(h, 33); items.hash(h); }
+            Expr::Array(items, _) => { tag(h, 33); items.hash(h); }
             Expr::ArraySpread(items) => { tag(h, 34); items.hash(h); }
             Expr::Conditional { condition, then_expr, else_expr, } => { tag(h, 35); condition.as_ref().hash(h); then_expr.as_ref().hash(h); else_expr.as_ref().hash(h); }
             Expr::TypeOf(e) => { tag(h, 36); e.as_ref().hash(h); }
@@ -95,6 +95,20 @@ impl SH for Expr {
             Expr::ClassMethodHome { class_name, is_static } => { tag(h, 12513); class_name.hash(h); is_static.hash(h); }
             Expr::ClassRef(s) => { tag(h, 44); s.hash(h); }
             Expr::EnumMember { enum_name, member_name, } => { tag(h, 45); enum_name.hash(h); member_name.hash(h); }
+            Expr::EnumImage { class_name, stores, strict } => {
+                tag(h, 12514);
+                class_name.hash(h);
+                strict.hash(h);
+                stores.len().hash(h);
+                for (key, value) in stores {
+                    key.hash(h);
+                    match value {
+                        crate::ir::EnumValue::Number(n) => { 0u8.hash(h); n.hash(h); }
+                        crate::ir::EnumValue::String(s) => { 1u8.hash(h); s.hash(h); }
+                        crate::ir::EnumValue::Computed => { 2u8.hash(h); }
+                    }
+                }
+            }
             Expr::StaticFieldGet { class_name, field_name, } => { tag(h, 46); class_name.hash(h); field_name.hash(h); }
             Expr::StaticFieldSet { class_name, field_name, value, } => { tag(h, 47); class_name.hash(h); field_name.hash(h); value.as_ref().hash(h); }
             Expr::ClassStaticSymbolSet { class_name, key, value, } => { tag(h, 48); class_name.hash(h); key.as_ref().hash(h); value.as_ref().hash(h); }
@@ -382,7 +396,7 @@ impl SH for Expr {
             Expr::ArrayIndexOf { array, value, from_index } => { tag(h, 254); array.as_ref().hash(h); value.as_ref().hash(h); if let Some(fi) = from_index { tag(h, 1); fi.as_ref().hash(h); } else { tag(h, 0); } }
             Expr::ArrayLastIndexOf { array, value, from_index } => { tag(h, 11244); array.as_ref().hash(h); value.as_ref().hash(h); if let Some(fi) = from_index { tag(h, 1); fi.as_ref().hash(h); } else { tag(h, 0); } }
             Expr::ArrayIncludes { array, value, from_index } => { tag(h, 255); array.as_ref().hash(h); value.as_ref().hash(h); if let Some(fi) = from_index { tag(h, 1); fi.as_ref().hash(h); } else { tag(h, 0); } }
-            Expr::ArraySlice { array, start, end } => { tag(h, 256); array.as_ref().hash(h); start.as_ref().hash(h); end.hash(h); }
+            Expr::ArraySlice { array, start, end, .. } => { tag(h, 256); array.as_ref().hash(h); start.as_ref().hash(h); end.hash(h); }
             Expr::ArraySplice { array_id, start, delete_count, items, } => { tag(h, 257); array_id.hash(h); start.as_ref().hash(h); delete_count.hash(h); items.hash(h); }
             Expr::ArrayForEach { array, callback } => { tag(h, 258); array.as_ref().hash(h); callback.as_ref().hash(h); }
             Expr::ArrayMap { array, callback } => { tag(h, 259); array.as_ref().hash(h); callback.as_ref().hash(h); }
@@ -567,7 +581,7 @@ impl SH for Expr {
             Expr::MapGroupBy { items, key_fn } => { tag(h, 12044); items.as_ref().hash(h); key_fn.as_ref().hash(h); }
             Expr::ObjectRest { object, exclude_keys, } => { tag(h, 395); object.as_ref().hash(h); exclude_keys.hash(h); }
             Expr::ArrayIsArray(e) => { tag(h, 396); e.as_ref().hash(h); }
-            Expr::ArrayFrom(e) => { tag(h, 397); e.as_ref().hash(h); }
+            Expr::ArrayFrom(e, _) => { tag(h, 397); e.as_ref().hash(h); }
             Expr::ArrayFromArrayLikeHoley(e) => { tag(h, 12320); e.as_ref().hash(h); }
             Expr::IteratorFrom(e) => { tag(h, 12270); e.as_ref().hash(h); }
             Expr::IteratorToArray(e) => { tag(h, 398); e.as_ref().hash(h); }

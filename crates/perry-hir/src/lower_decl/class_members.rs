@@ -53,6 +53,7 @@ pub fn lower_constructor(
     ctx: &mut LoweringContext,
     class_name: &str,
     ctor: &ast::Constructor,
+    field_inits: &[&ast::ClassProp],
 ) -> Result<Function> {
     let scope_mark = ctx.enter_scope();
     let class_expr_capture_mark = ctx.body_class_expr_captures.len();
@@ -186,6 +187,15 @@ pub fn lower_constructor(
         }
     }
 
+    // Assigned field initializers (`class_field_assign`), in the
+    // constructor's scope, as the `this.x = v` TypeScript emits.
+    let mut field_stores = Vec::with_capacity(field_inits.len());
+    for prop in field_inits {
+        if let Some(store) = super::class_field_assign::field_store(prop) {
+            field_stores.push(Stmt::Expr(lower_expr(ctx, &store)?));
+        }
+    }
+
     // Lower body — issue #569; constructor body may contain hoisted
     // inner function declarations that need PreallocateBoxes for sibling
     // captures.
@@ -198,6 +208,26 @@ pub fn lower_constructor(
     // Synthesize `this.field = param` assignments for parameter properties.
     // In TypeScript, `constructor(public name: string)` automatically assigns
     // `this.name = name` at the start of the constructor body.
+    let super_pos = body
+        .iter()
+        .position(|s| matches!(s, Stmt::Expr(Expr::SuperCall(_) | Expr::SuperCallSpread(_))));
+    if !field_stores.is_empty() {
+        // After super() and the parameter properties, as TypeScript emits.
+        let at = match super_pos {
+            Some(pos) => pos + 1,
+            None if ctx.current_class_is_derived => {
+                return Err(anyhow!(
+                    "class {class_name}: a 'super' call must be a root-level statement \
+                     within a constructor of a derived class that contains initialized \
+                     properties (TS2401)"
+                ));
+            }
+            None => 0,
+        };
+        let tail = body.split_off(at);
+        body.extend(field_stores);
+        body.extend(tail);
+    }
     if !param_prop_assignments.is_empty() {
         let assignments: Vec<Stmt> = param_prop_assignments
             .iter()
@@ -219,10 +249,7 @@ pub fn lower_constructor(
         // during effect Schema init (#1758). Base classes (no super() call)
         // keep prepending. The default-param / destructuring prologues below
         // touch only params (not `this`), so they stay at the very top.
-        if let Some(super_pos) = body
-            .iter()
-            .position(|s| matches!(s, Stmt::Expr(Expr::SuperCall(_) | Expr::SuperCallSpread(_))))
-        {
+        if let Some(super_pos) = super_pos {
             let tail = body.split_off(super_pos + 1);
             body.extend(assignments);
             body.extend(tail);
@@ -371,90 +398,6 @@ pub fn collect_method_captures(
     captures.sort();
     captures.dedup();
     captures
-}
-
-/// Conservative outer-capture check used to gate `[Symbol.dispose]` /
-/// `[Symbol.asyncDispose]` lowering: returns true when the method body
-/// references any LocalId that isn't `this` or one of the method's own
-/// parameters. Class-method-captures-outer-local has a pre-existing codegen
-/// gap; for the dispose family we silently drop the method when this is true,
-/// so test programs that previously compiled (with empty disposed output)
-/// keep compiling.
-#[allow(dead_code)]
-fn method_body_captures_outer(func: &Function, ctx: &LoweringContext) -> bool {
-    let mut own_locals: std::collections::HashSet<LocalId> =
-        func.params.iter().map(|p| p.id).collect();
-    // Also include `this` if it was registered (instance methods).
-    if let Some(this_id) = ctx
-        .locals
-        .iter()
-        .rev()
-        .find(|(name, _, _)| name == "this")
-        .map(|(_, id, _)| *id)
-    {
-        own_locals.insert(this_id);
-    }
-    // Locals defined inside the body (e.g., `let x = ...` inside the method)
-    // also need to be treated as own-locals so they don't trip the capture
-    // check. Walk the body collecting Let ids.
-    fn collect_let_ids(stmts: &[Stmt], out: &mut std::collections::HashSet<LocalId>) {
-        for s in stmts {
-            match s {
-                Stmt::Let { id, .. } => {
-                    out.insert(*id);
-                }
-                Stmt::If {
-                    then_branch,
-                    else_branch,
-                    ..
-                } => {
-                    collect_let_ids(then_branch, out);
-                    if let Some(e) = else_branch {
-                        collect_let_ids(e, out);
-                    }
-                }
-                Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => collect_let_ids(body, out),
-                Stmt::For { init, body, .. } => {
-                    if let Some(init_stmt) = init {
-                        if let Stmt::Let { id, .. } = init_stmt.as_ref() {
-                            out.insert(*id);
-                        }
-                    }
-                    collect_let_ids(body, out);
-                }
-                Stmt::Try {
-                    body,
-                    catch,
-                    finally,
-                } => {
-                    collect_let_ids(body, out);
-                    if let Some(c) = catch {
-                        collect_let_ids(&c.body, out);
-                    }
-                    if let Some(f) = finally {
-                        collect_let_ids(f, out);
-                    }
-                }
-                Stmt::Switch { cases, .. } => {
-                    for case in cases {
-                        collect_let_ids(&case.body, out);
-                    }
-                }
-                Stmt::Labeled { body, .. } => {
-                    collect_let_ids(std::slice::from_ref(body.as_ref()), out)
-                }
-                _ => {}
-            }
-        }
-    }
-    collect_let_ids(&func.body, &mut own_locals);
-
-    let mut refs = Vec::new();
-    let mut visited = std::collections::HashSet::new();
-    for stmt in &func.body {
-        crate::analysis::collect_local_refs_stmt(stmt, &mut refs, &mut visited);
-    }
-    refs.iter().any(|id| !own_locals.contains(id))
 }
 
 pub fn lower_class_method(
@@ -726,8 +669,10 @@ pub fn lower_class_method_with_name(
     // binding inside the lazy state-machine body, so a throwing default
     // initializer never fires at call time (test262 class/dstr async-gen-meth-*).
     if method.function.is_generator {
-        let prologue_len =
-            default_prologue_len + destructuring_prologue_len + usize::from(method_home.is_some());
+        // The method's home binding is not part of this count: the generator
+        // transform lifts it by its own shape (perry-transform
+        // `generator/lower.rs`), wherever it sits in the body.
+        let prologue_len = default_prologue_len + destructuring_prologue_len;
         if prologue_len > 0 {
             ctx.gen_param_prologue_len.insert(func_id, prologue_len);
         }
@@ -828,7 +773,7 @@ pub fn lower_getter_method_with_name(
                 name: "arguments".to_string(),
                 ty: Type::Any,
                 mutable: false,
-                init: Some(Expr::Array(Vec::new())),
+                init: Some(Expr::Array(Vec::new(), None)),
             },
         );
     }
@@ -1009,7 +954,7 @@ pub fn lower_setter_method_with_name(
                 name: "arguments".to_string(),
                 ty: Type::Any,
                 mutable: false,
-                init: Some(Expr::Array(raw_args)),
+                init: Some(Expr::Array(raw_args, None)),
             },
         );
     }
@@ -1084,6 +1029,18 @@ pub fn lower_class_prop(ctx: &mut LoweringContext, prop: &ast::ClassProp) -> Res
             .map(|v| infer_type_from_expr(v, ctx))
             .unwrap_or(Type::Any),
     };
+    if super::class_field_assign::assigned_instance_field(ctx, prop) {
+        return Ok(ClassField {
+            origin: crate::ClassFieldOrigin::ConstructorStore,
+            name,
+            key_expr,
+            ty,
+            init: None,
+            is_private: false,
+            is_readonly: prop.readonly,
+            decorators: lower_decorators(ctx, &prop.decorators),
+        });
+    }
 
     // Lower initializer expression if present. Mark the field-initializer
     // context so a direct `eval` in the initializer rejects `arguments`

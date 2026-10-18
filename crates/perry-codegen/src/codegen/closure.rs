@@ -540,6 +540,34 @@ pub(super) fn compile_closure(
     // every closure's FnCtx. Generated bundles contain thousands of closures,
     // making that O(closures * module locals) in both time and retained memory.
     // Build the precise key set once and project each global oracle through it.
+    // A closure region (`split_regions`): its parameter types are what its
+    // only caller proved at the call, and it has this one body.
+    let region_closure = cross_module.region_closures.contains(&func_id)
+        && typed_body.is_none()
+        && !trusted_box_captures
+        && !versioned_loop_callback;
+    let region_proofs: HashMap<u32, perry_hir::types::Type> = if region_closure {
+        params
+            .iter()
+            .filter(|p| {
+                matches!(
+                    p.ty,
+                    perry_hir::types::Type::String
+                        | perry_hir::types::Type::Number
+                        | perry_hir::types::Type::Boolean
+                        | perry_hir::types::Type::Array(_)
+                )
+            })
+            .map(|p| (p.id, p.ty.clone()))
+            .collect()
+    } else {
+        HashMap::new()
+    };
+    let region_number_params: HashSet<u32> = region_proofs
+        .iter()
+        .filter(|(_, t)| matches!(t, perry_hir::types::Type::Number))
+        .map(|(id, _)| *id)
+        .collect();
     let mut closure_referenced_ids: HashSet<u32> = HashSet::new();
     collect_ref_ids_in_stmts(body, &mut closure_referenced_ids);
     let mut closure_declared_ids: HashSet<u32> = HashSet::new();
@@ -672,6 +700,27 @@ pub(super) fn compile_closure(
         .copied()
         .collect();
     super::arguments::add_arguments_mapped_boxes(params, Some(body), &mut closure_boxed_vars);
+    // The region proofs that hold for the whole body: the parameter is never
+    // rebound (a Number one also normalized at entry, below).
+    let region_entry_proofs: HashMap<u32, perry_hir::types::Type> = if region_closure {
+        let mut m = crate::collectors::typed_locals::stable_param_proofs(
+            &region_proofs,
+            body,
+            &closure_boxed_vars,
+        );
+        let rebound = crate::collectors::reassigned_locals(body);
+        for id in &region_number_params {
+            if !closure_boxed_vars.contains(id)
+                && !rebound.contains(id)
+                && !crate::collectors::has_any_mutation(body, *id)
+            {
+                m.insert(*id, perry_hir::types::Type::Number);
+            }
+        }
+        m
+    } else {
+        HashMap::new()
+    };
 
     // Allocate slots for the closure's own params (captures don't get
     // alloca slots — they're accessed via the runtime).
@@ -688,11 +737,30 @@ pub(super) fn compile_closure(
         // then flows into unrooted Number storage (a typed local copied from
         // it) and across later safepoints. The map entry itself stays until
         // that drop so `capture_root_base` below keeps the original count.
-        let number_params: HashSet<u32> = typed_body
-            .map(|plan| crate::collectors::typed_locals::number_proof_params(&plan.proofs).collect())
+        let mut number_params: HashSet<u32> = typed_body
+            .map(|plan| {
+                crate::collectors::typed_locals::number_proof_params(&plan.proofs).collect()
+            })
             .unwrap_or_default();
+        number_params.extend(
+            region_entry_proofs
+                .iter()
+                .filter(|(_, t)| matches!(t, perry_hir::types::Type::Number))
+                .map(|(id, _)| *id),
+        );
         for p in params {
             let arg_name = format!("%arg{}", p.id);
+            // A closure region's Number parameter: an int32 box becomes the
+            // equal plain double once, here (`split_regions`).
+            let arg_name = if region_number_params.contains(&p.id) {
+                let is_int = super::typed_entry::emit_int32_box_test(blk, &arg_name);
+                let bits = blk.bitcast_double_to_i64(&arg_name);
+                let low = blk.trunc(I64, &bits, I32);
+                let as_f64 = blk.sitofp(I32, &low, DOUBLE);
+                blk.select(I1, &is_int, DOUBLE, &as_f64, &arg_name)
+            } else {
+                arg_name
+            };
             let slot = super::arguments::store_param_slot(blk, p, &closure_boxed_vars, &arg_name);
             if let Some(slot_idx) = shadow_slot_map
                 .get(&p.id)
@@ -732,6 +800,14 @@ pub(super) fn compile_closure(
             local_types.entry(*id).or_insert_with(|| ty.clone());
         }
     }
+    // The body's one seed set: captured-local proofs (5d) met with the
+    // definite-assignment facts (`typed_locals::outer_proofs`).
+    let outer_proofs = crate::collectors::typed_locals::outer_proofs(
+        cross_module.capture_type_proofs.get(&func_id),
+        &cross_module.definite_init,
+        Some(func_id),
+    );
+    crate::collectors::typed_locals::seed_local_types(&outer_proofs, &mut local_types);
 
     // Build the capture map: each captured LocalId gets the index it
     // occupies in the closure's capture array. Identical logic to the
@@ -916,13 +992,17 @@ pub(super) fn compile_closure(
     // construction under this body's entry proofs (none for a generic
     // body). Number locals join the by-construction set before any root
     // slot is dropped for it.
+    let mut code_unit_locals = std::collections::HashSet::new();
     let typed_locals = crate::collectors::typed_locals::apply(
         body,
-        &typed_body.map(|p| p.proofs.clone()).unwrap_or_default(),
-        cross_module.capture_type_proofs.get(&func_id),
+        &typed_body
+            .map(|p| p.proofs.clone())
+            .unwrap_or_else(|| region_entry_proofs.clone()),
+        &outer_proofs,
         &closure_boxed_vars,
         module_globals,
         &mut native_facts.representation.number_by_construction_locals,
+        &mut code_unit_locals,
     );
     super::helpers::drop_number_local_root_slots(
         &mut shadow_slot_map,
@@ -1102,8 +1182,13 @@ pub(super) fn compile_closure(
         locals,
         local_types,
         // A typed body's entry check (the public dispatcher) proved these.
-        proven_local_types: typed_body.map(|p| p.proofs.clone()).unwrap_or_default(),
+        proven_local_types: typed_body
+            .map(|p| p.proofs.clone())
+            .unwrap_or_else(|| region_proofs.clone()),
         typed_locals,
+        code_unit_locals,
+        confined_arrays: &cross_module.definite_init.confined,
+        confined_array_read: false,
         guarded_discriminant_aliases: std::collections::HashMap::new(),
         module_global_proven_types: &cross_module.module_global_proven_types,
         module_global_transfers: &cross_module.module_global_transfers,
@@ -1131,6 +1216,10 @@ pub(super) fn compile_closure(
         program_layouts: cross_module.program_layouts.clone(),
         wpfacts_sites: 0,
         wpfacts_tested: Vec::new(),
+        wpfacts_off: false,
+        inline_new_leaf: Vec::new(),
+        ctor_receiver: None,
+        ctor_receiver_selector: None,
         wpfacts_this: if captures_this {
             this_stack
                 .last()
@@ -1150,16 +1239,33 @@ pub(super) fn compile_closure(
         in_static_member: false,
         super_called_stack: Vec::new(),
         shared_super_scope_active: false,
-        lexical_this_uses_derived_binding: captures_this
-            && enclosing_class
-                .as_ref()
-                .and_then(|name| classes.get(name).copied())
-                .is_some_and(|class| {
-                    class.extends.is_some()
+        // Only an arrow written inside the derived CONSTRUCTOR (directly or
+        // through enclosing arrows) shares that constructor's uninitialized
+        // `this`. An arrow in a method of the same class has the method's
+        // receiver, which is initialized; checking the runtime binding stack
+        // there reads whichever derived constructor is running — e.g. a base
+        // constructor calling an overridden method (Next.js `NextNodeServer`
+        // during `super()`) — and threw "Must call super constructor".
+        // The class id names the constructor's activation together with the
+        // captured receiver: the runtime stack's top is whichever derived
+        // constructor is running, possibly another object's.
+        lexical_this_uses_derived_binding: enclosing_class
+            .as_ref()
+            .filter(|_| captures_this)
+            .filter(|name| {
+                classes.get(name.as_str()).copied().is_some_and(|class| {
+                    (class.extends.is_some()
                         || class.extends_name.is_some()
                         || class.native_extends.is_some()
-                        || class.extends_expr.is_some()
-                }),
+                        || class.extends_expr.is_some())
+                        && class.constructor.as_ref().is_some_and(|ctor| {
+                            crate::lower_call::ctor_body_lexically_contains_arrow(
+                                &ctor.body, func_id,
+                            )
+                        })
+                })
+            })
+            .map(|name| class_ids.get(name.as_str()).copied().unwrap_or(0)),
         inline_ctor_return: Vec::new(),
         methods,
         module_globals,
@@ -1279,7 +1385,6 @@ pub(super) fn compile_closure(
         i32_counter_slots: HashMap::new(),
         record_packed_admissions: std::collections::HashMap::new(),
         numeric_accumulator_f64_slots: HashMap::new(),
-        transition_cache_base_slot: None,
         receiver_descriptors: Default::default(),
         poll_stride_counter_slot: None,
         deferred_integer_update_accumulators: HashSet::new(),
@@ -1302,6 +1407,7 @@ pub(super) fn compile_closure(
         spec_i32_params: std::collections::HashSet::new(),
         spec_bool_params: std::collections::HashSet::new(),
         typed_element_locals: std::collections::HashSet::new(),
+        create_families: Default::default(),
         class_guard_window: None,
         i1_local_slots: HashMap::new(),
         index_used_locals: native_facts.index_used_locals(),
@@ -1316,7 +1422,6 @@ pub(super) fn compile_closure(
         imported_vars: &cross_module.imported_vars,
         imported_object_literals: &cross_module.imported_object_literals,
         short_spread_method_candidates: &cross_module.short_spread_method_candidates,
-        program_class_accessor_names: cross_module.program_class_accessor_names.as_deref(),
         object_literal_method_candidates: &cross_module.object_literal_method_candidates,
         compile_time_constants: native_facts.compile_time_constants(),
         target_triple: &cross_module.target_triple,
@@ -1386,6 +1491,7 @@ pub(super) fn compile_closure(
         was_unrolled: false,
         ic_site_counter: ic_base,
         ic_globals: Vec::new(),
+        born_let: None,
         typed_parse_rodata: Vec::new(),
         buffer_data_slots: HashMap::new(),
         native_arena_owner_aliases: HashMap::new(),

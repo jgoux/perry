@@ -146,19 +146,27 @@ fn build_async_function_tower() {
 
 /// Complete the async/generator intrinsic constructor and prototype parents
 /// after the global `Function` constructor has been populated.
+///
+/// Each prototype is then sealed under its reserved serial: from here on a
+/// write, delete or relink of it sets its own shadow bit, so an unshadowed
+/// word proves it still holds only the runtime's definitions over
+/// `%Function.prototype%` ([`function_kind_prototype_unwritten`]).
 pub(crate) fn wire_function_intrinsic_parents() {
-    for (ctor_slot, proto_slot) in [
+    for (ctor_slot, proto_slot, serial) in [
         (
             &crate::object::ASYNC_FUNCTION_INTRINSIC_PTR,
             &crate::object::ASYNC_FUNCTION_INTRINSIC_PROTO_PTR,
+            crate::closure::shape::INTRINSIC_SERIAL_ASYNC_FUNCTION,
         ),
         (
             &crate::object::GENERATOR_FUNCTION_INTRINSIC_PTR,
             &crate::object::GENERATOR_INTRINSIC_PROTO_PTR,
+            crate::closure::shape::INTRINSIC_SERIAL_GENERATOR_FUNCTION,
         ),
         (
             &crate::object::ASYNC_GENERATOR_FUNCTION_INTRINSIC_PTR,
             &crate::object::ASYNC_GENERATOR_INTRINSIC_PROTO_PTR,
+            crate::closure::shape::INTRINSIC_SERIAL_ASYNC_GENERATOR_FUNCTION,
         ),
     ] {
         let ctor = ctor_slot.load(Ordering::Acquire);
@@ -188,7 +196,42 @@ pub(crate) fn wire_function_intrinsic_parents() {
                     function_proto.get_nanbox_f64().to_bits(),
                 )
             });
+            // SAFETY: the live, fully built intrinsic, never moved (born old).
+            proto.with_mut_ptr::<ObjectHeader, _>(|proto| unsafe {
+                crate::object::builtin_proto::seal_runtime_prototype(proto, serial)
+            });
         }
+    }
+}
+
+/// Does `kind`'s intrinsic prototype (`%AsyncFunction.prototype%`,
+/// `%GeneratorFunction.prototype%`, `%AsyncGeneratorFunction.prototype%`)
+/// still hold only the runtime's definitions over `%Function.prototype%`?
+/// One load of the realm slot and of the prototype's meta and word: it was
+/// sealed once its parent was wired, and every write, delete or relink since
+/// set its shadow bit. A tower not built or not wired yet answers false.
+#[inline]
+pub(crate) fn function_kind_prototype_unwritten(
+    kind: crate::closure::shape::FunctionProtoKind,
+) -> bool {
+    use crate::closure::shape::FunctionProtoKind;
+    let slot = match kind {
+        FunctionProtoKind::Function => return true,
+        FunctionProtoKind::AsyncFunction => &crate::object::ASYNC_FUNCTION_INTRINSIC_PROTO_PTR,
+        FunctionProtoKind::Generator => &crate::object::GENERATOR_INTRINSIC_PROTO_PTR,
+        FunctionProtoKind::AsyncGenerator => &crate::object::ASYNC_GENERATOR_INTRINSIC_PROTO_PTR,
+    };
+    let proto = slot.load(Ordering::Acquire) as *const ObjectHeader;
+    if proto.is_null() {
+        return false;
+    }
+    // SAFETY: a live realm intrinsic (born old, never moved); its meta record
+    // is null or live.
+    unsafe {
+        let meta = (*proto).meta;
+        !meta.is_null()
+            && (*meta).flags & crate::object::meta_flags::OBJECT_META_FLAG_SEALED_INTRINSIC != 0
+            && (*proto).parent_class_id < crate::object::layout_desc::UNSHADOWED_WORD_END
     }
 }
 
@@ -420,52 +463,6 @@ fn generator_proto_method(
         ),
         None => bad_receiver(method),
     }
-}
-
-/// Declared body identity is the authority for the shared protocol route.
-/// Replacing a slot with another builtin retains ordinary value invocation.
-pub(crate) fn is_sync_generator_protocol_body(code: *const u8) -> bool {
-    code == generator_proto_next_thunk as *const u8
-        || code == generator_proto_return_thunk as *const u8
-        || code == generator_proto_throw_thunk as *const u8
-        || code == generator_proto_iterator_thunk as *const u8
-}
-
-/// A code target justified by the existing memo's generator-family proof.
-/// The selected closure's real intrinsic identity is still checked per use.
-/// These private bodies have the same one-argument ABI as the public methods.
-pub(crate) fn proven_sync_generator_protocol_code(code: *const u8) -> *const u8 {
-    if code == generator_proto_next_thunk as *const u8 {
-        proven_generator_next as *const u8
-    } else if code == generator_proto_return_thunk as *const u8 {
-        proven_generator_return as *const u8
-    } else if code == generator_proto_throw_thunk as *const u8 {
-        proven_generator_throw as *const u8
-    } else {
-        code
-    }
-}
-
-extern "C" fn proven_generator_next(
-    _: *const crate::closure::ClosureHeader,
-    this: crate::closure::JsThis,
-    arg: f64,
-) -> f64 {
-    unsafe { super::generator_state::resume_proven_receiver(this, 0.0, arg) }
-}
-extern "C" fn proven_generator_return(
-    _: *const crate::closure::ClosureHeader,
-    this: crate::closure::JsThis,
-    arg: f64,
-) -> f64 {
-    unsafe { super::generator_state::resume_proven_receiver(this, 1.0, arg) }
-}
-extern "C" fn proven_generator_throw(
-    _: *const crate::closure::ClosureHeader,
-    this: crate::closure::JsThis,
-    arg: f64,
-) -> f64 {
-    unsafe { super::generator_state::resume_proven_receiver(this, 2.0, arg) }
 }
 
 extern "C" fn generator_proto_next_thunk(

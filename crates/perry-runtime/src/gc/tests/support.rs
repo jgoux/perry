@@ -221,9 +221,22 @@ static COPYING_NURSERY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new((
 /// Such tests must take this lock too — reachable crate-wide as
 /// `crate::gc::global_side_table_test_lock()`.
 pub(crate) fn copying_nursery_isolation_lock() -> std::sync::MutexGuard<'static, ()> {
+    // Fixtures under the bare lock (old-generation and trace accounting) count
+    // exact bytes and reads on a pristine thread; keep the implicit bootstrap
+    // off for them. `global_side_table_test_lock` seeds explicitly instead.
+    crate::test_support::opt_out_of_thread_bootstrap();
     COPYING_NURSERY_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The crate-wide test lock (`crate::gc::global_side_table_test_lock`): the
+/// isolation lock plus an explicit per-thread runtime bootstrap
+/// (`crate::test_support::bootstrap_test_thread` covers lock-less fixtures).
+pub(crate) fn global_side_table_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    let guard = copying_nursery_isolation_lock();
+    let _ = crate::state::state();
+    guard
 }
 
 pub(super) fn root_scanner_registry_counts() -> (usize, usize, usize, usize) {
@@ -963,7 +976,7 @@ pub(super) unsafe fn alloc_old_test_object(
     // tests assert on is unchanged.
     let allocated_slots = std::cmp::max(field_count as usize, crate::object::INLINE_SLOT_FLOOR);
     let payload = std::mem::size_of::<crate::object::ObjectHeader>() + allocated_slots * 8;
-    let obj = crate::arena::arena_alloc_gc_old(payload, 8, GC_TYPE_OBJECT)
+    let obj = crate::arena::arena_alloc_gc_old_born_tenured(payload, 8, GC_TYPE_OBJECT)
         as *mut crate::object::ObjectHeader;
     (*obj).class_id = 0;
     // The fixture uses an Ordinary ShapeId; mark its newborn store kind
@@ -1065,7 +1078,7 @@ pub(super) unsafe fn alloc_old_test_array(
     length: u32,
 ) -> (*mut crate::array::ArrayHeader, *mut u64) {
     let payload = std::mem::size_of::<crate::array::ArrayHeader>() + length as usize * 8;
-    let arr = crate::arena::arena_alloc_gc_old(payload, 8, GC_TYPE_ARRAY)
+    let arr = crate::arena::arena_alloc_gc_old_born_tenured(payload, 8, GC_TYPE_ARRAY)
         as *mut crate::array::ArrayHeader;
     (*arr).length = length;
     (*arr).capacity = length;
