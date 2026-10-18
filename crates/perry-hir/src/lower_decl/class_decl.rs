@@ -399,7 +399,21 @@ pub fn lower_class_decl(
             // is unimplemented for the member-expression case generally;
             // this keeps the colliding-name case on par with the rest.
             if parent_name == name {
-                (None, None, None, None)
+                // `class FileStore extends tusFileStore.FileStore`: when the
+                // object is a value the program binds (a `require`d or
+                // imported namespace, not a native module or a global alias)
+                // the member holds a different class that merely shares the
+                // name, so the parent is the evaluated member, found at
+                // construction time. No static name or link is kept: a name
+                // lookup would find this class itself.
+                if member_heritage_object_is_program_value(ctx, member) {
+                    match lower_class_heritage_expr(ctx, super_class) {
+                        Ok(expr) => (None, None, None, Some(Box::new(expr))),
+                        Err(_) => (None, None, None, None),
+                    }
+                } else {
+                    (None, None, None, None)
+                }
             } else if parent_name == "default" {
                 // `class X extends _mod.default` — the interop ESM
                 // default-export-class pattern (Next.js `NextNodeServer
