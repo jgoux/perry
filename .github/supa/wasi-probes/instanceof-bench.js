@@ -1,3 +1,4 @@
+// network: yes (node:stream links the shared net code; supa_net is imported but never called)
 // `instanceof` cost: the left operands Storage's download path passes through
 // fastify's reply.send (`payload instanceof Error`) and an onSend hook
 // (`payload instanceof Blob`) -- a node:fs read stream -- plus the other common
@@ -15,6 +16,7 @@ class Derived extends Base {}
 function Legacy() {}
 
 const rs = fs.createReadStream(file);
+rs.on('error', () => {});
 const subjects = {
   'fs.ReadStream': rs,
   PassThrough: new PassThrough(),
@@ -90,4 +92,5 @@ for (const sk of Object.keys(subjects)) {
 }
 console.log(answers.join('\n'));
 console.error('slow checks (>= 1 ms for one call):', slow);
-fs.unlinkSync(file);
+rs.destroy();
+rs.on('close', () => fs.rmSync(file, { force: true }));
