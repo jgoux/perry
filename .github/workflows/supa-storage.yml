@@ -350,8 +350,13 @@ jobs:
           python3 -I .github/supa/wasi-imports.py --allow-supa-net "$wasm" | tee "$OUT/imports.txt"
           ls -l "$wasm"
           wasm-tools validate "$wasm" 2>&1 | tee "$OUT/validate.txt"
-          wasm-tools strip "$wasm" -o "$OUT/storage.stripped.wasm"
+          # --all drops every custom section: name (function names for wasmtime backtraces,
+          # ~16 MB here), producers, target_features. wasmtime needs none of them to load or
+          # run the module; a trap backtrace shows function indices instead of names.
+          wasm-tools strip "$wasm" | wc -c | sed 's/^/default strip (keeps name): /' | tee "$OUT/strip-sizes.txt"
+          wasm-tools strip --all "$wasm" -o "$OUT/storage.stripped.wasm"
           ls -l "$OUT/storage.stripped.wasm"
+          wasm-tools objdump "$OUT/storage.stripped.wasm" | grep -c 'custom' | sed 's/^/custom sections left: /' | tee -a "$OUT/strip-sizes.txt" || true
       - name: Function source consumers
         if: always()
         run: |
@@ -367,6 +372,7 @@ jobs:
             echo "- jobs: modules=$PERRY_MODULE_JOBS units=$PERRY_CODEGEN_UNIT_JOBS"
             [ -f "$OUT/compile.time" ] && grep -E 'Elapsed|Maximum resident' "$OUT/compile.time" | sed 's/^\s*/- compile: /'
             [ -f "$OUT/storage.wasm" ] && echo "- module: $(stat -c %s "$OUT/storage.wasm") bytes, $(stat -c %s "$OUT/storage.stripped.wasm" 2>/dev/null || echo ?) bytes stripped"
+            [ -f "$OUT/strip-sizes.txt" ] && sed 's/^/- /' "$OUT/strip-sizes.txt"
             echo '```'; [ -f "$OUT/compile.log" ] && grep -E 'Collecting modules|Generating code|Linking|Wrote|codegen: modules finished' "$OUT/compile.log" | tail -n 8; echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           true
@@ -379,6 +385,7 @@ jobs:
             supa-out/compile.time
             supa-out/imports.txt
             supa-out/fn-tostring-scan.txt
+            supa-out/strip-sizes.txt
           if-no-files-found: ignore
       # The compiler and the wasm runtime archive, for compiling small repros in a Linux
       # arm64 container on a dev machine (no LLVM 22 there).
