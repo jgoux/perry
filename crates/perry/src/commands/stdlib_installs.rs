@@ -137,6 +137,36 @@ pub fn install_symbols(features: &BTreeSet<String>) -> Vec<String> {
         .collect()
 }
 
+/// perry-stdlib features the wasm32-wasip1 bundle (`perry-runtime-static`'s
+/// `wasi-node-modules`) is built with. Keep in step with
+/// `WASIP1_STDLIB_FEATURES` in `scripts/wasi_build_runtime.py`.
+///
+/// The bundle links every wrapper crate, so the installer selects these
+/// features rather than `Compiled`: `js_stdlib_install_compiled` leaves out the
+/// `external-*` adapters (they are for a program that links their wrapper), and
+/// without `external-zlib-pump` a captured or `require`d `zlib.gzipSync` finds
+/// no dispatch and returns undefined.
+pub const WASIP1_STDLIB_FEATURES: &[&str] = &[
+    "async-bridge",
+    "bundled-events",
+    "bundled-streams",
+    "crypto",
+    "http-server",
+    "web-fetch",
+    "external-http-client-pump",
+    "external-http-server-pump",
+    "external-net-pump",
+    "external-net-tls",
+    "external-tls-server",
+    "external-ws-pump",
+    "external-zlib-pump",
+];
+
+/// The stdlib installs of a wasm32-wasip1 program.
+pub fn wasip1_stdlib_installs() -> FeatureInstalls {
+    FeatureInstalls::Selected(WASIP1_STDLIB_FEATURES.iter().map(|f| f.to_string()).collect())
+}
+
 /// The install entry points the generated installer calls for `installs`.
 pub fn installer_callees(installs: &FeatureInstalls) -> Vec<String> {
     match installs {

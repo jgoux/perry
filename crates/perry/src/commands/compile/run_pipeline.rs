@@ -7053,7 +7053,7 @@ pub fn run_with_parse_cache(
                     );
                     let stdlib_symbols = ctx.needs_stdlib.then(|| {
                         crate::commands::stdlib_installs::installer_callees(
-                            &crate::commands::stdlib_installs::FeatureInstalls::Compiled,
+                            &crate::commands::stdlib_installs::wasip1_stdlib_installs(),
                         )
                     });
                     let bytes = perry_codegen::stubs::generate_feature_installer_object(
