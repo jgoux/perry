@@ -207,6 +207,11 @@ jobs:
         env:
           WASI_PROBE_NAMES: ${{ inputs.wasi_probe_names }}
         run: .github/supa/wasi-probes.sh $WASI_PROBE_NAMES
+      # Code size of a setjmp function against its calls and live values, with
+      # and without the slot demotion (P55); the table lands in the summary.
+      - name: sjlj code size
+        if: ${{ !cancelled() && inputs.wasi_probe_names == '' }}
+        run: .github/supa/sjlj-size.sh
       - name: Hello module checks
         if: ${{ always() && inputs.wasi_probe_names == '' }}
         run: |

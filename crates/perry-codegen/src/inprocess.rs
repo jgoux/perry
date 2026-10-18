@@ -22,6 +22,7 @@ mod loop_interrupt;
 mod nanbox_operands;
 mod native_homes;
 mod optimize_emit;
+mod sjlj_demote;
 use optimize_emit::optimize_and_emit;
 
 use std::ffi::CString;

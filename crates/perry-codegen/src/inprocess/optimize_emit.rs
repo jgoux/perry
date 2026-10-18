@@ -214,6 +214,26 @@ pub(super) fn optimize_and_emit(
         effective_target,
     );
 
+    // wasm32's setjmp lowering pays (calls x block-crossing values) in code for
+    // every SSA value that lives across a block boundary (P55).
+    if effective_target.starts_with("wasm32") && super::sjlj_demote::enabled() {
+        let demoted = super::sjlj_demote::apply(module);
+        if demoted.values > 0 {
+            if let Err(message) = module.verify() {
+                return Err(anyhow!(
+                    "sjlj slot demotion produced invalid IR:\n{}",
+                    message.to_string()
+                ));
+            }
+            if std::env::var_os("PERRY_CODEGEN_UNIT_TIMINGS").is_some() {
+                eprintln!(
+                    "[perry] codegen: sjlj demotion moved {} values of {} functions to stack slots",
+                    demoted.values, demoted.functions
+                );
+            }
+        }
+    }
+
     let kind = if emit_asm {
         FileType::Assembly
     } else {
