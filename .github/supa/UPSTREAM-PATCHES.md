@@ -71,7 +71,7 @@ Conventions in this file:
 | P47 | bea2d51cb | fix(runtime): start reading when a readable that is not flowing is piped | runtime (node:stream, `node_stream_readwrite.rs`) | all | wasi probe `stream-pipe-starts-read.js` | not tried | PR-AD |
 | P48 | 19f404e40 | fix(runtime): hand a live stream to the function stage of stream.pipeline | runtime (node:stream, `node_stream_pipeline.rs`) | all | wasi probe `stream-pipeline-live-source.js` | not tried | PR-AE |
 | P49 | 32943d82a | fix(runtime): read an http request through Readable.toWeb with the request's own read() | runtime (node:stream web adapter, `node_stream_constructors/web_adapter.rs`) | all | wasi probe `http-request-to-web.js` | not tried | PR-AF |
-| P50 | TBD | fix(hir): extend the member a class heritage names when it shares the class's name | HIR class lowering (`perry-hir/src/lower_decl/class_decl.rs`) | all | wasi probe `class-extends-same-name-member.js` | not tried | PR-AG |
+| P50 | a5ffa98e1 | fix(hir): extend the member a class heritage names when it shares the class's name | HIR class lowering (`perry-hir/src/lower_decl/class_decl.rs`) | all | wasi probe `class-extends-same-name-member.js` | not tried | PR-AG |
 
 All 22 patches except P12's `.github` hunks, P05 and P06 cherry-pick cleanly.
 A stack of every patch except P05 and P06, with P12 limited to `crates/`, also applies cleanly in sequence on `1fd8ca2ae`.
@@ -616,7 +616,7 @@ Not proposed: P05, P06, P15. Upstream fixed the same bugs independently (`4ed616
 - Not covered: the CommonJS spelling `const { Readable } = require('node:stream'); Readable.toWeb(x)` goes through the method-value fallback, which returns a plain object rather than a ReadableStream; a `for await` over `Readable.fromWeb(...)` repeats the last chunk; `push(Uint8Array)` into a non-object-mode Readable yields a Uint8Array, not a Buffer.
 - Upstream: not cherry-picked. Depends on: PR-AD, PR-AE for the probe's roundtrip and pipeline routes. PR-AF.
 
-### P50 TBD fix(hir): extend the member a class heritage names when it shares the class's name
+### P50 a5ffa98e1 fix(hir): extend the member a class heritage names when it shares the class's name
 - Area / platform: HIR class lowering / all targets; seen on wasm32-wasip1.
 - Problem: `class FileStore extends import_file_store.FileStore` (Storage's tus store, esbuild-style CommonJS interop) was lowered without a parent. The base constructor never ran, so `this.configstore`, `this.directory` and the other base fields were undefined and `POST /upload/resumable` failed with `Cannot read properties of undefined (reading 'set')`.
 - Root cause: a member heritage is resolved by its trailing property name, and when that name equals the subclass's own name (issue 4908: `class Agent extends http.Agent`) the lookup finds the subclass itself, so the lowering left the class parentless. That is right for a native-module member but wrong when the object is a value the program binds.
