@@ -333,6 +333,199 @@ check('nullProto hasOwnProperty', show(nullProto['hasOwnProperty'.slice(0)]));
   check('class lost Object.prototype', show(inst['via' + 'Object']) + ' ' + show(arr['via' + 'Object']) + ' ' + show(re['via' + 'Object']) + ' ' + show(f['via' + 'Object']));
 }
 
+// declared-class instances: misses and Object.prototype reads settle per instance, and
+// every change a class chain can see (a method, a data property, a getter, a relinked
+// prototype or instance, Object.prototype itself) is observed on the next read
+{
+  const n = (name) => name.split('').join('');
+  const read = (o, names) => names.map((k) => show(o[n(k)])).join(' ');
+  class Base {
+    a = 1;
+    m() {
+      return 'm';
+    }
+    get acc() {
+      return 'acc ' + this.a;
+    }
+    static st() {}
+    static sv = 5;
+  }
+  class Mid extends Base {
+    b = 2;
+    mm() {}
+  }
+  class Leaf extends Mid {
+    c = 3;
+  }
+  class Plain {
+    p = 1;
+  }
+  const names = ['a', 'b', 'c', 'm', 'mm', 'acc', 'st', 'sv', 'p', 'zz', 'toString', 'hasOwnProperty', 'constructor', '__proto__', 'length', 'name'];
+  const base = new Base();
+  const mid = new Mid();
+  const leaf = new Leaf();
+  const plain = new Plain();
+  for (let round = 0; round < 3; round++) {
+    check('class rows ' + round, [base, mid, leaf, plain].map((o) => read(o, names)).join(' | '));
+  }
+  check('static vs instance', read(Leaf, ['st', 'sv', 'm', 'a', 'zz', 'name']) + ' | ' + read(base, ['st', 'sv']));
+  check('class instance proto links', (Object.getPrototypeOf(leaf) === Leaf.prototype) + ' ' + (Object.getPrototypeOf(Leaf.prototype) === Mid.prototype) + ' ' + (leaf instanceof Base));
+
+  // a prototype method added after the misses settled, then removed
+  const late = 'late' + 'Method';
+  check('class method add: before', read(leaf, [late]) + ' ' + read(plain, [late]));
+  Mid.prototype[late] = function lateMethod() {
+    return 'late';
+  };
+  check('class method add: after', read(leaf, [late]) + ' ' + read(mid, [late]) + ' ' + read(base, [late]) + ' ' + show(leaf[late]()));
+  delete Mid.prototype[late];
+  check('class method add: removed', read(leaf, [late]) + ' ' + read(mid, [late]));
+
+  // a data property added to the root class prototype
+  const dataKey = 'proto' + 'Data';
+  check('class data add: before', read(leaf, [dataKey]) + ' ' + read(mid, [dataKey]));
+  Base.prototype[dataKey] = 42;
+  check('class data add: after', read(leaf, [dataKey]) + ' ' + read(mid, [dataKey]) + ' ' + read(base, [dataKey]) + ' ' + read(plain, [dataKey]));
+  delete Base.prototype[dataKey];
+  check('class data add: removed', read(leaf, [dataKey]) + ' ' + read(base, [dataKey]));
+
+  // a getter defined on Class.prototype after the misses settled
+  const getKey = 'late' + 'Getter';
+  const getterCalls = [];
+  check('class getter: before', read(leaf, [getKey]) + ' ' + read(mid, [getKey]));
+  Object.defineProperty(Mid.prototype, getKey, {
+    get() {
+      getterCalls.push(this.constructor.name);
+      return 'got ' + this.a;
+    },
+    configurable: true,
+  });
+  check('class getter: after', read(leaf, [getKey]) + ' ' + read(mid, [getKey]) + ' ' + read(base, [getKey]) + ' ' + getterCalls.join());
+  delete Mid.prototype[getKey];
+  check('class getter: removed', read(leaf, [getKey]) + ' ' + read(mid, [getKey]));
+  Object.defineProperty(Leaf.prototype, getKey, { value: 'on leaf', configurable: true });
+  check('class defineProperty value', read(leaf, [getKey]) + ' ' + read(mid, [getKey]));
+  delete Leaf.prototype[getKey];
+
+  // Object.prototype additions seen through a class chain
+  const objKey = 'object' + 'Level';
+  check('class Object.prototype: before', read(leaf, [objKey]) + ' ' + read(plain, [objKey]));
+  Object.prototype[objKey] = 'op';
+  check('class Object.prototype: added', read(leaf, [objKey]) + ' ' + read(plain, [objKey]) + ' ' + read(base, [objKey]));
+  Object.defineProperty(Mid.prototype, objKey, { value: 'shadow', configurable: true, writable: true });
+  check('class Object.prototype: shadowed', read(leaf, [objKey]) + ' ' + read(base, [objKey]));
+  delete Mid.prototype[objKey];
+  delete Object.prototype[objKey];
+  check('class Object.prototype: removed', read(leaf, [objKey]) + ' ' + read(plain, [objKey]));
+
+  // own properties shadow and unshadow
+  const ownKey = 'own' + 'Shadow';
+  check('class own: before', read(leaf, [ownKey]));
+  leaf[ownKey] = 'mine';
+  check('class own: set', read(leaf, [ownKey]) + ' ' + read(mid, [ownKey]) + ' ' + Object.keys(leaf).join());
+  delete leaf[ownKey];
+  check('class own: deleted', read(leaf, [ownKey]) + ' ' + Object.keys(leaf).join());
+
+  // Object.setPrototypeOf on an instance
+  const relinkKey = 'relink' + 'Key';
+  const donor = { [relinkKey]: 'donor', a: 'donor a' };
+  const movable = new Leaf();
+  check('class setPrototypeOf instance: before', read(movable, [relinkKey, 'a', 'm']));
+  Object.setPrototypeOf(movable, donor);
+  check('class setPrototypeOf instance: donor', read(movable, [relinkKey, 'a', 'm', 'c', 'toString']));
+  Object.setPrototypeOf(movable, Mid.prototype);
+  check('class setPrototypeOf instance: Mid', read(movable, [relinkKey, 'a', 'm', 'mm', 'c']));
+  Object.setPrototypeOf(movable, null);
+  check('class setPrototypeOf instance: null', read(movable, [relinkKey, 'm', 'toString', 'c']));
+  Object.setPrototypeOf(movable, Leaf.prototype);
+  check('class setPrototypeOf instance: back', read(movable, [relinkKey, 'm', 'toString', 'c']));
+  const viaProto = new Leaf();
+  viaProto.__proto__ = donor;
+  check('class __proto__ set instance', read(viaProto, [relinkKey, 'm', 'c']));
+
+  // Object.setPrototypeOf on a class prototype
+  const protoKey = 'proto' + 'Link';
+  const target = new Leaf();
+  const otherChain = { [protoKey]: 'other chain', m: 'other m' };
+  check('class setPrototypeOf prototype: before', read(target, [protoKey, 'm', 'mm']));
+  const originalMid = Object.getPrototypeOf(Mid.prototype);
+  Object.setPrototypeOf(Mid.prototype, otherChain);
+  check('class setPrototypeOf prototype: other', read(target, [protoKey, 'm', 'mm', 'a', 'b']) + ' ' + read(new Leaf(), [protoKey, 'm']));
+  Object.setPrototypeOf(Mid.prototype, originalMid);
+  check('class setPrototypeOf prototype: restored', read(target, [protoKey, 'm', 'mm']));
+  Object.setPrototypeOf(Leaf.prototype, null);
+  check('class setPrototypeOf prototype: null', read(target, [protoKey, 'm', 'mm', 'toString', 'c']));
+  Object.setPrototypeOf(Leaf.prototype, Mid.prototype);
+  check('class setPrototypeOf prototype: back', read(target, [protoKey, 'm', 'mm', 'toString']));
+
+  // Function.prototype swaps and frozen prototypes
+  const frozen = new Plain();
+  Object.freeze(Plain.prototype);
+  check('class frozen prototype', read(frozen, ['p', 'zz', 'toString']));
+  let frozenWrite = 'no throw';
+  try {
+    Plain.prototype.zz = 'ignored';
+  } catch (e) {
+    frozenWrite = e.constructor.name;
+  }
+  check('class frozen prototype write', frozenWrite + ' ' + read(frozen, ['zz']));
+
+  // classes with accessors, statics, private names, native parents and null parents
+  class WithAccessor {
+    #secret = 7;
+    get visible() {
+      return this.#secret;
+    }
+    set visible(v) {
+      this.#secret = v;
+    }
+  }
+  const wa = new WithAccessor();
+  check('class accessor', read(wa, ['visible', 'secret', '#secret', 'zz']));
+  class NullParent extends null {
+    constructor() {
+      return Object.create(NullParent.prototype);
+    }
+  }
+  const np = new NullParent();
+  check('class extends null', read(np, ['toString', 'zz', 'constructor']) + ' ' + (Object.getPrototypeOf(NullParent.prototype) === null));
+  class MyArray extends Array {
+    own = 1;
+  }
+  const ma = new MyArray();
+  ma.push(1, 2);
+  check('class extends Array', read(ma, ['own', 'length', '0', 'zz', 'push', 'toString']));
+  class MyMap extends Map {}
+  const mm2 = new MyMap([['k', 1]]);
+  check('class extends Map', read(mm2, ['size', 'zz', 'get', 'toString']));
+  class MyError extends Error {
+    extra = 1;
+  }
+  const me = new MyError('boom');
+  check('class extends Error', read(me, ['message', 'extra', 'zz', 'name', 'toString']));
+  const Expr = class {
+    e = 1;
+  };
+  const ex = new Expr();
+  Expr.prototype.viaExpr = 'expr';
+  check('class expression', read(ex, ['e', 'viaExpr', 'zz']));
+
+  // one class expression evaluated twice: instances keep their own chains
+  const make = () =>
+    class {
+      v = 1;
+    };
+  const C1 = make();
+  const C2 = make();
+  const i1 = new C1();
+  const i2 = new C2();
+  const evalKey = 'eval' + 'Key';
+  check('per-evaluation classes: before', read(i1, [evalKey]) + ' ' + read(i2, [evalKey]));
+  C1.prototype[evalKey] = 'c1';
+  check('per-evaluation classes: after', read(i1, [evalKey]) + ' ' + read(i2, [evalKey]));
+  check('per-evaluation classes: fresh', read(new C1(), [evalKey]) + ' ' + read(new C2(), [evalKey]));
+}
+
 // missing reads that are `in`/hasOwn consistent
 {
   const o = { a: 1, u: undefined };
