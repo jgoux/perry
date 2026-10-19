@@ -139,11 +139,11 @@ on:
         description: Space-separated wasi probe names to run in the wasi-linux job (default all)
         default: ''
       extra_env:
-        description: "Space-separated KEY=VAL pairs exported in the storage-wasi job before the compile steps (code-size experiments); part of the object cache id"
-        default: ''
+        description: "Space-separated KEY=VAL pairs exported in the storage-wasi job before the compile steps (code-size settings); part of the object cache id. The default is the size configuration of the shipped module: no typed closure bodies, full outlined inline caches, static wasm32 relocation (empty for the compiler's defaults, for A/B runs)"
+        default: 'PERRY_TYPED_BODIES=0 PERRY_FULL_OUTLINE_IC=1 PERRY_WASM_STATIC_RELOC=1'
       runtime_opt_level:
         description: "Opt-level (0-3, s, z) of the wasm32-wasip1 runtime archive built in the storage-wasi job (empty = the profile's); part of the object cache id"
-        default: ''
+        default: 's'
       smoke_baseline_run:
         description: Run id whose storage-wasi-module artifact the storage-wasi-smoke job also runs, on the same host, to compare with (empty to skip)
         default: ''
