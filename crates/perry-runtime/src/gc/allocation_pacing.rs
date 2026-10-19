@@ -173,6 +173,7 @@ pub(crate) fn burst_boundary() -> bool {
             return false;
         }
     }
+    super::telemetry::note_old_reclaim_why("burst");
     super::policy::GC_OLD_RECLAIM_PENDING.with(|pending| pending.set(true));
     true
 }
