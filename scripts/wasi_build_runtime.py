@@ -59,8 +59,10 @@ def main() -> int:
     # release opt-level of the whole archive, perry-runtime's own override included.
     opt_level = os.environ.get("PERRY_WASI_RUNTIME_OPT_LEVEL", "")
     if opt_level:
-        command += ["--config", f'profile.release.opt-level="{opt_level}"',
-                    "--config", f'profile.release.package.perry-runtime.opt-level="{opt_level}"']
+        # Cargo takes the numeric levels as integers and only s and z as strings.
+        value = opt_level if opt_level.isdigit() else f'"{opt_level}"'
+        command += ["--config", f"profile.release.opt-level={value}",
+                    "--config", f"profile.release.package.perry-runtime.opt-level={value}"]
     # Cargo may legitimately reuse a fresh archive. Observe the target
     # artifact message instead of requiring an mtime change on every build.
     required = {"perry_runtime"}
