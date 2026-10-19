@@ -31,7 +31,8 @@ run() { # label cwasm tag bytes [guest env...]
   local label=$1 module=$2 tag=$3 bytes=$4; shift 4
   local name=${label}_$tag db=st_${label}_$tag
   local data="$out/data_$name" log="$out/host_$name.log" smoke="$out/smoke_$name.txt"
-  psql -h 127.0.0.1 -p "$pgport" -U postgres -q -c "drop database if exists $db" -c "create database $db" || return 1
+  psql -h 127.0.0.1 -p "$pgport" -U postgres -q -c "drop database if exists $db" -c "create database $db" \
+    || { echo "$name NOT-RUN (database setup failed)" | tee -a "$out/results.txt"; rc=1; return 1; }
   rm -rf "$data"; mkdir -p "$data"
   local guest_env=(); for e in "$@"; do guest_env+=(--env "$e"); done
   local start; start=$(now)
