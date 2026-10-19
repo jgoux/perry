@@ -312,7 +312,9 @@ pub use self::splice_slice::{
 pub(crate) use self::alloc::array_length_from_property_value_or_throw;
 #[cfg(feature = "regex-engine")]
 pub(crate) use self::alloc::js_array_alloc_named_props_reserved;
-pub(crate) use self::alloc::{js_array_from_arraylike, js_array_from_string_codepoints};
+pub(crate) use self::alloc::{
+    arraylike_has_no_indexed_properties, js_array_from_arraylike, js_array_from_string_codepoints,
+};
 pub(crate) use self::flat_clone::{
     dense_spread_copy, dense_spread_source, flattenable_array_ptr, plain_call_spread_source,
 };

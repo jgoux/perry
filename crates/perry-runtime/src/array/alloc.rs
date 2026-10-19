@@ -452,7 +452,7 @@ pub(crate) unsafe fn js_array_from_arraylike_holey(
 /// given an indexed property (`OBJECT_PROTO_HAS_INDEX`, flipped by every
 /// index write / `defineProperty` on it, so a later addition is seen by the
 /// next call). Anything else keeps the spec-shaped per-index walk.
-unsafe fn arraylike_has_no_indexed_properties(obj: *const crate::object::ObjectHeader) -> bool {
+pub(crate) unsafe fn arraylike_has_no_indexed_properties(obj: *const crate::object::ObjectHeader) -> bool {
     if crate::array::object_prototype_has_index_flag() {
         return false;
     }
