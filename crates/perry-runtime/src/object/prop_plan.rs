@@ -14,7 +14,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// installs/clears, prototype recording, and every GC collection (intern-table
 /// scan + dead-owner prune). Entries recorded under an older epoch never
 /// match.
+#[cfg(not(test))]
 static PROP_PLAN_EPOCH: AtomicU64 = AtomicU64::new(1);
+#[cfg(test)]
+static PROP_PLAN_EPOCH: test_epochs::ThreadEpoch =
+    test_epochs::ThreadEpoch(&test_epochs::PLAN_EPOCH);
 
 /// The SEMANTIC half of [`PROP_PLAN_EPOCH`]: bumped by exactly the events that
 /// change what a property lookup would ANSWER — descriptor installs and clears,
@@ -34,7 +38,51 @@ static PROP_PLAN_EPOCH: AtomicU64 = AtomicU64::new(1);
 /// into an unconditional recompute. Measured on `gc-handoff/apps/asyncpipe.ts`:
 /// +35 % instructions versus baseline, against −24.6 % with the recompute
 /// eliminated (#7910).
+#[cfg(not(test))]
 static PROP_PLAN_SEMANTIC_EPOCH: AtomicU64 = AtomicU64::new(1);
+#[cfg(test)]
+static PROP_PLAN_SEMANTIC_EPOCH: test_epochs::ThreadEpoch =
+    test_epochs::ThreadEpoch(&test_epochs::SEMANTIC_EPOCH);
+
+/// Test builds count both epochs PER THREAD.
+///
+/// In a product build the epochs are process-global so that one thread's
+/// mutation retires every thread's cached verdicts. Under the default test
+/// harness that turns every test into a source of invalidations for every
+/// other one: any property mutation, descriptor install or collection on a
+/// parallel test thread lands inside another test's "record, check, bump,
+/// check" sequence and flushes a verdict the test just recorded. Each test
+/// runs on its own thread with its own thread-local caches, so a per-thread
+/// epoch gives it exactly the invalidation events it causes itself. Retrying
+/// with fresh ids would only hide the interference.
+#[cfg(test)]
+mod test_epochs {
+    use std::cell::Cell;
+    use std::sync::atomic::Ordering;
+    use std::thread::LocalKey;
+
+    thread_local! {
+        pub(super) static PLAN_EPOCH: Cell<u64> = const { Cell::new(1) };
+        pub(super) static SEMANTIC_EPOCH: Cell<u64> = const { Cell::new(1) };
+    }
+
+    /// The `AtomicU64` surface the epoch call sites use, over a thread-local.
+    pub(super) struct ThreadEpoch(pub(super) &'static LocalKey<Cell<u64>>);
+
+    impl ThreadEpoch {
+        pub(super) fn load(&self, _: Ordering) -> u64 {
+            self.0.with(Cell::get)
+        }
+
+        pub(super) fn fetch_add(&self, n: u64, _: Ordering) -> u64 {
+            self.0.with(|cell| {
+                let old = cell.get();
+                cell.set(old + n);
+                old
+            })
+        }
+    }
+}
 
 /// Invalidate every cached store plan. Cheap (two relaxed adds); callers are
 /// rare, cold paths by construction.

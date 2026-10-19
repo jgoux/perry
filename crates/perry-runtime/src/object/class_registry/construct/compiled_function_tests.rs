@@ -316,30 +316,22 @@ fn classless_function_births_learn_width_from_the_actual_prototype() {
 fn classless_function_store_records_a_shape_plan() {
     let _global = crate::gc::global_side_table_test_lock();
     let _no_move = crate::gc::GcSuppressScope::new();
-    let func = compiled_function();
+    let instance = construct(compiled_function());
     let key = crate::string::intern_ascii_literal(b"shape_plan_field");
-    // The plan epoch is process-global (every collection and descriptor
-    // install on any thread bumps it), so a bump landing between the store
-    // and the check legitimately flushes the verdict. Retry with a fresh
-    // instance per lap: a real recording regression fails every lap, while
-    // a concurrent bump costs one.
-    let mut shape = 0;
-    let recorded = (0..64).any(|_| unsafe {
-        let instance = construct(func);
-        shape = crate::object::shapes::object_shape_stamp(instance);
+    unsafe {
+        let shape = crate::object::shapes::object_shape_stamp(instance);
         assert_eq!((*instance).class_id, 0);
         crate::object::js_object_set_field_by_name(instance, key, 7.0);
-        crate::object::prop_plan::store_plan_check(shape, key as usize)
-    });
-    assert!(
-        recorded,
-        "a full negative vet records the classless predecessor shape"
-    );
-    crate::object::prop_plan::prop_plan_epoch_bump();
-    assert!(!crate::object::prop_plan::store_plan_check(
-        shape,
-        key as usize
-    ));
+        assert!(
+            crate::object::prop_plan::store_plan_check(shape, key as usize),
+            "a full negative vet records the classless predecessor shape"
+        );
+        crate::object::prop_plan::prop_plan_epoch_bump();
+        assert!(!crate::object::prop_plan::store_plan_check(
+            shape,
+            key as usize
+        ));
+    }
 }
 
 #[test]

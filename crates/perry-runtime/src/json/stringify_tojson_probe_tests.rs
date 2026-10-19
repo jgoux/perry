@@ -207,37 +207,34 @@ fn probe_test_method_bits() -> u64 {
 
 #[test]
 fn class_chain_tojson_memo_reuses_a_verdict_until_a_generation_moves() {
-    // The memo is keyed on the PROCESS-global semantic epoch, which any
-    // parallel test's property mutation bumps at any moment; a bump landing
-    // inside the sequence retires the entry early and spoils the exact
-    // recompute counts. Retry on a fresh class id per attempt: a genuine
-    // memo regression fails every attempt, a concurrent bump costs one.
-    let attempt = |class_id: u32| -> bool {
-        super::test_reset_class_chain_tojson_recomputes();
-        let first = super::test_class_chain_may_have_to_json(class_id);
-        let recomputes = super::test_class_chain_tojson_recomputes;
-        if recomputes() != 1 {
-            return false;
-        }
-        // An unchanged generation pair must reuse the recorded verdict.
-        if super::test_class_chain_may_have_to_json(class_id) != first || recomputes() != 1 {
-            return false;
-        }
-        // A semantic property mutation must retire the entry.
-        crate::object::prop_plan::prop_plan_epoch_bump();
-        if super::test_class_chain_may_have_to_json(class_id) != first || recomputes() != 2 {
-            return false;
-        }
-        // A class lookup-surface mutation must retire the entry.
-        crate::object::shapes::write_identity_word(
-            crate::object::shapes::PROTO_ID_CLASS | u64::from(class_id),
-            crate::value::TAG_UNDEFINED,
-        );
-        super::test_class_chain_may_have_to_json(class_id) && recomputes() == 3
-    };
-    assert!(
-        (0..64).any(|n| attempt(probe_test_class_id(0x100 + n))),
-        "the memo must reuse an unchanged verdict and retire it on a semantic or class-surface mutation"
+    let class_id = probe_test_class_id(0x01);
+    super::test_reset_class_chain_tojson_recomputes();
+    let first = super::test_class_chain_may_have_to_json(class_id);
+    assert_eq!(super::test_class_chain_tojson_recomputes(), 1);
+    assert_eq!(super::test_class_chain_may_have_to_json(class_id), first);
+    assert_eq!(
+        super::test_class_chain_tojson_recomputes(),
+        1,
+        "an unchanged generation pair must reuse the recorded verdict"
+    );
+
+    crate::object::prop_plan::prop_plan_epoch_bump();
+    assert_eq!(super::test_class_chain_may_have_to_json(class_id), first);
+    assert_eq!(
+        super::test_class_chain_tojson_recomputes(),
+        2,
+        "a semantic property mutation must retire the entry"
+    );
+
+    crate::object::shapes::write_identity_word(
+        crate::object::shapes::PROTO_ID_CLASS | u64::from(class_id),
+        crate::value::TAG_UNDEFINED,
+    );
+    assert!(super::test_class_chain_may_have_to_json(class_id));
+    assert_eq!(
+        super::test_class_chain_tojson_recomputes(),
+        3,
+        "a class lookup-surface mutation must retire the entry"
     );
 }
 
@@ -461,23 +458,15 @@ fn class_chain_tojson_memo_holds_every_shape_of_one_nested_literal() {
     // 448-instruction registry walk on EVERY operation — which is what a
     // 16-slot table indexed by `>> 12` did (#10696).
     let ids: Vec<u32> = (0..5).map(|n| probe_test_class_id(0x70 + n)).collect();
-    // The memo is keyed on the PROCESS-global semantic epoch, which a
-    // parallel test's property mutation bumps at any time and which
-    // legitimately retires every entry (one extra recompute per id). Retry
-    // the measurement: a table that evicts shape ids recomputes on every lap
-    // of every attempt, while a concurrent bump only spoils one attempt.
-    let held = (0..64).any(|_| {
-        super::test_reset_class_chain_tojson_recomputes();
-        for _ in 0..50 {
-            for &id in &ids {
-                let _ = super::test_class_chain_may_have_to_json(id);
-            }
+    super::test_reset_class_chain_tojson_recomputes();
+    for _ in 0..50 {
+        for &id in &ids {
+            let _ = super::test_class_chain_may_have_to_json(id);
         }
-        // A cold attempt fills each id once; a retry finds them warm.
-        super::test_class_chain_tojson_recomputes() <= ids.len() as u64
-    });
-    assert!(
-        held,
+    }
+    assert_eq!(
+        super::test_class_chain_tojson_recomputes(),
+        ids.len() as u64,
         "consecutive shape ids of one walk must each keep their own slot"
     );
 }
