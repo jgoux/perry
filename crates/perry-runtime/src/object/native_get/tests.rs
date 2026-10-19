@@ -432,6 +432,13 @@ fn plain_object(name: &str, value: f64) -> *mut ObjectHeader {
     object
 }
 
+/// An instance of an object literal's synthetic anon-shape class, the way
+/// codegen births `{}` and `{ a: 1 }`: a nonzero class id, no birth mark.
+fn anon_shape_object(class_id: u32) -> *mut ObjectHeader {
+    unsafe { crate::object::js_register_anon_shape_class_id(class_id) };
+    crate::object::js_object_alloc_class_with_keys(class_id, 0, 0, std::ptr::null(), 0)
+}
+
 fn marked(receiver: f64) -> f64 {
     unsafe {
         crate::object::mark_object_plain_ordinary(
@@ -514,6 +521,11 @@ fn settled_named_reads_match_the_generic_ladder_across_receiver_kinds() {
     let grandchild = marked(js_object_create(child));
     let with_getter = plain_object("a", 1.0);
     install_getter(with_getter, "missing", true);
+    let anon = anon_shape_object(0x5A00_0001);
+    js_object_set_field_by_name(anon, key("a"), 1.0);
+    let anon_empty = anon_shape_object(0x5A00_0002);
+    let anon_getter = anon_shape_object(0x5A00_0003);
+    install_getter(anon_getter, "missing", true);
     let wide = js_object_alloc(0, 0);
     marked(boxed(wide));
     for i in 0..100 {
@@ -540,6 +552,9 @@ fn settled_named_reads_match_the_generic_ladder_across_receiver_kinds() {
     settled_matches_generic(child, "child of plain");
     settled_matches_generic(grandchild, "grandchild of plain");
     settled_matches_generic(boxed(with_getter), "own getter");
+    settled_matches_generic(boxed(anon), "anon-shape literal");
+    settled_matches_generic(boxed(anon_empty), "anon-shape empty literal");
+    settled_matches_generic(boxed(anon_getter), "anon-shape literal with a getter");
     settled_matches_generic(boxed(wide), "wide");
     settled_matches_generic(boxed(object_prototype_ptr), "Object.prototype");
     settled_matches_generic(crate::value::js_nanbox_pointer(array as i64), "array");
@@ -589,6 +604,46 @@ fn the_settled_miss_is_taken_only_for_plain_ordinary_receivers() {
         0,
     );
     assert_eq!(settled(arguments, "missing"), None);
+}
+
+#[test]
+fn an_anon_shape_literal_settles_until_its_class_gains_a_surface() {
+    let _no_gc = crate::gc::GcSuppressScope::new();
+    let _ = crate::object::builtin_prototype_value("Object");
+    let settled = |object: *mut ObjectHeader, name: &str| unsafe {
+        try_settled_get_by_name(object, key(name)).map(|value| value.bits())
+    };
+    let undefined = crate::value::TAG_UNDEFINED;
+    let class_id = 0x5A00_0010;
+    let literal = anon_shape_object(class_id);
+    js_object_set_field_by_name(literal, key("a"), 1.0);
+    assert_eq!(settled(literal, "a"), Some(1.0f64.to_bits()));
+    assert_eq!(settled(literal, "missing"), Some(undefined));
+    assert_ne!(settled(literal, "toString"), Some(undefined));
+    // An id that is a declared class (a name and a method) keeps the generic
+    // read, even when an anon-shape id once had the same number.
+    unsafe {
+        crate::object::js_register_class_name(class_id, b"Declared".as_ptr(), 8);
+        crate::object::js_register_class_method(
+            class_id as i64,
+            b"run".as_ptr(),
+            3,
+            0 as usize as i64,
+            0,
+            0,
+            0,
+        );
+    }
+    assert_eq!(settled(literal, "missing"), None);
+    // A class id nothing registered as an anon shape never settles.
+    let foreign = crate::object::js_object_alloc_class_with_keys(
+        0x5A00_0011,
+        0,
+        0,
+        std::ptr::null(),
+        0,
+    );
+    assert_eq!(settled(foreign, "missing"), None);
 }
 
 #[test]

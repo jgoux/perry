@@ -62,10 +62,13 @@ pub(crate) unsafe fn own_data_shape(dir: *const u8, shape_id: u32) -> Option<Opt
 /// also answers keys no link lists, for receivers whose reads are not decided
 /// by their shape alone: class instances and their getters, brands, exotic and
 /// native-backed cells, `arguments`, `process.env`, per-object prototypes. This
-/// admits only the receiver the runtime itself birthed as an ordinary plain
-/// object (`OBJ_FLAG_PLAIN_ORDINARY`, no class id) whose live shape is the
-/// plain `Ordinary` kind and whose [[Prototype]] is the realm default or null
-/// by identity, never a recorded link. Anything else keeps the generic read.
+/// admits only an ordinary plain object: either one the runtime birthed class-
+/// less and marked (`OBJ_FLAG_PLAIN_ORDINARY`, no class id), or an instance of
+/// an object literal's synthetic anon-shape class that no registry knows
+/// anything else about (`class_id_admissible`, the proof the thenable probe
+/// already relies on). Its live shape must be the plain `Ordinary` kind and its
+/// [[Prototype]] the realm default or null by identity, never a recorded link.
+/// Anything else keeps the generic read.
 ///
 /// # Safety
 /// `object` is a pointer the data walk accepted as a shaped `ObjectHeader`.
@@ -82,8 +85,15 @@ pub(crate) unsafe fn plain_receiver_miss_is_final(object: *const ObjectHeader, k
     let addr = object as usize;
     if !crate::value::addr_class::is_above_handle_band(addr)
         || !addr.is_multiple_of(std::mem::align_of::<ObjectHeader>())
-        || (*object).class_id != 0
     {
+        return false;
+    }
+    // A literal `{ ... }` is an instance of a synthetic anon-shape class, so its
+    // class id is nonzero and it carries no birth mark; the class identity is
+    // the proof there. A class-less receiver needs the birth mark instead.
+    let class_id = (*object).class_id;
+    let classless = class_id == 0;
+    if !classless && !crate::promise::then_probe::class_id_admissible(class_id) {
         return false;
     }
     let header = &*crate::gc::header_from_trusted_user_ptr(object.cast());
@@ -93,7 +103,8 @@ pub(crate) unsafe fn plain_receiver_miss_is_final(object: *const ObjectHeader, k
         | OBJ_FLAG_HAS_DESCRIPTORS;
     if header.obj_type != GC_TYPE_OBJECT
         || header.gc_flags & (GC_FLAG_ARENA | GC_FLAG_FORWARDED) != GC_FLAG_ARENA
-        || header._reserved & (BLOCKING | OBJ_FLAG_PLAIN_ORDINARY) != OBJ_FLAG_PLAIN_ORDINARY
+        || header._reserved & BLOCKING != 0
+        || (classless && header._reserved & OBJ_FLAG_PLAIN_ORDINARY == 0)
     {
         return false;
     }
