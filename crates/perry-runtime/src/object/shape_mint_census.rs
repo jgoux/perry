@@ -198,13 +198,18 @@ fn sink() -> &'static Option<Sink> {
 /// production build.
 #[inline]
 pub(crate) fn armed() -> bool {
+    // A test arms the census for the thread that holds `Capture` only, so a
+    // mint on any concurrently running test cannot move its counters. The
+    // process-global `STATE` plays no part in a test build: a thread resolving
+    // it for the first time wrote "off" over the "on" a capture had just
+    // swapped in, and the capture then saw no mint at all.
+    #[cfg(test)]
+    {
+        TEST_CAPTURE_THREAD.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
     match STATE.load(Ordering::Relaxed) {
         1 => false,
-        // A test arms the census for the thread that holds `Capture` only, so
-        // a mint on any concurrently running test cannot move its counters.
-        #[cfg(test)]
-        2 => TEST_CAPTURE_THREAD.with(std::cell::Cell::get),
-        #[cfg(not(test))]
         2 => true,
         _ => resolve_arming(),
     }
@@ -222,6 +227,7 @@ static TEST_COUNTER_SERIAL: Mutex<()> = Mutex::new(());
 
 #[cold]
 #[inline(never)]
+#[cfg_attr(test, allow(dead_code))]
 fn resolve_arming() -> bool {
     let on = sink().is_some();
     // Idempotent: every thread computes the same answer from the same env.
@@ -927,9 +933,11 @@ mod tests {
     /// without it, so this also pins that a test run never accumulates state.
     #[test]
     fn the_census_is_unarmed_by_default() {
-        let _serial = TEST_COUNTER_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = TEST_COUNTER_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         assert!(
-            !armed(),
+            !armed() && !resolve_arming(),
             "PERRY_SHAPE_MINT_DIAG must not be set in the test env"
         );
         note_memo_hit();
