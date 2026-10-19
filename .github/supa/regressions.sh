@@ -45,6 +45,8 @@ case "${1:?build|run}" in
       the_module_body_frame_is_labelled_with_the_module_path
       bare_enum_identifier_materializes_the_enum_object
       elf_startup_registration_lands_in_init_array
+      inline_cache_reads_native_alias_state_without_caching_a_miss
+      the_census_is_unarmed_by_default
       non_elf_startup_registration_keeps_global_ctors
     )
     out=$(mktemp)

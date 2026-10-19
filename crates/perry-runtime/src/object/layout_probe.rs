@@ -1285,8 +1285,16 @@ unsafe fn listed(obj: *const ObjectHeader, kind: super::ShapeObjectKind) -> bool
                 _ => false,
             };
     }
+    // A native alias keeps its own keys in the layout, but an absent key may
+    // still be the aliased handle's: only a marked ordinary receiver takes the
+    // `OrdinaryNativeAlias` kind, so an unmarked one (`new F()` of a plain
+    // function, whose `F.call` aliases it) carries the alias in its meta flag
+    // alone.
     if kind != super::ShapeObjectKind::OrdinaryUnmarked
-        || flags & crate::object::OBJECT_META_FLAG_EXOTIC_READ_RECEIVER != 0
+        || flags
+            & (crate::object::OBJECT_META_FLAG_EXOTIC_READ_RECEIVER
+                | crate::object::OBJECT_META_FLAG_NATIVE_ALIAS)
+            != 0
     {
         return false;
     }
@@ -1611,7 +1619,9 @@ unsafe fn inherited_walk<const ABSENT: bool>(
             // overflow) whose chain ends here proves absence.
             if (*rc).object_kind() == super::ShapeObjectKind::OrdinaryUnmarked
                 && ((*cur).meta.is_null()
-                    || (*(*cur).meta).flags & crate::object::OBJECT_META_FLAG_EXOTIC_READ_RECEIVER
+                    || (*(*cur).meta).flags
+                        & (crate::object::OBJECT_META_FLAG_EXOTIC_READ_RECEIVER
+                            | crate::object::OBJECT_META_FLAG_NATIVE_ALIAS)
                         == 0)
                 && matches!(prototype_of(dir, cur, rc), Next::End)
             {
