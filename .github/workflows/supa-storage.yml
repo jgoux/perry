@@ -325,6 +325,9 @@ jobs:
           "$GITHUB_WORKSPACE/.github/supa/shims.sh" .
           export PERRY_OBJECT_CACHE_BUILD_ID=${{ steps.objid.outputs.id }}
           export PERRY_NO_AUTO_OPTIMIZE=1 PERRY_KEEP_SYMBOLS=1
+          # Keep `function name(params) { /* source elided */ }` instead of each function's full source:
+          # fn-tostring-scan.txt lists every reader of a function's text in Storage's dependencies.
+          export PERRY_FUNCTION_SOURCE=header
           echo "jobs: modules=$PERRY_MODULE_JOBS units=$PERRY_CODEGEN_UNIT_JOBS"
           set +e
           /usr/bin/time -v -o "$OUT/compile.time" \
