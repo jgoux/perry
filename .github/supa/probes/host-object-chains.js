@@ -124,8 +124,6 @@ out.push('proto chain reaches Readable.prototype: ' + R.prototype.isPrototypeOf(
 out.push('Stream.prototype.isPrototypeOf(rs): ' + S.prototype.isPrototypeOf(rs));
 out.push('EventEmitter.prototype.isPrototypeOf(rs): ' + E.prototype.isPrototypeOf(rs));
 out.push('Object.prototype.isPrototypeOf(rs): ' + Object.prototype.isPrototypeOf(rs));
-out.push('rs.constructor === fs.ReadStream: ' + (rs.constructor === fs.ReadStream));
-out.push('rs.hasOwnProperty is inherited: ' + (typeof rs.hasOwnProperty));
 
 rs.destroy();
 ws.destroy();

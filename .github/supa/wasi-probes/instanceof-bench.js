@@ -57,6 +57,7 @@ for (const k of Object.keys(subjects)) {
 const now = () => Number(process.hrtime.bigint()) / 1e6;
 const answers = [];
 let slow = 0;
+let readStreamInReadable = NaN;
 for (const sk of Object.keys(subjects)) {
   const v = subjects[sk];
   const row = [];
@@ -79,6 +80,7 @@ for (const sk of Object.keys(subjects)) {
     } else {
       slow++;
     }
+    if (sk === 'fs.ReadStream' && tk === 'Readable') readStreamInReadable = per;
     console.error(
       'bench',
       sk.padEnd(14),
@@ -91,6 +93,7 @@ for (const sk of Object.keys(subjects)) {
   answers.push(sk + ' ' + row.join(''));
 }
 console.log(answers.join('\n'));
+console.error('summary: fs.ReadStream instanceof Readable', (readStreamInReadable * 1000).toFixed(2), 'us/op');
 console.error('slow checks (>= 1 ms for one call):', slow);
 rs.destroy();
 rs.on('close', () => fs.rmSync(file, { force: true }));
