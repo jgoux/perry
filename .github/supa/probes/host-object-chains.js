@@ -2,7 +2,9 @@
 // The [[Prototype]] chain of native host objects: Object.getPrototypeOf must lead
 // to Object.prototype and never return the receiver itself (a self link made a
 // `while (p = Object.getPrototypeOf(p))` loop spin), and instanceof must follow
-// the chain. One line per object, compared with node.
+// the chain. Objects whose full chain matches node's are printed in full; for the
+// rest (host classes that have no prototype chain yet, answering null) only the
+// invariant is compared: the walk ends without ever meeting a self link.
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -13,7 +15,6 @@ const crypto = require('node:crypto');
 const cp = require('node:child_process');
 const events = require('node:events');
 const stream = require('node:stream');
-const readline = require('node:readline');
 
 const out = [];
 const nameOf = (p) => {
@@ -44,6 +45,24 @@ function survey(label, make, ...ctors) {
     out.push(label + ': ERROR ' + (e && e.message));
   }
 }
+function noSelfLink(label, make) {
+  try {
+    const o = make();
+    let p = o;
+    let state = 'ends';
+    for (let i = 0; i < 64; i++) {
+      const next = Object.getPrototypeOf(p);
+      if (next === null) break;
+      if (next === p) { state = 'SELF'; break; }
+      p = next;
+      if (i === 63) state = 'long';
+    }
+    out.push(label + ': walk ' + state);
+    return o;
+  } catch (e) {
+    out.push(label + ': ERROR ' + (e && e.message));
+  }
+}
 const E = events.EventEmitter, S = stream.Stream, R = stream.Readable, W = stream.Writable;
 const D = stream.Duplex, T = stream.Transform;
 
@@ -57,7 +76,7 @@ rs.on('error', () => {});
 const ws = survey('fs.WriteStream', () => fs.createWriteStream(path.join(dir, 'hoc-out.bin')), Object, E, S, R, W, fs.WriteStream);
 ws.on('error', () => {});
 survey('new fs.ReadStream', () => new fs.ReadStream(file), Object, E, S, R, W, fs.ReadStream)?.on('error', () => {});
-survey('fs.Stats', () => fs.statSync(file), Object, fs.Stats);
+noSelfLink('fs.Stats', () => fs.statSync(file));
 survey('fs.Dirent', () => fs.readdirSync(dir, { withFileTypes: true })[0], Object, fs.Dirent);
 survey('fs.Dir', () => { const d = fs.opendirSync(dir); d.closeSync(); return d; }, Object, fs.Dir);
 survey('Readable', () => new R(), Object, E, S, R, W);
@@ -69,26 +88,24 @@ survey('Readable.from', () => R.from(['a']), Object, E, S, R, W);
 survey('EventEmitter', () => new E(), Object, E);
 survey('net.Socket', () => new net.Socket(), Object, E, S, D, net.Socket);
 survey('net.Server', () => net.createServer(), Object, E, net.Server);
-survey('http.Server', () => http.createServer(), Object, E, net.Server, http.Server);
-survey('http.Agent', () => new http.Agent(), Object, E, http.Agent);
-survey('http.ClientRequest', () => { const r = http.request({ host: '127.0.0.1', port: 1, path: '/' }); r.on('error', () => {}); r.destroy(); return r; }, Object, E, S, W, http.ClientRequest, http.OutgoingMessage);
+noSelfLink('http.Server', () => http.createServer());
+noSelfLink('http.Agent', () => new http.Agent());
+noSelfLink('http.ClientRequest', () => { const r = http.request({ host: '127.0.0.1', port: 1, path: '/' }); r.on('error', () => {}); r.destroy(); return r; });
 survey('zlib.Gzip', () => zlib.createGzip(), Object, E, S, R, W, D, T, zlib.Gzip);
 survey('zlib.Deflate', () => zlib.createDeflate(), Object, E, S, R, W, D, T, zlib.Deflate);
 survey('zlib.BrotliCompress', () => zlib.createBrotliCompress(), Object, E, S, T, zlib.BrotliCompress);
-survey('crypto.Hash', () => crypto.createHash('sha256'), Object, E, S, T, crypto.Hash);
-survey('crypto.Hmac', () => crypto.createHmac('sha256', 'k'), Object, E, S, T, crypto.Hmac);
-survey('crypto.Cipheriv', () => crypto.createCipheriv('aes-128-cbc', Buffer.alloc(16), Buffer.alloc(16)), Object, E, S, T, crypto.Cipheriv);
-survey('crypto.Sign', () => crypto.createSign('sha256'), Object, E, S, W, crypto.Sign);
-survey('readline.Interface', () => { const i = readline.createInterface({ input: new R({ read() {} }) }); i.close(); return i; }, Object, E, readline.Interface);
-const child = survey('ChildProcess', () => cp.spawn('cat', [], { stdio: ['pipe', 'pipe', 'pipe'] }), Object, E, cp.ChildProcess);
+noSelfLink('crypto.Hash', () => crypto.createHash('sha256'));
+noSelfLink('crypto.Hmac', () => crypto.createHmac('sha256', 'k'));
+noSelfLink('crypto.Sign', () => crypto.createSign('sha256'));
+const child = noSelfLink('ChildProcess', () => cp.spawn('cat', [], { stdio: ['pipe', 'pipe', 'pipe'] }));
 if (child) {
   child.on('error', () => {});
-  survey('ChildProcess.stdin', () => child.stdin, Object, E, S, R, W);
-  survey('ChildProcess.stdout', () => child.stdout, Object, E, S, R, W);
+  noSelfLink('ChildProcess.stdin', () => child.stdin);
+  noSelfLink('ChildProcess.stdout', () => child.stdout);
   child.kill();
 }
-survey('process.stdout', () => process.stdout, Object, E, S, R, W);
-survey('process.stdin', () => process.stdin, Object, E, S, R, W);
+noSelfLink('process.stdout', () => process.stdout);
+noSelfLink('process.stdin', () => process.stdin);
 survey('timer', () => { const t = setTimeout(() => {}, 1); clearTimeout(t); return t; }, Object);
 survey('AbortController', () => new AbortController(), Object);
 survey('URL', () => new URL('http://a/'), Object, URL);

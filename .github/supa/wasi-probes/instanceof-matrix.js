@@ -5,6 +5,7 @@
 // Every line is compared with node.
 const fs = require('node:fs');
 const path = require('node:path');
+const stream = require('node:stream');
 const out = [];
 const check = (label, value) => out.push(label + ': ' + value);
 
@@ -117,6 +118,12 @@ class Even {
 check('2 in Even', 2 instanceof Even);
 check('3 in Even', 3 instanceof Even);
 check('instance in Even', new Even() instanceof Even);
+// A static hook is inherited by a subclass.
+class SubEven extends Even {}
+check('2 in SubEven', 2 instanceof SubEven);
+check('3 in SubEven', 3 instanceof SubEven);
+check('instance in SubEven', new SubEven() instanceof SubEven);
+check('SubEven instance in Even', new SubEven() instanceof Even);
 class Late {}
 const late = new Late();
 check('late before', late instanceof Late);
@@ -161,6 +168,14 @@ const file = path.join(dir, 'instanceof-matrix.bin');
 fs.writeFileSync(file, 'x');
 const rs = fs.createReadStream(file);
 rs.on('error', () => {});
+check('fs stream in Readable', rs instanceof stream.Readable);
+check('fs stream in Stream', rs instanceof stream.Stream);
+check('fs stream in EventEmitter', rs instanceof require('node:events').EventEmitter);
+check('fs stream in Object', rs instanceof Object);
+check('fs stream in fs.ReadStream', rs instanceof fs.ReadStream);
+check('fs stream in Writable', rs instanceof stream.Writable);
+check('fs stream proto', Object.getPrototypeOf(rs) === fs.ReadStream.prototype);
+check('fs stream proto is not itself', Object.getPrototypeOf(rs) !== rs);
 check('fs stream in Error', rs instanceof Error);
 check('fs stream in Blob', rs instanceof Blob);
 check('fs stream in ArrayBuffer', rs instanceof ArrayBuffer);
