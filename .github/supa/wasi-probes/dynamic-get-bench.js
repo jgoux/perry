@@ -1,10 +1,11 @@
 // Dynamic string-key read cost on the shapes ajv's generated validators, find-my-way,
-// lru-cache and fastify read through `o[key]`: a hit in a small object, an absent
-// key that ends at Object.prototype, inherited reads through a short chain, a
-// big dictionary with mixed hits and misses, a null-prototype map, and a class
-// instance missing its method names. stdout (compared with node) carries a
-// checksum of every phase's results; the timings go to stderr, which is not
-// compared.
+// lru-cache and fastify read through `o[key]` and `o.name`: a hit in a small object,
+// an absent key that ends at Object.prototype, inherited reads through a short chain,
+// a big dictionary with mixed hits and misses, a null-prototype map, a class
+// instance missing its method names, and named reads from one site that sees
+// many shapes (the site stays megamorphic, so every read takes the miss path).
+// stdout (compared with node) carries a checksum of every phase's results; the
+// timings go to stderr, which is not compared.
 const now = () => Number(process.hrtime.bigint()) / 1e6;
 const N = Number(process.env.DYNGET_ITERS || 200000);
 const ROUNDS = 3;
@@ -63,6 +64,24 @@ function score(v) {
   return v === undefined ? 1 : typeof v === 'number' ? v : typeof v === 'string' ? v.length : 3;
 }
 
+// one site, many shapes: absent schema keywords, and the names libraries probe on any value
+function readSchema(n) {
+  return (
+    score(n.type) + score(n.properties) + score(n.required) + score(n.additionalProperties) +
+    score(n.minLength) + score(n.pattern) + score(n.format) + score(n.items) + score(n.enum) +
+    score(n.$ref)
+  );
+}
+function probeAny(v) {
+  return (
+    (v.then === undefined ? 1 : 2) + (v.toJSON === undefined ? 1 : 2) + (v.nodeType === undefined ? 1 : 2) +
+    (v.$$typeof === undefined ? 1 : 2) + (v.asymmetricMatch === undefined ? 1 : 2) +
+    (v.toString === undefined ? 1 : 2) + (v.hasOwnProperty === undefined ? 1 : 2) +
+    (v.valueOf === undefined ? 1 : 2)
+  );
+}
+const READS_PER_ITER = { 'named-megamorphic': 10, 'named-probe-any': 8 };
+
 const phases = [
   ['small-hit/miss', () => {
     let sum = 0;
@@ -92,6 +111,16 @@ const phases = [
     for (let i = 0; i < N; i++) sum += score(dict[dictKeys[i % dictKeys.length]]);
     return sum;
   }],
+  ['named-megamorphic', () => {
+    let sum = 0;
+    for (let i = 0; i < N; i++) sum += readSchema(nodes[i & 63]);
+    return sum;
+  }],
+  ['named-probe-any', () => {
+    let sum = 0;
+    for (let i = 0; i < N; i++) sum += probeAny(nodes[i & 63]);
+    return sum;
+  }],
   ['class-instance', () => {
     let sum = 0;
     for (let i = 0; i < N; i++) sum += score(instance[instanceKeys[i % instanceKeys.length]] === undefined ? 0 : 1);
@@ -111,7 +140,8 @@ for (const [label, run] of phases) {
   }
   total += best;
   results.push(label + ' ' + sum);
-  console.error('bench', label.padEnd(16), best.toFixed(1).padStart(9), 'ms /', N, 'reads', ((best * 1e6) / N).toFixed(0).padStart(6), 'ns/read');
+  const reads = N * (READS_PER_ITER[label] || 1);
+  console.error('bench', label.padEnd(18), best.toFixed(1).padStart(9), 'ms /', reads, 'reads', ((best * 1e6) / reads).toFixed(0).padStart(6), 'ns/read');
 }
 console.log(results.join('\n'));
 console.error('bench total best-of-' + ROUNDS + ':', total.toFixed(1), 'ms');
