@@ -84,6 +84,7 @@ Conventions in this file:
 | P58 | 0b9a602cf | fix(runtime): consult a computed static @@hasInstance declared in a class body | runtime (`object/global_this/generator_state.rs`) | all (found on wasm32) | wasi probe `instanceof-matrix.js` (`2 instanceof Even`) | not tried | PR-AO |
 | P59 | 0e7c812a8 | fix(runtime): initialize the derived instance when super() targets a native Error | runtime (`object/class_registry/construct/site.rs`) | all (seen on wasm32) | wasi probe `error-subclass-props.js`, Storage smoke error paths | not tried | PR-AP |
 | P60 | fc09fa86a | fix(hir): read a per-evaluation class declaration through its binding from earlier closures | HIR (`lower_decl/forward_class_reads.rs`, `block.rs`, `body_stmt.rs`) | all (seen on wasm32) | wasi probe `forward-class-binding.js`, Storage smoke duplicate upload | not tried | PR-AQ |
+| P61 | aacde9b2a | fix(runtime): clear an adopted promise's rejection once the adoption job attaches to it | runtime (`promise/assimilate.rs`) | all targets (seen on wasm32-wasip1) | wasi probe `async-throw-after-await.js`, native twin in `probes/` | not tried | PR-AR |
 
 All 22 patches except P12's `.github` hunks, P05 and P06 cherry-pick cleanly.
 A stack of every patch except P05 and P06, with P12 limited to `crates/`, also applies cleanly in sequence on `1fd8ca2ae`.
@@ -135,6 +136,7 @@ Ordered by value and independence. Each PR carries its patches' tests.
 41. **PR-AO A class-body `static [Symbol.hasInstance]` is consulted by `instanceof`** (P58). Prerequisite: upstream `152fccfa2` (the hook is a computed static member since then); the probe needs PR-R and PR-S.
 42. **PR-AP `super()` into a native Error initialises the derived instance** (P59). A class that extends an Error and whose class value escapes lost its own properties and its polymorphic methods. Prerequisite: none (the probe needs PR-R and PR-S on wasm32; the logic is target-independent).
 43. **PR-AQ A forward reference to a per-evaluation class declaration reads that evaluation's class** (P60). In a function body `class B extends Error` is created per evaluation, but a closure written before the declaration (esbuild's `__export(exports, { B: () => B })`) read the shared template class, whose `.prototype` differs from the evaluation's, so `instanceof`, `constructor` and prototype identity disagreed. Prerequisite: none (pre-existing at the 2026-10-18 merge).
+44. **PR-AR An async arrow returning an async function that throws after an await no longer reports the inner rejection as unhandled** (P61). Prerequisite: none (the probe is self-contained).
 
 Not proposed: P04, P05, P06, P10, P15, P16, P47. Upstream fixed the same bugs independently (`c4bf643f6` for P04, `4ed616f5e` for P05, `79aae9aa7` for P06 and P15, `09e7861b4` for P10, `c1671d39d` for P16, `b0d159c8c` for P47); the 2026-10-18 merge took upstream's versions and kept the fork's tests as regression tests.
 
