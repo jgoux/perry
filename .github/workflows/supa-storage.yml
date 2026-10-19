@@ -582,9 +582,11 @@ jobs:
       - name: Smoke
         run: |
           set -o pipefail
-          # the new module runs under the stubbed environment and is compared with the node run of the same stubs
-          modules=(new="$OUT/new/storage.stripped.wasm::$OUT/node-reference/node-variant-transcript.txt::$OUT/storage.variant.env")
-          [ -f "$OUT/base/storage.stripped.wasm" ] && modules=(base="$OUT/base/storage.stripped.wasm" "${modules[@]}")
+          # the new module runs under the stubbed environment and is compared with the node run of the same stubs;
+          # a baseline module from a stubbed run needs the same environment (swagger is stubbed out and EXPOSE_DOCS=false)
+          variant="$OUT/node-reference/node-variant-transcript.txt::$OUT/storage.variant.env"
+          modules=(new="$OUT/new/storage.stripped.wasm::$variant")
+          [ -f "$OUT/base/storage.stripped.wasm" ] && modules=(base="$OUT/base/storage.stripped.wasm::$variant" "${modules[@]}")
           ls -l "$OUT"/new "$OUT"/base 2>/dev/null || true
           .github/supa/wasi-smoke.sh "$PWD/supa-host-src/host/target/release/supa-host" "$OUT/node-reference/node-transcript.txt" "$OUT/smoke" "${modules[@]}"
       - name: Job summary
