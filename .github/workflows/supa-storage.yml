@@ -346,6 +346,30 @@ jobs:
       - name: Prune old object caches
         if: always() && steps.compile.conclusion != 'skipped' && steps.compile.outputs.codegen == 'true'
         run: .github/supa/prune-caches.sh perry-wobj- 2
+      - name: Storage renderers under wasmtime
+        # The info and HEAD renderers from the real build, driven by a stand-in
+        # reply (.github/supa/storage-info.js): same stdout as node or the job fails.
+        working-directory: ${{ env.STORAGE_DIR }}
+        run: |
+          set -o pipefail
+          export PERRY_NO_AUTO_OPTIMIZE=1 PERRY_KEEP_SYMBOLS=1
+          export PERRY_OBJECT_CACHE_BUILD_ID=${{ steps.objid.outputs.id }}
+          cp "$GITHUB_WORKSPACE/.github/supa/storage-info.js" storage-info.js
+          "$GITHUB_WORKSPACE/.github/supa/env.sh" > "$RUNNER_TEMP/driver.env"
+          { echo "DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/none"
+            echo "STORAGE_FILE_BACKEND_PATH=$RUNNER_TEMP/data-driver"
+            echo "NODE_ENV=production"; } >> "$RUNNER_TEMP/driver.env"
+          mkdir -p "$RUNNER_TEMP/data-driver"
+          env_flags=(); while IFS= read -r kv; do env_flags+=(--env "$kv"); done < "$RUNNER_TEMP/driver.env"
+          set -a; . "$RUNNER_TEMP/driver.env"; set +a
+          node storage-info.js > "$OUT/info-driver.node.out" 2>&1 || true
+          echo "--- node ---"; cat "$OUT/info-driver.node.out"
+          "$GITHUB_WORKSPACE/target/release/perry" compile --target wasip1 storage-info.js -o "$OUT/info-driver.wasm" 2>&1 | tail -n 5
+          set +e
+          wasmtime run -W exceptions=y "${env_flags[@]}" --env PERRY_TRACE_THROW=1 "$OUT/info-driver.wasm" > "$OUT/info-driver.wasm.out" 2> "$OUT/info-driver.wasm.err"
+          echo "wasm exit=$?"
+          echo "--- wasm ---"; cat "$OUT/info-driver.wasm.out"; echo "--- wasm stderr (tail) ---"; tail -n 40 "$OUT/info-driver.wasm.err"
+          diff -u "$OUT/info-driver.node.out" "$OUT/info-driver.wasm.out"
       - name: Module checks
         run: |
           set -o pipefail
