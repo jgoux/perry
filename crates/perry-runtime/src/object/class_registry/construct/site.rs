@@ -261,12 +261,20 @@ unsafe fn init_error_family_receiver(
         std::slice::from_raw_parts(args_ptr, args_len)
     };
     let undefined = f64::from_bits(crate::value::TAG_UNDEFINED);
+    // The init runs user JS (`message` ToString, an `options.cause` getter) and
+    // so can run a moving collection: hand the caller the refreshed receiver,
+    // not the raw `this` it passed in, or the caller's own root is overwritten
+    // with a stale address.
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let this_h = scope.root_nanbox_f64(this);
+    let message = args.first().copied().unwrap_or(undefined);
+    let options = args.get(1).copied().unwrap_or(undefined);
     super::super::super::class_constructors::js_error_subclass_default_init_with_options(
-        this,
-        args.first().copied().unwrap_or(undefined),
-        args.get(1).copied().unwrap_or(undefined),
+        this_h.get_nanbox_f64(),
+        message,
+        options,
     );
-    Some(this)
+    Some(this_h.get_nanbox_f64())
 }
 
 #[used(compiler)]
