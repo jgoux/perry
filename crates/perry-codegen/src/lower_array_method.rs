@@ -93,6 +93,16 @@ pub(crate) fn emit_grow_mutator_writeback(
     Ok(())
 }
 
+/// `fill` over a pre-sized array past its backing store grows the store
+/// (`array/concat_reverse.rs::fill_slots`), which replaces the head. Write the
+/// head it returns back to a single-local receiver like any growing mutator.
+fn fill_writeback(ctx: &mut FnCtx<'_>, object: &Expr, new_box: &str) -> Result<()> {
+    if let Expr::LocalGet(array_id) = object {
+        emit_grow_mutator_writeback(ctx, *array_id, new_box)?;
+    }
+    Ok(())
+}
+
 /// How many **leading** arguments the arm for `property` lowers, in source
 /// order. The module's operand contract, stated once.
 ///
@@ -756,7 +766,9 @@ pub(crate) fn lower_array_method(
                             "js_array_fill",
                             &[(I64, &recv_handle), (DOUBLE, &val_box)],
                         );
-                        Ok(nanbox_pointer_inline(blk, &result))
+                        let new_box = nanbox_pointer_inline(blk, &result);
+                        fill_writeback(ctx, object, &new_box)?;
+                        Ok(new_box)
                     }
                     2 | 3 => {
                         let end_d = if args.len() == 3 {
@@ -777,7 +789,9 @@ pub(crate) fn lower_array_method(
                                 (DOUBLE, &end_d),
                             ],
                         );
-                        Ok(nanbox_pointer_inline(blk, &result))
+                        let new_box = nanbox_pointer_inline(blk, &result);
+                        fill_writeback(ctx, object, &new_box)?;
+                        Ok(new_box)
                     }
                     _ => bail!(
                         "perry-codegen: Array.fill expects 1-3 args, got {}",
