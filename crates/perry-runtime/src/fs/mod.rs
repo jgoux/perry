@@ -1599,6 +1599,11 @@ pub(crate) fn mkdtemp_bytes_result(prefix_value: f64) -> Result<Vec<u8>, f64> {
         // Try a handful of candidate suffixes until one succeeds. Only real
         // EEXIST collisions are retried; permission/missing-parent errors are
         // reported against the attempted candidate path.
+        // std::process::id() panics on wasi (no process model): the timestamp
+        // and counter already make the candidate unique there.
+        #[cfg(target_os = "wasi")]
+        let pid = 0u64;
+        #[cfg(not(target_os = "wasi"))]
         let pid = std::process::id() as u64;
         let mut last_collision_path = None;
         for attempt in 0..64u64 {
