@@ -461,7 +461,17 @@ unsafe fn arraylike_has_no_indexed_properties(obj: *const crate::object::ObjectH
     else {
         return false;
     };
-    if (*receiver).class_id != 0 || crate::object::shapes::object_prototype_word(receiver) != 0 {
+    // A closed object literal carries an anonymous class id, but its DEFAULT
+    // shape prototype proves no class vtable sits on its chain; a declared class
+    // instance or a synthetic id has a different prototype identity.
+    let class_id = (*receiver).class_id;
+    if class_id != 0
+        && (class_id >= crate::object::shapes::SYNTHETIC_CLASS_ID_BASE
+            || shape.proto_id != crate::object::shapes::PROTO_ID_DEFAULT)
+    {
+        return false;
+    }
+    if crate::object::shapes::object_prototype_word(receiver) != 0 {
         return false;
     }
     let keys = crate::object::ObjectKeys::new(
