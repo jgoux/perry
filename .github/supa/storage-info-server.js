@@ -33,6 +33,14 @@ const options = { bucket: "bkt", key: "k", version: "v1", object };
 const { withFiniteAjv } = require("./dist/http/finite");
 const app = fastify(withFiniteAjv({}));
 setErrorHandler(app);
+// The response hooks Storage's app registers (onSend/onResponse), in its order.
+const plugins = require("./dist/http/plugins");
+const excludeUrls = new Set(["/status", "/metrics", "/health", "/healthcheck", "/version", "/documentation"]);
+app.register(plugins.closeConnectionOnError);
+app.register(plugins.blobResponse);
+app.register(plugins.requestContext);
+app.register(plugins.logRequest({ excludeUrls }));
+app.register(plugins.headerValidator({ excludeUrls }));
 
 // The real Storage routes (schemas, async requestHandler with default
 // parameters, renderer switch) on a faked request.storage.
