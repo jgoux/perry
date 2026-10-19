@@ -1,4 +1,5 @@
 // npm: fastify@5.11.2
+// network: yes
 // Fastify's own inject (light-my-request) running unpatched from node_modules.
 // A GET with a body answers through Response.write, which collects
 // Buffer.from(data) in an array the response keeps in a nested field, and

@@ -1245,16 +1245,13 @@ fn js_buffer_concat_impl(
     arr_ptr: *const ArrayHeader,
     requested_total_length: Option<usize>,
 ) -> *mut BufferHeader {
-    // Strip NaN-boxing tags if present
-    let arr_ptr = {
-        let bits = arr_ptr as u64;
-        let top16 = (bits >> 48) as u16;
-        if top16 >= 0x7FF8 {
-            (bits & 0x0000_FFFF_FFFF_FFFF) as *const ArrayHeader
-        } else {
-            arr_ptr
-        }
-    };
+    // Strip the NaN-boxing tag and follow array growth forwarding (#233). A
+    // list that grew by `push` leaves a forwarding stub at its old head with
+    // the new address where `length` and `capacity` were; a binding that kept
+    // the old head (a nested field no push write-back reaches, a capture) hands
+    // that stub here, and reading it raw sees the forwarding pointer as the
+    // first element.
+    let arr_ptr = crate::array::clean_arr_ptr(arr_ptr);
     if arr_ptr.is_null() || (arr_ptr as u64) < 0x1000 {
         return buffer_alloc(0);
     }
