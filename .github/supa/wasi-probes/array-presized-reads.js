@@ -49,3 +49,40 @@ t('unfilled with a tail value', () => {
   const r = a.fill(0, 4, 8);
   return digest(r);
 });
+t('unfilled iteration', () => {
+  const a = new Array(1200000);
+  let n = 0;
+  for (const v of a) if (v === undefined) n++;
+  let m = 0;
+  for (const k of a.keys()) m++;
+  let e = 0;
+  for (const [k, v] of a.entries()) e++;
+  return [n, m, e, a.some((v) => v !== undefined), a.every((v) => v === undefined), a.find((v) => v === undefined), a.reduce((x) => x + 1, 0)].join(' ');
+});
+t('unfilled copies', () => {
+  const a = new Array(1200000);
+  const s = a.slice(0, 10);
+  const c = a.concat([1]);
+  const sp = [...a];
+  const f = Array.from(a);
+  return [s.length, c.length, c[1200000], sp.length, sp[5], f.length, f[1199999], 3 in c, 3 in sp, 3 in f].join(' ');
+});
+t('unfilled in-place', () => {
+  const a = new Array(1200000);
+  a.copyWithin(0, 5, 10);
+  const b = new Array(1200000);
+  b.splice(0, 1);
+  const c = new Array(1200000);
+  c.shift();
+  const d = new Array(1200000);
+  d.unshift(1);
+  const e = new Array(1200000);
+  e.length = 1100000;
+  const g = new Array(1200000);
+  g.length = 1300000;
+  return [digest(a), digest(b), digest(c), digest(d), digest(e), digest(g)].join(' | ');
+});
+t('unfilled stringify', () => {
+  const a = new Array(1200000);
+  return JSON.stringify(a).length + ' ' + a.toString().length + ' ' + String(a.flat().length) + ' ' + Object.keys(a).length;
+});
