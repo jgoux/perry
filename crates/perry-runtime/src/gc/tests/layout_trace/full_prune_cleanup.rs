@@ -3,9 +3,13 @@ use super::*;
 
 fn isolated(f: impl FnOnce() + Send + 'static) {
     std::thread::spawn(move || {
+        // The element-shape lock comes first, as `test_serialize` documents:
+        // the element-shape GC tests take it before the nursery guard, so the
+        // opposite order here is a lock-order inversion that deadlocks both
+        // under the default parallel harness.
+        let _lock = crate::array::test_serialize();
         let _guard = CopyingNurseryTestGuard::new(2);
         let _triggers = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
-        let _lock = crate::array::test_serialize();
         f();
     })
     .join()
