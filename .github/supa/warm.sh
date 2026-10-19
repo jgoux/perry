@@ -10,10 +10,11 @@ auth="Authorization: Bearer ${SERVICE_KEY:?}"
 work=$(mktemp -d)
 : > "$out"
 
-# Collections logged since line $1 of the host log: "gcs=<n> fulls=<n> gc_ms=<ms>".
+# Collections logged since line $1 of the host log: "gcs=<n> fulls=<n> gc_ms=<ms>". Only the per-collection
+# lines count: they carry a kind= field (gc/telemetry.rs); "[gc-log] owed ..." lines are pacing debt reports.
 gc_since() {
   tail -n +"$(($1 + 1))" "$log" 2>/dev/null | awk '
-    /^\[gc-log\]/ { n++; for (i = 1; i <= NF; i++) { if ($i == "kind=full") f++; if ($i ~ /^pause_us=/) { split($i, p, "="); us += p[2] } } }
+    /^\[gc-log\] kind=/ { n++; for (i = 1; i <= NF; i++) { if ($i == "kind=full") f++; if ($i ~ /^pause_us=/) { split($i, p, "="); us += p[2] } } }
     END { printf "gcs=%d fulls=%d gc_ms=%.1f", n, f, us / 1000 }'
 }
 loglines() { wc -l < "$log" 2>/dev/null || echo 0; }
@@ -31,10 +32,13 @@ req() { # <expected> <curl args...>; prints time_total, fails the run on an unex
 phase() { # <name> <count> <curl args producing one request; {i} is the iteration>...
   local name=$1 n=$2; shift 2
   local mark; mark=$(loglines)
-  local times=() i args
+  local times=() i args t
   for i in $(seq 1 "$n"); do
     args=("${@//\{i\}/$i}")
-    times+=("$(req 200 "${args[@]}")")
+    # req runs in a subshell here, so its exit only ends that subshell: propagate it, or a failed request
+    # records an empty timing and the script can still exit 0.
+    t=$(req 200 "${args[@]}") || exit 1
+    times+=("$t")
   done
   sleep 0.5 # a collection that follows the response still belongs to this phase
   printf '%s\n' "${times[@]}" | sort -n | awk -v name="$name" -v gc="$(gc_since "$mark")" '
