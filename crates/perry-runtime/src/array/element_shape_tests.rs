@@ -378,6 +378,12 @@ fn declaring_a_numeric_layout_clears_the_invariant() {
 #[test]
 fn prototype_writes_keep_proofs_and_an_instance_relink_retires_them() {
     let _serialized = test_serialize();
+    // The first class-prototype write on a thread materializes `globalThis`,
+    // and wiring the builtin prototype tower is itself a `RuntimeWiring`
+    // `[[Prototype]]` link that retires every outstanding proof once (a
+    // conservative, self-healing event). Pay it before the proofs under test
+    // exist, so the write below is the only thing being measured.
+    crate::object::js_get_global_this();
     let a = built_from_pushes(CLASS_A, 2);
     let b = built_from_pushes(CLASS_B, 2);
     assert!(proof(a).is_some());
