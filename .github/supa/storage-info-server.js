@@ -28,7 +28,8 @@ const object = {
 };
 const options = { bucket: "bkt", key: "k", version: "v1", object };
 
-const app = fastify();
+const { withFiniteAjv } = require("./dist/http/finite");
+const app = fastify(withFiniteAjv({}));
 setErrorHandler(app);
 
 // The real Storage routes (schemas, async requestHandler with default
