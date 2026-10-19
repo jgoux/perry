@@ -73,6 +73,11 @@ on:
         type: choice
         options: [lazy, eager]
         default: lazy
+      ajv:
+        description: "lazy defers the S3 router validators and the fastify ajv instance to first use and skips meta-schema checks (patch-ajv-boot.cjs); eager keeps ajv's own startup work, for A/B runs"
+        type: choice
+        options: [lazy, eager]
+        default: lazy
       simulate:
         description: Measurement aid, touch one source file to exercise cache invalidation without a commit
         type: choice
@@ -80,7 +85,7 @@ on:
         default: none
 
 concurrency:
-  group: supa-storage-${{ github.ref }}-${{ inputs.schemas }}
+  group: supa-storage-${{ github.ref }}-${{ inputs.schemas }}-${{ inputs.ajv }}
   cancel-in-progress: true
 
 permissions:
@@ -109,6 +114,7 @@ env:
   PERRY_BUILD_COMMIT: supa-storage-fork
   # Read by .github/supa/shims.sh.
   SUPA_LAZY_SCHEMAS: ${{ inputs.schemas == 'eager' && '0' || '1' }}
+  SUPA_LAZY_AJV: ${{ inputs.ajv == 'eager' && '0' || '1' }}
 
 jobs:
   # Compiler and runtime archives, built once per source hash.

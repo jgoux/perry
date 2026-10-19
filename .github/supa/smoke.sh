@@ -65,6 +65,29 @@ step "GET /object/smoke/missing.bin" 400 "$base/object/smoke/missing.bin" -H "${
 norm '.'
 step "GET /bucket (bad JWT)" 400 "$base/bucket" -H 'Authorization: Bearer not.a.jwt' || exit 1
 norm '.'
+# Error paths: every rejected request must carry node's status and body. They go through the
+# validators that are built lazily (fastify's route schemas, the S3 router's) and through
+# the error handlers that format their failures.
+step "POST /bucket (invalid json)" 400 -X POST "$base/bucket" -H "${auth[0]}" -H 'Content-Type: application/json' \
+  -d '{"name":' || exit 1
+norm '.'
+step "POST /bucket (wrong type)" 400 -X POST "$base/bucket" -H "${auth[0]}" -H 'Content-Type: application/json' \
+  -d '{"name":"smoke2","public":"maybe"}' || exit 1
+norm '.'
+step "POST /bucket (invalid name)" 400 -X POST "$base/bucket" -H "${auth[0]}" -H 'Content-Type: application/json' \
+  -d '{"name":"bad/name","public":false}' || exit 1
+norm '.'
+step "GET /bucket (bad query)" 400 "$base/bucket?limit=abc" -H "${auth[0]}" || exit 1
+norm '.'
+step "POST /object/list/smoke (invalid body)" 400 -X POST "$base/object/list/smoke" -H "${auth[0]}" \
+  -H 'Content-Type: application/json' -d '{"limit":"abc"}' || exit 1
+norm '.'
+if [ -n "${S3_PROTOCOL_ACCESS_KEY_ID:-}" ]; then
+  s3=(--user "$S3_PROTOCOL_ACCESS_KEY_ID:${S3_PROTOCOL_ACCESS_KEY_SECRET:?}" --aws-sigv4 'aws:amz:us-east-1:s3')
+  step "GET /s3/smoke (ListObjectsV2)" 200 "${s3[@]}" "$base/s3/smoke?list-type=2" || exit 1
+  step "GET /s3/smoke (bad max-keys)" 400 "${s3[@]}" "$base/s3/smoke?list-type=2&max-keys=abc" || exit 1
+  cat "$work/body" >> "$out"; echo >> "$out"
+fi
 # Object info and HEAD, authenticated and public. A failing step does not stop the flow, so
 # one run reports every route; a route that kills the server shows as curl-failed after it.
 step "HEAD /object/authenticated/smoke/hello.bin" 200 -I "$base/object/authenticated/smoke/hello.bin" -H "${auth[0]}"

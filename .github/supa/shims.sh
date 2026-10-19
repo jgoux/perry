@@ -23,5 +23,14 @@ if [ "${SUPA_LAZY_SCHEMAS:-1}" = 0 ]; then
 else
   node "$(dirname "$0")/patch-fastify-lazy-schema.cjs" "$root"
 fi
+# Every Ajv instance Storage builds at boot compiles the meta-schema, and every S3 route
+# compiles its validator while the routes register; defer the route compiles to their
+# first request and skip the meta-schema check (patch-ajv-boot.cjs explains why that
+# loses nothing). SUPA_LAZY_AJV=0 restores the originals, for A/B measurements.
+if [ "${SUPA_LAZY_AJV:-1}" = 0 ]; then
+  node "$(dirname "$0")/patch-ajv-boot.cjs" "$root" off
+else
+  node "$(dirname "$0")/patch-ajv-boot.cjs" "$root"
+fi
 
 echo "shims applied under $root/node_modules"
