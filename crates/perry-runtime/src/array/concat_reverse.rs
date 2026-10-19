@@ -654,14 +654,31 @@ pub extern "C" fn js_array_fill_range(
     // An explicit `undefined` end means "to length" (step 7) — coercing it
     // gave NaN → 0 → no-op (`[0, 0].fill(1, 0, undefined)` stayed [0, 0],
     // test262 fill/coerced-indexes).
+    //
+    // Both coercions run user code, which can allocate enough to run a moving
+    // collection and can rebind, grow or shrink the receiver. `arr`, `value`
+    // and the operand not coerced yet are rooted across them and re-read after
+    // each one (a raw `*mut ArrayHeader` or heap pointer held in a local goes
+    // stale on wasm32, which has no conservative scan). `len` is read before
+    // any coercion, as the spec reads LengthOfArrayLike first.
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let arr_handle = scope.root_raw_mut_ptr(arr);
+    let value_handle = scope.root_nanbox_f64(value);
+    let end_handle = scope.root_nanbox_f64(end);
+    let len = unsafe { (*arr).length as i64 };
     let start = crate::builtins::js_to_integer_or_infinity(start);
+    let end = end_handle.get_nanbox_f64();
     let end = if end.to_bits() == crate::value::TAG_UNDEFINED {
         f64::INFINITY
     } else {
         crate::builtins::js_to_integer_or_infinity(end)
     };
+    let arr = clean_arr_ptr_mut(arr_handle.get_raw_mut_ptr::<ArrayHeader>());
+    let value = value_handle.get_nanbox_f64();
+    if arr.is_null() {
+        return arr;
+    }
     unsafe {
-        let len = (*arr).length as i64;
         if len == 0 {
             return arr;
         }
@@ -694,6 +711,15 @@ pub extern "C" fn js_array_fill_range(
         let e = clamp(end, true);
         if s >= e {
             return arr;
+        }
+        if e > (*arr).length as i64 {
+            // The coercions shrank the receiver below the range they were
+            // clamped against: each index is a Set that re-extends it.
+            let mut arr = arr;
+            for i in s..e {
+                arr = js_array_set_f64_extend(arr, i as u32, value_handle.get_nanbox_f64());
+            }
+            return clean_arr_ptr_mut(arr);
         }
         fill_slots(arr, s as usize, e as usize, value)
     }
