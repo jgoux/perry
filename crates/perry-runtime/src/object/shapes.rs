@@ -1499,7 +1499,16 @@ fn alloc_shape_id_of_kind(
 /// mint except a dictionary or exotic shape's.
 fn alloc_shape_id(proto_id: u64) -> Result<u32, ShapeIdExhausted> {
     let kind = proto_id_kind(proto_id);
-    alloc_shape_id_of_kind(&SHAPE_ID_NEXT[kind as usize], SITE_SHAPE_ID_END, kind)
+    let id = alloc_shape_id_of_kind(&SHAPE_ID_NEXT[kind as usize], SITE_SHAPE_ID_END, kind)?;
+    #[cfg(test)]
+    TEST_SHAPE_IDS_MINTED.with(|minted| minted.set(minted.get().wrapping_add(1)));
+    Ok(id)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Ordinary-band ids minted by THIS thread; see [`test_shape_id_counter`].
+    static TEST_SHAPE_IDS_MINTED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// An exotic-band ShapeId ([`EXOTIC_SHAPE_ID_BASE`]).
@@ -1515,17 +1524,19 @@ fn alloc_shape_id_for_generation(
     alloc_shape_id(proto_id)
 }
 
-/// The ordinary-band ids this process has handed out, as a counter.
+/// The ordinary-band ids the CALLING THREAD has minted, as a counter.
 ///
 /// Tests assert the DELTA across a workload, because ids come from a 2^30
 /// range that is never reused and parks (fail-stop) at the end: a path that
 /// mints one id per operation is a process-LIFETIME bug, not merely a memory
 /// cost, and nothing in the program's output ever reveals it.
+///
+/// Per thread, not read off the process-global allocator: the allocator is
+/// shared by every parallel test, so its counter moves whenever any of them
+/// mints a shape, which lands inside another test's before/after window.
 #[cfg(test)]
 pub(crate) fn test_shape_id_counter() -> u32 {
-    SHAPE_ID_NEXT.iter().fold(0u32, |sum, next| {
-        sum.wrapping_add(next.load(std::sync::atomic::Ordering::Relaxed))
-    })
+    TEST_SHAPE_IDS_MINTED.with(std::cell::Cell::get)
 }
 
 /// Get or create the exact structural descriptor. The public allocation and
