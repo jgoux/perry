@@ -93,63 +93,66 @@ pub(crate) fn emit_grow_mutator_writeback(
     Ok(())
 }
 
+/// Emit `callee(receiver, rest..)` for `fill` and write the head it returns back
+/// to a single-local receiver, but only when the binding still holds the array
+/// the call operated on.
+///
 /// `fill` over a pre-sized array past its backing store grows the store
-/// (`array/concat_reverse.rs::fill_slots`), which replaces the head. Write the
-/// head it returns back to a single-local receiver like any growing mutator,
-/// but only when the binding still holds the receiver the call operated on.
+/// (`array/concat_reverse.rs::fill_slots`), which replaces the head, so the head
+/// the call returns is written back like any growing mutator's. Two things can
+/// rebind the receiver's variable before that write-back, and in both the call
+/// filled the OLD array while the binding must keep the new one
+/// (`a.fill(7, { valueOf() { a = [9]; return 0 } })`):
 ///
-/// An argument can rebind the receiver's variable
-/// (`a.fill((a = [9], 0))`): the call then filled the OLD array, and the
-/// binding must keep the new one. `unchanged` is that test, taken by
-/// [`fill_receiver_unchanged`] before the call because the call itself is a
-/// collection point. The receiver slot is a root, so a collection during the
-/// arguments rewrites the binding and the rooted re-read alike and they stay
-/// equal; a grown array leaves a forwarding stub at the old head, so the
-/// binding holds the old head bits until this write-back.
-fn fill_writeback(
-    ctx: &mut FnCtx<'_>,
-    object: &Expr,
-    new_box: &str,
-    unchanged: Option<&str>,
-) -> Result<()> {
-    let Expr::LocalGet(array_id) = object else {
-        return Ok(());
-    };
-    let Some(unchanged) = unchanged else {
-        return emit_grow_mutator_writeback(ctx, *array_id, new_box);
-    };
-    let write_idx = ctx.new_block("fill.writeback");
-    let done_idx = ctx.new_block("fill.writeback_done");
-    let write_label = ctx.block_label(write_idx);
-    let done_label = ctx.block_label(done_idx);
-    ctx.block().cond_br(unchanged, &write_label, &done_label);
-    ctx.current_block = write_idx;
-    emit_grow_mutator_writeback(ctx, *array_id, new_box)?;
-    ctx.block().br(&done_label);
-    ctx.current_block = done_idx;
-    Ok(())
-}
-
-/// `i1`: does a single-local receiver's binding still hold `recv_box`, the
-/// receiver value re-read after the arguments were evaluated? `None` for a
-/// receiver that is not a single local (no write-back happens there).
+///  * an argument expression (`a.fill((a = [9], 0))`), which ran before the call;
+///  * the call itself, whose start/end coercion runs user `valueOf` /
+///    `Symbol.toPrimitive`.
 ///
-/// The read is a plain binding load compared on the spot, with no collection
-/// point between it and the compare, so the register it produces never lives
-/// across one.
-fn fill_receiver_unchanged(
+/// So the decision is taken after the call, from two re-reads of roots: the
+/// receiver, held in a temp-root slot across the call, and the binding. A
+/// collection during the call rewrites both alike; a grown array leaves a
+/// forwarding stub at the old head that both keep holding until the write-back,
+/// so equal bits mean the binding was left alone. Nothing unrooted is held
+/// across the call.
+fn emit_fill_with_writeback(
     ctx: &mut FnCtx<'_>,
     object: &Expr,
     recv_box: &str,
-) -> Result<Option<String>> {
-    if !matches!(object, Expr::LocalGet(_)) {
-        return Ok(None);
-    }
-    let current = crate::expr::lower_expr(ctx, object)?;
-    let blk = ctx.block();
-    let current_bits = blk.bitcast_double_to_i64(&current);
-    let recv_bits = blk.bitcast_double_to_i64(recv_box);
-    Ok(Some(blk.icmp_eq(I64, &current_bits, &recv_bits)))
+    callee: &str,
+    rest: &[(crate::types::LlvmType, &str)],
+) -> Result<String> {
+    let call = |ctx: &mut FnCtx<'_>| {
+        let blk = ctx.block();
+        let recv_handle = unbox_to_i64(blk, recv_box);
+        let mut call_args = vec![(I64, recv_handle.as_str())];
+        call_args.extend_from_slice(rest);
+        let result = blk.call(I64, callee, &call_args);
+        nanbox_pointer_inline(blk, &result)
+    };
+    let Expr::LocalGet(array_id) = object else {
+        // Non-local receiver (property chain): nothing to write back.
+        return Ok(call(ctx));
+    };
+    rooting::with_rooted_group(ctx, 1, |ctx, group| {
+        let receiver = group.adopt_emitted(ctx, rooting::Repr::Boxed, recv_box, true);
+        let new_box = call(ctx);
+        let current = crate::expr::lower_expr(ctx, object)?;
+        let original = group.reread_emitted(ctx, receiver);
+        let blk = ctx.block();
+        let current_bits = blk.bitcast_double_to_i64(&current);
+        let original_bits = blk.bitcast_double_to_i64(&original);
+        let unchanged = blk.icmp_eq(I64, &current_bits, &original_bits);
+        let write_idx = ctx.new_block("fill.writeback");
+        let done_idx = ctx.new_block("fill.writeback_done");
+        let write_label = ctx.block_label(write_idx);
+        let done_label = ctx.block_label(done_idx);
+        ctx.block().cond_br(&unchanged, &write_label, &done_label);
+        ctx.current_block = write_idx;
+        emit_grow_mutator_writeback(ctx, *array_id, &new_box)?;
+        ctx.block().br(&done_label);
+        ctx.current_block = done_idx;
+        Ok(new_box)
+    })
 }
 
 /// How many **leading** arguments the arm for `property` lowers, in source
@@ -808,17 +811,13 @@ pub(crate) fn lower_array_method(
                     // `undefined` (ECMA-262 step: value defaults to undefined).
                     0 | 1 => {
                         let val_box = arg_or_undefined(arg_vals, 0);
-                        let unchanged = fill_receiver_unchanged(ctx, object, recv_box)?;
-                        let blk = ctx.block();
-                        let recv_handle = unbox_to_i64(blk, recv_box);
-                        let result = blk.call(
-                            I64,
+                        emit_fill_with_writeback(
+                            ctx,
+                            object,
+                            recv_box,
                             "js_array_fill",
-                            &[(I64, &recv_handle), (DOUBLE, &val_box)],
-                        );
-                        let new_box = nanbox_pointer_inline(blk, &result);
-                        fill_writeback(ctx, object, &new_box, unchanged.as_deref())?;
-                        Ok(new_box)
+                            &[(DOUBLE, &val_box)],
+                        )
                     }
                     2 | 3 => {
                         let end_d = if args.len() == 3 {
@@ -827,22 +826,17 @@ pub(crate) fn lower_array_method(
                             // Default end = +Infinity → clamps to length in the runtime.
                             double_literal(f64::INFINITY)
                         };
-                        let unchanged = fill_receiver_unchanged(ctx, object, recv_box)?;
-                        let blk = ctx.block();
-                        let recv_handle = unbox_to_i64(blk, recv_box);
-                        let result = blk.call(
-                            I64,
+                        emit_fill_with_writeback(
+                            ctx,
+                            object,
+                            recv_box,
                             "js_array_fill_range",
                             &[
-                                (I64, &recv_handle),
                                 (DOUBLE, &arg_vals[0]),
                                 (DOUBLE, &arg_vals[1]),
                                 (DOUBLE, &end_d),
                             ],
-                        );
-                        let new_box = nanbox_pointer_inline(blk, &result);
-                        fill_writeback(ctx, object, &new_box, unchanged.as_deref())?;
-                        Ok(new_box)
+                        )
                     }
                     _ => bail!(
                         "perry-codegen: Array.fill expects 1-3 args, got {}",
