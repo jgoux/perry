@@ -190,7 +190,7 @@ pub use self::immutable::{
     js_array_with, js_arraylike_copy_within,
 };
 pub(crate) use self::indexing::{
-    array_custom_prototype, array_has_own_index, array_iteration_is_exotic,
+    array_custom_prototype, array_has_own_index, array_holes_are_absent, array_iteration_is_exotic,
     array_iteration_is_exotic_cleaned, array_iteration_is_exotic_resolved, array_spec_get,
     array_spec_has_index, array_spec_set, try_strict_dense_index_set,
 };

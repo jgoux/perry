@@ -1014,7 +1014,7 @@ unsafe fn concat_capacity_hint(recv: *const ArrayHeader, args_ptr: *const f64, c
 }
 
 /// Validate one concat source for the all-dense bulk path: a genuine plain
-/// dense hole-free `ArrayHeader`. `Some((ptr, len))` on success (null →
+/// dense `ArrayHeader` whose holes (if any) are provably absent. `Some((ptr, len))` on success (null →
 /// `Some((null, 0))`), `None` for anything the bulk path must not touch.
 /// Pure reads — runs no user code, allocates nothing.
 unsafe fn dense_concat_array_source(src: *const ArrayHeader) -> Option<(*const ArrayHeader, u32)> {
@@ -1076,10 +1076,12 @@ unsafe fn dense_concat_array_source(src: *const ArrayHeader) -> Option<(*const A
     if len > (*src).capacity {
         return None;
     }
-    let elems = crate::array::array_elements_ptr(src as *const ArrayHeader) as *const f64;
-    for i in 0..len as usize {
-        if (*elems.add(i)).to_bits() == crate::value::TAG_HOLE {
-            return None;
+    if !crate::array::array_holes_are_absent(src) {
+        let elems = crate::array::array_elements_ptr(src as *const ArrayHeader) as *const f64;
+        for i in 0..len as usize {
+            if (*elems.add(i)).to_bits() == crate::value::TAG_HOLE {
+                return None;
+            }
         }
     }
     Some((src, len))
@@ -1245,10 +1247,15 @@ unsafe fn try_append_spread_array_dense(
     // punt those to the slow path. String addrefs happen only after the copy
     // has committed below, so a mid-scan bail can't leave the fallback path
     // double-retaining an already-addref'd string.
-    let src_elems = crate::array::array_elements_ptr(src as *const ArrayHeader) as *const f64;
-    for i in 0..src_len as usize {
-        if (*src_elems.add(i)).to_bits() == crate::value::TAG_HOLE {
-            return None;
+    // When every hole is provably absent (no descriptors, custom prototype or
+    // indexed property on the chain) the spec read finds nothing at a hole, and
+    // the hole is carried over verbatim.
+    if !crate::array::array_holes_are_absent(src) {
+        let src_elems = crate::array::array_elements_ptr(src as *const ArrayHeader) as *const f64;
+        for i in 0..src_len as usize {
+            if (*src_elems.add(i)).to_bits() == crate::value::TAG_HOLE {
+                return None;
+            }
         }
     }
     let dest_len = (*array).length;
