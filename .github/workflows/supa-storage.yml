@@ -1444,13 +1444,24 @@ jobs:
       - name: Wait for the Perry libraries
         if: steps.done.outputs.cache-hit != 'true'
         # build-perry saves perry-dist as its last step, so its success means the cache exists.
+        # A failed gh call is retried; ten failed calls in a row (about two minutes) fail the step.
         run: |
+          failures=0
           for _ in $(seq 1 360); do
-            r=$(gh run view "$GITHUB_RUN_ID" --json jobs --jq '.jobs[] | select(.name == "build-perry") | .conclusion')
-            case "$r" in
-              success) exit 0 ;;
-              failure|cancelled|skipped) echo "::error::build-perry ended as $r"; exit 1 ;;
-            esac
+            if r=$(gh run view "$GITHUB_RUN_ID" --json jobs --jq '.jobs[] | select(.name == "build-perry") | .conclusion'); then
+              failures=0
+              case "$r" in
+                success) exit 0 ;;
+                failure|cancelled|skipped) echo "::error::build-perry ended as $r"; exit 1 ;;
+              esac
+            else
+              failures=$((failures + 1))
+              echo "::warning::gh run view failed ($failures in a row)"
+              if [ "$failures" -ge 10 ]; then
+                echo "::error::could not read the build-perry result: gh run view failed 10 times in a row"
+                exit 1
+              fi
+            fi
             sleep 10
           done
           echo "::error::build-perry did not finish in an hour"; exit 1
