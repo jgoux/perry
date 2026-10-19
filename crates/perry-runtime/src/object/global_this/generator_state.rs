@@ -88,6 +88,9 @@ pub(crate) unsafe fn install_class_symbol_method(
     rest: bool,
     entry: usize,
 ) {
+    // `instanceof` reads an own static `@@hasInstance` only once this latch is
+    // armed; every other route that stores a static symbol on a class arms it.
+    crate::symbol::CLASS_STATIC_SYMBOLS_LATCH.arm();
     let scope = crate::gc::RuntimeHandleScope::new();
     let key = scope.root_nanbox_f64(key);
     let owner = if crate::object::value_is_object_like(owner) {
