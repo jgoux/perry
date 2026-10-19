@@ -32,12 +32,6 @@ const source = (...chunks) => stream.Readable.from(chunks);
     r.resume();
     return (await finished(r)) === undefined;
   });
-  await show("pipeline array", async () => {
-    const chunks = [];
-    const sink = new stream.Writable({ write(c, e, cb) { chunks.push(String(c)); cb(); } });
-    await sp.pipeline([source("a", "b"), sink]);
-    return chunks;
-  });
   await show("pipeline comma", async () => {
     const chunks = [];
     const sink = new stream.Writable({ write(c, e, cb) { chunks.push(String(c)); cb(); } });

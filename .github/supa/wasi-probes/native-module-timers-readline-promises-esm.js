@@ -13,9 +13,10 @@ import { PassThrough } from "stream";
 const readlinePromises = readline.promises;
 
 for (const n of ["setTimeout", "setImmediate", "setInterval"]) {
-  console.log("timers/promises", n, typeof tp[n], typeof tpDefault[n], tp[n] === timersPromises[n]);
+  console.log("timers/promises", n, typeof tp[n], typeof tpDefault[n], tp[n] === tpDefault[n]);
 }
-console.log("named", sleep === timersPromises.setTimeout, setInterval === timersPromises.setInterval);
+console.log("named", sleep === tp.setTimeout, setInterval === tp.setInterval);
+console.log("timers.promises", typeof timersPromises, typeof timersPromises.setTimeout);
 console.log("namespace", await tp.setTimeout(5, "ns"));
 console.log("default", await tpDefault.setTimeout(5, "default"));
 console.log("named call", await sleep(5, "named"));

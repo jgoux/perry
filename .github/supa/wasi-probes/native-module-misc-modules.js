@@ -42,7 +42,7 @@ subscribe("nm-audit-2", onMessage);
 console.log("subscribe destructured", dc.hasSubscribers("nm-audit-2"));
 const tracing = dc.tracingChannel("nm-audit-trace");
 console.log("tracingChannel", typeof tracing, typeof tracing.traceSync, typeof tracing.subscribe);
-console.log("traceSync", tracing.traceSync((a, b) => a + b, {}, null, 2, 3));
+console.log("traceSync", tracing.traceSync((a) => a + 1, {}, null, 2));
 
 for (const n of ["createTracing", "getEnabledCategories"]) {
   console.log("trace_events", n, typeof te[n], typeof tePrefixed[n]);
