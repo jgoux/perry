@@ -214,6 +214,8 @@ env:
   # p1 guest a listener (`-S preview2=n -S tcplisten`). Used by the server probes.
   WASMTIME_P1_VERSION: 46.0.3
   WASM_TOOLS_VERSION: 1.261.0
+  # wasm-opt of the shipped Storage module (storage-wasi, "Strip and optimize the module").
+  BINARYEN_VERSION: version_133
   WASI_SHARDS: "5"
   # Perry's environment for the wasip1 Storage compile: part of the module cache key.
   # `function name(params) { /* source elided */ }` instead of each function's full source:
@@ -677,6 +679,45 @@ jobs:
           wasm-tools strip --all "$wasm" -o "$OUT/storage.stripped.wasm"
           ls -l "$OUT/storage.stripped.wasm"
           wasm-tools objdump "$OUT/storage.stripped.wasm" | grep -c 'custom' | sed 's/^/custom sections left: /' | tee -a "$OUT/strip-sizes.txt" || true
+      # The shipped module: strip every custom section, then wasm-opt -Oz. storage.wasm becomes the
+      # optimized module (the one storage-dist packs) and storage.stripped.wasm, which the
+      # storage-wasi-smoke job runs under supa-host, its copy; the compiler's output stays in
+      # storage.raw.wasm. Never --all-features: binaryen 133 then writes compact imports, which
+      # wasmtime rejects, so each feature the module uses is enabled by name.
+      - name: Strip and optimize the module
+        run: |
+          set -o pipefail
+          case "$(uname -m)" in
+            aarch64) arch=aarch64-linux ;;
+            x86_64) arch=x86_64-linux ;;
+            *) echo "no binaryen release for $(uname -m)"; exit 1 ;;
+          esac
+          tarball="binaryen-${BINARYEN_VERSION}-${arch}.tar.gz"
+          cd "$RUNNER_TEMP"
+          curl -fsSLO "https://github.com/WebAssembly/binaryen/releases/download/${BINARYEN_VERSION}/${tarball}"
+          curl -fsSL "https://github.com/WebAssembly/binaryen/releases/download/${BINARYEN_VERSION}/${tarball}.sha256" | sha256sum -c -
+          tar xzf "$tarball"
+          export PATH="$RUNNER_TEMP/binaryen-${BINARYEN_VERSION}/bin:$PATH"
+          wasm-opt --version
+          cd "$OUT"
+          mv storage.wasm storage.raw.wasm
+          wasm-tools strip --all storage.raw.wasm -o storage.strip.wasm
+          wasm-opt -Oz --strip-debug --strip-producers \
+            --enable-gc --enable-reference-types --enable-exception-handling --enable-bulk-memory \
+            --enable-tail-call --enable-sign-ext --enable-mutable-globals \
+            --enable-nontrapping-float-to-int --enable-multivalue --enable-simd \
+            storage.strip.wasm -o storage.wasm
+          cp storage.wasm storage.stripped.wasm
+          {
+            echo "raw (compiler output): $(stat -c %s storage.raw.wasm) bytes"
+            echo "stripped: $(stat -c %s storage.strip.wasm) bytes"
+            echo "optimized (shipped): $(stat -c %s storage.wasm) bytes"
+          } | tee -a "$OUT/strip-sizes.txt"
+          rm storage.strip.wasm
+          wasm-tools validate storage.wasm
+          python3 -I "$GITHUB_WORKSPACE/.github/supa/wasi-imports.py" --allow-supa-net storage.wasm | tee "$OUT/imports.txt"
+          wasm-tools objdump storage.wasm | grep -c 'custom' | sed 's/^/custom sections left in the shipped module: /' | tee -a "$OUT/strip-sizes.txt" || true
+          sha256sum storage.wasm
       # What supa-wasm downloads: the module plus the files Storage reads at run time, built from this
       # job's Storage checkout (the one storage-prep built and the shims were applied to).
       - name: Pack storage-dist
@@ -726,7 +767,7 @@ jobs:
             echo "- perry: \`${GITHUB_SHA::8}\`, storage: \`${{ needs.storage-prep.outputs.sha }}\` (\`$STORAGE_REF\`), objects: \`${{ steps.objid.outputs.id }}\`, module cache key: \`${{ needs.storage-wasi-cache.outputs.key }}\` (miss)"
             echo "- jobs: modules=$PERRY_MODULE_JOBS units=$PERRY_CODEGEN_UNIT_JOBS, storage variant: \`$SUPA_STORAGE_VARIANT\`"
             [ -f "$OUT/compile.time" ] && grep -E 'Elapsed|Maximum resident' "$OUT/compile.time" | sed 's/^\s*/- compile: /'
-            [ -f "$OUT/storage.wasm" ] && echo "- module: $(stat -c %s "$OUT/storage.wasm") bytes, $(stat -c %s "$OUT/storage.stripped.wasm" 2>/dev/null || echo ?) bytes stripped"
+            [ -f "$OUT/storage.wasm" ] && echo "- module: $(stat -c %s "$OUT/storage.wasm") bytes shipped (stripped, wasm-opt -Oz), $(stat -c %s "$OUT/storage.raw.wasm" 2>/dev/null || echo ?) bytes raw"
             [ -f "$OUT/strip-sizes.txt" ] && sed 's/^/- /' "$OUT/strip-sizes.txt"
             echo '```'; [ -f "$OUT/compile.log" ] && grep -E 'Collecting modules|Generating code|Linking|Wrote|codegen: modules finished' "$OUT/compile.log" | tail -n 8; echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
