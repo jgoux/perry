@@ -4,6 +4,7 @@
 // the Fastify request and reply, so a failure points at the renderer code
 // instead of the server around it.
 "use strict";
+require("./dist/start/minimal-defaults"); // stdout logging, no pino worker thread
 const { HeadRenderer } = require("./dist/storage/renderer/head");
 const { InfoRenderer } = require("./dist/storage/renderer/info");
 const { ImageRenderer } = require("./dist/storage/renderer/image");
