@@ -17,6 +17,7 @@ Conventions in this file:
 - "Upstream touched" lists upstream commits after the fork's last sync (`43a40d056`, 38 upstream commits) that changed the non-test source files the patch edits.
 - "Upstream also affected" is "likely" when the patched pre-image is unchanged on upstream main but the bug was not reproduced there, and "unknown" when that inference is weak.
 - A "Merge of upstream `2bbab8aff`" bullet in an entry records what the 2026-10-18 merge (`supa/upstream-merge-1018`, 231 upstream commits since `43a40d056`) did to it: "superseded" (upstream fixed the same thing, the fork's code was dropped, any test stays as a regression test), "adapted" (the fork's intent was re-applied on upstream's new code; no new id) or "absorbed". Status text above those bullets describes the tree at `1fd8ca2ae`.
+- A "Merge of upstream `f3d38d16d`" bullet records what the 2026-10-19 merge (`supa/upstream-merge-1019`, 66 upstream commits after `2bbab8aff`) did to a patch, with the same vocabulary. Patches without such a bullet were not touched by those 66 commits (no changed file in common).
 - Tests live in the same commit as their fix (the fork has no separate `test:` commits). Test paths are under `crates/` unless noted.
 
 ## Summary table
@@ -77,6 +78,7 @@ Conventions in this file:
 | P52 | 7eb0760bd | fix(wasm32): call a captureless some() callback at its declared arity | runtime (`array/iter_methods.rs`) | wasm32 | wasi probe `array-some-callback-arity.js` | not tried | PR-AI |
 | P53 | fc6a4b86c | fix(codegen): keep a scope group's frame root live until its last member reference | codegen (`collectors/shadow_slots.rs` and its six call sites) | all (observed on wasm32) | wasi probe `scope-group-root-live.js` | not tried | PR-AJ |
 | P54 | 7f6a2b5f2 | fix(runtime): classify an uncaught throw by the personality's verdicts, not _Unwind_RaiseException's status | runtime (`eh.rs`, `exception.rs`) | aarch64 Linux native (libgcc) | native probe `eh-uncaught.js` | not tried | PR-AK |
+| P55 | a29271566 | fix(wasm32): size the family-method tables and read the word directory at the target's width | runtime (`object/layout_desc/methods.rs`, `object/shapes.rs`) | wasm32 (build break) | the wasm32 runtime build (`wasi-linux`, `storage-wasi`) | not tried | PR-AL |
 
 All 22 patches except P12's `.github` hunks, P05 and P06 cherry-pick cleanly.
 A stack of every patch except P05 and P06, with P12 limited to `crates/`, also applies cleanly in sequence on `1fd8ca2ae`.
@@ -122,6 +124,7 @@ Ordered by value and independence. Each PR carries its patches' tests.
 35. **PR-AI `arr.some(captureless arrow)` applies the arrow's declared arity on wasm32** (P52). Prerequisite: none (the probe needs PR-R and PR-S).
 36. **PR-AJ A scope group's frame root stays live until the last reference to any member** (P53). Prerequisite: none (the probe needs PR-R and PR-S).
 37. **PR-AK An uncaught throw is recognised from the personality's verdicts, not the status `_Unwind_RaiseException` returns** (P54). Prerequisite: none (the probe is the existing `eh-uncaught`).
+38. **PR-AL The upstream family-method tables are pointer-width aware** (P55). `PerryFamilyMethods` and its entries pin LP64 sizes, and `perry_probe_family_method` reads the shape directory's word directory at an LP64 offset. Only matters to a tree that builds the runtime for a 32-bit target (needs PR-R). Prerequisite: PR-R.
 
 Not proposed: P04, P05, P06, P10, P15, P16, P47. Upstream fixed the same bugs independently (`c4bf643f6` for P04, `4ed616f5e` for P05, `79aae9aa7` for P06 and P15, `09e7861b4` for P10, `c1671d39d` for P16, `b0d159c8c` for P47); the 2026-10-18 merge took upstream's versions and kept the fork's tests as regression tests.
 
@@ -143,6 +146,7 @@ Not proposed: P04, P05, P06, P10, P15, P16, P47. Upstream fixed the same bugs in
   const later = (n) => n + 1;
   let limit = 5;
   ```
+- Merge of upstream `f3d38d16d` (2026-10-19): still needed, kept as it was. `expr/static_field_meta.rs` merged without conflict; upstream `152fccfa2` ("follow live constructor and home-object heritage") changed `lower_class_evaluation_object` elsewhere in the file, and this patch's `store_first_evaluation_slot` call is intact.
 
 ### P02 fc9f6cb62 fix(codegen): register computed-member methods with the entry they define
 - Area / platform: codegen / all.
@@ -163,6 +167,7 @@ Not proposed: P04, P05, P06, P10, P15, P16, P47. Upstream fixed the same bugs in
   const c: any = new Child();
   console.log(c.dynamic(), c.hello(1));
   ```
+- Merge of upstream `f3d38d16d` (2026-10-19): still needed, kept as it was. The `body_needs_explicit_method_owner` call in `lower_computed_member_registration` is intact; upstream `152fccfa2` made `lower_class_evaluation_object` define static computed members on the evaluation object as well, in another hunk of the same file.
 
 ### P03 78f00dedd fix(codegen): load regex literal handles in worker programs
 - Area / platform: codegen + runtime / all, programs that use `Worker` or thread agents.
@@ -179,6 +184,7 @@ Not proposed: P04, P05, P06, P10, P15, P16, P47. Upstream fixed the same bugs in
   console.log(['abbbc', 'ABC', 'x12'].map((t) => re.test(t) + ':' + re2.test(t)).join(','));
   worker.terminate().then(() => process.exit(0));
   ```
+- Merge of upstream `f3d38d16d` (2026-10-19): kept as it was. The `js_regexp_literal_loaded` declaration in `runtime_decls/strings.rs` sits among upstream's new `js_class_super_parent` and `js_class_super_construct_apply` declarations (`152fccfa2`) and the removal of `js_region_guard_prime` (`fabd82345`).
 
 ### P04 2d333eac4 fix(codegen): accept the zero-width .alt_entry directive in stack-map blocks
 - Area / platform: codegen (gc_map) / Mach-O only (the directive is what LLVM emits on Mach-O).
@@ -229,6 +235,7 @@ Not proposed: P04, P05, P06, P10, P15, P16, P47. Upstream fixed the same bugs in
 - Upstream: cherry-pick clean. Upstream touched: `291142de3`. Also affected: likely.
 - Depends on: none. PR-M.
 - Repro: two modules that each define a small class and a loop pushing `new Pt(i, i).x` into an array, imported by a third module, built with `PERRY_CODEGEN_UNITS=2` (full sources in the test).
+- Merge of upstream `f3d38d16d` (2026-10-19): kept as it was. The `weak_odr` header case in `dialect/mod.rs` is intact; upstream `1bda539c9` (native IR reader builds `freeze` from a rendered text line) edited the same parser in other hunks.
 
 ### P08 150fc3c39 fix(root_reload): stop declining large require closures on the cost cap
 - Area / platform: codegen (root_reload) / all.
@@ -240,6 +247,7 @@ Not proposed: P04, P05, P06, P10, P15, P16, P47. Upstream fixed the same bugs in
 - Merge of upstream `2bbab8aff` (2026-10-18): adapted, no new id. Upstream `914a51a86` ("root reload past the block x load cap for entry-stored roots") added an entry-store fallback for functions over the cap, which conflicts with this patch's intent. Both are kept: the cap is measured against `walking_groups` (groups read from another block than their load), the bound is 64M (`MAX_BLOCK_LOAD_PRODUCT`), and a function over it takes upstream's fallback. The register-use index is built ahead of the cap. `root_reload_tests.rs` keeps the fork's large-closure test next to upstream's.
 - Depends on: none. PR-P. The 64M value is a fork measurement; expect review discussion.
 - Repro: none small; the trigger is a function with more than ~14k blocks.
+- Merge of upstream `f3d38d16d` (2026-10-19): kept as it was. Upstream `0199f9921` (family-layout method lookup) added `perry_probe_family_method` to `NON_COLLECTING` in `root_reload.rs`, a one-line hunk away from the cap logic (`MAX_BLOCK_LOAD_PRODUCT` is still 64M).
 
 ### P09 76d54d44a fix(codegen): mark the hot-TLS thread-pointer read gc-leaf where it is emitted
 - Area / platform: codegen / Apple aarch64 only (the `mrs $0, tpidrro_el0` hot-cache read).
@@ -403,6 +411,7 @@ Not proposed: P04, P05, P06, P10, P15, P16, P47. Upstream fixed the same bugs in
   body.write('hello '); body.write('world'); body.end();
   done.then(() => { console.log('done', fs.readFileSync(file, 'utf8')); fs.unlinkSync(file); });
   ```
+- Merge of upstream `f3d38d16d` (2026-10-19): kept as it was. Upstream `5d49df9a2` ("honor pipe destination and digest listener protocols") routes pipe destinations that are not classic stream instances through their own `write` and `end` in `node_stream_pipe_dests.rs`. This patch's fs-write-stream branch of `end_pipe_destinations` still runs ahead of that routing; `pipeline_into_fs_write_stream` stays in `regressions.sh` and passed on the merged tree.
 
 ### P21 286f4ae58 fix(http): pipe a server request's buffered body into its destination
 - Area / platform: perry-ext-http / all.
@@ -413,6 +422,7 @@ Not proposed: P04, P05, P06, P10, P15, P16, P47. Upstream fixed the same bugs in
 - Upstream: cherry-pick clean. Upstream touched: none; `is_incoming_message_member` upstream has no `pipe`. Also affected: likely.
 - Depends on: P22 for the test to pass. PR-C (squash with P22).
 - Repro: `http.createServer((req, res) => { const p = new PassThrough(); const ret = req.pipe(p); ... })`, POST a body, expect `ret === p` and the body on `p` (full source in the test).
+- Merge of upstream `f3d38d16d` (2026-10-19): kept as it was. Upstream `5d64ee58e` ("Enter HTTP response operations through per-method prototype bodies") moved the response dispatch (`setHeader`, `writeHead`, `write`, ...) in `perry-ext-http/src/server/handle_dispatch.rs` into `server/response_methods.rs`; the request-side `pipe` entry this patch added is not part of it. `incoming_message_pipe` stays in `regressions.sh` and passed on the merged tree.
 
 ### P22 248ec8347 fix(http): route req.pipe to the server request's dispatcher
 - Area / platform: perry-ext-http / all.
@@ -431,6 +441,7 @@ Not proposed: P04, P05, P06, P10, P15, P16, P47. Upstream fixed the same bugs in
 - Test: none of its own; every wasi probe depends on it.
 - Upstream: not cherry-picked. Depends on: none. PR-R.
 - Merge of upstream `2bbab8aff` (2026-10-18): adapted, no new id. Upstream changed `PerryLayoutDesc.proto` to `*const PerryProtoFamily` and moved layouts, atoms and image ranges behind `static_registry.rs`; the wasm `.init_array` constructors and the ILP32 `BandDir` offsets (`FLAT_IDS_OFFSET`, `PROTO_CELL_OFFSET`, `WORD_DIR_OFFSET` in `shapes_store.rs`, used by `layout_probe.rs`) were re-applied on that layout.
+- Merge of upstream `f3d38d16d` (2026-10-19): adapted, no new id. Upstream `0199f9921` ("answer unknown method calls from family layouts") added a `methods` pointer to `PerryLayoutDesc` (LP64 size 64 to 72, `class_id` at 56; the ILP32 sizes 56 and 44 are unchanged because the pointer fits existing padding), the `PerryFamilyMethods` tables and `perry_probe_family_method`. The conflict in `layout_desc.rs` was resolved by keeping this patch's pointer-width-aware asserts with the new LP64 values. `layout_probe.rs` already reads the shape directory at the `shapes_store` offsets (`FLAT_BASE_OFFSET`, `FLAT_IDS_OFFSET`, `PROTO_CELL_OFFSET`, `WORD_DIR_OFFSET`). The new method-table code did not, and is fixed by P55. wasm32 codegen emits no layout descriptors, so the family tables are null there and the lookup answers 0 (ordinary dispatch).
 
 ### P24 bd6269a6b fix(runtime): make the wasm32 runtime compile for wasip1
 - Area / platform: runtime, updater / wasm32.
@@ -471,6 +482,7 @@ Not proposed: P04, P05, P06, P10, P15, P16, P47. Upstream fixed the same bugs in
 - Test: `scripts/runtime_abi_check.py`.
 - Upstream: not cherry-picked; the table churns, so regenerate on the upstream base instead of cherry-picking. Depends on: none. PR-S.
 - Merge of upstream `2bbab8aff` (2026-10-18): `runtime_abi.tsv` was not merged by hand. It was regenerated on the merged tree with `scripts/runtime_abi_check.py --emit-wasm-abi` (5199 symbols) and checked with `--check-wasm-abi`.
+- Merge of upstream `f3d38d16d` (2026-10-19): `runtime_abi.tsv` conflicted again and was regenerated on the merged tree with `scripts/runtime_abi_check.py --emit-wasm-abi` (5202 symbols). Added: `js_class_super_construct_apply`, `js_class_super_parent`, `js_node_http_method_fallback`, `js_node_http_response_layout_receiver`, `perry_probe_family_method`. Removed: `js_region_guard_pack`, `js_region_guard_prime`.
 
 ### P29 c546aab14 fix(codegen): cover macro-defined runtime entry points in the wasm32 ABI table
 - Area / platform: codegen (wasm32), scripts / wasm32.
@@ -479,6 +491,7 @@ Not proposed: P04, P05, P06, P10, P15, P16, P47. Upstream fixed the same bugs in
 - Test: `scripts/runtime_abi_check.py`.
 - Upstream: not cherry-picked. Depends on: P28. PR-S.
 - Merge of upstream `2bbab8aff` (2026-10-18): covered by the P28 regeneration.
+- Merge of upstream `f3d38d16d` (2026-10-19): covered by the P28 regeneration.
 
 ### P30 f7c9d2b0b fix(runtime): declare the array builtin entries at pointer width so wasm32 calls resolve
 - Area / platform: runtime / wasm32 (no change on 64-bit).
@@ -620,6 +633,7 @@ Not proposed: P04, P05, P06, P10, P15, P16, P47. Upstream fixed the same bugs in
 - Not covered: `new Wrapped.Headers()` (a member callee whose property is named like a global) still builds the native class, a separate bug found while writing the probe.
 - Upstream: not cherry-picked. Depends on: none. PR-AC.
 - Merge of upstream `2bbab8aff` (2026-10-18): still needed, kept as it was (the hir files merged without conflict). The upstream commits `3bc9b5492` (IncomingMessage explicit receivers) and `3ab9e5fa4` (native inits on user subclasses) do not touch how `new Alias()` resolves its class. Checked on CI (wasi-linux, experiment branches off the merge without this fix and with it): the probe `headers-global-alias.js` exits 1 without the fix and matches node with it.
+- Merge of upstream `f3d38d16d` (2026-10-19): still needed, kept as it was. Upstream `dc081fd0c` ("construct evaluated classes through their lexical bindings") changed which local `lower_new` looks up for a per-evaluation class declaration (`expr_new.rs`); it does not touch how `new Alias()` resolves a global alias, and the merge was textually clean. `headers-global-alias.js` ran in `wasi-linux` on the merged tree.
 
 ### P47 bea2d51cb fix(runtime): start reading when a readable that is not flowing is piped
 - Area / platform: runtime node:stream / all targets; seen on wasm32-wasip1.
@@ -660,6 +674,7 @@ Not proposed: P04, P05, P06, P10, P15, P16, P47. Upstream fixed the same bugs in
 - Not covered: a base class and a same-named subclass in the SAME module (for example an IIFE-local base and a top-level subclass) still collide on the by-name class tables in codegen (`class_ids`), and `super()` fails with `Class constructor X cannot be invoked without 'new'`.
 - Upstream: not cherry-picked. Depends on: none. PR-AG.
 - Merge of upstream `2bbab8aff` (2026-10-18): still needed, kept as it was (the class_decl files merged without conflict). Upstream's canonical-class and IIFE series (`d7918a6d6`, "Cover overridable IIFE call evaluating a class twice", and its neighbours) is in the merge, and the probe `class-extends-same-name-member.js` still differs from node without the fix (checked on CI). The gap listed under "Not covered" is still open: the probes `class-iife-base-same-name` (an IIFE-local base and a same-named top-level subclass) and `cbp1` to `cbp4` fail with and without the fork's fixes on the merged tree, so upstream's series does not close them either.
+- Merge of upstream `f3d38d16d` (2026-10-19): still needed, kept as it was. Upstream `152fccfa2` and `dc081fd0c` touch the same files (`class_decl.rs` re-exports `lower_class_heritage_expr`, which became `pub(crate)`); `member_heritage_object_is_program_value` and its call site are intact and the merge was textually clean. `class-extends-same-name-member.js` passed in `wasi-linux` on the merged tree. The gap under "Not covered" is unchanged.
 
 ### P51 a45195e98 fix(gc-effects): size the disassembler output buffer with c_char
 - Area / platform: gc-effects (`perry-gc-effects/src/archive.rs`) / aarch64 Linux (compile error); other targets unaffected.
@@ -685,6 +700,7 @@ Not proposed: P04, P05, P06, P10, P15, P16, P47. Upstream fixed the same bugs in
 - Fix: a reference to any member of a group counts as a reference to the group's root (`ScopeMap::capture_key`). Roots are live for longer, never for less time, so no collector invariant changes; the six call sites pass `cross_module.scope_map`.
 - Test: wasi probe `.github/supa/wasi-probes/scope-group-root-live.js` (a group whose first member is dead before another member is read and written after a forced evacuation, in a function, a method and a closure; expects the node output). The probe's `// wasm-env:` marker (new, `wasi-probes.sh`) hands `PERRY_GC_SCAVENGE_NURSERY_MB=1 PERRY_GC_FORCE_EVACUATE=1` to the wasm run. The Storage smoke under supa-host with default GC settings is the end-to-end check. The three ajv probes written while diagnosing it passed without the fix and were dropped.
 - Upstream: not cherry-picked (written on top of the 2026-10-18 merge). Depends on: none. PR-AJ. Upstream's own tests would need a compile that reaches a moving collection with the group's first member unused; that is easiest with the probe's `PERRY_GC_*` settings.
+- Merge of upstream `f3d38d16d` (2026-10-19): kept as it was. `codegen/method.rs` was changed by upstream `3ff413af5` (shared checked default-derived parent constructors) and `152fccfa2`; the `scope_map` argument this patch passes to `collect_shadow_slot_clear_points` is intact and the merge was textually clean. `scope-group-root-live.js` passed in `wasi-linux` on the merged tree, and the merged Storage module runs under supa-host with the default GC settings (job `storage-wasi-smoke`).
 
 ### P54 7f6a2b5f2 fix(runtime): classify an uncaught throw by the personality's verdicts, not _Unwind_RaiseException's status
 - Area / platform: Itanium exception transport (`perry-runtime/src/eh.rs`, `exception.rs` `js_throw`) / native aarch64 Linux with glibc's libgcc (`libgcc_s`); macOS and x86_64 return the documented status.
@@ -694,12 +710,24 @@ Not proposed: P04, P05, P06, P10, P15, P16, P47. Upstream fixed the same bugs in
 - Test: the existing native probe `.github/supa/probes/eh-uncaught.js` (`// expect-exit: 1`) in the probes-linux job; it is the failing case without the fix and passed with it on the first CI run (run 39172226453: `no handler in 7 frame(s); walk ended with reason 5 ... the raise returned -311891416`, the second number being the garbage status). No unit test: the broken status is only produced by the libgcc build on that runner.
 - Upstream: not cherry-picked (written on top of the 2026-10-18 merge). Depends on: none. PR-AK. A candidate for upstream Perry, whose own aarch64 Linux CI would show the same failure of any uncaught-throw test.
 
+### P55 a29271566 fix(wasm32): size the family-method tables and read the word directory at the target's width
+- Area / platform: runtime object model (`perry-runtime/src/object/layout_desc/methods.rs`, `object/shapes.rs`) / wasm32-wasip1 (build break); LP64 targets unaffected.
+- Problem: after the 2026-10-19 merge the wasm32 runtime did not compile: `methods.rs` (upstream `0199f9921`, "answer unknown method calls from family layouts") asserts `size_of::<PerryFamilyMethods>() == 16` and `size_of::<PerryFamilyMethod>() == 24`, which are the LP64 sizes (12 and 16 on ILP32). Past the asserts, `perry_probe_family_method` reads the word directory of the shape directory at `SHAPE_DIR_FLAT_BASE + 24`, an LP64 offset: on wasm32 the field sits at +12 and the read would have returned another word of the directory.
+- Root cause: the tables spell pointers as `ptr` in codegen's IR, which LLVM lays out at the target's width, and the runtime's view of them has to follow; upstream builds the runtime for 64-bit targets only. `layout_desc.rs` already carried pointer-width-aware asserts from P23, `layout_probe.rs` the `shapes_store` offsets; the new file did neither.
+- Fix: the two size asserts are pinned per pointer width (64-bit: 16 and 24; 32-bit: 12 and 16; `PerryMethodHolder` is 8 on both). The word directory is read at `shapes::WORD_DIR_OFFSET` (`offset_of!(BandDir, word_dir)`, re-exported from the private `shapes_store` as `pub(crate)`), as `layout_probe.rs` does.
+- Test: none of its own. The wasm32 runtime build is the check (`cargo check -p perry-runtime-static --target wasm32-wasip1`, `wasi-linux` and `storage-wasi` in CI). The lookup is inert on wasm32 today (wasm32 codegen emits no layout descriptors, so `PerryLayoutDesc.methods` is null and `perry_probe_family_method` answers 0), so no probe reaches the corrected read; it matters once wasm32 codegen emits descriptors.
+- Not covered: nothing on wasm32 reaches the corrected read today. `layouts_enabled` (`perry-codegen/src/layout_desc.rs`) is false for wasm targets, so no descriptor or family table is emitted, and `expr/method_site.rs` emits the `perry_probe_family_method` call only when the program has families. If wasm32 ever emits descriptors, that site calls the selected closure body through a code pointer (`JsBody::Pointer`), an indirect call that needs the callee retyping of P39 and the declared-arity rule of P52; neither was exercised.
+- Upstream: not cherry-picked (written on top of the 2026-10-19 merge). Depends on: P23 (and PR-R). PR-AL.
+
 ## Not for upstream
 
 Every other fork-only non-merge commit is CI, probes, a temporary diagnostic, or a Storage shim. None edits files outside `.github/` (checked with `git show --name-only`). There are 44 such commits, 23 fix/feat commits are the patches above, and the fork has no `test:` commits.
 
 **Fork CI workflow, composite action and driver scripts** (`.github/workflows/supa-storage.yml`, `.github/actions/supa-rust-env`, `.github/supa/*.sh`; Blacksmith runner, sccache, lld, caches). Fork-specific infrastructure for supabase/perry. Merge of upstream `2bbab8aff` (2026-10-18): adapted. Upstream's perry compiles natively only against runtime archives that carry a `.gc-effects` sidecar and routes `undici` to `libperry_ext_undici.a`, so `build-perry` writes the sidecars (`scripts/gc_call_effects/sidecars.sh target-libs/release`), builds `perry-ext-undici`, stages both in `perry-dist` (cache key `perry-dist-*-wasi-gcfx-*`), and `regressions-linux` copies the sidecars with the archives. The `perry-ext-zlib` and `perry-ext-ws` wrapper archives are built and staged the same way (compiled programs that import `zlib` or `ws` link them; cache key `perry-dist-*-wasi-gcfx2-*`), and the wasip1 compile of Storage needs no sidecar (`native_link_set_skipped` covers wasi targets; see P31 and P32). The workflow also gained a `wasi_probe_names` dispatch input (run only the named wasi probes) and `wasi-probes.sh` a `// wasm-env: NAME=VALUE...` marker (variables for the wasm run only); both were written to reproduce P53.
 Known and parked: the probes `cbp1` to `cbp4` and `class-iife-base-same-name` are open gaps (see P50). The probe `eh-uncaught` failed on aarch64 Linux from before the merge and is fixed by P54.
+
+**Storage smoke under supa-host** (`.github/supa/wasi-smoke.sh`, job `storage-wasi-smoke` in `supa-storage.yml`, dispatch input `smoke_baseline_run`; the host source is the orphan branch `supa/ci-supa-host`). The job runs the compiled, stripped Storage module under a wasmtime host with the `supa_net` sockets against a Postgres service, three times (a 100 KB upload, a 5 MiB upload, a 100 KB upload with `PERRY_GC_FORCE_EVACUATE=1 PERRY_GC_VERIFY_EVACUATION=1`), and diffs each smoke transcript with the one node produces from the same Storage checkout (`node-reference` artifact). It reports ready time, RSS, the precompiled (`.cwasm`) size and the precompile time, and fails on any difference, a dead host or a host that never answers `/status`. With `smoke_baseline_run=<run id>` it also runs the `storage-wasi-module` artifact of that run on the same host and runner, so sizes and ready times compare like for like. It runs on `supa/wasip1` pushes and on dispatches with `storage_wasi=true`. The host is `host/` of supabase/supa-wasm at `6186ad065` plus a small patch (`--rw-dir`, `--threads`, `compile`, `.cwasm` loading, exceptions and GC on); supabase/supa-wasm is not reachable from this repository's Actions token, which is why the source is vendored on `supa/ci-supa-host`. It is built from outside the checkout (this repository's `.cargo/config.toml` holds nightly-only flags) and cached by the hash of its sources. Known gaps: the host is a snapshot, not supa-wasm's current head; one measurement per run, and ready times on the shared runner vary by a few hundred milliseconds between runs.
+`7ed44e85e` `89067cad4` `dc4aeef27` (`supa/upstream-merge-1019`); `8bbdfb2` `811c1c5` `e0b0cab` (`supa/ci-supa-host`)
 `e8ac78fea` `ece6015bb` `297306927` `18b63cef3` `512996ccb` `0c3401687` `9d2cbde15` `8a051e924` `53423af73` `942a6fe56` `5b1438709`
 
 **CI wiring of regression tests** (adds test names or log capture to `.github/supa/regressions.sh`; the tests themselves belong to the patches above).
@@ -716,7 +744,7 @@ Known and parked: the probes `cbp1` to `cbp4` and `class-iife-base-same-name` ar
 
 **wasip1 series since storage-ci** (`supa/wasip1`): CI wiring and diagnostics `ef0f3969f` `dd33cf711` `f96fd56bd` `e81da245e` `04a35b714` `5c07ca9f3` `e5558632d` `628f36abe` `367281739` `5defe7f9a` `74694d7d4` `37c69af62` `61aa2c6df` (`supa-storage.yml`, `.github/supa/*.sh`, the temporary diagnostic probes and the `SMOKE_BYTES` smoke input). The `test(wasi)` probe commits `506e7d053` and `ec19714e1` and the `docs:` commit `b3cce1633` (how the wasm32 ABI table is regenerated) go upstream with PR-T and PR-S respectively.
 
-Merge commits (not counted): `1f3c775af` (merge of upstream main) and `03ef52d0f` (merge of `supa/upstream-sync`).
+Merge commits (not counted): `1f3c775af` (merge of upstream main), `03ef52d0f` (merge of `supa/upstream-sync`), `d7c409f8c` (merge of upstream `f3d38d16d`, 2026-10-19).
 
 ## Fork baseline
 
@@ -726,4 +754,5 @@ Merge commits (not counted): `1f3c775af` (merge of upstream main) and `03ef52d0f
 - Original fork point of the earlier patches (P01-P14): `5b76f8acc` (2026-10-15, "gc effects: regenerate macOS table for Object.create families"). The older branch `supa/storage` (an older tip) is an ancestor of `supa/storage-ci`.
 - Fork tip: `supa/storage-ci` (tip, 2026-10-16); 68 fork-only commits, 66 non-merge.
 - Upstream merge (2026-10-18): `supa/upstream-merge-1018` merges upstream `2bbab8aff` (2026-10-18, "docs(changelog): record V8 heap snapshot stream crash fix") into `supa/wasip1`; merge-base `43a40d056`, 231 upstream commits. Superseded by it: P04, P05, P06, P10, P15, P16, P47. Adapted: P08, P11, P12, P17, P18, P19, P23, P24, P28, P29, P31, P32, P41, P45. Checked and kept as they were: P46, P48, P49, P50. New on top of the merge: P51, P52, P53, P54.
-- Ledger written: 2026-10-17.
+- Upstream merge (2026-10-19): `supa/upstream-merge-1019` merges upstream `f3d38d16d` (66 commits after `2bbab8aff`) into `d455a2f12`, the green head of `supa/upstream-merge-1018`. Two textual conflicts: `object/layout_desc.rs` (the fork's pointer-width-aware asserts kept, the LP64 `PerryLayoutDesc` assert is now 72 bytes for upstream's new `methods` field, see P23) and `wasm32/runtime_abi.tsv` (regenerated, 5202 symbols, see P28). Superseded by it: none. Adapted: P23, P28, P29. Checked and kept as they were: P01, P02, P03, P07, P08, P20, P21, P46, P50, P53 (their files changed upstream). New on top of the merge: P55. Upstream's family-layout method tables (`0199f9921`) are inert on wasm32 because wasm32 codegen emits no layout descriptors; the other commits (nursery births, module-evaluation identity, class heritage, HTTP response methods, removal of `js_region_guard_pack` and `js_region_guard_prime`, ...) needed no fork change beyond P55. The Storage module compiled for `wasip1` is 375,881,317 bytes (373,830,860 stripped), against 373,932,969 (371,882,512) for the 1018 merge: +1,948,348 bytes, +0.52%, all in code. Precompiled with the smoke job's host on the Linux arm64 runner: 515,276,616 bytes against 512,648,416 for the 1018 module (+0.51%). The Storage smoke (100 KB, 5 MiB, and 100 KB under forced evacuation with verification) is identical to node's transcript for both modules; ready times on the same runner and host were 6615, 6522, 6900 ms (1018 module) and 7781, 6862, 7159 ms (this merge), idle RSS 556 and 574 MB.
+- Ledger written: 2026-10-17. Updated 2026-10-19 for the merge of `f3d38d16d`.
