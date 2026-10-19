@@ -55,6 +55,12 @@ def main() -> int:
     command = ["cargo", "build", "--locked", "--release", "-p", "perry-runtime-static",
                "--target", target, "--no-default-features", "--features", features,
                "--message-format=json-render-diagnostics"]
+    # Size experiments: PERRY_WASI_RUNTIME_OPT_LEVEL (0-3, s, z) overrides the
+    # release opt-level of the whole archive, perry-runtime's own override included.
+    opt_level = os.environ.get("PERRY_WASI_RUNTIME_OPT_LEVEL", "")
+    if opt_level:
+        command += ["--config", f'profile.release.opt-level="{opt_level}"',
+                    "--config", f'profile.release.package.perry-runtime.opt-level="{opt_level}"']
     # Cargo may legitimately reuse a fresh archive. Observe the target
     # artifact message instead of requiring an mtime change on every build.
     required = {"perry_runtime"}

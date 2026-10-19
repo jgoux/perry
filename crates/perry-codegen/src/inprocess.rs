@@ -82,7 +82,7 @@ pub(crate) fn statepoint_rewritten_ir_with_passes(
             default_cpu_for_triple(effective_target),
             "",
             OptimizationLevel::None,
-            RelocMode::PIC,
+            reloc_mode_for(effective_target),
             CodeModel::Default,
         )
         .ok_or_else(|| anyhow!("failed to create TargetMachine for `{effective_target}`"))?;
@@ -216,6 +216,19 @@ pub fn compile_ll_to_object_inprocess(
         native_roots,
         None,
     )
+}
+
+/// Relocation model of the target machine: PIC everywhere, except that
+/// `PERRY_WASM_STATIC_RELOC=1` selects the static model on wasm32 (no
+/// GOT-indirected globals; the wasm link is a plain static one).
+fn reloc_mode_for(effective_target: &str) -> RelocMode {
+    if effective_target.starts_with("wasm32")
+        && std::env::var("PERRY_WASM_STATIC_RELOC").as_deref() == Ok("1")
+    {
+        RelocMode::Static
+    } else {
+        RelocMode::PIC
+    }
 }
 
 /// The CPU an empty `-mcpu` means for this triple.

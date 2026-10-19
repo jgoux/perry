@@ -56,7 +56,7 @@ pub(super) fn optimize_and_emit(
             &cpu,
             &features,
             opt_level,
-            RelocMode::PIC,
+            reloc_mode_for(effective_target),
             CodeModel::Default,
         )
         .ok_or_else(|| anyhow!("failed to create TargetMachine for `{effective_target}`"))?;
