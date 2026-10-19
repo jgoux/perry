@@ -57,7 +57,8 @@ gen() {
   echo 'console.log(run());'
 }
 
-# measure NAME DEMOTE: compile, print "stores lines bytes" of `run`.
+# measure NAME DEMOTE: compile, print "stores lines module-bytes" of `run`
+# (FAIL FAIL FAIL when the build or the function is missing).
 measure() {
   local name=$1 demote=$2 d="$work/$1-$2"
   rm -rf "$d"; mkdir -p "$d"; cp "$work/$name.js" "$d/$name.js"
@@ -65,13 +66,18 @@ measure() {
     tail -n 20 "$d/compile.log" >&2; echo "FAIL FAIL FAIL"; return 1
   fi
   wasm-tools print "$d/$name.wasm" > "$d/$name.wat" || { echo "FAIL FAIL FAIL"; return 1; }
-  awk -v want="__run" '
-    /^  \(func \$perry_fn_/ { n = $2; sub(/^\$/, "", n); keep = (n ~ want "$") }
-    keep { lines++; if ($0 ~ /store/) stores++ }
+  local counts
+  counts=$(awk -v want="perry_fn_${name}_js__run" '
+    /^  \(func \$/ { n = $2; sub(/^\$/, "", n); keep = (n == want); if (keep) found = 1 }
+    keep { lines++; if ($0 ~ /[a-z0-9]\.store/) stores++ }
     keep && /^  \)/ { keep = 0 }
-    END { printf "%d %d", stores, lines }
-  ' "$d/$name.wat" | tr '\n' ' '
-  stat -c %s "$d/$name.wasm"
+    END { if (found) printf "%d %d\n", stores, lines; else print "FAIL FAIL" }
+  ' "$d/$name.wat")
+  if [ "$counts" = "FAIL FAIL" ]; then
+    echo "function perry_fn_${name}_js__run not found; candidates:" >&2
+    grep -o '^  (func \$[^ ]*__run' "$d/$name.wat" | head -n 5 >&2
+  fi
+  echo "$counts $(stat -c %s "$d/$name.wasm")"
   rm -f "$d/$name.wat"
 }
 
@@ -89,7 +95,7 @@ for kind in try finally forof; do
     # Both builds must print what node prints.
     for d in 0 1; do
       # shellcheck disable=SC2086
-      if ! "$wasmtime" $flags run "$work/$name-$d/$name.wasm" > "$work/$name-$d/out.txt" 2> "$work/$name-$d/err.txt" \
+      if ! "$wasmtime" run $flags "$work/$name-$d/$name.wasm" > "$work/$name-$d/out.txt" 2> "$work/$name-$d/err.txt" \
         || ! cmp -s "$work/$name.node.out" "$work/$name-$d/out.txt"; then
         echo "::error::$name (demote=$d) differs from node: $(head -c 200 "$work/$name-$d/out.txt") | $(head -c 300 "$work/$name-$d/err.txt")"
         rc=1
@@ -109,7 +115,8 @@ done
 
 largest=${sizes[${#sizes[@]}-1]}
 so=${off_stores[try,$largest]:-0}; sn=${on_stores[try,$largest]:-0}
-if [ "$so" != FAIL ] && [ "$sn" != FAIL ] && ! [ "$sn" -lt "$so" ]; then
-  echo "::error::demotion did not shrink the try variant at N=$largest ($so -> $sn stores)"; rc=1
+# Quadratic growth is what the pass removes: it must at least halve the stores.
+if [ "$so" = FAIL ] || [ "$sn" = FAIL ] || ! [ $((sn * 2)) -lt "$so" ]; then
+  echo "::error::demotion did not halve the stores of the try variant at N=$largest ($so -> $sn)"; rc=1
 fi
 exit $rc

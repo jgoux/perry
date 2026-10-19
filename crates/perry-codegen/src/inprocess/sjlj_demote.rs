@@ -19,6 +19,16 @@
 //! value of the latest execution of the definition, exactly what the phi
 //! carried.
 //!
+//! A call result that feeds a phi is the same case in disguise. The lowering
+//! checks dominance of a phi user against the phi's own block, not the end of
+//! the incoming block, and an `invoke` result only dominates through its
+//! normal edge. So `%r = call ...; br %merge` with `%merge = phi [%r, %b]` is
+//! "not dominated" after the split, SSA reconstruction then walks every
+//! predecessor back around the longjmp cycle, and the phis it leaves behind
+//! (dead, but demoted to a store per `invoke` before anything removes them)
+//! are the same quadratic cost. Perry's inline property reads, whose slow
+//! paths are calls merging into one phi, produce this everywhere.
+//!
 //! It must run after the optimizer (which would promote the slots straight
 //! back to SSA) and only on wasm32, whose lowering is the one that pays for
 //! SSA values across the dispatch. Perry roots GC values through shadow-frame
@@ -109,17 +119,42 @@ struct Demotion {
     uses: Vec<(LLVMValueRef, Vec<u32>)>,
 }
 
+/// The name of the function a call instruction calls directly.
+unsafe fn direct_callee_name<'a>(inst: LLVMValueRef) -> Option<&'a [u8]> {
+    if LLVMGetInstructionOpcode(inst) != LLVMOpcode::LLVMCall {
+        return None;
+    }
+    let callee = LLVMGetCalledValue(inst);
+    if callee.is_null() || LLVMIsAFunction(callee).is_null() {
+        return None;
+    }
+    let mut len: usize = 0;
+    let name = LLVMGetValueName2(callee, &mut len);
+    (!name.is_null()).then(|| std::slice::from_raw_parts(name.cast::<u8>(), len))
+}
+
 unsafe fn is_setjmp_call(inst: LLVMValueRef) -> bool {
+    direct_callee_name(inst) == Some(b"setjmp")
+}
+
+/// Whether the lowering turns this call into an `invoke` (its `canLongjmp`):
+/// every call but intrinsics, inline assembly and the allocator and setjmp
+/// helpers it emits itself.
+unsafe fn becomes_invoke(inst: LLVMValueRef) -> bool {
     if LLVMGetInstructionOpcode(inst) != LLVMOpcode::LLVMCall {
         return false;
     }
     let callee = LLVMGetCalledValue(inst);
-    if callee.is_null() || LLVMIsAFunction(callee).is_null() {
+    if callee.is_null() || !LLVMIsAInlineAsm(callee).is_null() {
         return false;
     }
-    let mut len: usize = 0;
-    let name = LLVMGetValueName2(callee, &mut len);
-    !name.is_null() && std::slice::from_raw_parts(name.cast::<u8>(), len) == b"setjmp"
+    if !LLVMIsAFunction(callee).is_null() && LLVMGetIntrinsicID(callee) != 0 {
+        return false;
+    }
+    !matches!(
+        direct_callee_name(inst),
+        Some(b"setjmp" | b"malloc" | b"free")
+    )
 }
 
 /// Rewrite one function; returns how many values were demoted.
@@ -261,6 +296,9 @@ unsafe fn plan(
         return None;
     }
     let def = layout.point(inst);
+    // A call's result lives on its invoke's normal edge: a phi that reads it
+    // is out of reach of the dominance check even from the same block.
+    let invoke = becomes_invoke(inst);
     let mut users: Vec<LLVMValueRef> = Vec::new();
     let mut seen = HashSet::new();
     let mut use_ = LLVMGetFirstUse(inst);
@@ -278,7 +316,7 @@ unsafe fn plan(
         if !LLVMIsAPHINode(user).is_null() {
             for index in 0..LLVMCountIncoming(user) {
                 if LLVMGetOperand(user, index) == inst
-                    && layout.end_of(LLVMGetIncomingBlock(user, index)) != def
+                    && (invoke || layout.end_of(LLVMGetIncomingBlock(user, index)) != def)
                 {
                     operands.push(index);
                 }
