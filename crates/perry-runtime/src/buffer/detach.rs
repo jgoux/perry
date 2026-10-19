@@ -69,6 +69,19 @@ pub fn detach_array_buffer(addr: usize) {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static DECOMMITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many payload decommits this thread has issued. Whether the OS zeroed a
+/// decommitted page is platform-dependent (macOS may keep the bytes), so
+/// tests that need to know a decommit happened, or did not, count the requests.
+#[cfg(test)]
+pub(crate) fn decommit_requests_on_this_thread() -> usize {
+    DECOMMITS.with(|count| count.get())
+}
+
 /// Release the page-aligned interior of a detached payload back to the OS.
 /// Rounds INWARD (start up, end down), so only pages lying entirely inside
 /// `[data, data + capacity)` are touched — the BufferHeader, the GcHeader in
@@ -87,6 +100,8 @@ pub(super) fn decommit_payload_pages(data: *mut u8, capacity: usize) {
     if end <= start {
         return;
     }
+    #[cfg(test)]
+    DECOMMITS.with(|count| count.set(count.get() + 1));
     unsafe {
         // macOS: MADV_FREE_REUSABLE drops the pages from the process
         // footprint immediately (plain MADV_FREE only reclaims under

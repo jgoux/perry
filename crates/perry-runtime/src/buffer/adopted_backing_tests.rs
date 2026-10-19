@@ -2,7 +2,6 @@ use super::*;
 use crate::gc::RuntimeHandleScope;
 use crate::thread::{deserialize_nanbox_on_current_thread, serialize_message};
 use crate::value::{JSValue, POINTER_MASK};
-use std::sync::atomic::Ordering;
 
 fn data(ptr: *const BufferHeader) -> *mut u8 {
     bytes::no_gc(|_| {
@@ -33,7 +32,7 @@ fn adopted_vec_keeps_capacity_layout_and_visible_length() {
 fn adopted_response_bytes_survive_views_transfer_gc_and_worker_exit() {
     let _lock = crate::gc::global_side_table_test_lock();
     crate::gc::register_runtime_handle_root_scanner_for_tests();
-    let before = backing::LIVE_BACKINGS.load(Ordering::SeqCst);
+    let before = backing::live_backings();
     let scope = RuntimeHandleScope::new();
     let mut bytes = Vec::with_capacity(1024 * 1024);
     bytes.resize(1024 * 1024, 0);
@@ -74,7 +73,7 @@ fn adopted_response_bytes_survive_views_transfer_gc_and_worker_exit() {
         assert!(is_detached_buffer(source as usize));
         assert_eq!(store::length(view as usize), 0);
         crate::gc::js_gc_collect();
-        assert_eq!(backing::LIVE_BACKINGS.load(Ordering::SeqCst), before + 1);
+        assert_eq!(backing::live_backings(), before + 1);
         std::thread::spawn(move || {
             crate::gc::register_runtime_handle_root_scanner_for_tests();
             let scope = RuntimeHandleScope::new();
@@ -93,5 +92,5 @@ fn adopted_response_bytes_survive_views_transfer_gc_and_worker_exit() {
         .join()
         .unwrap();
     }
-    assert_eq!(backing::LIVE_BACKINGS.load(Ordering::SeqCst), before);
+    assert_eq!(backing::live_backings(), before);
 }

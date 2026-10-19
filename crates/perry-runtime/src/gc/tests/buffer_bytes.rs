@@ -6,7 +6,6 @@ use crate::buffer::{
     bytes::{self, Brand, Init},
 };
 use crate::value::JSValue;
-use std::sync::atomic::Ordering;
 fn bits(p: *const buffer::BufferHeader) -> f64 {
     f64::from_bits(ptr_bits(p as usize))
 }
@@ -55,7 +54,7 @@ fn pinned_native_call_survives_a_moving_collection() {
 #[test]
 fn detach_defers_native_free_until_the_last_pin() {
     let _guard = guard(0);
-    let before = buffer::LIVE_BACKINGS.load(Ordering::SeqCst);
+    let before = buffer::live_backings();
     let buffer = buffer::js_array_buffer_new(1024 * 1024);
     let first = bytes::pin(bits(buffer)).unwrap();
     let second = bytes::pin(bits(buffer)).unwrap();
@@ -68,17 +67,17 @@ fn detach_defers_native_free_until_the_last_pin() {
         |scope| bytes::bytes(bits(buffer), scope).is_err()
     ));
     assert_eq!(
-        buffer::LIVE_BACKINGS.load(Ordering::SeqCst),
+        buffer::live_backings(),
         before + 1,
         "detach must retain the allocation while native code owns pins"
     );
     drop(first);
-    assert_eq!(buffer::LIVE_BACKINGS.load(Ordering::SeqCst), before + 1);
+    assert_eq!(buffer::live_backings(), before + 1);
     unsafe {
         assert_eq!(*second.as_ptr(), 91);
     }
     drop(second);
-    assert_eq!(buffer::LIVE_BACKINGS.load(Ordering::SeqCst), before);
+    assert_eq!(buffer::live_backings(), before);
 }
 
 #[test]

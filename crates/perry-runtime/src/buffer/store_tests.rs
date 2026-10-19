@@ -39,11 +39,11 @@ fn large_concat_uses_native_store_and_preserves_buffer_identity() {
     let array = crate::array::js_array_alloc(1);
     let array_root = scope.root_raw_mut_ptr(array);
     crate::array::js_array_push(array, JSValue::pointer(part.cast()));
-    let count = super::super::backing::LIVE_BACKINGS.load(std::sync::atomic::Ordering::SeqCst);
+    let count = super::super::backing::live_backings();
     let concat = super::super::js_buffer_concat(array_root.get_raw_mut_ptr());
     let concat_root = scope.root_raw_mut_ptr(concat);
     assert_eq!(
-        super::super::backing::LIVE_BACKINGS.load(std::sync::atomic::Ordering::SeqCst),
+        super::super::backing::live_backings(),
         count + 1,
         "concat must create one Native store"
     );

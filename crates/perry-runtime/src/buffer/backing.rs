@@ -22,7 +22,7 @@ impl Backing {
             handle_alloc_error(layout);
         }
         #[cfg(test)]
-        LIVE_BACKINGS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        ledger::register(data);
         Self {
             data,
             capacity,
@@ -37,7 +37,7 @@ impl Backing {
             handle_alloc_error(layout);
         }
         #[cfg(test)]
-        LIVE_BACKINGS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        ledger::register(data);
         Self {
             data,
             capacity,
@@ -57,7 +57,7 @@ impl Backing {
         let capacity = bytes.capacity() as u32;
         std::mem::forget(bytes);
         #[cfg(test)]
-        LIVE_BACKINGS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        ledger::register(data);
         Self {
             data,
             capacity,
@@ -90,15 +90,91 @@ impl Drop for Backing {
         let layout =
             Layout::from_size_align((self.capacity as usize).max(1), self.alignment as usize)
                 .expect("buffer backing layout");
-        unsafe { dealloc(self.data, layout) };
+        // Settle before freeing: once the address is free another thread may
+        // allocate it and register a new owner.
         #[cfg(test)]
-        LIVE_BACKINGS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        ledger::release(self.data);
+        unsafe { dealloc(self.data, layout) };
     }
 }
 
+/// Per-test accounting of live backings. Unit tests run in parallel, and many
+/// of them allocate backings while knowing nothing of the tests that assert on
+/// an exact count, so a process-wide counter cannot give any of them a stable
+/// baseline. Every backing instead settles against the ledger of the thread
+/// that created it, wherever it is dropped, so a transfer to another thread
+/// keeps counting for the test that made it. A thread the test spawns to
+/// allocate joins the test's ledger with `spawn_in_ledger`. The ledger lives
+/// beside the backing, keyed by its address, so the struct has its production
+/// layout under test.
 #[cfg(test)]
-pub(crate) static LIVE_BACKINGS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+mod ledger {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    pub(super) type Ledger = Arc<AtomicUsize>;
+
+    thread_local! {
+        static CURRENT: RefCell<Ledger> = RefCell::new(Ledger::default());
+    }
+
+    fn owners() -> &'static Mutex<HashMap<usize, Ledger>> {
+        static OWNERS: OnceLock<Mutex<HashMap<usize, Ledger>>> = OnceLock::new();
+        OWNERS.get_or_init(Default::default)
+    }
+
+    pub(super) fn current() -> Ledger {
+        // A backing created while the thread is being torn down has no test
+        // left to count it.
+        static ORPHANS: OnceLock<Ledger> = OnceLock::new();
+        CURRENT
+            .try_with(|current| current.borrow().clone())
+            .unwrap_or_else(|_| ORPHANS.get_or_init(Ledger::default).clone())
+    }
+
+    pub(super) fn register(data: *mut u8) {
+        let ledger = current();
+        ledger.fetch_add(1, Ordering::SeqCst);
+        let previous = owners().lock().unwrap().insert(data as usize, ledger);
+        assert!(previous.is_none(), "a live backing's address was reused");
+    }
+
+    pub(super) fn release(data: *mut u8) {
+        let ledger = owners()
+            .lock()
+            .unwrap()
+            .remove(&(data as usize))
+            .expect("a dropped backing was never registered");
+        ledger.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    pub(super) fn spawn<T: Send + 'static>(
+        body: impl FnOnce() -> T + Send + 'static,
+    ) -> std::thread::JoinHandle<T> {
+        let ledger = current();
+        std::thread::spawn(move || {
+            CURRENT.with(|current| *current.borrow_mut() = ledger);
+            body()
+        })
+    }
+}
+
+/// Backings created by the calling test (and the threads it spawned through
+/// `spawn_in_ledger`) that are still alive.
+#[cfg(test)]
+pub(crate) fn live_backings() -> usize {
+    ledger::current().load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// `std::thread::spawn` for a test thread whose backings count for its parent.
+#[cfg(test)]
+pub(crate) fn spawn_in_ledger<T: Send + 'static>(
+    body: impl FnOnce() -> T + Send + 'static,
+) -> std::thread::JoinHandle<T> {
+    ledger::spawn(body)
+}
 
 /// A single-use transfer in the serialized tree. During the private writer
 /// walk it names a source; commit removes that address before publication.
@@ -174,7 +250,6 @@ mod tests {
     use crate::gc::RuntimeHandleScope;
     use crate::thread::{deserialize_nanbox_on_current_thread, serialize_message};
     use crate::value::{JSValue, POINTER_MASK};
-    use std::sync::atomic::Ordering;
 
     fn setup() -> std::sync::MutexGuard<'static, ()> {
         let lock = crate::gc::global_side_table_test_lock();
@@ -191,7 +266,7 @@ mod tests {
     }
 
     fn count() -> usize {
-        LIVE_BACKINGS.load(Ordering::SeqCst)
+        live_backings()
     }
     fn collect() {
         crate::gc::js_gc_collect();
@@ -261,7 +336,7 @@ mod tests {
     fn backing_outlives_its_allocating_worker() {
         let _guard = setup();
         let before = count();
-        let (message, original) = std::thread::spawn(|| {
+        let (message, original) = spawn_in_ledger(|| {
             let source = js_array_buffer_new(1024 * 1024);
             let original = byte_address(source);
             unsafe {
@@ -321,7 +396,7 @@ mod tests {
     fn receiver_gc_releases_owned_backing() {
         let _guard = setup();
         let before = count();
-        std::thread::spawn(move || {
+        spawn_in_ledger(move || {
             crate::gc::register_runtime_handle_root_scanner_for_tests();
             let source = js_array_buffer_new(1024 * 1024);
             let message = unsafe {

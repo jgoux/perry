@@ -12,7 +12,7 @@ mod backing;
 #[cfg(test)]
 mod byte_cell_admission_tests;
 #[cfg(test)]
-pub(crate) use backing::LIVE_BACKINGS;
+pub(crate) use backing::live_backings;
 pub mod bytes;
 pub use backing::TransferredBacking;
 pub(crate) use header::{buffer_adopt_backing, buffer_alloc_owned};
@@ -22,6 +22,8 @@ mod copy_bytes;
 mod copy_write;
 mod dataview;
 mod detach;
+#[cfg(test)]
+pub(crate) use detach::decommit_requests_on_this_thread;
 mod encode;
 mod exotic_view;
 /// #8149: `ArrayBuffer` / `SharedArrayBuffer` / `DataView` are registered
