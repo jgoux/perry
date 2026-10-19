@@ -8,6 +8,13 @@ require("./dist/start/minimal-defaults"); // stdout logging, no pino worker thre
 const { HeadRenderer } = require("./dist/storage/renderer/head");
 const { InfoRenderer } = require("./dist/storage/renderer/info");
 const { ImageRenderer } = require("./dist/storage/renderer/image");
+const { setErrorHandler } = require("./dist/http/error-handler");
+const fastify = require("fastify");
+
+process.on("uncaughtException", (e) => {
+  console.log("UNCAUGHT", e && e.name, e && e.message);
+  process.exit(1);
+});
 
 function reply() {
   const r = { code: 0, headers: {}, sent: undefined };
@@ -64,6 +71,24 @@ async function main() {
     await info.render(request, res, options);
     return { code: res.code, headers: res.headers, sent: res.sent };
   });
+  // The same renderers behind real Fastify routes, requests injected in-process.
+  const app = fastify();
+  setErrorHandler(app);
+  app.head("/head", async (req, res) => new HeadRenderer().render(req, res, options));
+  app.get("/info", async (req, res) => new InfoRenderer().render(req, res, options));
+  app.get("/object", async (req, res) => res.send({ a: 1 }));
+  app.get("/object-late", async (req, res) => { await null; return res.send({ a: 1 }); });
+  app.get("/throws", async () => { throw new Error("boom"); });
+  await app.ready();
+  for (const [method, url] of [
+    ["HEAD", "/head"], ["GET", "/info"], ["GET", "/info"], ["GET", "/object"],
+    ["GET", "/object-late"], ["GET", "/throws"],
+  ]) {
+    await stage("inject " + method + " " + url, async () => {
+      const r = await app.inject({ method, url });
+      return { status: r.statusCode, type: r.headers["content-type"], body: r.body };
+    });
+  }
   console.log("done");
 }
 main();
