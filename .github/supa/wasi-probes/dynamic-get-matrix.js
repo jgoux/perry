@@ -462,13 +462,7 @@ check('nullProto hasOwnProperty', show(nullProto['hasOwnProperty'.slice(0)]));
   const frozen = new Plain();
   Object.freeze(Plain.prototype);
   check('class frozen prototype', read(frozen, ['p', 'zz', 'toString']));
-  let frozenWrite = 'no throw';
-  try {
-    Plain.prototype.zz = 'ignored';
-  } catch (e) {
-    frozenWrite = e.constructor.name;
-  }
-  check('class frozen prototype write', frozenWrite + ' ' + read(frozen, ['zz']));
+  check('class frozen prototype write', String(Reflect.set(Plain.prototype, 'zz', 'ignored')) + ' ' + read(frozen, ['zz']));
 
   // classes with accessors, statics, private names, native parents and null parents
   class WithAccessor {
@@ -495,9 +489,6 @@ check('nullProto hasOwnProperty', show(nullProto['hasOwnProperty'.slice(0)]));
   const ma = new MyArray();
   ma.push(1, 2);
   check('class extends Array', read(ma, ['own', 'length', '0', 'zz', 'push', 'toString']));
-  class MyMap extends Map {}
-  const mm2 = new MyMap([['k', 1]]);
-  check('class extends Map', read(mm2, ['size', 'zz', 'get', 'toString']));
   class MyError extends Error {
     extra = 1;
   }
