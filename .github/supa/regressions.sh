@@ -28,12 +28,16 @@ perry=(cargo test --locked --profile perry-dev -p perry --no-default-features --
 # feature set and profile as the integration tests, so `build` compiles the bin's test target in the
 # same invocation; `run` selects the audit alone (the bin has many other unit tests).
 audit=(cargo test --locked --profile perry-dev -p perry --no-default-features --features compile-cli --bin perry)
+# The whole perry-hir lib suite (cheap, ~700 tests): the substring-filtered names below only pin
+# individual tests, so a lib test that rots after an upstream change would otherwise go unnoticed.
+hir_lib=(cargo test --locked --profile perry-dev -p perry-hir --lib)
 rest=(cargo test --locked --profile perry-dev -p perry-hir -p perry-runtime -p perry-codegen --lib "${hir_tests[@]}")
 
 case "${1:?build|run}" in
   build)
     "${perry[@]}" --bin perry --no-run
     "${rest[@]}" --no-run
+    "${hir_lib[@]}" --no-run
     ;;
   run)
     "${perry[@]}"
@@ -41,6 +45,11 @@ case "${1:?build|run}" in
     "${audit[@]}" compile_env::tests::codegen_env_vars_are_build_cache_inputs 2>&1 | tee "$audit_out"
     grep -Eq '^test commands::compile::compile_env::tests::codegen_env_vars_are_build_cache_inputs \.\.\. ok$' "$audit_out" \
       || { echo "::error::the compile_env audit did not run and pass"; exit 1; }
+    hir_out=$(mktemp)
+    "${hir_lib[@]}" 2>&1 | tee "$hir_out"
+    # A suite that compiled to zero tests also reports success: insist on a real count.
+    grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed' "$hir_out" \
+      || { echo "::error::the perry-hir lib suite did not run and pass"; exit 1; }
     # Substring filters; the exact function names matter because other
     # perry-codegen lib tests abort on this baseline. The hot-TLS test builds
     # IR for an explicit Apple triple, so it runs on Linux. The runtime tests
