@@ -97,6 +97,7 @@ impl LoweringContext {
             class_decl_self_binding_wanted: false,
             class_decl_self_binding: None,
             per_evaluation_class_decls: HashSet::new(),
+            fresh_class_decl_bindings: HashMap::new(),
             shared_first_class_bindings: HashMap::new(),
             evaluated_parent_bindings: HashMap::new(),
             shared_first_decl_locals: HashMap::new(),

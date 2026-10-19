@@ -1428,7 +1428,28 @@ pub fn lower_stmts_using_aware(
     for name in &newly {
         ctx.forward_lexical_names.remove(name);
     }
-    r
+    r.map(|mut body| {
+        redirect_forward_reads_of_fresh_classes(ctx, stmts, &mut body);
+        body
+    })
+}
+
+/// A closure lowered before a per-evaluation class declaration of this block
+/// read the class's shared template; point those reads at the evaluation.
+fn redirect_forward_reads_of_fresh_classes(
+    ctx: &LoweringContext,
+    stmts: &[ast::Stmt],
+    body: &mut Vec<Stmt>,
+) {
+    for stmt in stmts {
+        let ast::Stmt::Decl(ast::Decl::Class(class_decl)) = stmt else {
+            continue;
+        };
+        let template = ctx.resolve_class_name(class_decl.ident.sym.as_str());
+        if let Some(&binding) = ctx.fresh_class_decl_bindings.get(&template) {
+            super::forward_class_reads::redirect_forward_class_reads(body, &template, binding);
+        }
+    }
 }
 
 fn lower_stmts_using_aware_inner(

@@ -576,6 +576,8 @@ fn lower_body_stmt_impl(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<V
                     let binding_name = class_decl.ident.sym.to_string();
                     let class_local = ctx.define_local(binding_name.clone(), Type::Any);
                     ctx.record_local_source_span(class_local, class_decl.ident.span);
+                    ctx.fresh_class_decl_bindings
+                        .insert(template_name.clone(), class_local);
                     if shares_first_evaluation {
                         ctx.shared_first_decl_locals
                             .insert(template_name.clone(), class_local);

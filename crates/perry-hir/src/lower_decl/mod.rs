@@ -18,6 +18,7 @@ mod class_members;
 mod class_validation;
 mod enum_decl;
 mod fn_decl;
+mod forward_class_reads;
 mod helpers;
 mod interface_decl;
 mod lexical_block;

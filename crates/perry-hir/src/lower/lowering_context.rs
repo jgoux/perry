@@ -405,6 +405,11 @@ pub struct LoweringContext {
     /// per-evaluation `ClassExprFresh` binding. A static write through such a
     /// class's name must reach the evaluated object, not the template.
     pub(crate) per_evaluation_class_decls: HashSet<String>,
+    /// Template name -> the local a per-evaluation class DECLARATION binds
+    /// its evaluated class object to. A closure lowered before the
+    /// declaration (a forward reference) read the shared template; the body
+    /// funnel redirects those reads through this binding once it is known.
+    pub(crate) fresh_class_decl_bindings: HashMap<String, LocalId>,
     /// #11759 (c′): locals that hold an evaluation of a class declaration
     /// whose later evaluations are fresh (the declaration's binding and its
     /// members' self-binding) → (template, its declared static field names).
