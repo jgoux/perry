@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Smoke flow against a running Storage: /status, create bucket, upload, download (bytes identical), list.
+# Smoke flow against a running Storage: /status, create bucket, upload, download (bytes identical), list,
+# then four error paths (invalid key, duplicate upload, missing object, bad JWT) whose bodies must match node.
+# Storage answers each of them with HTTP 400 and the real status in the body's statusCode.
 # Writes a normalized transcript to <outfile>; exits non-zero on the first failed expectation.
 # usage: smoke.sh <port> <outfile>     (needs SERVICE_KEY; SMOKE_BYTES sets the upload size, default 100000)
 set -uo pipefail
@@ -50,5 +52,17 @@ norm 'map(del(.created_at, .updated_at))'
 step "POST /object/list/smoke" 200 -X POST "$base/object/list/smoke" -H "${auth[0]}" \
   -H 'Content-Type: application/json' -d '{"prefix":"","limit":10,"offset":0}' || exit 1
 norm 'map({name})'
+# Error paths: Storage's error objects carry their own statusCode/code, rendered through
+# StorageBackendError.render(); a runtime that loses them answers FST_ERR_FAILED_ERROR_SERIALIZATION.
+step "POST /object/smoke/bad^key.bin (invalid key)" 400 -X POST "$base/object/smoke/bad%5Ekey.bin" -H "${auth[0]}" \
+  -H 'Content-Type: application/octet-stream' --data-binary @"$work/up.bin" || exit 1
+norm '.'
+step "POST /object/smoke/hello.bin (exists, no upsert)" 400 -X POST "$base/object/smoke/hello.bin" -H "${auth[0]}" \
+  -H 'Content-Type: application/octet-stream' --data-binary @"$work/up.bin" || exit 1
+norm '.'
+step "GET /object/smoke/missing.bin" 400 "$base/object/smoke/missing.bin" -H "${auth[0]}" || exit 1
+norm '.'
+step "GET /bucket (bad JWT)" 400 "$base/bucket" -H 'Authorization: Bearer not.a.jwt' || exit 1
+norm '.'
 echo "smoke ok" >> "$out"
 exit $fail
