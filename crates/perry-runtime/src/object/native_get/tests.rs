@@ -422,3 +422,243 @@ fn wide_private_shape_keeps_public_and_private_names_separate() {
         }
     }
 }
+
+/// A runtime-born ordinary plain object, as every literal and `{}` birth site
+/// marks it; `js_object_alloc` alone leaves the mark to its caller.
+fn plain_object(name: &str, value: f64) -> *mut ObjectHeader {
+    let object = js_object_alloc(0, 0);
+    unsafe { crate::object::mark_object_plain_ordinary(object) };
+    js_object_set_field_by_name(object, key(name), value);
+    object
+}
+
+fn marked(receiver: f64) -> f64 {
+    unsafe {
+        crate::object::mark_object_plain_ordinary(
+            crate::value::js_nanbox_get_pointer(receiver) as *mut ObjectHeader
+        )
+    };
+    receiver
+}
+
+fn by_name(receiver: f64, name: &str) -> u64 {
+    crate::object::js_object_get_field_by_name(receiver.to_bits() as *const ObjectHeader, key(name))
+        .bits()
+}
+
+const PROBE_KEYS: &[&str] = &[
+    "a",
+    "missing",
+    "toString",
+    "hasOwnProperty",
+    "valueOf",
+    "isPrototypeOf",
+    "propertyIsEnumerable",
+    "toLocaleString",
+    "__defineGetter__",
+    "__lookupGetter__",
+    "__proto__",
+    "constructor",
+    "0",
+    "1",
+    "length",
+    "name",
+    "flags",
+    "callee",
+    "@@iterator",
+    "@@toStringTag",
+    "#private",
+];
+
+/// The named read must settle to exactly what the generic ladder returns, for
+/// every probe key, with the settled lanes on and with every shape lane off.
+fn settled_matches_generic(receiver: f64, label: &str) {
+    for name in PROBE_KEYS {
+        let settled = by_name(receiver, name);
+        let generic = {
+            let _slow = Slow::enter();
+            by_name(receiver, name)
+        };
+        assert!(
+            settled == generic || same_string(settled, generic),
+            "{label}: settled read of {name:?} diverged from the generic ladder \
+             ({settled:#x} vs {generic:#x})"
+        );
+    }
+}
+
+/// Two reads of one string-valued property may materialize distinct cells.
+fn same_string(a: u64, b: u64) -> bool {
+    let (a, b) = (JSValue::from_bits(a), JSValue::from_bits(b));
+    (a.is_string() || a.is_short_string())
+        && (b.is_string() || b.is_short_string())
+        && crate::string::js_string_equals_value(f64::from_bits(a.bits()), f64::from_bits(b.bits()))
+            != 0
+}
+
+#[test]
+fn settled_named_reads_match_the_generic_ladder_across_receiver_kinds() {
+    let _no_gc = crate::gc::GcSuppressScope::new();
+    // Resolve the realm Object.prototype so the terminal shortcuts can engage.
+    let object_prototype = crate::object::builtin_prototype_value("Object");
+    let object_prototype_ptr =
+        crate::value::js_nanbox_get_pointer(object_prototype) as *mut ObjectHeader;
+    assert!(!object_prototype_ptr.is_null());
+
+    let plain = plain_object("a", 1.0);
+    js_object_set_field_by_name(plain, key("0"), 2.0);
+    let empty = js_object_alloc(0, 0);
+    marked(boxed(empty));
+    let null_proto = marked(js_object_create(f64::from_bits(crate::value::TAG_NULL)));
+    let child = marked(js_object_create(boxed(plain)));
+    let grandchild = marked(js_object_create(child));
+    let with_getter = plain_object("a", 1.0);
+    install_getter(with_getter, "missing", true);
+    let wide = js_object_alloc(0, 0);
+    marked(boxed(wide));
+    for i in 0..100 {
+        js_object_set_field_by_name(wide, key(&format!("field{i}")), i as f64);
+    }
+    let array = crate::array::js_array_alloc(4);
+    let closure = crate::closure::js_closure_alloc(crate::fn_info!(getter, 0), 0);
+    let weakmap = crate::weakref::js_weakmap_new();
+    let weakset = crate::weakref::js_weakset_new();
+    marked(boxed(weakmap));
+    marked(boxed(weakset));
+    let map = crate::map::js_map_alloc(4);
+    let set = crate::set::js_set_alloc(4);
+    let args = crate::array::js_array_alloc(1);
+    crate::array::js_array_push(args, JSValue::number(1.0));
+    let arguments = crate::object::js_arguments_object_alloc_mapped(
+        crate::value::js_nanbox_pointer(args as i64),
+        f64::from_bits(crate::value::TAG_UNDEFINED),
+        1,
+    );
+    settled_matches_generic(boxed(plain), "plain");
+    settled_matches_generic(boxed(empty), "empty");
+    settled_matches_generic(null_proto, "Object.create(null)");
+    settled_matches_generic(child, "child of plain");
+    settled_matches_generic(grandchild, "grandchild of plain");
+    settled_matches_generic(boxed(with_getter), "own getter");
+    settled_matches_generic(boxed(wide), "wide");
+    settled_matches_generic(boxed(object_prototype_ptr), "Object.prototype");
+    settled_matches_generic(crate::value::js_nanbox_pointer(array as i64), "array");
+    settled_matches_generic(crate::value::js_nanbox_pointer(closure as i64), "closure");
+    settled_matches_generic(boxed(weakmap), "WeakMap");
+    settled_matches_generic(boxed(weakset), "WeakSet");
+    settled_matches_generic(crate::value::js_nanbox_pointer(map as i64), "Map");
+    settled_matches_generic(crate::value::js_nanbox_pointer(set as i64), "Set");
+    settled_matches_generic(boxed(arguments), "arguments");
+    #[cfg(feature = "regex-engine")]
+    {
+        let regexp = crate::regex::js_regexp_new(key("x"), key("g"));
+        settled_matches_generic(boxed(regexp as *mut ObjectHeader), "RegExp");
+    }
+}
+
+#[test]
+fn the_settled_miss_is_taken_only_for_plain_ordinary_receivers() {
+    let _no_gc = crate::gc::GcSuppressScope::new();
+    let _ = crate::object::builtin_prototype_value("Object");
+    let settled = |object: *mut ObjectHeader, name: &str| unsafe {
+        try_settled_get_by_name(object, key(name)).map(|value| value.bits())
+    };
+    let undefined = crate::value::TAG_UNDEFINED;
+    let plain = plain_object("a", 1.0);
+    assert_eq!(settled(plain, "a"), Some(1.0f64.to_bits()));
+    assert_eq!(settled(plain, "missing"), Some(undefined));
+    assert_eq!(settled(plain, "toString").is_some(), true);
+    assert_ne!(settled(plain, "toString"), Some(undefined));
+    // Symbol-keyed reads stay with the generic ladder.
+    assert_eq!(settled(plain, "@@iterator"), None);
+    // A miss decided by an own accessor is never settled to undefined here.
+    let with_getter = plain_object("a", 1.0);
+    install_getter(with_getter, "missing", true);
+    assert_eq!(settled(with_getter, "missing"), None);
+    // Receivers the shapes alone do not decide.
+    let weakmap = crate::weakref::js_weakmap_new();
+    marked(boxed(weakmap));
+    assert_eq!(settled(weakmap, "missing"), None);
+    // A birth that never carried the runtime's plain mark keeps the generic read.
+    let unmarked = object("a", 1.0);
+    assert_eq!(settled(unmarked, "missing"), None);
+    let arguments_args = crate::array::js_array_alloc(0);
+    let arguments = crate::object::js_arguments_object_alloc_mapped(
+        crate::value::js_nanbox_pointer(arguments_args as i64),
+        f64::from_bits(crate::value::TAG_UNDEFINED),
+        0,
+    );
+    assert_eq!(settled(arguments, "missing"), None);
+}
+
+#[test]
+fn object_prototype_mutation_after_a_settled_miss_is_observed() {
+    let _no_gc = crate::gc::GcSuppressScope::new();
+    let object_prototype = crate::object::builtin_prototype_value("Object");
+    let proto_ptr = crate::value::js_nanbox_get_pointer(object_prototype) as *mut ObjectHeader;
+    let undefined = crate::value::TAG_UNDEFINED;
+    let plain = plain_object("a", 1.0);
+    let child = marked(js_object_create(boxed(plain)));
+    let child_ptr = crate::value::js_nanbox_get_pointer(child) as *mut ObjectHeader;
+    let name = "settled_probe_added_later";
+    for receiver in [boxed(plain), child] {
+        assert_eq!(by_name(receiver, name), undefined);
+    }
+    // A data property added to Object.prototype is inherited by every chain.
+    js_object_set_field_by_name(proto_ptr, key(name), 5.0);
+    for receiver in [boxed(plain), child] {
+        assert_eq!(by_name(receiver, name), 5.0f64.to_bits());
+        let _slow = Slow::enter();
+        assert_eq!(by_name(receiver, name), 5.0f64.to_bits());
+    }
+    // An own property shadows it; deleting the own property reveals it again.
+    js_object_set_field_by_name(child_ptr, key(name), 6.0);
+    assert_eq!(by_name(child, name), 6.0f64.to_bits());
+    assert_eq!(js_object_delete_field(child_ptr, key(name)), 1);
+    assert_eq!(by_name(child, name), 5.0f64.to_bits());
+    // Deleting the Object.prototype property returns the settled miss.
+    assert_eq!(js_object_delete_field(proto_ptr, key(name)), 1);
+    for receiver in [boxed(plain), child] {
+        assert_eq!(by_name(receiver, name), undefined);
+        let _slow = Slow::enter();
+        assert_eq!(by_name(receiver, name), undefined);
+    }
+    // An accessor added to Object.prototype runs for a receiver that missed.
+    GETTER_CALLS.store(0, Ordering::Relaxed);
+    install_getter(proto_ptr, name, true);
+    for receiver in [boxed(plain), child] {
+        assert_eq!(by_name(receiver, name), 47.0f64.to_bits());
+    }
+    assert_eq!(GETTER_CALLS.load(Ordering::Relaxed), 2);
+    install_getter(proto_ptr, name, false);
+}
+
+#[test]
+fn deleting_and_re_adding_keys_keeps_the_settled_miss_exact() {
+    let _no_gc = crate::gc::GcSuppressScope::new();
+    let _ = crate::object::builtin_prototype_value("Object");
+    let undefined = crate::value::TAG_UNDEFINED;
+    let object = plain_object("a", 1.0);
+    js_object_set_field_by_name(object, key("b"), 2.0);
+    for _ in 0..3 {
+        assert_eq!(by_name(boxed(object), "b"), 2.0f64.to_bits());
+        assert_eq!(js_object_delete_field(object, key("b")), 1);
+        assert_eq!(by_name(boxed(object), "b"), undefined);
+        assert_eq!(by_name(boxed(object), "a"), 1.0f64.to_bits());
+        js_object_set_field_by_name(object, key("b"), 2.0);
+    }
+    // A prototype change after a miss is observed.
+    let holder = self::object("late", 9.0);
+    assert_eq!(by_name(boxed(object), "late"), undefined);
+    crate::object::prototype_chain::object_set_user_prototype(
+        object as usize,
+        boxed(holder).to_bits(),
+    );
+    assert_eq!(by_name(boxed(object), "late"), 9.0f64.to_bits());
+    crate::object::prototype_chain::object_set_user_prototype(
+        object as usize,
+        f64::from_bits(crate::value::TAG_NULL).to_bits(),
+    );
+    assert_eq!(by_name(boxed(object), "late"), undefined);
+    assert_eq!(by_name(boxed(object), "toString"), undefined);
+}
