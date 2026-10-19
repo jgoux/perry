@@ -6,6 +6,9 @@
 # The runtime archive is built by exactly one job (the workflow's wasi-setup, build-runtime
 # "true"), which saves it to the cache; every other job restores it ("false") and fails on a
 # miss instead of building the same archive again in parallel.
+# The size settings (runtime-opt-level, extra-env) are inputs, so that every job of a run sees the
+# same values: the opt-level is part of the archive's cache key, and extra-env is exported to the
+# job's later steps (the compile gates of Perry's wasm32 backend).
 name: supa-wasi-env
 description: wasm32-wasip1 toolchain, wasi tools and runtime archive for the supa-storage wasip1 jobs
 inputs:
@@ -15,6 +18,12 @@ inputs:
   fast-build:
     description: 'true is the plan fast build (no thin LTO, 16 codegen units), cached under its own key. Every job of a run passes the same value, the plan fast_build output'
     default: 'false'
+  runtime-opt-level:
+    description: 'Opt-level (0-3, s, z) of the wasm32-wasip1 runtime archive; empty keeps the profile opt-level. Part of the archive cache key and of the fast-build guard expectation. Every job of a run passes the same value, the workflow runtime_opt_level input'
+    default: ''
+  extra-env:
+    description: 'Space-separated KEY=VAL pairs exported to the later steps of the job (the workflow extra_env input, compile gates such as PERRY_TYPED_BODIES=0)'
+    default: ''
   simulate:
     description: 'The workflow simulate input (.github/supa/simulate.sh), applied before the cache key is computed so that the key sees the simulated change'
     default: ''
@@ -78,7 +87,7 @@ runs:
     - name: Runtime cache key
       id: rtkey
       shell: bash
-      run: echo "key=perry-wasip1-runtime-${{ inputs.fast-build == 'true' && 'fast-' || '' }}${{ runner.arch }}-${{ hashFiles('crates/perry-runtime/**', 'crates/perry-runtime-static/**', 'crates/perry-ext-net/**', 'crates/perry-ext-http/**', 'crates/perry-http-server/**', 'crates/perry-ext-undici/**', 'crates/perry-ext-zlib/**', 'crates/perry-ext-ws/**', 'crates/perry-stdlib/**', 'crates/perry-ffi/**', 'crates/perry-native-registration/**', 'crates/perry-abi/**', 'crates/perry-parser/**', 'crates/perry-diagnostics/**', 'crates/perry-dispatch/**', 'Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/**', 'scripts/wasi_build_runtime.*') }}" >> "$GITHUB_OUTPUT"
+      run: echo "key=perry-wasip1-runtime-${{ inputs.fast-build == 'true' && 'fast-' || '' }}${{ runner.arch }}-${{ hashFiles('crates/perry-runtime/**', 'crates/perry-runtime-static/**', 'crates/perry-ext-net/**', 'crates/perry-ext-http/**', 'crates/perry-http-server/**', 'crates/perry-ext-undici/**', 'crates/perry-ext-zlib/**', 'crates/perry-ext-ws/**', 'crates/perry-stdlib/**', 'crates/perry-ffi/**', 'crates/perry-native-registration/**', 'crates/perry-abi/**', 'crates/perry-parser/**', 'crates/perry-diagnostics/**', 'crates/perry-dispatch/**', 'Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/**', 'scripts/wasi_build_runtime.*') }}${{ inputs.runtime-opt-level != '' && format('-opt{0}', inputs.runtime-opt-level) || '' }}" >> "$GITHUB_OUTPUT"
     - name: Runtime cache (restore only)
       if: inputs.build-runtime != 'true'
       uses: actions/cache/restore@v4
@@ -96,6 +105,9 @@ runs:
     - name: Build the wasm32-wasip1 runtime
       if: inputs.build-runtime == 'true' && steps.runtime.outputs.cache-hit != 'true'
       shell: bash
+      env:
+        # Read by scripts/wasi_build_runtime.py and by the fast-build guard of ci-build-profile.sh.
+        PERRY_WASI_RUNTIME_OPT_LEVEL: ${{ inputs.runtime-opt-level }}
       run: |
         start=$(date +%s)
         # The fast profile (iteration presets only) or the real release: see ci-build-profile.sh.
@@ -103,7 +115,7 @@ runs:
         scripts/wasi_build_runtime.sh wasm32-wasip1
         {
           echo "### wasm32-wasip1 runtime"
-          echo "- build: $(( $(date +%s) - start )) s, profile: $FAST_BUILD_PROFILE"
+          echo "- build: $(( $(date +%s) - start )) s, profile: $FAST_BUILD_PROFILE, runtime opt-level: ${PERRY_WASI_RUNTIME_OPT_LEVEL:-profile}"
           echo '```'; sccache --show-stats | sed -n 1,12p; echo '```'
         } >> "$GITHUB_STEP_SUMMARY"
     - name: Runtime cache hit summary
@@ -117,3 +129,15 @@ runs:
     - name: Runtime archive
       shell: bash
       run: ls -l "$PERRY_RUNTIME_DIR"/libperry_runtime.a
+    # The compile gates of this run, for every later step of the job that compiles.
+    - name: Extra environment
+      if: inputs.extra-env != ''
+      shell: bash
+      env:
+        EXTRA_ENV: ${{ inputs.extra-env }}
+      run: |
+        for kv in $EXTRA_ENV; do
+          [[ "$kv" =~ ^[A-Z][A-Z0-9_]*=[A-Za-z0-9_.:/,-]*$ ]] || { echo "::error::extra-env: '$kv' is not NAME=VALUE"; exit 1; }
+          echo "$kv" >> "$GITHUB_ENV"
+          echo "extra env: $kv"
+        done

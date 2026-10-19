@@ -12,6 +12,12 @@
 # staticlib wrapper crates) win over the variable; those crates only archive the runtime rlib.
 # `false` leaves the release profile exactly as it is.
 #
+# PERRY_WASI_RUNTIME_OPT_LEVEL (the runtime_opt_level dispatch input, read by
+# scripts/wasi_build_runtime.py) overrides the opt-level of the wasm32 runtime archive with
+# `--config` arguments. Those set `profile.release.opt-level` and perry-runtime's package
+# override, keys the CARGO_PROFILE_RELEASE_* variables above do not touch, so the two compose;
+# the guard below resolves the profile with the same arguments and expects that opt-level.
+#
 # Sets FAST_BUILD_PROFILE to `fast` or `release` for the caller's summary.
 if [ "${1:-false}" = true ]; then
   if [ -n "${RUSTFLAGS:-}${CARGO_ENCODED_RUSTFLAGS:-}" ]; then
@@ -24,12 +30,19 @@ if [ "${1:-false}" = true ]; then
   # What cargo will actually build the runtime with (no compilation: --unit-graph): the exception
   # transport needs panic=abort next to the unwind tables, and the speed-up needs the override
   # to have taken effect.
-  runtime=$(cargo build --locked --release -p perry-runtime-static --unit-graph -Z unstable-options 2>/dev/null \
+  # (the numeric levels are integers and s and z strings in TOML, as in wasi_build_runtime.py)
+  rt_opt=${PERRY_WASI_RUNTIME_OPT_LEVEL:-}
+  rt_args=()
+  if [ -n "$rt_opt" ]; then
+    case "$rt_opt" in [0-9]) rt_value=$rt_opt ;; *) rt_value="\"$rt_opt\"" ;; esac
+    rt_args=(--config "profile.release.opt-level=$rt_value" --config "profile.release.package.perry-runtime.opt-level=$rt_value")
+  fi
+  runtime=$(cargo build --locked --release -p perry-runtime-static "${rt_args[@]}" --unit-graph -Z unstable-options 2>/dev/null \
     | jq -c '[.units[] | select(.target.name == "perry_runtime" and (.target.kind | index("rlib"))) | .profile
               | {panic, opt_level, lto, codegen_units}][0]')
   echo "fast build: perry_runtime rlib profile $runtime"
-  jq -e '.panic == "abort" and .opt_level == "3" and .lto == "off" and .codegen_units == 16' <<< "$runtime" >/dev/null \
-    || { echo "::error::fast build: perry_runtime does not get panic=abort, opt-level 3, lto off and 16 codegen units"; return 1 2>/dev/null || exit 1; }
+  jq -e --arg opt "${rt_opt:-3}" '.panic == "abort" and .opt_level == $opt and .lto == "off" and .codegen_units == 16' <<< "$runtime" >/dev/null \
+    || { echo "::error::fast build: perry_runtime does not get panic=abort, opt-level ${rt_opt:-3}, lto off and 16 codegen units"; return 1 2>/dev/null || exit 1; }
 else
   FAST_BUILD_PROFILE=release
 fi

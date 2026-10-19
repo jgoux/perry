@@ -34,6 +34,17 @@
 # ~28 min for full. The concurrency group includes the preset, so two presets dispatched on one
 # ref run side by side; the same preset again cancels its predecessor.
 #
+# Size settings (dispatch inputs extra_env and runtime_opt_level, defaults 'PERRY_TYPED_BODIES=0
+# PERRY_WASM_STATIC_RELOC=1' and 's'; pushes and empty inputs build the compiler's defaults): every
+# wasip1 job gets them through the supa-wasi-env action, so the probes, the Storage module and the
+# renderers all run the configuration that ships. The runtime archive is built once by wasi-setup at
+# that opt-level (its cache key ends in -opt<level>; with fast_build the override composes with the
+# fast profile: CARGO_PROFILE_RELEASE_* and the --config opt-level are different keys, and the
+# guard of ci-build-profile.sh checks the opt-level it expects). The module cache key holds both
+# inputs, so another setting never reuses a module built with the first. storage-wasi then strips the
+# compiler's output and runs binaryen's wasm-opt -Oz over it; that is the module the smoke runs and
+# storage-dist packs (storage.raw.wasm is the compiler's output, kept in the job only).
+#
 # wasi-linux is sharded: wasi-shards.py splits the probes and the sjlj-size.sh cells into
 # WASI_SHARDS balanced shards (greedy, weights in wasi-probe-weights.txt, any probe missing
 # there weighs 3 s). Each shard records what it ran; wasi-verify.sh requires the union to be
@@ -66,8 +77,9 @@
 #                         patch-*.cjs, wasi-imports.py, env.sh and anything new count
 #                       - the hash of .github/actions/** (toolchain pins, wasi tool downloads)
 #                         and scripts/wasi_build_runtime.*
-#                       - the build flags: STORAGE_WASI_FLAGS, STORAGE_WASI_ENTRY, the wasi-sdk,
-#                         wasmtime and wasm-tools versions, and MODULE_RECIPE (bump it when the
+#                       - the build flags: STORAGE_WASI_FLAGS, STORAGE_WASI_ENTRY, the extra_env
+#                         and runtime_opt_level inputs, the wasi-sdk, wasmtime, wasm-tools and
+#                         binaryen versions, and MODULE_RECIPE (bump it when the
 #                         compile, check or pack steps of the storage-wasi job change)
 #                     A docs, probe or test change leaves all of that alone and hits; any other
 #                     change misses. A miss costs a compile, a wrong hit ships a stale module, so
@@ -80,7 +92,8 @@
 #                     object cache of the renderers programs, which the job did not save before.
 #   storage-built-*   built Storage checkout (node_modules + dist), keyed by SHA.
 #   perry-wasip1-*    wasm32-wasip1 runtime archive for `perry compile --target
-#                     wasip1`, keyed by the runtime, stdlib and ext crates only.
+#                     wasip1`, keyed by the runtime, stdlib and ext crates, the profile and
+#                     the runtime_opt_level input.
 #   wasi-tools-*      wasi-sdk, wasmtime and wasm-tools for the wasi jobs.
 name: supa-storage
 run-name: supa-storage / ${{ github.sha }}
@@ -139,10 +152,10 @@ on:
         description: Space-separated wasi probe names to run in the wasi-linux job (default all)
         default: ''
       extra_env:
-        description: "Space-separated KEY=VAL pairs exported in the storage-wasi job before the compile steps (code-size settings); part of the object cache id. The default is the size configuration of the shipped module: no typed closure bodies and static wasm32 relocation (PERRY_FULL_OUTLINE_IC=1 saves 4.4 MB more but slows Storage requests on arm64 by about 20%) (empty for the compiler's defaults, for A/B runs)"
+        description: "Space-separated KEY=VAL pairs exported to every wasip1 job that compiles (wasi-linux probes, the Storage module, the renderers; code-size settings); part of the object cache ids and of the module cache key. The default is the size configuration of the shipped module: no typed closure bodies and static wasm32 relocation (PERRY_FULL_OUTLINE_IC=1 saves 4.4 MB more but slows Storage requests on arm64 by about 20%) (empty for the compiler's defaults, for A/B runs)"
         default: 'PERRY_TYPED_BODIES=0 PERRY_WASM_STATIC_RELOC=1'
       runtime_opt_level:
-        description: "Opt-level (0-3, s, z) of the wasm32-wasip1 runtime archive built in the storage-wasi job (empty = the profile's); part of the object cache id"
+        description: "Opt-level (0-3, s, z) of the wasm32-wasip1 runtime archive that wasi-setup builds and every wasip1 job links (empty = the profile's); part of the archive's cache key (perry-wasip1-runtime-*-opt<level>), the object cache ids and the module cache key"
         default: 's'
       smoke_baseline_run:
         description: Run id whose storage-wasi-module artifact the storage-wasi-smoke job also runs, on the same host, to compare with (empty to skip)
@@ -223,7 +236,7 @@ env:
   STORAGE_WASI_FLAGS: "PERRY_NO_AUTO_OPTIMIZE=1 PERRY_KEEP_SYMBOLS=1 PERRY_FUNCTION_SOURCE=header"
   STORAGE_WASI_ENTRY: dist/start/server-minimal.js
   # Bump when the compile, check or pack steps of storage-wasi change (module cache key).
-  MODULE_RECIPE: "1"
+  MODULE_RECIPE: "2"
   RENDERERS_RECIPE: "1"
 
 jobs:
@@ -350,6 +363,8 @@ jobs:
         with:
           build-runtime: "true"
           fast-build: ${{ needs.plan.outputs.fast_build }}
+          runtime-opt-level: ${{ inputs.runtime_opt_level }}
+          extra-env: ${{ inputs.extra_env }}
           simulate: ${{ inputs.simulate }}
 
   # Perry's wasm32-wasip1 target: compile the probes in .github/supa/wasi-probes
@@ -389,6 +404,8 @@ jobs:
         with:
           build-runtime: "false"
           fast-build: ${{ needs.plan.outputs.fast_build }}
+          runtime-opt-level: ${{ inputs.runtime_opt_level }}
+          extra-env: ${{ inputs.extra_env }}
           simulate: ${{ inputs.simulate }}
       - uses: actions/setup-node@v4 # the reference runs
         with:
@@ -512,6 +529,9 @@ jobs:
       - uses: actions/checkout@v4
       - name: Cache keys
         id: keys
+        env:
+          EXTRA_ENV: ${{ inputs.extra_env }}
+          RUNTIME_OPT_LEVEL: ${{ inputs.runtime_opt_level }}
         run: |
           # Files of .github/supa that cannot change the module or its checks: the probe programs
           # and drivers, the other jobs' scripts, the CI plumbing and notes.
@@ -520,7 +540,9 @@ jobs:
           common+=" variant=$SUPA_STORAGE_VARIANT schemas=$SUPA_LAZY_SCHEMAS ajv=$SUPA_LAZY_AJV"
           common+=" actions=${{ hashFiles('.github/actions/**') }} runtime-script=${{ hashFiles('scripts/wasi_build_runtime.*') }}"
           common+=" flags=[$STORAGE_WASI_FLAGS] entry=$STORAGE_WASI_ENTRY"
-          common+=" sdk=$WASI_SDK_VERSION wasmtime=$WASMTIME_VERSION wasmtime-p1=$WASMTIME_P1_VERSION wasm-tools=$WASM_TOOLS_VERSION"
+          common+=" sdk=$WASI_SDK_VERSION wasmtime=$WASMTIME_VERSION wasmtime-p1=$WASMTIME_P1_VERSION wasm-tools=$WASM_TOOLS_VERSION binaryen=$BINARYEN_VERSION"
+          # The size settings change the module's bytes: the compile gates and the runtime archive's opt-level.
+          common+=" extra-env=[$EXTRA_ENV] runtime-opt-level=[$RUNTIME_OPT_LEVEL]"
           supa='${{ hashFiles('.github/supa/**', '!.github/supa/wasi-probes/**', '!.github/supa/probes/**', '!.github/supa/probes.sh', '!.github/supa/probe.js', '!.github/supa/regressions.sh', '!.github/supa/wasi-probes.sh', '!.github/supa/wasi-probe-weights.txt', '!.github/supa/wasi-shards.py', '!.github/supa/wasi-verify.sh', '!.github/supa/wasi-smoke.sh', '!.github/supa/warm.sh', '!.github/supa/sjlj-size.sh', '!.github/supa/smoke.sh', '!.github/supa/compare.sh', '!.github/supa/serve.sh', '!.github/supa/diagnose.sh', '!.github/supa/simulate.sh', '!.github/supa/prune-caches.sh', '!.github/supa/ci-*.sh', '!.github/supa/storage-info*', '!.github/supa/*.md') }}'
           # the renderer programs and their driver only matter to the renderers job
           renderers='${{ hashFiles('.github/supa/storage-info*') }}'
@@ -590,7 +612,6 @@ jobs:
       PERRY_RUNTIME_DIR: ${{ github.workspace }}/target/wasm32-wasip1/release
       PERRY_MODULE_JOBS: ${{ inputs.module_jobs || '8' }}
       PERRY_CODEGEN_UNIT_JOBS: ${{ inputs.codegen_jobs || '4' }}
-      PERRY_WASI_RUNTIME_OPT_LEVEL: ${{ inputs.runtime_opt_level }}
     steps:
       - uses: actions/checkout@v4
       - name: Perry build
@@ -604,6 +625,8 @@ jobs:
         with:
           build-runtime: "false"
           fast-build: ${{ needs.plan.outputs.fast_build }}
+          runtime-opt-level: ${{ inputs.runtime_opt_level }}
+          extra-env: ${{ inputs.extra_env }}
           simulate: ${{ inputs.simulate }}
       - uses: actions/setup-node@v4
         with:
@@ -628,8 +651,6 @@ jobs:
             id=$(printf '%s|%s|%s' "$id" "$EXTRA_ENV" "$RUNTIME_OPT_LEVEL" | sha256sum | cut -c1-16)
           fi
           echo "id=$id" >> "$GITHUB_OUTPUT"
-          # The compile gates of this run, for every step that compiles.
-          for kv in $EXTRA_ENV; do echo "$kv" >> "$GITHUB_ENV"; echo "extra env: $kv"; done
       - name: Restore the object cache
         id: objects
         uses: actions/cache/restore@v4
@@ -838,6 +859,8 @@ jobs:
         with:
           build-runtime: "false"
           fast-build: ${{ needs.plan.outputs.fast_build }}
+          runtime-opt-level: ${{ inputs.runtime_opt_level }}
+          extra-env: ${{ inputs.extra_env }}
           simulate: ${{ inputs.simulate }}
       - uses: actions/setup-node@v4
         with:
@@ -850,8 +873,15 @@ jobs:
           fail-on-cache-miss: true
       - name: Object cache id
         id: objid
+        env:
+          EXTRA_ENV: ${{ inputs.extra_env }}
+          RUNTIME_OPT_LEVEL: ${{ inputs.runtime_opt_level }}
         run: |
           id=$(echo '${{ hashFiles('crates/perry-codegen/**', 'crates/perry-hir/**', 'crates/perry-transform/**', 'crates/perry-types/**', 'crates/perry-parser/**', 'crates/perry-diagnostics/**', 'crates/perry-api-manifest/**', 'crates/perry-dispatch/**', 'crates/perry-abi/**', 'crates/perry-ui-model/**', 'crates/perry/src/**', '!crates/*/tests/**', '!crates/**/*_tests.rs', '!crates/**/tests.rs', '!crates/perry/src/commands/compile/link/**', '!crates/perry/src/commands/compile/optimized_libs/**', '!crates/perry/src/commands/compile/optimized_libs.rs', '!crates/perry/src/commands/compile/strip_dedup/**', '!crates/perry/src/commands/compile/strip_dedup.rs', '!crates/perry/src/commands/compile/library_search/**', '!crates/perry/src/commands/compile/library_search.rs', '!crates/perry/src/commands/compile/post_link.rs', '!crates/perry/src/commands/compile/compressed_libs.rs', '!crates/perry/src/commands/compile/size_report.rs', '!crates/perry/src/commands/compile/bundle_*.rs') }}' | cut -c1-16)
+          # Experiments never share objects with the baseline or with each other.
+          if [ -n "$EXTRA_ENV$RUNTIME_OPT_LEVEL" ]; then
+            id=$(printf '%s|%s|%s' "$id" "$EXTRA_ENV" "$RUNTIME_OPT_LEVEL" | sha256sum | cut -c1-16)
+          fi
           echo "id=$id" >> "$GITHUB_OUTPUT"
       - name: Restore the renderers' object cache
         uses: actions/cache/restore@v4
