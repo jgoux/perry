@@ -379,7 +379,7 @@ jobs:
           export PERRY_OBJECT_CACHE_BUILD_ID=${{ steps.objid.outputs.id }}
           export PERRY_BIN="$GITHUB_WORKSPACE/target/release/perry" WASM_ENV_FILE="$RUNNER_TEMP/driver.env"
           set -a; . "$WASM_ENV_FILE"; set +a
-          "$GITHUB_WORKSPACE/.github/supa/storage-info-server.sh"
+          INFO_SERVER_DIAG=1 "$GITHUB_WORKSPACE/.github/supa/storage-info-server.sh"
       - name: Module checks
         run: |
           set -o pipefail

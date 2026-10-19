@@ -29,8 +29,9 @@ requests=(
   "AUTH GET /object/info/authenticated/b/a.bin?width=100&resize=cover"
   "GET /quit"
 )
-serve_requests() {  # outfile
+serve_requests() {  # outfile, server stdout file
   : > "$1"
+  for _ in $(seq 1 240); do grep -q listening "$2" 2>/dev/null && break; sleep 0.5; done
   for line in "${requests[@]}"; do
     method=${line%% *}; path=${line#* }; auth=()
     if [ "$method" = AUTH ]; then auth=(-H 'Authorization: Bearer x'); method=${path%% *}; path=${path#* }; line="AUTH $method $path"; fi
@@ -46,20 +47,35 @@ serve_requests() {  # outfile
   done
 }
 
+wasm_env=()   # extra --env flags for the wasm run
+run_wasm() {  # label
+  local label=$1
+  (timeout 300 "$wasmtime" run -W exceptions=y -W unknown-imports-trap -S preview2=n -S "tcplisten=127.0.0.1:$port" \
+     "${env_flags[@]}" "${wasm_env[@]}" "$out/info-server.wasm" > "$out/srv.$label.out" 2> "$out/srv.$label.err"; echo $? > "$out/srv.$label.rc") &
+  local pid=$!; serve_requests "$out/srv.$label.serve" "$out/srv.$label.out"; wait $pid
+  cat "$out/srv.$label.serve" "$out/srv.$label.out" > "$out/srv.$label.all"
+}
+
 (timeout 120 node storage-info-server.js > "$out/srv.node.out" 2>&1; echo $? > "$out/srv.node.rc") &
-pid=$!; serve_requests "$out/srv.node.serve"; wait $pid
-(timeout 300 "$wasmtime" run -W exceptions=y -W unknown-imports-trap -S preview2=n -S "tcplisten=127.0.0.1:$port" \
-   "${env_flags[@]}" --env PERRY_TRACE_THROW=1 "$out/info-server.wasm" > "$out/srv.wasm.out" 2> "$out/srv.wasm.err"; echo $? > "$out/srv.wasm.rc") &
-pid=$!; serve_requests "$out/srv.wasm.serve"; wait $pid
+pid=$!; serve_requests "$out/srv.node.serve" "$out/srv.node.out"; wait $pid
+cat "$out/srv.node.serve" "$out/srv.node.out" > "$out/srv.node.all"
+run_wasm wasm
 
 echo "--- node: answers ---"; cat "$out/srv.node.serve"
-echo "--- wasm: answers ---"; cat "$out/srv.wasm.serve"
 echo "--- wasm: stdout ---"; cat "$out/srv.wasm.out"
-echo "--- wasm: stderr (tail) ---"; tail -n 40 "$out/srv.wasm.err"
+echo "--- wasm: stderr (tail) ---"; grep -v trace-throw "$out/srv.wasm.err" | tail -n 20
 echo "exit: node $(cat "$out/srv.node.rc"), wasm $(cat "$out/srv.wasm.rc")"
 rc=0
-cat "$out/srv.node.serve" "$out/srv.node.out" > "$out/srv.node.all"
-cat "$out/srv.wasm.serve" "$out/srv.wasm.out" > "$out/srv.wasm.all"
 diff -u "$out/srv.node.all" "$out/srv.wasm.all" || rc=1
 [ "$(cat "$out/srv.node.rc")" = "$(cat "$out/srv.wasm.rc")" ] || rc=1
+
+# Diagnostics (never gating): the same run with other collector settings.
+if [ -n "${INFO_SERVER_DIAG:-}" ]; then
+  for variant in "PERRY_GEN_GC=0" "PERRY_GC_FORCE_EVACUATE=1" "PERRY_GC_SCAVENGE=0"; do
+    wasm_env=(--env "$variant"); label=diag-${variant%%=*}
+    run_wasm "$label"
+    echo "=== $variant: exit $(cat "$out/srv.$label.rc")"
+    diff -u "$out/srv.node.all" "$out/srv.$label.all" | head -n 30 || true
+  done
+fi
 exit $rc
