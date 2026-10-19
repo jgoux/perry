@@ -1,8 +1,12 @@
 use super::*;
 
+// Per thread: a process-global count moved whenever a concurrently running test
+// boxed a primitive, landing inside another test's before/after window.
 #[cfg(test)]
-static TEST_BOXED_PRIMITIVE_ALLOCATIONS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static TEST_BOXED_PRIMITIVE_ALLOCATIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
 
 const CLASS_ID_BOXED_NUMBER: u32 = 0xFFFF_00D0;
 const CLASS_ID_BOXED_STRING: u32 = 0xFFFF_00D1;
@@ -89,7 +93,7 @@ unsafe fn boxed_primitive_payload_for_object(
 
 #[cfg(test)]
 pub(crate) fn test_boxed_primitive_allocation_count() -> usize {
-    TEST_BOXED_PRIMITIVE_ALLOCATIONS.load(std::sync::atomic::Ordering::Relaxed)
+    TEST_BOXED_PRIMITIVE_ALLOCATIONS.with(std::cell::Cell::get)
 }
 
 fn register_boxed_primitive_payload(obj: *mut crate::object::ObjectHeader, payload: f64) {
@@ -110,7 +114,7 @@ fn register_boxed_primitive_payload(obj: *mut crate::object::ObjectHeader, paylo
         );
     }
     #[cfg(test)]
-    TEST_BOXED_PRIMITIVE_ALLOCATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    TEST_BOXED_PRIMITIVE_ALLOCATIONS.with(|count| count.set(count.get() + 1));
 }
 
 fn boxed_constructor_name(class_id: u32) -> Option<&'static [u8]> {
