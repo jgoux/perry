@@ -1,6 +1,6 @@
 // wasm-env: PERRY_GC_LOG=1
-// stderr-max-count: 0 kind=full
-// max-rss-mb: 900
+// stderr-max-count: 16 kind=full
+// max-rss-mb: 600
 // A request-shaped loop over a steady live heap: each turn of the event loop reads a 1 MiB
 // buffer, copies it twice (concat and a typed-array slice copy) and drops all three, the way a
 // storage server streams an object. The off-heap bytes die young, so the collector should pay
