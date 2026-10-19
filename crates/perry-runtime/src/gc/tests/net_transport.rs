@@ -493,6 +493,10 @@ fn n9_a_stale_resolve_leaves_the_new_plan_and_backlog_alone() {
     let (mut peer, _) = listener
         .accept()
         .expect("only the new plan reaches the v4 listener");
+    // BSD and macOS hand `accept` a socket that inherited the listener's
+    // O_NONBLOCK, which makes the read timeout below a no-op and the read fail
+    // with WouldBlock whenever the bytes are not in the kernel buffer yet.
+    peer.set_nonblocking(false).unwrap();
     peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
     let mut bytes = [0; 11];
     peer.read_exact(&mut bytes).unwrap();
