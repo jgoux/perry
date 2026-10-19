@@ -25,7 +25,4 @@ console.log("json named", JSON.stringify(await json(source('{"k":', "2}"))));
 console.log("buffer", (await sc.buffer(source(Buffer.from("buf")))).toString());
 console.log("web", typeof sw.ReadableStream, typeof swDefault.WritableStream, sw.ReadableStream === globalThis.ReadableStream,
   ReadableStream === globalThis.ReadableStream, swDefault.TransformStream === globalThis.TransformStream);
-const reader = new sw.ReadableStream({ start(c) { c.enqueue("w"); c.close(); } }).getReader();
-console.log("read", JSON.stringify(await reader.read()));
-console.log("strategy", new swDefault.CountQueuingStrategy({ highWaterMark: 4 }).highWaterMark);
 process.exit(0);

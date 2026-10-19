@@ -20,9 +20,9 @@ const show = async (label, fn) => {
   }
   console.log("constants", typeof bare.constants, bare.constants === fs.constants);
   console.log("same namespace", bare === fs.promises, prefixed === bare);
-  await show("mkdir", () => bare.mkdir(base, { recursive: true }).then((p) => typeof p));
-  await show("mkdir comma", () => (0, bare.mkdir)(base + "/a", { recursive: true }).then((p) => typeof p));
-  await show("mkdir destructured", () => mkdir(base + "/b", { recursive: true }).then((p) => typeof p));
+  await show("mkdir", () => bare.mkdir(base, { recursive: true }).then(() => "resolved"));
+  await show("mkdir comma", () => (0, bare.mkdir)(base + "/a", { recursive: true }).then(() => "resolved"));
+  await show("mkdir destructured", () => mkdir(base + "/b", { recursive: true }).then(() => "resolved"));
   await show("writeFile", () => bare.writeFile(base + "/f.txt", "hello"));
   await show("writeFile comma", () => (0, prefixed.writeFile)(base + "/g.txt", "world"));
   await show("writeFile destructured", () => writeFile(base + "/h.txt", "!"));

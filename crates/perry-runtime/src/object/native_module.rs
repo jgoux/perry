@@ -901,12 +901,8 @@ unsafe fn native_module_property_by_name_impl(
     }
     // `readline.promises` is the `readline/promises` submodule namespace.
     if module_name == "readline" && property_name == "promises" {
-        return unsafe {
-            crate::node_submodules::js_node_submodule_namespace(
-                b"readline_promises".as_ptr(),
-                "readline_promises".len() as u32,
-            )
-        };
+        let submodule = "readline/promises";
+        return js_create_native_module_namespace(submodule.as_ptr(), submodule.len());
     }
     if module_name == "dns" && property_name == "promises" {
         crate::dns::dns_promises_init_servers_from_callback_if_unset();

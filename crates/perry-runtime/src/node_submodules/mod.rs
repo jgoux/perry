@@ -1771,6 +1771,27 @@ pub unsafe extern "C" fn js_node_submodule_export_as_function(
         if let Some(value) = submodule_default_object_value(submod) {
             return value;
         }
+        // A submodule without a default export object: `import x from "node:<sub>"`
+        // binds the namespace itself (CommonJS `module.exports`), never the
+        // unknown-export sentinel (registry-backed modules only). It is the one `require("<sub>")`
+        // and `import * as` hand out, so identity holds across the forms.
+        if find_export(submod, "default").is_none()
+            && special_export_value(submod.key, name).is_none()
+        {
+            let module = match submod.key {
+                "timers_promises" => Some("timers/promises"),
+                "readline_promises" => Some("readline/promises"),
+                "stream_consumers" => Some("stream/consumers"),
+                "stream_web" => Some("stream/web"),
+                _ => None,
+            };
+            if let Some(module) = module {
+                return crate::object::js_create_native_module_namespace(
+                    module.as_ptr(),
+                    module.len(),
+                );
+            }
+        }
     }
     if submod.key == "timers" && name == "promises" {
         return crate::object::timers_promises_parent_namespace();
