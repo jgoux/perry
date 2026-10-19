@@ -95,12 +95,61 @@ pub(crate) fn emit_grow_mutator_writeback(
 
 /// `fill` over a pre-sized array past its backing store grows the store
 /// (`array/concat_reverse.rs::fill_slots`), which replaces the head. Write the
-/// head it returns back to a single-local receiver like any growing mutator.
-fn fill_writeback(ctx: &mut FnCtx<'_>, object: &Expr, new_box: &str) -> Result<()> {
-    if let Expr::LocalGet(array_id) = object {
-        emit_grow_mutator_writeback(ctx, *array_id, new_box)?;
-    }
+/// head it returns back to a single-local receiver like any growing mutator,
+/// but only when the binding still holds the receiver the call operated on.
+///
+/// An argument can rebind the receiver's variable
+/// (`a.fill((a = [9], 0))`): the call then filled the OLD array, and the
+/// binding must keep the new one. `unchanged` is that test, taken by
+/// [`fill_receiver_unchanged`] before the call because the call itself is a
+/// collection point. The receiver slot is a root, so a collection during the
+/// arguments rewrites the binding and the rooted re-read alike and they stay
+/// equal; a grown array leaves a forwarding stub at the old head, so the
+/// binding holds the old head bits until this write-back.
+fn fill_writeback(
+    ctx: &mut FnCtx<'_>,
+    object: &Expr,
+    new_box: &str,
+    unchanged: Option<&str>,
+) -> Result<()> {
+    let Expr::LocalGet(array_id) = object else {
+        return Ok(());
+    };
+    let Some(unchanged) = unchanged else {
+        return emit_grow_mutator_writeback(ctx, *array_id, new_box);
+    };
+    let write_idx = ctx.new_block("fill.writeback");
+    let done_idx = ctx.new_block("fill.writeback_done");
+    let write_label = ctx.block_label(write_idx);
+    let done_label = ctx.block_label(done_idx);
+    ctx.block().cond_br(unchanged, &write_label, &done_label);
+    ctx.current_block = write_idx;
+    emit_grow_mutator_writeback(ctx, *array_id, new_box)?;
+    ctx.block().br(&done_label);
+    ctx.current_block = done_idx;
     Ok(())
+}
+
+/// `i1`: does a single-local receiver's binding still hold `recv_box`, the
+/// receiver value re-read after the arguments were evaluated? `None` for a
+/// receiver that is not a single local (no write-back happens there).
+///
+/// The read is a plain binding load compared on the spot, with no collection
+/// point between it and the compare, so the register it produces never lives
+/// across one.
+fn fill_receiver_unchanged(
+    ctx: &mut FnCtx<'_>,
+    object: &Expr,
+    recv_box: &str,
+) -> Result<Option<String>> {
+    if !matches!(object, Expr::LocalGet(_)) {
+        return Ok(None);
+    }
+    let current = crate::expr::lower_expr(ctx, object)?;
+    let blk = ctx.block();
+    let current_bits = blk.bitcast_double_to_i64(&current);
+    let recv_bits = blk.bitcast_double_to_i64(recv_box);
+    Ok(Some(blk.icmp_eq(I64, &current_bits, &recv_bits)))
 }
 
 /// How many **leading** arguments the arm for `property` lowers, in source
@@ -759,6 +808,7 @@ pub(crate) fn lower_array_method(
                     // `undefined` (ECMA-262 step: value defaults to undefined).
                     0 | 1 => {
                         let val_box = arg_or_undefined(arg_vals, 0);
+                        let unchanged = fill_receiver_unchanged(ctx, object, recv_box)?;
                         let blk = ctx.block();
                         let recv_handle = unbox_to_i64(blk, recv_box);
                         let result = blk.call(
@@ -767,7 +817,7 @@ pub(crate) fn lower_array_method(
                             &[(I64, &recv_handle), (DOUBLE, &val_box)],
                         );
                         let new_box = nanbox_pointer_inline(blk, &result);
-                        fill_writeback(ctx, object, &new_box)?;
+                        fill_writeback(ctx, object, &new_box, unchanged.as_deref())?;
                         Ok(new_box)
                     }
                     2 | 3 => {
@@ -777,6 +827,7 @@ pub(crate) fn lower_array_method(
                             // Default end = +Infinity → clamps to length in the runtime.
                             double_literal(f64::INFINITY)
                         };
+                        let unchanged = fill_receiver_unchanged(ctx, object, recv_box)?;
                         let blk = ctx.block();
                         let recv_handle = unbox_to_i64(blk, recv_box);
                         let result = blk.call(
@@ -790,7 +841,7 @@ pub(crate) fn lower_array_method(
                             ],
                         );
                         let new_box = nanbox_pointer_inline(blk, &result);
-                        fill_writeback(ctx, object, &new_box)?;
+                        fill_writeback(ctx, object, &new_box, unchanged.as_deref())?;
                         Ok(new_box)
                     }
                     _ => bail!(
