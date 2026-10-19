@@ -9,6 +9,8 @@ const { HeadRenderer } = require("./dist/storage/renderer/head");
 const { InfoRenderer } = require("./dist/storage/renderer/info");
 const { setErrorHandler } = require("./dist/http/error-handler");
 const fastify = require("fastify");
+const { authSchema, errorSchema } = require("./dist/http/schemas");
+const objectInfoRoutes = require("./dist/http/routes/object/getObjectInfo");
 
 process.on("uncaughtException", (e) => {
   console.log("UNCAUGHT", e && e.name, e && e.message);
@@ -28,6 +30,29 @@ const options = { bucket: "bkt", key: "k", version: "v1", object };
 
 const app = fastify();
 setErrorHandler(app);
+
+// The real Storage routes (schemas, async requestHandler with default
+// parameters, renderer switch) on a faked request.storage.
+app.addSchema(authSchema);
+app.addSchema(errorSchema);
+app.decorateRequest("storage", null);
+app.decorateRequest("tenantId", "");
+app.decorateRequest("isAuthenticated", false);
+const q = {
+  location: { getKeyLocation: (p) => p.tenantId + "/" + p.bucketId + "/" + p.objectName },
+  db: { hasMigration: async () => true },
+  asSuperUser() { return q; },
+  async findBucket(id) { return id === "nobucket" ? undefined : { id, public: id === "pub" }; },
+  from() { return { async findObject() { return object; } }; },
+  renderer(type) { return type === "info" ? new InfoRenderer() : new HeadRenderer(); },
+};
+app.addHook("onRequest", async (request) => {
+  request.storage = q;
+  request.tenantId = "t";
+  request.isAuthenticated = request.headers.authorization !== undefined;
+});
+app.register(objectInfoRoutes.authenticatedRoutes, { prefix: "/object" });
+app.register(objectInfoRoutes.publicRoutes, { prefix: "/object" });
 app.head("/head/*", async (req, res) => new HeadRenderer().render(req, res, options));
 app.get("/info/*", async (req, res) => new InfoRenderer().render(req, res, options));
 app.get("/object", async (req, res) => res.send({ a: 1 }));

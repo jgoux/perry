@@ -19,13 +19,22 @@ requests=(
   "GET /info/a.bin"
   "GET /object"
   "GET /throws"
+  "AUTH GET /object/info/authenticated/b/a.bin"
+  "AUTH HEAD /object/authenticated/b/a.bin"
+  "GET /object/info/pub/a.bin"
+  "GET /object/info/public/pub/a.bin"
+  "HEAD /object/public/pub/a.bin"
+  "GET /object/info/public/b/a.bin"
+  "AUTH GET /object/info/authenticated/nobucket/a.bin"
+  "AUTH GET /object/info/authenticated/b/a.bin?width=100&resize=cover"
   "GET /quit"
 )
 serve_requests() {  # outfile
   : > "$1"
   for line in "${requests[@]}"; do
-    method=${line%% *}; path=${line#* }
-    args=(-s -S --max-time 60 --retry 60 --retry-delay 1 --retry-connrefused -H 'Connection: close' -D "$out/h.txt" -o "$out/b.txt")
+    method=${line%% *}; path=${line#* }; auth=()
+    if [ "$method" = AUTH ]; then auth=(-H 'Authorization: Bearer x'); method=${path%% *}; path=${path#* }; line="AUTH $method $path"; fi
+    args=("${auth[@]}" -s -S --max-time 60 --retry 60 --retry-delay 1 --retry-connrefused -H 'Connection: close' -D "$out/h.txt" -o "$out/b.txt")
     if [ "$method" = HEAD ]; then args+=(--head); else args+=(-X "$method"); fi
     { echo "> $line"
       if curl "${args[@]}" "http://127.0.0.1:$port$path"; then
