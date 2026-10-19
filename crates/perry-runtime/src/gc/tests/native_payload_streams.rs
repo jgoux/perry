@@ -269,6 +269,12 @@ fn z9_moving_gc_inside_data_keeps_the_output_correct() {
 /// cell is finalized), and no step job (no JS) runs after the teardown.
 #[test]
 fn z10_worker_exit_with_a_step_queued_runs_no_step() {
+    // The assertion below is a delta over `PAYLOAD_FINALIZED`, a process-wide
+    // counter every payload test advances. Hold the same lock they hold
+    // (`CopyingNurseryTestGuard`), or a sibling finalizing a cell mid-test
+    // makes the delta wrong (432117 against 432107 under a filter that ran
+    // the payload tests together).
+    let _gc = super::support::CopyingNurseryTestGuard::new(0);
     let _reset = FamilyReset::new();
     let cells_before = finalized();
     let (jobs, steps) = std::thread::spawn(|| {
