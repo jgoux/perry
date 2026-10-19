@@ -78,6 +78,11 @@ on:
         type: choice
         options: [lazy, eager]
         default: lazy
+      storage_variant:
+        description: "all stubs the packages supa-wasm never reaches (AWS SDK, swagger, pg-boss, rate-limit, vector/iceberg/render/admin routes; storage-stubs.sh) and runs with EXPOSE_DOCS=false; base keeps them, for A/B runs"
+        type: choice
+        options: [all, base]
+        default: all
       simulate:
         description: Measurement aid, touch one source file to exercise cache invalidation without a commit
         type: choice
@@ -85,7 +90,7 @@ on:
         default: none
 
 concurrency:
-  group: supa-storage-${{ github.ref }}-${{ inputs.schemas }}-${{ inputs.ajv }}
+  group: supa-storage-${{ github.ref }}-${{ inputs.schemas }}-${{ inputs.ajv }}-${{ inputs.storage_variant }}
   cancel-in-progress: true
 
 permissions:
@@ -115,6 +120,8 @@ env:
   # Read by .github/supa/shims.sh.
   SUPA_LAZY_SCHEMAS: ${{ inputs.schemas == 'eager' && '0' || '1' }}
   SUPA_LAZY_AJV: ${{ inputs.ajv == 'eager' && '0' || '1' }}
+  # Read by .github/supa/shims.sh (stubs) and the jobs that run Storage (storage-stubs.sh env).
+  SUPA_STORAGE_VARIANT: ${{ inputs.storage_variant || 'all' }}
 
 jobs:
   # Compiler and runtime archives, built once per source hash.
@@ -402,6 +409,26 @@ jobs:
           wasm-tools strip --all "$wasm" -o "$OUT/storage.stripped.wasm"
           ls -l "$OUT/storage.stripped.wasm"
           wasm-tools objdump "$OUT/storage.stripped.wasm" | grep -c 'custom' | sed 's/^/custom sections left: /' | tee -a "$OUT/strip-sizes.txt" || true
+      # What supa-wasm downloads: the module plus the files Storage reads at run time, built from this
+      # job's Storage checkout (the one storage-prep built and the shims were applied to).
+      - name: Pack storage-dist
+        run: |
+          command -v zstd >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq zstd; }
+          d=$RUNNER_TEMP/storage-dist
+          mkdir -p "$d/runtime/node_modules/postgres-migrations/dist/migrations"
+          install -m 755 "$OUT/storage.wasm" "$d/storage.wasm"
+          cp -r "$STORAGE_DIR/migrations" "$d/runtime/migrations"
+          cp "$STORAGE_DIR/node_modules/postgres-migrations/dist/migrations/0_create-migrations-table.sql" \
+            "$d/runtime/node_modules/postgres-migrations/dist/migrations/"
+          # the swagger UI assets are served from node_modules: only a build that keeps swagger needs them
+          if [ "$SUPA_STORAGE_VARIANT" = base ]; then
+            mkdir -p "$d/runtime/node_modules/@fastify/swagger-ui"
+            cp -r "$STORAGE_DIR/node_modules/@fastify/swagger-ui/static" "$d/runtime/node_modules/@fastify/swagger-ui/static"
+          fi
+          tar --sort=name --owner=0 --group=0 --numeric-owner -C "$d" -I 'zstd -T0 -19' -cf "$OUT/storage-dist.tar.zst" storage.wasm runtime
+          ls -l "$OUT/storage-dist.tar.zst"
+          tar -I zstd -tf "$OUT/storage-dist.tar.zst" | grep -v '/$' | sed 's/^/  /' > "$OUT/storage-dist.files.txt"
+          { echo "- storage-dist: $(stat -c %s "$OUT/storage-dist.tar.zst") bytes, variant \`$SUPA_STORAGE_VARIANT\`, $(wc -l < "$OUT/storage-dist.files.txt") files"; } >> "$GITHUB_STEP_SUMMARY"
       - name: Function source consumers
         if: always()
         run: |
@@ -414,7 +441,7 @@ jobs:
           {
             echo "### storage-wasi"
             echo "- perry: \`${GITHUB_SHA::8}\`, storage: \`${{ needs.storage-prep.outputs.sha }}\` (\`$STORAGE_REF\`), objects: \`${{ steps.objid.outputs.id }}\`"
-            echo "- jobs: modules=$PERRY_MODULE_JOBS units=$PERRY_CODEGEN_UNIT_JOBS"
+            echo "- jobs: modules=$PERRY_MODULE_JOBS units=$PERRY_CODEGEN_UNIT_JOBS, storage variant: \`$SUPA_STORAGE_VARIANT\`"
             [ -f "$OUT/compile.time" ] && grep -E 'Elapsed|Maximum resident' "$OUT/compile.time" | sed 's/^\s*/- compile: /'
             [ -f "$OUT/storage.wasm" ] && echo "- module: $(stat -c %s "$OUT/storage.wasm") bytes, $(stat -c %s "$OUT/storage.stripped.wasm" 2>/dev/null || echo ?) bytes stripped"
             [ -f "$OUT/strip-sizes.txt" ] && sed 's/^/- /' "$OUT/strip-sizes.txt"
@@ -431,6 +458,7 @@ jobs:
             supa-out/imports.txt
             supa-out/fn-tostring-scan.txt
             supa-out/strip-sizes.txt
+            supa-out/storage-dist.files.txt
           if-no-files-found: ignore
       # The compiler and the wasm runtime archive, for compiling small repros in a Linux
       # arm64 container on a dev machine (no LLVM 22 there).
@@ -450,6 +478,15 @@ jobs:
             supa-out/storage.wasm
             supa-out/storage.stripped.wasm
           retention-days: 14
+      # Long-lived, for supa-wasm: one file, the layout of the storage-dist-*.tar.zst release assets
+      # (storage.wasm unstripped, runtime/ with migrations/ and the postgres-migrations bootstrap sql).
+      - uses: actions/upload-artifact@v4
+        if: success() && hashFiles('supa-out/storage-dist.tar.zst') != ''
+        with:
+          name: storage-dist
+          path: supa-out/storage-dist.tar.zst
+          retention-days: 90
+          compression-level: 0
 
   # Storage compiled to wasip1, run under supa-host (the host of supabase/supa-wasm) against
   # Postgres and compared with the node reference: three fresh instances (100 KB upload, 5 MiB upload,
@@ -486,6 +523,8 @@ jobs:
         run: |
           mkdir -p "$OUT"
           .github/supa/env.sh > "$ENV_FILE"
+          # the environment of the stubbed Storage: the plain one plus what the stubs need (EXPOSE_DOCS=false)
+          { cat "$ENV_FILE"; .github/supa/storage-stubs.sh "$SUPA_STORAGE_VARIANT" env; } > "$OUT/storage.variant.env"
           grep -E '^(AUTH_JWT_SECRET|PGRST_JWT_SECRET|SERVICE_KEY|ANON_KEY|S3_PROTOCOL_ACCESS_KEY_ID|S3_PROTOCOL_ACCESS_KEY_SECRET)=' "$ENV_FILE" \
             | cut -d= -f2- | while read -r v; do echo "::add-mask::$v"; done
       - uses: actions/setup-node@v4
@@ -543,7 +582,8 @@ jobs:
       - name: Smoke
         run: |
           set -o pipefail
-          modules=(new="$OUT/new/storage.stripped.wasm")
+          # the new module runs under the stubbed environment and is compared with the node run of the same stubs
+          modules=(new="$OUT/new/storage.stripped.wasm::$OUT/node-reference/node-variant-transcript.txt::$OUT/storage.variant.env")
           [ -f "$OUT/base/storage.stripped.wasm" ] && modules=(base="$OUT/base/storage.stripped.wasm" "${modules[@]}")
           ls -l "$OUT"/new "$OUT"/base 2>/dev/null || true
           .github/supa/wasi-smoke.sh "$PWD/supa-host-src/host/target/release/supa-host" "$OUT/node-reference/node-transcript.txt" "$OUT/smoke" "${modules[@]}"
@@ -552,7 +592,7 @@ jobs:
         run: |
           {
             echo "### storage-wasi-smoke"
-            echo "- perry: \`${GITHUB_SHA::8}\`, storage: \`${{ needs.storage-prep.outputs.sha }}\`, baseline run: \`${{ inputs.smoke_baseline_run || 'none' }}\`"
+            echo "- perry: \`${GITHUB_SHA::8}\`, storage: \`${{ needs.storage-prep.outputs.sha }}\`, storage variant: \`$SUPA_STORAGE_VARIANT\`, baseline run: \`${{ inputs.smoke_baseline_run || 'none' }}\`"
             echo '```'; cat "$OUT/smoke/results.txt" 2>/dev/null; echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           true
@@ -689,6 +729,8 @@ jobs:
         run: .github/supa/serve.sh stop node "$OUT"
       # The shims must not change what Storage does under node.
       - name: Node smoke with the shims applied
+        env:
+          SUPA_STORAGE_VARIANT: base # the stubs are checked in the next step
         run: |
           export PGPASSWORD=postgres
           psql -h 127.0.0.1 -U postgres -c 'create database ref_shim'
@@ -701,10 +743,30 @@ jobs:
       - name: Stop shimmed node
         if: always()
         run: .github/supa/serve.sh stop nodeshim "$OUT"
+      # The stubbed packages (storage-stubs.sh) must not change what Storage does under supa-wasm's
+      # environment: the same smoke, with EXPOSE_DOCS=false, may differ from the reference only in the
+      # docs probes. Its transcript is the reference of the jobs that run the stubbed Storage.
+      - name: Node smoke with the stubbed packages
+        run: |
+          export PGPASSWORD=postgres
+          psql -h 127.0.0.1 -U postgres -c 'create database ref_stubs'
+          cd "$STORAGE_DIR"
+          "$GITHUB_WORKSPACE/.github/supa/shims.sh" .
+          while IFS= read -r l; do [ -n "$l" ] && export "$l"; done < <("$GITHUB_WORKSPACE/.github/supa/storage-stubs.sh" "$SUPA_STORAGE_VARIANT" env)
+          "$GITHUB_WORKSPACE/.github/supa/serve.sh" start nodestubs ref_stubs 5621 "$OUT" -- node dist/start/server-minimal.js
+          "$GITHUB_WORKSPACE/.github/supa/smoke.sh" 5621 "$OUT/node-variant-transcript.txt"
+          diff -u "$OUT/node-transcript.txt" "$OUT/node-variant-transcript.txt" > "$OUT/variant-vs-reference.diff" || true
+          cat "$OUT/variant-vs-reference.diff"
+          unexpected=$(grep -E '^[-+][^-+]' "$OUT/variant-vs-reference.diff" | grep -vF 'extra GET /documentation' || true)
+          if [ -n "$unexpected" ]; then echo "::error::the stubbed Storage differs from the reference beyond the docs probes"; echo "$unexpected"; exit 1; fi
+          echo "- node smoke with the stubbed packages (\`$SUPA_STORAGE_VARIANT\`): identical to the reference except the docs probes" >> "$GITHUB_STEP_SUMMARY"
+      - name: Stop stubbed node
+        if: always()
+        run: .github/supa/serve.sh stop nodestubs "$OUT"
       - name: Node server log tail
         if: failure()
         run: |
-          for l in node nodeshim; do
+          for l in node nodeshim nodestubs; do
             [ -f "$OUT/$l.log" ] && { echo "::group::$l.log (last 80 lines)"; tail -n 80 "$OUT/$l.log"; echo "::endgroup::"; }
           done
           true
@@ -715,6 +777,7 @@ jobs:
           path: |
             supa-out/*.log
             supa-out/*.txt
+            supa-out/*.diff
           if-no-files-found: ignore
 
   storage-linux:
@@ -749,6 +812,8 @@ jobs:
           grep -E '^(AUTH_JWT_SECRET|PGRST_JWT_SECRET|SERVICE_KEY|ANON_KEY|S3_PROTOCOL_ACCESS_KEY_ID|S3_PROTOCOL_ACCESS_KEY_SECRET)=' "$RUNNER_TEMP/storage.env" \
             | cut -d= -f2- | while read -r v; do echo "::add-mask::$v"; done
           cat "$RUNNER_TEMP/storage.env" >> "$GITHUB_ENV"
+          # what the stubbed packages need (EXPOSE_DOCS=false)
+          .github/supa/storage-stubs.sh "$SUPA_STORAGE_VARIANT" env >> "$GITHUB_ENV"
 
       - uses: actions/setup-node@v4
         with:
@@ -887,7 +952,7 @@ jobs:
           path: ${{ env.OUT }}/node
       - name: Compare with node
         if: ${{ !inputs.probe }}
-        run: .github/supa/compare.sh "$OUT/node/node-transcript.txt" "$OUT/native-transcript.txt"
+        run: .github/supa/compare.sh "$OUT/node/node-variant-transcript.txt" "$OUT/native-transcript.txt"
 
       - name: Diagnostics
         if: failure()
@@ -917,7 +982,7 @@ jobs:
               [ -f "$OUT/$b" ] && echo "- $b: $(stat -c %s "$OUT/$b") bytes unstripped, $(strip -o /dev/stdout "$OUT/$b" 2>/dev/null | wc -c) bytes stripped"
             done
             [ -f "$OUT/native-idle-rss.txt" ] && sed 's/^/- idle /' "$OUT/native-idle-rss.txt"
-            echo "- fastify schemas: ${{ inputs.schemas || 'lazy' }}"
+            echo "- fastify schemas: ${{ inputs.schemas || 'lazy' }}, storage variant: \`$SUPA_STORAGE_VARIANT\`"
             echo '```'
             [ -f "$OUT/node/ready-times.txt" ] && sed "s/^/node-ref /" "$OUT/node/ready-times.txt"
             [ -f "$OUT/ready-times.txt" ] && cat "$OUT/ready-times.txt"

@@ -33,4 +33,9 @@ else
   node "$(dirname "$0")/patch-ajv-boot.cjs" "$root"
 fi
 
+# Packages supa-wasm never reaches (the AWS SDK, swagger, pg-boss, rate-limit, the vector/iceberg/render/
+# admin routes) become throwing stubs, so the compile leaves them out: local-dev only, see
+# storage-stubs.sh. They need EXPOSE_DOCS=false at run time. SUPA_STORAGE_VARIANT=base keeps them.
+"$(dirname "$0")/storage-stubs.sh" "${SUPA_STORAGE_VARIANT:-all}" apply "$root"
+
 echo "shims applied under $root/node_modules"

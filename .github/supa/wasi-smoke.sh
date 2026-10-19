@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Storage compiled to wasip1, run under supa-host against Postgres, compared with node.
-#   wasi-smoke.sh <supa-host> <node-transcript> <outdir> <label>=<module.wasm> [...]
+#   wasi-smoke.sh <supa-host> <node-transcript> <outdir> <label>=<module.wasm>[::<transcript>[::<env file>]] [...]
+# The transcript to diff against and the environment file default to the node transcript and ENV_FILE; a
+# module compiled from the stubbed Storage (storage-stubs.sh) names its own, with EXPOSE_DOCS=false.
 # Per module: precompile it to a .cwasm (size, time), then start three fresh instances on fresh
 # databases, each timed from launch to /status answering 200, driven through smoke.sh and its
 # transcript diffed against node's:
@@ -14,7 +16,7 @@
 # Environment: STORAGE_DIR (the checkout the module was compiled in; mounted at the same path),
 # ENV_FILE (env.sh output, with SERVICE_KEY), PG_PORT (default 5432), SMOKE_PORT (default 18080).
 set -uo pipefail
-host=${1:?supa-host}; node_ref=${2:?node transcript}; out=${3:?outdir}; shift 3
+host=${1:?supa-host}; node_ref_default=${2:?node transcript}; out=${3:?outdir}; shift 3
 [ $# -gt 0 ] || { echo "usage: $0 <supa-host> <node-transcript> <outdir> <label>=<module.wasm>..." >&2; exit 2; }
 here=$(cd "$(dirname "$0")" && pwd)
 : "${STORAGE_DIR:?}" "${ENV_FILE:?}"
@@ -23,7 +25,8 @@ export PGPASSWORD=postgres
 mkdir -p "$out"; : > "$out/results.txt"
 set -a; . "$ENV_FILE"; set +a
 env_args=()
-while IFS= read -r l; do [ -n "$l" ] && env_args+=(--env "$l"); done < "$ENV_FILE"
+load_env() { env_args=(); while IFS= read -r l; do [ -n "$l" ] && env_args+=(--env "$l"); done < "$1"; }
+load_env "$ENV_FILE"
 now() { date +%s%3N; }
 rss_mb() { ps -o rss= -p "$1" 2>/dev/null | awk '{ printf "%d", $1 / 1024 }'; }
 rc=0
@@ -68,7 +71,9 @@ run() { # label cwasm tag bytes [guest env...]
 }
 
 for spec in "$@"; do
-  label=${spec%%=*}; wasm=${spec#*=}
+  label=${spec%%=*}; rest=${spec#*=}
+  IFS='|' read -r wasm ref envfile <<< "${rest//::/|}"
+  node_ref=${ref:-$node_ref_default}; load_env "${envfile:-$ENV_FILE}"
   cwasm="$out/$label.cwasm"
   start=$(now)
   "$host" compile "$wasm" "$cwasm" || { echo "$label: precompile failed" >&2; rc=1; continue; }
