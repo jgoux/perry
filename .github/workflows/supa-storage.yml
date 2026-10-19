@@ -438,15 +438,17 @@ jobs:
           key: supa-host-${{ runner.arch }}-rust${{ env.RUST_VERSION }}-${{ hashFiles('supa-host-src/host/**') }}
       - name: Build supa-host
         if: steps.host.outputs.cache-hit != 'true'
-        working-directory: supa-host-src/host
-        # This job installs no sccache or lld (the workflow-wide RUSTC_WRAPPER and linker are for Perry's jobs).
+        # Built from outside the checkout: cargo reads `.cargo/config.toml` from the working directory
+        # upward, and this repository's holds nightly-only flags. This job also installs no sccache or lld
+        # (the workflow-wide RUSTC_WRAPPER and linker are for Perry's jobs).
+        working-directory: ${{ runner.temp }}
         env:
           RUSTC_WRAPPER: ""
           SCCACHE_GHA_ENABLED: "false"
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: cc
         run: |
           rustup toolchain install "$RUST_VERSION" --profile minimal
-          cargo "+$RUST_VERSION" build --release --locked
+          cargo "+$RUST_VERSION" build --release --locked --manifest-path "$GITHUB_WORKSPACE/supa-host-src/host/Cargo.toml"
       - name: Tools for the smoke flow
         run: |
           command -v psql >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client; }
