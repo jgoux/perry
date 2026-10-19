@@ -9,7 +9,8 @@
 #   gc     a 100000-byte upload with the collector forced to evacuate every cycle and to verify it
 #          (PERRY_GC_FORCE_EVACUATE=1 PERRY_GC_VERIFY_EVACUATION=1)
 # One line per run: ready time, smoke exit status, verdict against node, whether the host survived,
-# RSS idle and after the smoke. Exits non-zero if any run is not IDENTICAL, died or never became ready.
+# RSS idle and after the smoke. Exits non-zero if any run is not IDENTICAL, died or never became ready; the module labelled base
+# is informational and does not count.
 # Environment: STORAGE_DIR (the checkout the module was compiled in; mounted at the same path),
 # ENV_FILE (env.sh output, with SERVICE_KEY), PG_PORT (default 5432), SMOKE_PORT (default 18080).
 set -uo pipefail
@@ -73,9 +74,13 @@ for spec in "$@"; do
   "$host" compile "$wasm" "$cwasm" || { echo "$label: precompile failed" >&2; rc=1; continue; }
   line="$label module=$(stat -c %s "$wasm")B cwasm=$(stat -c %s "$cwasm")B precompile=$(( $(now) - start ))ms"
   echo "$line" | tee -a "$out/results.txt"
+  # The baseline module (label base) is there for the before/after numbers: the smoke script gains
+  # steps that exercise fixes the baseline predates, so its verdict is reported but never fails the job.
+  saved_rc=$rc
   run "$label" "$cwasm" 100k 100000
   run "$label" "$cwasm" 5mb 5242880
   run "$label" "$cwasm" gc 100000 PERRY_GC_FORCE_EVACUATE=1 PERRY_GC_VERIFY_EVACUATION=1
+  [ "$label" = base ] && rc=$saved_rc
   rm -f "$cwasm"
 done
 exit $rc
