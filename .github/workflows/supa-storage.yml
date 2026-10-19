@@ -53,7 +53,7 @@
 #                       - the Storage commit SHA
 #                       - storage_variant, schemas and ajv (the SUPA_* env that shims.sh reads)
 #                       - the hash of .github/supa/** minus the test-only files (probe and
-#                         probe dirs, regression/smoke/sjlj/shard scripts, the renderer
+#                         probe dirs, regression/smoke/warm/sjlj/shard scripts, the renderer
 #                         programs, notes): shims.sh, storage-stubs.sh, stub-packages.cjs,
 #                         patch-*.cjs, wasi-imports.py, env.sh and anything new count
 #                       - the hash of .github/actions/** (toolchain pins, wasi tool downloads)
@@ -491,7 +491,7 @@ jobs:
           common+=" actions=${{ hashFiles('.github/actions/**') }} runtime-script=${{ hashFiles('scripts/wasi_build_runtime.*') }}"
           common+=" flags=[$STORAGE_WASI_FLAGS] entry=$STORAGE_WASI_ENTRY"
           common+=" sdk=$WASI_SDK_VERSION wasmtime=$WASMTIME_VERSION wasmtime-p1=$WASMTIME_P1_VERSION wasm-tools=$WASM_TOOLS_VERSION"
-          supa='${{ hashFiles('.github/supa/**', '!.github/supa/wasi-probes/**', '!.github/supa/probes/**', '!.github/supa/probes.sh', '!.github/supa/probe.js', '!.github/supa/regressions.sh', '!.github/supa/wasi-probes.sh', '!.github/supa/wasi-probe-weights.txt', '!.github/supa/wasi-shards.py', '!.github/supa/wasi-verify.sh', '!.github/supa/wasi-smoke.sh', '!.github/supa/sjlj-size.sh', '!.github/supa/smoke.sh', '!.github/supa/compare.sh', '!.github/supa/serve.sh', '!.github/supa/diagnose.sh', '!.github/supa/simulate.sh', '!.github/supa/prune-caches.sh', '!.github/supa/ci-*.sh', '!.github/supa/storage-info*', '!.github/supa/*.md') }}'
+          supa='${{ hashFiles('.github/supa/**', '!.github/supa/wasi-probes/**', '!.github/supa/probes/**', '!.github/supa/probes.sh', '!.github/supa/probe.js', '!.github/supa/regressions.sh', '!.github/supa/wasi-probes.sh', '!.github/supa/wasi-probe-weights.txt', '!.github/supa/wasi-shards.py', '!.github/supa/wasi-verify.sh', '!.github/supa/wasi-smoke.sh', '!.github/supa/warm.sh', '!.github/supa/sjlj-size.sh', '!.github/supa/smoke.sh', '!.github/supa/compare.sh', '!.github/supa/serve.sh', '!.github/supa/diagnose.sh', '!.github/supa/simulate.sh', '!.github/supa/prune-caches.sh', '!.github/supa/ci-*.sh', '!.github/supa/storage-info*', '!.github/supa/*.md') }}'
           # the renderer programs and their driver only matter to the renderers job
           renderers='${{ hashFiles('.github/supa/storage-info*') }}'
           sha() { printf '%s' "$1" | sha256sum | cut -c1-40; }
