@@ -290,7 +290,7 @@ pub(crate) fn lower_module_decl(
                                     )
                                 {
                                     (format!("inspector.{imported}"), None)
-                                } else if matches!(source.as_str(), "fs" | "dns" | "stream")
+                                } else if matches!(source.as_str(), "fs" | "dns" | "stream" | "readline")
                                     && imported == "promises"
                                 {
                                     // `import { promises } from "node:fs"` binds the

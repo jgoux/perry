@@ -515,6 +515,8 @@ pub extern "C" fn js_nm_install_readline() {
         Ordering::Relaxed,
     );
     nm_register_ctor(NmBucket::Readline, nm_ctor_readline);
+    // `readline.promises` resolves through the readline/promises registry.
+    crate::node_submodules::arm_readline_promises();
 }
 #[no_mangle]
 pub extern "C" fn js_nm_install_repl() {
@@ -572,6 +574,8 @@ pub extern "C" fn js_nm_install_stream() {
 }
 #[no_mangle]
 pub extern "C" fn js_nm_install_timers() {
+    // `timers.promises` resolves through the timers/promises registry.
+    crate::node_submodules::js_node_submod_install_timers_promises();
     NM_DISPATCH_REGISTRY[NmBucket::Timers as usize].store(
         nm_dispatch_timers as NmDispatchFn as *mut (),
         Ordering::Relaxed,

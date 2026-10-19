@@ -965,6 +965,11 @@ pub extern "C" fn js_node_submod_install_fs_promises() {
 #[no_mangle]
 pub extern "C" fn js_node_submod_install_readline_promises() {
     crate::object::js_nm_install_readline();
+    arm_readline_promises();
+}
+/// The registry store alone, for `js_nm_install_readline`: a program that names
+/// `readline` can read `readline.promises`, whose exports live in this spec.
+pub(crate) fn arm_readline_promises() {
     SUBMOD_REGISTRY[SubmodBucket::ReadlinePromises as usize].store(
         &SUBMOD_READLINE_PROMISES as *const SubmoduleSpec as *mut SubmoduleSpec,
         Ordering::Relaxed,
@@ -1794,6 +1799,53 @@ pub(crate) fn stream_promises_export_callable(name: &str) -> f64 {
             name.len() as u32,
         )
     }
+}
+
+/// The submodule registry key of a Node module id that has no method-dispatch
+/// bucket because the registry implements it (`timers/promises`,
+/// `stream/web`, ...). `module` may carry the `node:` prefix. `None` for every
+/// module with a dispatch bucket and for `test`/`test/reporters`, whose
+/// exports are decorated by the `mod-node-test` hooks.
+pub(crate) fn registry_backed_module_key(module: &str) -> Option<&'static str> {
+    match module.strip_prefix("node:").unwrap_or(module) {
+        "fs/promises" => Some("fs_promises"),
+        "timers/promises" => Some("timers_promises"),
+        "readline/promises" => Some("readline_promises"),
+        "stream/promises" => Some("stream_promises"),
+        "stream/consumers" => Some("stream_consumers"),
+        "stream/web" => Some("stream_web"),
+        "diagnostics_channel" => Some("diagnostics_channel"),
+        "trace_events" => Some("trace_events"),
+        _ => None,
+    }
+}
+
+/// The real implementation of `module.name` for a registry-backed module (see
+/// `registry_backed_module_key`): the registry's export value, a callable
+/// singleton for functions. `None` when `module` is not registry-backed, the
+/// registry does not list `name`, or the registry was never installed (codegen
+/// installs it wherever the module is named; dynamic `require` arms the
+/// install-all hook).
+pub(crate) fn registry_backed_module_export(module: &str, name: &str) -> Option<f64> {
+    let key = registry_backed_module_key(module)?;
+    let value = unsafe {
+        js_node_submodule_namespace_member(
+            key.as_ptr(),
+            key.len() as u32,
+            name.as_ptr(),
+            name.len() as u32,
+        )
+    };
+    (value.to_bits() != crate::value::TAG_UNDEFINED).then_some(value)
+}
+
+/// `registry_backed_module_export` restricted to callable closures.
+pub(crate) fn registry_backed_module_callable(module: &str, name: &str) -> Option<f64> {
+    let value = registry_backed_module_export(module, name)?;
+    let bits = value.to_bits();
+    ((bits & crate::value::TAG_MASK) == crate::value::POINTER_TAG
+        && crate::closure::is_closure_ptr((bits & crate::value::POINTER_MASK) as usize))
+    .then_some(value)
 }
 
 /// Returns a namespace-member value for a known Node submodule namespace import.

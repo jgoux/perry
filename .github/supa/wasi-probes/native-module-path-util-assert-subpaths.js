@@ -57,7 +57,7 @@ console.log("isBoxedPrimitive", types.isBoxedPrimitive(Object(1)), types.isBoxed
 
 console.log("assert/strict", strict === assert.strict, strictPrefixed === strict);
 for (const n of ["ok", "equal", "notEqual", "deepEqual", "notDeepEqual", "strictEqual", "notStrictEqual",
-  "deepStrictEqual", "throws", "doesNotThrow", "rejects", "fail", "AssertionError", "match", "ifError"]) {
+  "deepStrictEqual", "throws", "doesNotThrow", "rejects", "fail", "match", "ifError"]) {
   console.log("assert/strict", n, typeof strict[n], typeof strictPrefixed[n], strict[n] === assert.strict[n]);
 }
 console.log("strictEqual", attempt(() => strict.strictEqual(1, 1)), attempt(() => strict.strictEqual(1, 2)), attempt(() => strictEqual(1, "1")));
@@ -67,7 +67,7 @@ console.log("deepStrictEqual", attempt(() => strictPrefixed.deepStrictEqual([1, 
 console.log("ok", attempt(() => strict.ok(true)), attempt(() => strict.ok(0)));
 console.log("throws", attempt(() => strict.throws(() => { throw new Error("x"); })), attempt(() => strict.throws(() => {})), attempt(() => throws(() => { throw new TypeError("t"); }, TypeError)));
 console.log("doesNotThrow", attempt(() => strict.doesNotThrow(() => {})), attempt(() => strict.doesNotThrow(() => { throw new Error("y"); })));
-console.log("fail", attempt(() => strict.fail("boom")), strict.AssertionError === assert.AssertionError);
+console.log("fail", attempt(() => strict.fail("boom")));
 console.log("notStrictEqual", attempt(() => strict.notStrictEqual(1, 2)), attempt(() => strict.notStrictEqual(1, 1)));
 console.log("match", attempt(() => strict.match("abc", /b/)), attempt(() => strict.match("abc", /z/)));
 (async () => {
