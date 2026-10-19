@@ -100,6 +100,8 @@ env:
   STORAGE_REPO: https://github.com/jgoux/storage
   STORAGE_REF: ${{ inputs.storage_ref || 'supa/aot-friendly' }}
   STORAGE_DIR: /home/runner/storage
+  # The smoke also probes the docs endpoint, the S3 protocol (sigv4), TUS and the feature routes
+  SMOKE_EXTRA: "1"
   PERRY_WORKSPACE_ROOT: ${{ github.workspace }}
   PERRY_BUILD_WORKSPACE_ROOT: ${{ github.workspace }}
   PERRY_SRC: ${{ github.workspace }}
@@ -478,7 +480,7 @@ jobs:
         run: |
           mkdir -p "$OUT"
           .github/supa/env.sh > "$ENV_FILE"
-          grep -E '^(AUTH_JWT_SECRET|PGRST_JWT_SECRET|SERVICE_KEY|ANON_KEY)=' "$ENV_FILE" \
+          grep -E '^(AUTH_JWT_SECRET|PGRST_JWT_SECRET|SERVICE_KEY|ANON_KEY|S3_PROTOCOL_ACCESS_KEY_ID|S3_PROTOCOL_ACCESS_KEY_SECRET)=' "$ENV_FILE" \
             | cut -d= -f2- | while read -r v; do echo "::add-mask::$v"; done
       - uses: actions/setup-node@v4
         with:
@@ -619,7 +621,7 @@ jobs:
         run: |
           mkdir -p "$OUT"
           .github/supa/env.sh > "$RUNNER_TEMP/storage.env"
-          grep -E '^(AUTH_JWT_SECRET|PGRST_JWT_SECRET|SERVICE_KEY|ANON_KEY)=' "$RUNNER_TEMP/storage.env" \
+          grep -E '^(AUTH_JWT_SECRET|PGRST_JWT_SECRET|SERVICE_KEY|ANON_KEY|S3_PROTOCOL_ACCESS_KEY_ID|S3_PROTOCOL_ACCESS_KEY_SECRET)=' "$RUNNER_TEMP/storage.env" \
             | cut -d= -f2- | while read -r v; do echo "::add-mask::$v"; done
           cat "$RUNNER_TEMP/storage.env" >> "$GITHUB_ENV"
       - uses: actions/setup-node@v4
@@ -738,7 +740,7 @@ jobs:
         run: |
           mkdir -p "$OUT"
           .github/supa/env.sh > "$RUNNER_TEMP/storage.env"
-          grep -E '^(AUTH_JWT_SECRET|PGRST_JWT_SECRET|SERVICE_KEY|ANON_KEY)=' "$RUNNER_TEMP/storage.env" \
+          grep -E '^(AUTH_JWT_SECRET|PGRST_JWT_SECRET|SERVICE_KEY|ANON_KEY|S3_PROTOCOL_ACCESS_KEY_ID|S3_PROTOCOL_ACCESS_KEY_SECRET)=' "$RUNNER_TEMP/storage.env" \
             | cut -d= -f2- | while read -r v; do echo "::add-mask::$v"; done
           cat "$RUNNER_TEMP/storage.env" >> "$GITHUB_ENV"
 
