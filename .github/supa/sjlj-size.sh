@@ -8,9 +8,17 @@
 # in `run` alone, the wasm stores and the lines of text format; it goes to the
 # job summary. Fails when demotion does not shrink the largest `try` variant,
 # or when a demoted module's output differs from node's.
-# Usage: sjlj-size.sh [N...]
+# Usage: sjlj-size.sh [CELL...]   a CELL is kind:N (try:128) or a bare N for every kind;
+#                                 no cells runs all of them (the table above)
+#        sjlj-size.sh --list      print the default cells, one line, for the CI shards
+# The two builds of a cell compile side by side. The cells that ran go to $OUT/sjlj-size.ran
+# (wasi-verify.sh counts them). The halving check needs the largest `try` cell, so it runs on
+# the shard that has that cell and is skipped elsewhere.
 # Environment: PERRY_BIN, WASMTIME, WASMTIME_FLAGS, OUT.
 set -uo pipefail
+kinds=(try finally forof); all_sizes=(16 32 64 128)
+all_cells=(); for kind in "${kinds[@]}"; do for n in "${all_sizes[@]}"; do all_cells+=("$kind:$n"); done; done
+if [ "${1:-}" = --list ]; then echo "${all_cells[*]}"; exit 0; fi
 work=${OUT:-$PWD/supa-out}/sjlj-size
 mkdir -p "$work"
 perry=${PERRY_BIN:-$PWD/target/release/perry}
@@ -18,7 +26,11 @@ wasmtime=${WASMTIME:-wasmtime}
 flags=${WASMTIME_FLAGS:--W exceptions=y}
 summary=${GITHUB_STEP_SUMMARY:-/dev/null}
 export PERRY_NO_AUTO_OPTIMIZE=1 PERRY_KEEP_SYMBOLS=1
-sizes=("$@"); [ ${#sizes[@]} -gt 0 ] || sizes=(16 32 64 128)
+cells=(); for a in "$@"; do
+  if [[ "$a" == *:* ]]; then cells+=("$a"); else for kind in "${kinds[@]}"; do cells+=("$kind:$a"); done; fi
+done
+[ ${#cells[@]} -gt 0 ] || cells=("${all_cells[@]}")
+: > "${OUT:-$PWD/supa-out}/sjlj-size.ran"
 
 # gen KIND N: print the source of one variant.
 gen() {
@@ -84,39 +96,44 @@ measure() {
 rc=0
 rows=("| variant | N | stores off | stores on | lines off | lines on | module off | module on |" "|---|---|---|---|---|---|---|---|")
 declare -A off_stores on_stores
-for kind in try finally forof; do
-  for n in "${sizes[@]}"; do
-    name="sjlj_${kind}_$n"
-    gen "$kind" "$n" > "$work/$name.js"
-    node "$work/$name.js" > "$work/$name.node.out" 2>&1
-    echo "::group::$name"
-    read -r so lo mo < <(measure "$name" 0)
-    read -r sn ln mn < <(measure "$name" 1)
-    # Both builds must print what node prints.
-    for d in 0 1; do
-      # shellcheck disable=SC2086
-      if ! "$wasmtime" run $flags "$work/$name-$d/$name.wasm" > "$work/$name-$d/out.txt" 2> "$work/$name-$d/err.txt" \
-        || ! cmp -s "$work/$name.node.out" "$work/$name-$d/out.txt"; then
-        echo "::error::$name (demote=$d) differs from node: $(head -c 200 "$work/$name-$d/out.txt") | $(head -c 300 "$work/$name-$d/err.txt")"
-        rc=1
-      fi
-    done
-    echo "$name: stores $so -> $sn, lines $lo -> $ln, module $mo -> $mn"
-    echo "::endgroup::"
-    rows+=("| $kind | $n | $so | $sn | $lo | $ln | $mo | $mn |")
-    off_stores[$kind,$n]=$so; on_stores[$kind,$n]=$sn
-    if [ "$so" = FAIL ] || [ "$sn" = FAIL ]; then rc=1; fi
+for cell in "${cells[@]}"; do
+  kind=${cell%%:*}; n=${cell#*:}
+  name="sjlj_${kind}_$n"
+  gen "$kind" "$n" > "$work/$name.js"
+  node "$work/$name.js" > "$work/$name.node.out" 2>&1
+  echo "::group::$name"
+  measure "$name" 0 > "$work/$name.m0" & p0=$!
+  measure "$name" 1 > "$work/$name.m1" & p1=$!
+  wait $p0 $p1
+  read -r so lo mo < "$work/$name.m0"
+  read -r sn ln mn < "$work/$name.m1"
+  # Both builds must print what node prints.
+  for d in 0 1; do
+    # shellcheck disable=SC2086
+    if ! "$wasmtime" run $flags "$work/$name-$d/$name.wasm" > "$work/$name-$d/out.txt" 2> "$work/$name-$d/err.txt" \
+      || ! cmp -s "$work/$name.node.out" "$work/$name-$d/out.txt"; then
+      echo "::error::$name (demote=$d) differs from node: $(head -c 200 "$work/$name-$d/out.txt") | $(head -c 300 "$work/$name-$d/err.txt")"
+      rc=1
+    fi
   done
+  echo "$name: stores $so -> $sn, lines $lo -> $ln, module $mo -> $mn"
+  echo "::endgroup::"
+  rows+=("| $kind | $n | $so | $sn | $lo | $ln | $mo | $mn |")
+  off_stores[$kind,$n]=$so; on_stores[$kind,$n]=$sn
+  if [ "$so" = FAIL ] || [ "$sn" = FAIL ]; then rc=1; fi
+  echo "$cell" >> "${OUT:-$PWD/supa-out}/sjlj-size.ran"
 done
 {
   echo "### sjlj slot demotion (P55)"
   printf '%s\n' "${rows[@]}"
 } | tee -a "$summary"
 
-largest=${sizes[${#sizes[@]}-1]}
-so=${off_stores[try,$largest]:-0}; sn=${on_stores[try,$largest]:-0}
-# Quadratic growth is what the pass removes: it must at least halve the stores.
-if [ "$so" = FAIL ] || [ "$sn" = FAIL ] || ! [ $((sn * 2)) -lt "$so" ]; then
-  echo "::error::demotion did not halve the stores of the try variant at N=$largest ($so -> $sn)"; rc=1
+largest=${all_sizes[${#all_sizes[@]}-1]}
+if [ -n "${off_stores[try,$largest]+x}" ]; then
+  so=${off_stores[try,$largest]}; sn=${on_stores[try,$largest]}
+  # Quadratic growth is what the pass removes: it must at least halve the stores.
+  if [ "$so" = FAIL ] || [ "$sn" = FAIL ] || ! [ $((sn * 2)) -lt "$so" ]; then
+    echo "::error::demotion did not halve the stores of the try variant at N=$largest ($so -> $sn)"; rc=1
+  fi
 fi
 exit $rc

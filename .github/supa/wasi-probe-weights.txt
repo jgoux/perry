@@ -1,0 +1,38 @@
+# Seconds per work item of the wasi-linux job, from run 39231263839 (16 vCPU Blacksmith arm).
+# wasi-shards.py balances the shards with them; an item missing here weighs 3 s, so a new probe
+# needs no entry. Only the balance depends on these numbers, never which probes run.
+#
+# probes: compile + node run + wasmtime run
+fastify-inject-get 78
+array-holey-copy 46
+dynamic-get-matrix 32
+class-extends-same-name-member 17
+instanceof-matrix 10
+native-module-path-util-assert-subpaths 10
+native-module-misc-modules 7
+native-module-stream-subpaths 6
+dynamic-get-bench 6
+pg-client 6
+native-module-timers-readline-promises 6
+http-request-to-web 6
+http-early-reply 6
+instanceof-bench 5
+http-server 5
+stale-array-consumers 5
+date-cell-reuse 4
+native-module-timers-readline-promises-esm 4
+native-module-fs-promises-esm 4
+native-module-fs-promises 4
+# sjlj-size.sh cells (kind:N); serial off+on time divided by the 1.6 the two parallel compiles buy
+sjlj:try:16 15
+sjlj:try:32 16
+sjlj:try:64 19
+sjlj:try:128 35
+sjlj:finally:16 16
+sjlj:finally:32 17
+sjlj:finally:64 19
+sjlj:finally:128 36
+sjlj:forof:16 19
+sjlj:forof:32 20
+sjlj:forof:64 28
+sjlj:forof:128 200

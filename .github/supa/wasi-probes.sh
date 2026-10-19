@@ -34,6 +34,8 @@
 # Every run gets a writable scratch directory: WORK_DIR for node, preopened as
 # /work for wasmtime (--dir HOST::/work), so fs probes can write files.
 # Environment: PERRY_BIN, WASMTIME, WASMTIME_P1 (server probes), WASMTIME_FLAGS, OUT.
+# Every probe that ran is recorded as `name<TAB>verdict` in $OUT/wasi-probes.ran, which the
+# wasi-linux shards upload and wasi-verify.sh checks (each probe exactly once across shards).
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 work=${OUT:-$PWD/supa-out}/wasi-probes
@@ -49,6 +51,7 @@ names=("$@")
 [ ${#names[@]} -gt 0 ] || names=($(cd "$here/wasi-probes" && ls *.js | sed 's/\.js$//'))
 rc=0
 rows=()
+ran=${OUT:-$PWD/supa-out}/wasi-probes.ran; : > "$ran"
 for n in "${names[@]}"; do
   d="$work/$n"; rm -rf "$d"; mkdir -p "$d"
   src="$here/wasi-probes/$n.js"; cp "$src" "$d/$n.js"
@@ -68,7 +71,7 @@ for n in "${names[@]}"; do
     tail -n 25 "$d/compile.log"
     if [ -n "$optional" ]; then verdict="MISSING ($optional)"; else verdict="FAIL (compile)"; rc=1; fi
     echo "probe $n: $verdict"; echo "::endgroup::"
-    rows+=("| $n | $verdict | - | - |"); continue
+    rows+=("| $n | $verdict | - | - |"); printf '%s\t%s\n' "$n" "$verdict" >> "$ran"; continue
   fi
   echo "compile: $(( $(date +%s) - s )) s"
   size=$(stat -c %s "$d/$n.wasm")
@@ -79,7 +82,7 @@ for n in "${names[@]}"; do
   fi
   if [ -n "$compile_only" ]; then
     echo "probe $n: $verdict (compile only: $compile_only)"; echo "::endgroup::"
-    rows+=("| $n | $verdict (compile only) | $size | - |"); continue
+    rows+=("| $n | $verdict (compile only) | $size | - |"); printf '%s\t%s\n' "$n" "$verdict" >> "$ran"; continue
   fi
 
   mkdir -p "$d/work"
@@ -148,7 +151,7 @@ for n in "${names[@]}"; do
   fi
   echo "probe $n: $verdict"
   echo "::endgroup::"
-  rows+=("| $n | $verdict | $size | $rss |")
+  rows+=("| $n | $verdict | $size | $rss |"); printf '%s\t%s\n' "$n" "$verdict" >> "$ran"
 done
 
 {
