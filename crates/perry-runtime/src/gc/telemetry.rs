@@ -41,6 +41,19 @@ pub(super) fn note_old_reclaim_why(why: &'static str) {
     OLD_RECLAIM_WHY.with(|c| c.set(why));
 }
 
+/// Compiled-code temp roots held right now (WASI only; other targets root
+/// compiled temporaries on the native stack).
+fn temp_root_depth() -> usize {
+    #[cfg(target_os = "wasi")]
+    {
+        super::roots::temp_root_len()
+    }
+    #[cfg(not(target_os = "wasi"))]
+    {
+        0
+    }
+}
+
 pub(super) fn log_collection(
     full: bool,
     trigger: super::policy::GcTriggerKind,
@@ -52,7 +65,7 @@ pub(super) fn log_collection(
     }
     let why = OLD_RECLAIM_WHY.with(|c| c.replace(""));
     eprintln!(
-        "[gc-log] kind={} trigger={:?} why={} pause_us={} freed={} old={} ext={}",
+        "[gc-log] kind={} trigger={:?} why={} pause_us={} freed={} old={} ext={} handles={} temps={}",
         if full { "full" } else { "minor" },
         trigger,
         if full && !why.is_empty() { why } else { "-" },
@@ -60,6 +73,8 @@ pub(super) fn log_collection(
         freed_bytes,
         crate::arena::old_gen_in_use_bytes(),
         super::policy::external_side_live_bytes(),
+        super::runtime_handle_stack_len(),
+        temp_root_depth(),
     );
 }
 
