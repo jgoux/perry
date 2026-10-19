@@ -91,6 +91,9 @@ Conventions in this file:
 | P65 | 55259826f | perf(runtime): copy holey arrays and plain array-likes without a per-index HasProperty | runtime (`array/alloc.rs`, `array/indexing_proto_chain.rs`, `array/from_concat.rs`) | all (measured on wasm32) | wasi probes `array-holey-copy.js` (compared with node), `array-holey-copy-bench.js` | not tried | PR-AV |
 | P66 | 0831472a1 | fix(runtime): route native-module namespaces without a dispatch bucket to their implementations | runtime (`node_submodules/mod.rs`, `object/native_module.rs`, `object/native_module/callable_exports.rs`, `object/native_module_dispatch.rs`, `object/class_registry/construct.rs`, `object/util_types.rs`, `dns/ffi.rs`), codegen (`nm_install.rs`), hir (`lower/module_decl.rs`), api manifest | all (observed on wasm32 and Linux native) | wasi probes `native-module-*.js` (11) | not tried | PR-AW |
 | P67 | d870c5082 | fix(runtime): do not ask wasi for a process id in mkdtemp | runtime (`fs/mod.rs`) | wasm32-wasip1 | wasi probe `native-module-fs-promises.js` | not tried | PR-AX |
+| P68 | 7488b053c | fix(runtime): do not ask wasi for a process id in the sys deprecation warning | runtime (`node_submodules/mod.rs`) | wasm32-wasip1 | wasi probe `native-module-misc-modules.js` | not tried | PR-AX |
+| P69 | 06d8f5e85 | fix(runtime): make the promises namespaces one object across require, import and member reads | runtime (`node_submodules/mod.rs`, `object/native_module.rs`, `object/native_module/name_tables.rs`), hir (`lower/module_decl.rs`) | all | wasi probes `native-module-timers-readline-promises*.js`, `native-module-readline-promises-named-esm.js`, `native-module-stream-subpaths.js` | not tried | PR-AW |
+| P70 | 23cb2e5e0 | fix(hir): construct StringDecoder through a string_decoder namespace member | hir (`lower/expr_new/member.rs`) | all | wasi probes `native-module-misc-modules*.js` | not tried | PR-AW |
 
 All 22 patches except P12's `.github` hunks, P05 and P06 cherry-pick cleanly.
 A stack of every patch except P05 and P06, with P12 limited to `crates/`, also applies cleanly in sequence on `1fd8ca2ae`.
@@ -147,8 +150,8 @@ Ordered by value and independence. Each PR carries its patches' tests.
 46. **PR-AT `node:fs` streams, `Dir` and `Dirent` have a real [[Prototype]] chain; a subclass inherits a static `Symbol.hasInstance`** (P63). Prerequisite: PR-AN is not required (the probes need PR-R and PR-S).
 47. **PR-AU `Buffer.concat` follows the forwarding stub a grown list leaves behind** (P64). Prerequisite: none (the probes need PR-R and PR-S for the `// npm:` and `// network:` markers).
 48. **PR-AV Copying a holey array or a plain array-like skips the per-index HasProperty when no index can be found** (P65). Prerequisite: none (the probes need PR-R and PR-S).
-49. **PR-AW Native-module namespaces with no dispatch bucket resolve to their real implementations, and fail loudly otherwise** (P66). P62 fixed `stream/promises` `pipeline` and `finished` only. Every other `require("X")` namespace without a bucket (`fs/promises`, `timers/promises`, `readline/promises`, `stream/consumers`, `stream/web`, `diagnostics_channel`, `trace_events`) had the same silent `undefined`; the fallback now throws `TypeError: <module>.<name> is not supported`. Also makes `path/posix`, `path/win32` and `util/types` identical to `path.posix`, `path.win32` and `util.types`, adds `readline.promises`, makes `util.types.isPromise` check the GC type, and lets `new dns.promises.Resolver()` work through a bound export. Prerequisite: PR-AS (replaces its stream/promises special case with the general route).
-50. **PR-AX `fs/promises` `mkdtemp` does not abort on wasi** (P67). `std::process::id()` panics on wasm32-wasi; the temp-name suffix uses 0 there. Prerequisite: none.
+49. **PR-AW Native-module namespaces with no dispatch bucket resolve to their real implementations, and fail loudly otherwise** (P66). P62 fixed `stream/promises` `pipeline` and `finished` only. Every other `require("X")` namespace without a bucket (`fs/promises`, `timers/promises`, `readline/promises`, `stream/consumers`, `stream/web`, `diagnostics_channel`, `trace_events`) had the same silent `undefined`; the fallback now throws `TypeError: <module>.<name> is not supported`. Also makes `path/posix`, `path/win32` and `util/types` identical to `path.posix`, `path.win32` and `util.types`, adds `readline.promises`, makes `util.types.isPromise` check the GC type, and lets `new dns.promises.Resolver()` work through a bound export. Also one namespace object per `X/promises` across `require`, `import * as`, default and named imports, `readline.promises` and `timers.promises`, and `new ns.StringDecoder()` on a `string_decoder` namespace (P69, P70). Prerequisite: PR-AS (replaces its stream/promises special case with the general route).
+50. **PR-AX `fs/promises` `mkdtemp` does not abort on wasi** (P67). `std::process::id()` panics on wasm32-wasi; the temp-name suffix of `mkdtemp` and the pid of the `sys` deprecation warning use 0 there (P68). Prerequisite: none.
 
 Not proposed: P04, P05, P06, P10, P15, P16, P47. Upstream fixed the same bugs independently (`c4bf643f6` for P04, `4ed616f5e` for P05, `79aae9aa7` for P06 and P15, `09e7861b4` for P10, `c1671d39d` for P16, `b0d159c8c` for P47); the 2026-10-18 merge took upstream's versions and kept the fork's tests as regression tests.
 
@@ -840,8 +843,8 @@ Not proposed: P04, P05, P06, P10, P15, P16, P47. Upstream fixed the same bugs in
 - Root cause: `callable_exports.rs` (`bound_native_callable_export_value`) minted a closure over a namespace with no dispatch target, `native_module_dispatch.rs` (`dispatch_native_module_method`) mapped a missing bucket to `undefined`, and `nm_install.rs` (`runtime_bucket_install_symbol`) armed no submodule registry for these ids so the registry's implementations were not even linked.
 - Fix: `registry_backed_module_key` / `registry_backed_module_export` / `registry_backed_module_callable` in `node_submodules/mod.rs` map a bucketless namespace to its submodule-registry export; the read path (`native_module_property_by_name_impl`), the bound-closure mint and the call path use them, replacing the P62 stream/promises special case. The codegen arms the registry for those ids. A namespace with neither a bucket nor a registry entry throws `TypeError: <module>.<name> is not supported`. `normalize_native_module_alias` aliases `path/posix`, `path/win32` and `util/types` to their cached namespaces; `readline.promises` is a property of `readline` and a named-import source; `util.types.isPromise` uses `js_value_is_promise`; dynamic `new` of a bound `dns` / `dns/promises` `Resolver` goes through `dispatch_export`.
 - Test: eleven wasi probes `.github/supa/wasi-probes/native-module-*.js` (CJS and ESM, `typeof`, identity with the main-module export and one real call per export, compared with node), plus the `registry_backed_dispatch_tests` unit tests and `registry_backed_modules_install_their_submodule_registry` in `nm_install.rs`.
-- Not covered: `assert.AssertionError` read as a value is `undefined` (only `new assert.AssertionError` is special-cased in codegen); pre-existing, left alone. `test`, `test/reporters` and `sys` keep their existing paths.
 - Upstream: not cherry-picked (written on the fork). Depends on: P62 (PR-AS). PR-AW, a candidate for upstream PerryTS/perry.
+- Not covered: `assert.AssertionError` read as a value is `undefined` (only `new assert.AssertionError` is special-cased in codegen); pre-existing, left alone. `test`, `test/reporters` and `sys` keep their existing paths. `fs/promises` `mkdir` with `recursive` resolves `undefined` where node resolves the first directory created, and `new <stream/web export>()` over a member or destructured binding does not construct (only the bare global form is reified); both are pre-existing and outside the silent-`undefined` class.
 
 ### P67 d870c5082 fix(runtime): do not ask wasi for a process id in mkdtemp
 - Area / platform: runtime `fs` (`perry-runtime/src/fs/mod.rs`, `mkdtemp_bytes_result`) / wasm32-wasip1.
@@ -850,6 +853,30 @@ Not proposed: P04, P05, P06, P10, P15, P16, P47. Upstream fixed the same bugs in
 - Fix: the pid component of the random suffix is 0 on wasi.
 - Test: wasi probe `native-module-fs-promises.js`.
 - Upstream: not cherry-picked (written on the fork). Depends on: none. PR-AX, a candidate for upstream PerryTS/perry.
+
+### P68 7488b053c fix(runtime): do not ask wasi for a process id in the sys deprecation warning
+- Area / platform: runtime `node_submodules` (`emit_sys_deprecation_warning_once`) / wasm32-wasip1.
+- Problem: `require("sys")` aborted the wasm module.
+- Root cause: the DEP0025 warning formats `std::process::id()`, which panics on wasm32-wasi.
+- Fix: the pid is 0 on wasi.
+- Test: wasi probe `native-module-misc-modules.js`.
+- Upstream: not cherry-picked (written on the fork). Depends on: none. PR-AX, a candidate for upstream PerryTS/perry.
+
+### P69 06d8f5e85 fix(runtime): make the promises namespaces one object across require, import and member reads
+- Area / platform: runtime native-module namespaces (`object/native_module.rs`, `object/native_module/name_tables.rs`, `node_submodules/mod.rs` `js_node_submodule_export_as_function`), HIR named import of `timers.promises` (`lower/module_decl.rs`) / all targets.
+- Problem: `require("stream/promises") === require("stream").promises` was false (an uncached namespace per read), `readline.promises` was the registry singleton rather than the `readline/promises` namespace, `import { promises } from "timers"` bound a native method, and a default import of `readline/promises`, `timers/promises`, `stream/consumers` or `stream/web` bound the unknown-export sentinel `true` (`rlp.createInterface` threw "(boolean).createInterface is not a function").
+- Root cause: `should_cache_native_module_namespace` lacked `stream/promises`, `stream/consumers` and `stream/web`; `js_node_submodule_export_as_function` returned `TAG_TRUE` for `default` on a submodule with no default object.
+- Fix: cache those namespaces, return the cached `readline/promises` namespace from `readline.promises`, route `import { promises } from "timers"` like `timers/promises`, and answer the default export of a registry-backed module with its cached namespace.
+- Test: wasi probes `native-module-timers-readline-promises.js`, `native-module-timers-readline-promises-esm.js`, `native-module-readline-promises-named-esm.js`, `native-module-stream-subpaths.js`.
+- Upstream: not cherry-picked (written on the fork). Depends on: P66. PR-AW, a candidate for upstream PerryTS/perry.
+
+### P70 23cb2e5e0 fix(hir): construct StringDecoder through a string_decoder namespace member
+- Area / platform: HIR `new` lowering (`perry-hir/src/lower/expr_new/member.rs`) / all targets.
+- Problem: `new sd.StringDecoder("utf8")` over `import * as sd`, a default import or `const sd = require("string_decoder")` built an object with no decoder state; `write` threw `ERR_INVALID_THIS`. The named import worked.
+- Root cause: only the named import reached the handle-backed `StringDecoder` constructor (`Expr::New`); the member callee fell to the generic dynamic `new`.
+- Fix: a `string_decoder` namespace, default or CommonJS alias with the `StringDecoder` member lowers to the same `Expr::New`.
+- Test: wasi probes `native-module-misc-modules.js` and `native-module-misc-modules-esm.js`.
+- Upstream: not cherry-picked (written on the fork). Depends on: none. PR-AW, a candidate for upstream PerryTS/perry.
 
 ## Not for upstream
 
