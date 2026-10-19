@@ -14,9 +14,17 @@
 #   custom         (default) the individual flags below, exactly as before the presets existed
 # Pushes keep their selection: supa/wasip1 runs wasi + storage-wasi besides the usual
 # storage-linux + regressions. skip_regressions removes regressions-linux from any preset.
-# Typical wall-clock with warm caches: unit ~3 min, regress-wasi ~9 min, storage-wasi ~7 min on a
-# module-cache hit and ~12 min on a miss. The concurrency group includes the preset, so two
-# presets dispatched on one ref run side by side; the same preset again cancels its predecessor.
+# Measured wall-clock (Blacksmith arm), "same source" meaning every cache below hits and "crates
+# changed" meaning perry-dist, the regressions marker and the module cache all miss:
+#   preset         same source   crates changed (sccache + object cache warm)
+#   unit             ~2 min        ~13 min  (test binaries build next to build-perry)
+#   regress-wasi     ~7.5 min      ~17 min  (build-perry ~11.5 min, then the 5 probe shards ~4 min)
+#   storage-wasi     ~4.5 min      ~19 min  (build-perry, module compile ~4 min, smoke ~1.5 min;
+#                                            the renderers job runs beside it, ~7 min)
+#   full             ~7.5 min      ~20 min
+# A cold ref (no caches yet) adds the wasi runtime build (~10 min, once, in wasi-setup) and costs
+# ~28 min for full. The concurrency group includes the preset, so two presets dispatched on one
+# ref run side by side; the same preset again cancels its predecessor.
 #
 # wasi-linux is sharded: wasi-shards.py splits the probes and the sjlj-size.sh cells into
 # WASI_SHARDS balanced shards (greedy, weights in wasi-probe-weights.txt, any probe missing
