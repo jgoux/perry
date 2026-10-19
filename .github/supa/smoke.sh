@@ -95,17 +95,22 @@ if [ "${SMOKE_RENDERABLE_ERRORS:-1}" != 0 ]; then
     -d '{"name":"bad/name","public":false}' || exit 1
   norm '.'
 fi
-# The info body carries the object size, which follows SMOKE_BYTES; compare it to the upload instead
-# of recording it, so every size variant diffs against the one node transcript.
-info_norm='del(.id, .version, .etag, .last_modified, .created_at) | .size = (.size == ((env.SMOKE_BYTES // "100000") | tonumber))'
+# The info body carries the object size, which follows SMOKE_BYTES for hello.bin and is the 13 bytes of
+# "public object" for pub.txt; compare it to the size each step uploaded instead of recording it, so every
+# size variant diffs against the one node transcript and a wrong size shows up as false on that line.
+norm_info() { # <expected size>
+  jq -S -c --argjson want "$1" 'del(.id, .version, .etag, .last_modified, .created_at) | .size = (.size == $want)' "$work/body" >> "$out"
+}
+hello_bytes=${SMOKE_BYTES:-100000}
+pub_bytes=13
 # Object info and HEAD, authenticated and public. A failing step does not stop the flow, so
 # one run reports every route; a route that kills the server shows as curl-failed after it.
 step "HEAD /object/authenticated/smoke/hello.bin" 200 -I "$base/object/authenticated/smoke/hello.bin" -H "${auth[0]}"
 step "HEAD /object/smoke/hello.bin" 200 -I "$base/object/smoke/hello.bin" -H "${auth[0]}"
 step "GET /object/info/smoke/hello.bin" 200 "$base/object/info/smoke/hello.bin" -H "${auth[0]}" \
-  && norm "$info_norm"
+  && norm_info "$hello_bytes"
 step "GET /object/info/authenticated/smoke/hello.bin" 200 "$base/object/info/authenticated/smoke/hello.bin" -H "${auth[0]}" \
-  && norm "$info_norm"
+  && norm_info "$hello_bytes"
 step "GET /object/info/authenticated/smoke/missing.bin" 400 "$base/object/info/authenticated/smoke/missing.bin" -H "${auth[0]}" \
   && norm '.'
 step "GET /object/info/public/smoke/hello.bin (private bucket)" 400 "$base/object/info/public/smoke/hello.bin" \
@@ -115,7 +120,7 @@ step "POST /bucket (public)" 200 -X POST "$base/bucket" -H "${auth[0]}" -H 'Cont
 step "POST /object/smokepub/pub.txt" 200 -X POST "$base/object/smokepub/pub.txt" -H "${auth[0]}" \
   -H 'Content-Type: text/plain' --data-binary 'public object' && norm 'del(.Id)'
 step "GET /object/info/public/smokepub/pub.txt" 200 "$base/object/info/public/smokepub/pub.txt" \
-  && norm "$info_norm"
+  && norm_info "$pub_bytes"
 step "HEAD /object/public/smokepub/pub.txt" 200 -I "$base/object/public/smokepub/pub.txt"
 # Optional probes of what the dependency-removal variants touch (SMOKE_EXTRA=1): status codes of the
 # docs endpoint, the S3 protocol (sigv4 signed by curl), TUS and the feature routes. They never fail the
