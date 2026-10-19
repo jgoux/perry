@@ -531,7 +531,7 @@ pub(crate) unsafe fn closure_alloc_bound_function(
             shape_id,
         );
     };
-    crate::promise::bump(&CLOSURE_ALLOC_COUNT);
+    count_closure_alloc();
     let closure = raw as *mut ClosureHeader;
     (*closure).capture_count = count as u32;
     (*closure).shape_id = shape_id;
@@ -574,7 +574,7 @@ pub extern "C" fn js_closure_alloc_init(
     capture_count: u32,
     captures_ptr: *const u64,
 ) -> *mut ClosureHeader {
-    crate::promise::bump(&CLOSURE_ALLOC_COUNT);
+    count_closure_alloc();
     let actual_count = ordinary_capture_count(capture_count);
     if actual_count == 0 || captures_ptr.is_null() {
         return js_closure_alloc(info, capture_count);
@@ -665,7 +665,7 @@ pub extern "C" fn js_closure_alloc_small(
         let words = [capture0, capture1, capture2];
         return closure_alloc_init_collecting(info, capture_count, words.as_ptr(), true, shape_id);
     };
-    crate::promise::bump(&CLOSURE_ALLOC_COUNT);
+    count_closure_alloc();
     let closure = raw as *mut ClosureHeader;
     unsafe {
         // GC_STORE_AUDIT(INIT): the two adjacent scalar header words
@@ -741,7 +741,7 @@ pub extern "C" fn js_closure_alloc_fixed(
     }
     match closure_alloc_storage_no_collect(actual_count) {
         Some(raw) => {
-            crate::promise::bump(&CLOSURE_ALLOC_COUNT);
+            count_closure_alloc();
             let closure = raw as *mut ClosureHeader;
             unsafe {
                 // GC_STORE_AUDIT(INIT): scalar count and ShapeId header image.
@@ -945,7 +945,7 @@ fn closure_alloc_empty(
     capture_count: u32,
     shape_id: u32,
 ) -> *mut ClosureHeader {
-    crate::promise::bump(&CLOSURE_ALLOC_COUNT);
+    count_closure_alloc();
     let actual_count = ordinary_capture_count(capture_count);
     let raw = closure_alloc_storage(actual_count);
     let ptr = raw as *mut ClosureHeader;
@@ -975,6 +975,27 @@ fn closure_alloc_empty(
 }
 
 pub static CLOSURE_ALLOC_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+thread_local! {
+    static THREAD_CLOSURE_ALLOCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Count one closure allocation. Tests that assert an exact allocation window
+/// read [`thread_closure_allocs`]: the process-wide counter above is gated by a
+/// shared flag and fed by every test thread running in parallel.
+#[inline(always)]
+fn count_closure_alloc() {
+    crate::promise::bump(&CLOSURE_ALLOC_COUNT);
+    #[cfg(test)]
+    THREAD_CLOSURE_ALLOCS.with(|count| count.set(count.get() + 1));
+}
+
+/// Closures allocated by the calling thread so far.
+#[cfg(test)]
+pub(crate) fn thread_closure_allocs() -> u64 {
+    THREAD_CLOSURE_ALLOCS.with(|count| count.get())
+}
 pub static CLOSURE_CAP_SINGLETON_HIT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub static CLOSURE_CAP_SINGLETON_MISS: std::sync::atomic::AtomicU64 =

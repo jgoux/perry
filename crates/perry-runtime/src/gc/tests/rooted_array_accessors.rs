@@ -240,7 +240,7 @@ fn descriptor_snapshot_named_array_accessors_copy_in_each_rebind_window() {
             let cycles = copying_minor_cycles();
             let moved = moved_objects_total();
             let allocations =
-                crate::closure::CLOSURE_ALLOC_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+                crate::closure::thread_closure_allocs();
             trigger.make_arena_trigger_due();
             assert_eq!(
                 crate::object::define_array_property(
@@ -253,7 +253,7 @@ fn descriptor_snapshot_named_array_accessors_copy_in_each_rebind_window() {
                 Some(true)
             );
             assert_eq!(
-                crate::closure::CLOSURE_ALLOC_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+                crate::closure::thread_closure_allocs()
                     - allocations,
                 2
             );
@@ -371,7 +371,7 @@ fn descriptor_snapshot_named_array_retained_accessor_halves_survive_rebind_copyi
             let cycles = copying_minor_cycles();
             let moved = moved_objects_total();
             let allocations =
-                crate::closure::CLOSURE_ALLOC_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+                crate::closure::thread_closure_allocs();
             trigger.make_arena_trigger_due();
             // Direct decoded application isolates the rebind window for an
             // existing key from the public current-record builder allocation.
@@ -389,7 +389,7 @@ fn descriptor_snapshot_named_array_retained_accessor_halves_survive_rebind_copyi
             assert!(moved_objects_total() > moved);
             assert_ne!(addr_of(receiver.get_nanbox_f64()), before_receiver);
             assert_eq!(
-                crate::closure::CLOSURE_ALLOC_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+                crate::closure::thread_closure_allocs()
                     - allocations,
                 1
             );
