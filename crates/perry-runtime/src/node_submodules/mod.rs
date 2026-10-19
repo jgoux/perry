@@ -1129,11 +1129,7 @@ pub(crate) fn emit_sys_deprecation_warning_once() {
     {
         return;
     }
-    // `std::process::id()` panics on wasm32-wasi, which has no process ids.
-    #[cfg(target_os = "wasi")]
-    let pid = 0u32;
-    #[cfg(not(target_os = "wasi"))]
-    let pid = std::process::id();
+    let pid = crate::os::current_process_id();
     eprintln!(
         "(node:{pid}) [DEP0025] DeprecationWarning: sys is deprecated. Use `node:util` instead."
     );
