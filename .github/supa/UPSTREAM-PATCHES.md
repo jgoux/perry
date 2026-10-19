@@ -81,6 +81,7 @@ Conventions in this file:
 | P55 | a29271566 | fix(wasm32): size the family-method tables and read the word directory at the target's width | runtime (`object/layout_desc/methods.rs`, `object/shapes.rs`) | wasm32 (build break) | the wasm32 runtime build (`wasi-linux`, `storage-wasi`) | not tried | PR-AL |
 | P56 | 9a28f536b, ef4582580 | perf(wasm32): keep block-crossing values in stack slots in setjmp functions | codegen (`inprocess/sjlj_demote.rs`, `inprocess/optimize_emit.rs`) | wasm32 | wasi probe `sjlj-live-values.js` (GC stress) + `sjlj-size.sh` A/B table | not tried | PR-AM |
 | P57 | ba91cd3d5 | perf(runtime): end an instanceof prototype walk at a self link or cycle | runtime (`object/instanceof.rs`) | all (measured on wasm32) | wasi probes `instanceof-matrix.js`, `instanceof-bench.js` | not tried | PR-AN |
+| P58 | 0b9a602cf | fix(runtime): consult a computed static @@hasInstance declared in a class body | runtime (`object/global_this/generator_state.rs`) | all (found on wasm32) | wasi probe `instanceof-matrix.js` (`2 instanceof Even`) | not tried | PR-AO |
 
 All 22 patches except P12's `.github` hunks, P05 and P06 cherry-pick cleanly.
 A stack of every patch except P05 and P06, with P12 limited to `crates/`, also applies cleanly in sequence on `1fd8ca2ae`.
@@ -129,6 +130,7 @@ Ordered by value and independence. Each PR carries its patches' tests.
 38. **PR-AL The upstream family-method tables are pointer-width aware** (P55). `PerryFamilyMethods` and its entries pin LP64 sizes, and `perry_probe_family_method` reads the shape directory's word directory at an LP64 offset. Only matters to a tree that builds the runtime for a 32-bit target (needs PR-R). Prerequisite: PR-R.
 39. **PR-AM wasm32 setjmp functions keep block-crossing values in stack slots, so try/for-of code grows linearly** (P56). Prerequisite: none (the probe needs PR-R and PR-S for its GC-stress marker; the A/B size script is fork-only).
 40. **PR-AN `instanceof` stops following a [[Prototype]] self link or cycle** (P57). Prerequisite: none (the probes need PR-R and PR-S).
+41. **PR-AO A class-body `static [Symbol.hasInstance]` is consulted by `instanceof`** (P58). Prerequisite: upstream `152fccfa2` (the hook is a computed static member since then); the probe needs PR-R and PR-S.
 
 Not proposed: P04, P05, P06, P10, P15, P16, P47. Upstream fixed the same bugs independently (`c4bf643f6` for P04, `4ed616f5e` for P05, `79aae9aa7` for P06 and P15, `09e7861b4` for P10, `c1671d39d` for P16, `b0d159c8c` for P47); the 2026-10-18 merge took upstream's versions and kept the fork's tests as regression tests.
 
@@ -740,6 +742,14 @@ Not proposed: P04, P05, P06, P10, P15, P16, P47. Upstream fixed the same bugs in
 - Test: wasi probe `.github/supa/wasi-probes/instanceof-matrix.js` (90 comparisons with node: classes, builtins, `Symbol.hasInstance`, prototype reassignment, bound functions, primitives, deep chains, read streams) and `instanceof-bench.js` (answers compared with node; per-operation time and the prototype chain of each operand on stderr). Before the fix the bench reports `chain fs.ReadStream => SELF!` and 130 ms for each non-class target.
 - Not fixed, found on the way: the read stream still answers false to `instanceof Readable` and `instanceof Object` (node: true) because its chain is the self link, and a static `Symbol.hasInstance` inherited by a subclass is not consulted (`2 instanceof SubEven`). The probes leave both out of the compare.
 - Upstream: not cherry-picked. Upstream `f3d38d16d` touches `object_ops/prototype.rs` only lightly and does not change this walk. Depends on: none. PR-AN.
+
+### P58 0b9a602cf fix(runtime): consult a computed static @@hasInstance declared in a class body
+- Area / platform: `install_class_symbol_method` (`perry-runtime/src/object/global_this/generator_state.rs`) / all targets; found on wasm32.
+- Problem: `class Even { static [Symbol.hasInstance](n) { return n % 2 === 0; } }` was ignored: `2 instanceof Even` answered false (node: true). The `instanceof-matrix` wasi probe caught it after the merge of upstream `1019`.
+- Root cause: upstream `152fccfa2` stopped lifting the hook into `__perry_wk_hasinstance_<class>` and made it a real computed static member, installed on the class object by `install_class_symbol_method`. `js_instanceof` reads an own `@@hasInstance` only when `CLASS_STATIC_SYMBOLS_LATCH` is armed, and that function stored the method without arming it. Every other route that puts a static symbol on a class (`store_class_static_symbol_root`, `Object.defineProperty` on a class) arms it, so the hook worked only after one of those had run.
+- Fix: arm the latch in `install_class_symbol_method`.
+- Test: wasi probe `.github/supa/wasi-probes/instanceof-matrix.js`, lines `2 in Even`, `3 in Even`, `instance in Even`.
+- Upstream: not proposed yet; the regression is in upstream `152fccfa2`. Depends on: none. PR-AO.
 
 ## Not for upstream
 
