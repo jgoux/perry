@@ -5,9 +5,9 @@
 //! agent owns its own string handles. The regex-literal site descriptor stored
 //! the *address* of those globals, and in that mode a `ptr @global` names the
 //! thread-local descriptor, not the calling agent's slot, so the runtime read
-//! garbage as the pattern/flags strings. The literal's handles are now loaded
-//! by the generated code (which resolves the per-agent slot) and handed to the
-//! runtime (`js_regexp_literal_loaded`).
+//! garbage as the pattern/flags strings. A literal site now names the module's
+//! immutable static string descriptors instead, and the runtime builds the
+//! pattern and flags from their bytes, which is valid in every agent.
 
 use std::path::PathBuf;
 use std::process::Command;
