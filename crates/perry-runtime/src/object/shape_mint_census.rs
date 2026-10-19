@@ -200,10 +200,25 @@ fn sink() -> &'static Option<Sink> {
 pub(crate) fn armed() -> bool {
     match STATE.load(Ordering::Relaxed) {
         1 => false,
+        // A test arms the census for the thread that holds `Capture` only, so
+        // a mint on any concurrently running test cannot move its counters.
+        #[cfg(test)]
+        2 => TEST_CAPTURE_THREAD.with(std::cell::Cell::get),
+        #[cfg(not(test))]
         2 => true,
         _ => resolve_arming(),
     }
 }
+
+#[cfg(test)]
+thread_local! {
+    /// Set while this thread owns a `Capture`.
+    static TEST_CAPTURE_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Serializes the tests that read or rewrite the process-global counters.
+#[cfg(test)]
+static TEST_COUNTER_SERIAL: Mutex<()> = Mutex::new(());
 
 #[cold]
 #[inline(never)]
@@ -912,6 +927,7 @@ mod tests {
     /// without it, so this also pins that a test run never accumulates state.
     #[test]
     fn the_census_is_unarmed_by_default() {
+        let _serial = TEST_COUNTER_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         assert!(
             !armed(),
             "PERRY_SHAPE_MINT_DIAG must not be set in the test env"

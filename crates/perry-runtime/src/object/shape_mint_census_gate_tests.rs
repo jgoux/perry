@@ -2,6 +2,7 @@ use super::*;
 use crate::object::{canonical_keys, shapes};
 
 struct Capture {
+    _serial: std::sync::MutexGuard<'static, ()>,
     state: u8,
     mints: u64,
     hits: u64,
@@ -9,8 +10,11 @@ struct Capture {
 
 impl Capture {
     fn new() -> Self {
+        let serial = TEST_COUNTER_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        TEST_CAPTURE_THREAD.with(|armed| armed.set(true));
         *census().lock().unwrap() = Census::default();
         Self {
+            _serial: serial,
             state: STATE.swap(2, Ordering::Relaxed),
             mints: MINTS.swap(0, Ordering::Relaxed),
             hits: MEMO_HITS.swap(0, Ordering::Relaxed),
@@ -36,6 +40,7 @@ impl Capture {
 
 impl Drop for Capture {
     fn drop(&mut self) {
+        TEST_CAPTURE_THREAD.with(|armed| armed.set(false));
         STATE.store(self.state, Ordering::Relaxed);
         MINTS.store(self.mints, Ordering::Relaxed);
         MEMO_HITS.store(self.hits, Ordering::Relaxed);
