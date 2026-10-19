@@ -182,10 +182,14 @@ fn sibling_same_named_class_bindings_construct_their_own_class() {
     let one = compact(&function(&module, "twinOne").body);
     let two = compact(&function(&module, "twinTwo").body);
     let key_of = |body: &str| -> String {
+        // `new K()` constructs through the evaluated class binding
+        // (`Let K = ClassExprFresh{template:"…"}; NewDynamic{callee:LocalGet(K)}`),
+        // so the class key is the fresh evaluation's template.
+        let marker = "ClassExprFresh{template:\"";
         let at = body
-            .find("New{class_name:\"")
-            .expect("the fixture constructs its class statically");
-        let rest = &body[at + "New{class_name:\"".len()..];
+            .find(marker)
+            .expect("the fixture evaluates its class expression freshly");
+        let rest = &body[at + marker.len()..];
         rest[..rest.find('"').expect("class name is terminated")].to_string()
     };
     let (one_key, two_key) = (key_of(&one), key_of(&two));
