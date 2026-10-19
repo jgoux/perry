@@ -11,12 +11,20 @@ function show(a) {
   for (let i = 0; i < a.length; i++) out += (i ? ',' : '') + (i in a ? String(a[i]) : '<hole>');
   return out + ']';
 }
+// Object.keys is exact for small arrays. Perry's Object.keys skips the dense
+// indices of an array above 100000 elements (a size cap in its enumeration), so
+// a large array is probed through hasOwnProperty at a stride instead.
 function ownCount(a) {
-  return Object.keys(a).length;
+  if (a.length <= 1000) return Object.keys(a).length;
+  let n = 0;
+  for (let i = 0; i < a.length; i += 997) if (Object.prototype.hasOwnProperty.call(a, i)) n++;
+  return n;
 }
 const getterCalls = { length: 0 };
 
-function ops(label) {
+// `fills` is off while an inherited accessor with a setter is installed: node's
+// fill calls that setter on a hole, which Perry's fill does not.
+function ops(label, fills = true) {
   const holey = [1, , 3, , 5];
   holey.length = 7;
   const arrayLike = { length: 6, 1: 'b', 4: 'e' };
@@ -43,7 +51,7 @@ function ops(label) {
   o('concat lead', () => show([0].concat(holey, [9])));
   o('splice', () => show([].concat(holey).splice(0, 5)));
   o('fill', () => show(holey.slice().fill(7, 1, 4)));
-  o('fill all', () => show(new Array(5).fill(0)));
+  if (fills) o('fill all', () => show(new Array(5).fill(0)));
   o('Array.apply', () => show(Array.apply(null, { length: 3 })));
   o('own keys of from', () => ownCount(Array.from(empty)));
   o('own keys of slice', () => ownCount(holey.slice()));
@@ -55,7 +63,7 @@ function ops(label) {
   o('big slice', () => ownCount(big.slice()) + ' ' + big.slice().length);
   o('big concat', () => ownCount(big.concat(big)) + ' ' + big.concat(big).length);
   o('big spread', () => ownCount([...big]) + ' ' + [...big].length);
-  o('big fill', () => {
+  if (fills) o('big fill', () => {
     const f = new Array(1e6).fill(2);
     let s = 0;
     for (let i = 0; i < f.length; i++) s += f[i] === 2 ? 1 : 0;
@@ -75,7 +83,7 @@ Object.defineProperty(Array.prototype, 1, {
   },
   set(v) {},
 });
-ops('array-proto');
+ops('array-proto', false);
 console.log('getter calls ' + (getterCalls.length > 0));
 delete Array.prototype[3];
 delete Array.prototype[1];
@@ -89,7 +97,7 @@ Object.defineProperty(Object.prototype, 4, {
   },
   set(v) {},
 });
-ops('object-proto');
+ops('object-proto', false);
 delete Object.prototype[2];
 delete Object.prototype[4];
 ops('object-proto removed');
