@@ -53,5 +53,20 @@ case "${1:?build|run}" in
     for n in "${names[@]}"; do
       grep -Eq "^test .*${n} \.\.\. ok$" "$out" || { echo "::error::regression test $n did not run and pass"; exit 1; }
     done
+    # The buffer backing tests assert exact live-backing counts and the B4
+    # sabotage witness re-runs sibling tests in child processes. They must hold
+    # under the default parallel harness, which is how they flaked before the
+    # counts were isolated per test, so run them that way, repeatedly.
+    buffer_names=(
+      transfer_receiver_uses_original_pointer_after_sender_gc
+      backing_outlives_its_allocating_worker
+      each_compatible_b4_sabotage_turns_its_witness_red
+    )
+    for round in 1 2 3 4 5 6 7 8 9 10; do
+      "${rest[@]}" -- buffer 2>&1 | tee "$out"
+      for n in "${buffer_names[@]}"; do
+        grep -Eq "^test .*${n} \.\.\. ok$" "$out" || { echo "::error::buffer test $n did not run and pass (round $round)"; exit 1; }
+      done
+    done
     ;;
 esac
