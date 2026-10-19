@@ -1,5 +1,6 @@
 // import of "fs/promises" in its namespace, default and named forms resolves
 // every export to the real implementation, identical to fs.promises.
+// network: yes
 import * as ns from "fs/promises";
 import def from "node:fs/promises";
 import { readFile, writeFile, mkdir, rm } from "fs/promises";

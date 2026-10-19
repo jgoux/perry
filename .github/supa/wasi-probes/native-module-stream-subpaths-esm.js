@@ -1,4 +1,5 @@
 // import of stream/promises, stream/consumers and stream/web (namespace, default, named).
+// network: yes
 import * as sp from "stream/promises";
 import spDefault from "node:stream/promises";
 import { finished } from "stream/promises";

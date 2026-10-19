@@ -1,5 +1,6 @@
 // require() of stream/promises, stream/consumers and stream/web: every export must
 // run the real implementation, however it is read or called.
+// network: yes
 "use strict";
 const stream = require("stream");
 const sp = require("stream/promises");

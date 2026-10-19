@@ -1,6 +1,7 @@
 // require() of diagnostics_channel, trace_events, string_decoder, constants, sys,
 // inspector/promises, node:test and node:test/reporters: every export must resolve
 // to the real implementation, however it is read or called.
+// network: yes
 "use strict";
 const dc = require("diagnostics_channel");
 const dcPrefixed = require("node:diagnostics_channel");

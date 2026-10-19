@@ -1,6 +1,7 @@
 // require("timers/promises") and require("readline/promises"): native-module
 // namespaces whose exports must run the real implementations, not answer
 // undefined, however they are read or called.
+// network: yes
 "use strict";
 const timers = require("timers");
 const readline = require("readline");

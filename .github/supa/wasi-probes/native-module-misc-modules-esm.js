@@ -1,5 +1,6 @@
 // import of diagnostics_channel, string_decoder, trace_events and constants
 // (namespace, default, named) must resolve every export to the real implementation.
+// network: yes
 import * as dc from "diagnostics_channel";
 import dcDefault from "node:diagnostics_channel";
 import { channel, hasSubscribers, subscribe, unsubscribe } from "diagnostics_channel";

@@ -1,4 +1,5 @@
 // import of "timers/promises" and "readline/promises" (namespace, default, named).
+// network: yes
 import * as tp from "timers/promises";
 import tpDefault from "node:timers/promises";
 import { setTimeout as sleep, setInterval } from "timers/promises";
@@ -6,8 +7,10 @@ import * as rlp from "readline/promises";
 import rlpDefault from "node:readline/promises";
 import { createInterface } from "readline/promises";
 import { promises as timersPromises } from "timers";
-import { promises as readlinePromises } from "readline";
+import readline from "readline";
 import { PassThrough } from "stream";
+
+const readlinePromises = readline.promises;
 
 for (const n of ["setTimeout", "setImmediate", "setInterval"]) {
   console.log("timers/promises", n, typeof tp[n], typeof tpDefault[n], tp[n] === timersPromises[n]);
