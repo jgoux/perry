@@ -2,6 +2,29 @@
 # natively and runs a smoke flow against it. Not part of upstream; drop together
 # with .github/supa/ when the fixes land upstream.
 #
+# Iterating on Perry: dispatch with a `preset` (the plan job turns it into the set of jobs
+# that run; .github/supa/ci-plan.sh is the one place that decides, and the final `gate` job
+# fails the run if any job's result disagrees with the plan, so nothing is skipped silently):
+#   unit           regressions-linux only: the runtime unit and integration tests
+#   regress-wasi   regressions + wasi-linux. wasi_probe_names narrows the probes to those names
+#                  (one shard, no sjlj-size cells); empty runs every probe over WASI_SHARDS shards
+#   storage-wasi   Storage compiled to wasip1: module (or its cache), renderers (or their ok
+#                  marker) and the supa-host smoke
+#   full           everything: the three above, storage-linux and probes-linux
+#   custom         (default) the individual flags below, exactly as before the presets existed
+# Pushes keep their selection: supa/wasip1 runs wasi + storage-wasi besides the usual
+# storage-linux + regressions. skip_regressions removes regressions-linux from any preset.
+# Typical wall-clock with warm caches: unit ~3 min, regress-wasi ~9 min, storage-wasi ~7 min on a
+# module-cache hit and ~12 min on a miss. The concurrency group includes the preset, so two
+# presets dispatched on one ref run side by side; the same preset again cancels its predecessor.
+#
+# wasi-linux is sharded: wasi-shards.py splits the probes and the sjlj-size.sh cells into
+# WASI_SHARDS balanced shards (greedy, weights in wasi-probe-weights.txt, any probe missing
+# there weighs 3 s). Each shard records what it ran; wasi-verify.sh requires the union to be
+# exactly the probes in .github/supa/wasi-probes and the sjlj cells, each once, all PASS.
+# wasi-setup builds the wasm32-wasip1 runtime archive once; the shards, the module job and the
+# renderers job only restore it (they used to rebuild it in parallel on a cache miss).
+#
 # Caches, in the order they pay off:
 #   perry-dist-*      compiler + runtime archives, keyed by the hash of crates/**.
 #                     build-perry skips the build when it exists.
@@ -10,10 +33,39 @@
 #   perry-obj-*       Storage object cache (node_modules/.cache/perry), keyed by
 #                     the sources that shape generated objects only. Link-side
 #                     changes keep it, so they cost a relink, not 35 min of codegen.
+#   storage-wasi-module-*
+#                     the finished storage.wasm, storage.stripped.wasm and storage-dist.tar.zst
+#                     plus their check logs. A hit skips the compile, the module checks and the
+#                     packing (storage-wasi-cache re-publishes the artifacts). The key is a
+#                     sha256 over everything that can change those bytes or their checks:
+#                       - the perry-dist key: hash of crates/**, Cargo.lock, Cargo.toml,
+#                         rust-toolchain.toml and .cargo/** (compiler, wasm backend and every
+#                         runtime crate, and the nightly), plus its own recipe literal and the
+#                         simulate input
+#                       - the Storage commit SHA
+#                       - storage_variant, schemas and ajv (the SUPA_* env that shims.sh reads)
+#                       - the hash of .github/supa/** minus the test-only files (probe and
+#                         probe dirs, regression/smoke/sjlj/shard scripts, the renderer
+#                         programs, notes): shims.sh, storage-stubs.sh, stub-packages.cjs,
+#                         patch-*.cjs, wasi-imports.py, env.sh and anything new count
+#                       - the hash of .github/actions/** (toolchain pins, wasi tool downloads)
+#                         and scripts/wasi_build_runtime.*
+#                       - the build flags: STORAGE_WASI_FLAGS, STORAGE_WASI_ENTRY, the wasi-sdk,
+#                         wasmtime and wasm-tools versions, and MODULE_RECIPE (bump it when the
+#                         compile, check or pack steps of the storage-wasi job change)
+#                     A docs, probe or test change leaves all of that alone and hits; any other
+#                     change misses. A miss costs a compile, a wrong hit ships a stale module, so
+#                     whatever might matter is in the key. Parallelism (module_jobs, codegen_jobs)
+#                     is left out: it does not change the output.
+#   storage-wasi-renderers-ok-*
+#                     marker that the renderers checks passed for the same inputs (the module key
+#                     minus MODULE_RECIPE, plus the renderer programs); a hit skips the job.
+#   perry-wobj-render-*
+#                     object cache of the renderers programs, which the job did not save before.
 #   storage-built-*   built Storage checkout (node_modules + dist), keyed by SHA.
 #   perry-wasip1-*    wasm32-wasip1 runtime archive for `perry compile --target
 #                     wasip1`, keyed by the runtime, stdlib and ext crates only.
-#   wasi-tools-*      wasi-sdk, wasmtime and wasm-tools for the wasi-linux job.
+#   wasi-tools-*      wasi-sdk, wasmtime and wasm-tools for the wasi jobs.
 name: supa-storage
 run-name: supa-storage / ${{ github.sha }}
 
@@ -22,11 +74,16 @@ on:
     branches: [supa/storage, supa/storage-ci, supa/wasip1]
   workflow_dispatch:
     inputs:
+      preset:
+        description: "Which jobs run (see the header): unit = runtime tests only; regress-wasi = regressions + wasi probes (wasi_probe_names narrows them); storage-wasi = Storage to wasip1 + smoke; full = everything; custom = the flags below"
+        type: choice
+        options: [custom, unit, regress-wasi, storage-wasi, full]
+        default: custom
       storage_ref:
         description: Branch of jgoux/storage to compile
         default: supa/aot-friendly
       skip_regressions:
-        description: Skip the regression tests added on this branch
+        description: Skip the regression tests added on this branch (any preset)
         type: boolean
         default: false
       storage:
@@ -90,7 +147,7 @@ on:
         default: none
 
 concurrency:
-  group: supa-storage-${{ github.ref }}-${{ inputs.schemas }}-${{ inputs.ajv }}-${{ inputs.storage_variant }}
+  group: supa-storage-${{ github.ref }}-${{ inputs.preset }}-${{ inputs.schemas }}-${{ inputs.ajv }}-${{ inputs.storage_variant }}
   cancel-in-progress: true
 
 permissions:
@@ -122,10 +179,64 @@ env:
   SUPA_LAZY_AJV: ${{ inputs.ajv == 'eager' && '0' || '1' }}
   # Read by .github/supa/shims.sh (stubs) and the jobs that run Storage (storage-stubs.sh env).
   SUPA_STORAGE_VARIANT: ${{ inputs.storage_variant || 'all' }}
+  # The wasip1 jobs.
+  WASI_TOOLS: /home/runner/wasi-tools
+  WASI_SDK_VERSION: "34"
+  WASMTIME_VERSION: 49.0.2
+  # The last wasmtime with the legacy preview1 implementation; only it can hand a
+  # p1 guest a listener (`-S preview2=n -S tcplisten`). Used by the server probes.
+  WASMTIME_P1_VERSION: 46.0.3
+  WASM_TOOLS_VERSION: 1.261.0
+  WASI_SHARDS: "5"
+  # Perry's environment for the wasip1 Storage compile: part of the module cache key.
+  # `function name(params) { /* source elided */ }` instead of each function's full source:
+  # fn-tostring-scan.txt lists every reader of a function's text in Storage's dependencies.
+  STORAGE_WASI_FLAGS: "PERRY_NO_AUTO_OPTIMIZE=1 PERRY_KEEP_SYMBOLS=1 PERRY_FUNCTION_SOURCE=header"
+  STORAGE_WASI_ENTRY: dist/start/server-minimal.js
+  # Bump when the compile, check or pack steps of storage-wasi change (module cache key).
+  MODULE_RECIPE: "1"
+  RENDERERS_RECIPE: "1"
 
 jobs:
+  # Which jobs run, and the wasi shards. Every other job reads its `if:` from here.
+  plan:
+    runs-on: blacksmith-2vcpu-ubuntu-2404-arm
+    timeout-minutes: 10
+    outputs:
+      preset: ${{ steps.plan.outputs.preset }}
+      regressions: ${{ steps.plan.outputs.regressions }}
+      storage: ${{ steps.plan.outputs.storage }}
+      storage_wasi: ${{ steps.plan.outputs.storage_wasi }}
+      wasi: ${{ steps.plan.outputs.wasi }}
+      probes: ${{ steps.plan.outputs.probes }}
+      build_perry: ${{ steps.plan.outputs.build_perry }}
+      storage_prep: ${{ steps.plan.outputs.storage_prep }}
+      wasi_setup: ${{ steps.plan.outputs.wasi_setup }}
+      wasi_matrix: ${{ steps.plan.outputs.wasi_matrix }}
+      wasi_probes: ${{ steps.plan.outputs.wasi_probes }}
+      wasi_sjlj: ${{ steps.plan.outputs.wasi_sjlj }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+      - name: Plan
+        id: plan
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          PRESET: ${{ inputs.preset }}
+          SKIP_REGRESSIONS: ${{ inputs.skip_regressions }}
+          STORAGE: ${{ inputs.storage }}
+          STORAGE_WASI: ${{ inputs.storage_wasi }}
+          WASI: ${{ inputs.wasi }}
+          PROBES: ${{ inputs.probes }}
+          WASI_PROBE_NAMES: ${{ inputs.wasi_probe_names }}
+        run: .github/supa/ci-plan.sh
+
   # Compiler and runtime archives, built once per source hash.
   build-perry:
+    if: ${{ needs.plan.outputs.build_perry == 'true' }}
+    needs: plan
     runs-on: blacksmith-32vcpu-ubuntu-2404-arm
     timeout-minutes: 120
     outputs:
@@ -189,29 +300,46 @@ jobs:
           echo "### build-perry" >> "$GITHUB_STEP_SUMMARY"
           echo "- reused \`${{ steps.key.outputs.key }}\`" >> "$GITHUB_STEP_SUMMARY"
 
+  # The wasm32-wasip1 runtime archive, built once per runtime source hash and cached. The jobs
+  # below restore it and fail on a miss, so they never build it again side by side.
+  wasi-setup:
+    if: ${{ needs.plan.outputs.wasi_setup == 'true' }}
+    needs: plan
+    runs-on: blacksmith-16vcpu-ubuntu-2404-arm
+    timeout-minutes: 60
+    env:
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: cc
+      PERRY_RUNTIME_DIR: ${{ github.workspace }}/target/wasm32-wasip1/release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/supa-wasi-env
+        with:
+          build-runtime: "true"
+
   # Perry's wasm32-wasip1 target: compile the probes in .github/supa/wasi-probes
   # to preview1 core modules, require that they import only what the supa-wasm
-  # host links, and compare their output with node under wasmtime.
+  # host links, and compare their output with node under wasmtime. One matrix job per
+  # shard (wasi-shards.py); wasi-verify checks that together they ran everything once.
   wasi-linux:
-    if: ${{ github.ref_name == 'supa/wasip1' || (github.event_name == 'workflow_dispatch' && inputs.wasi) }}
-    needs: build-perry
+    if: ${{ needs.plan.outputs.wasi == 'true' }}
+    needs: [plan, build-perry, wasi-setup]
+    name: wasi-linux (${{ matrix.shard }})
     runs-on: blacksmith-16vcpu-ubuntu-2404-arm
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.wasi_matrix) }}
     env:
       OUT: ${{ github.workspace }}/supa-out
-      WASI_TOOLS: /home/runner/wasi-tools
-      WASI_SDK_VERSION: "34"
-      WASMTIME_VERSION: 49.0.2
-      # The last wasmtime with the legacy preview1 implementation; only it can hand a
-      # p1 guest a listener (`-S preview2=n -S tcplisten`). Used by the server probes.
-      WASMTIME_P1_VERSION: 46.0.3
-      WASM_TOOLS_VERSION: 1.261.0
       # exnref exception handling is what wasi-sdk's setjmp/longjmp lowering emits.
       WASMTIME_FLAGS: -W exceptions=y
       # Host build scripts link with the system linker; LLVM 22 (and its lld) is not installed here.
       CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: cc
       # The wasm runtime archive, not the native one the other jobs use.
       PERRY_RUNTIME_DIR: ${{ github.workspace }}/target/wasm32-wasip1/release
+      SHARD_PROBES: ${{ matrix.probes }}
+      SHARD_SJLJ: ${{ matrix.sjlj }}
     steps:
       - uses: actions/checkout@v4
       - name: Perry build
@@ -222,23 +350,24 @@ jobs:
           fail-on-cache-miss: true
       - run: mkdir -p target/release && cp perry-dist/perry target/release/perry && target/release/perry --version
       - uses: ./.github/actions/supa-wasi-env
+        with:
+          build-runtime: "false"
       - uses: actions/setup-node@v4 # the reference runs
         with:
           node-version: 24
       - name: Probes
-        env:
-          WASI_PROBE_NAMES: ${{ inputs.wasi_probe_names }}
-        run: .github/supa/wasi-probes.sh $WASI_PROBE_NAMES
+        if: ${{ matrix.probes != '' }}
+        run: .github/supa/wasi-probes.sh $SHARD_PROBES
       # Code size of a setjmp function against its calls and live values, with
       # and without the slot demotion (P55); the table lands in the summary.
       - name: sjlj code size
-        if: ${{ !cancelled() && inputs.wasi_probe_names == '' }}
-        run: .github/supa/sjlj-size.sh
+        if: ${{ !cancelled() && matrix.sjlj != '' }}
+        run: .github/supa/sjlj-size.sh $SHARD_SJLJ
+      # Runs on the shard that has the hello probe.
       - name: Hello module checks
-        if: ${{ always() && inputs.wasi_probe_names == '' }}
+        if: ${{ !cancelled() && hashFiles('supa-out/wasi-probes/hello/hello.wasm') != '' }}
         run: |
           hello="$OUT/wasi-probes/hello/hello.wasm"
-          [ -f "$hello" ] || { echo "no hello.wasm"; exit 1; }
           {
             echo "### hello.wasm"
             echo '```'
@@ -257,10 +386,21 @@ jobs:
           echo "_start calls __wasm_call_ctors"
           echo "try_table sites: $(grep -c 'try_table' "$OUT/hello.wat" || true)"
           echo "legacy try sites: $(grep -cE '^\s*try( |$)' "$OUT/hello.wat" || true)"
+      # What this shard ran, for wasi-verify.
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: wasi-probes
+          name: wasi-ran-${{ matrix.shard }}
+          path: |
+            supa-out/wasi-probes.ran
+            supa-out/sjlj-size.ran
+          if-no-files-found: ignore
+          retention-days: 3
+      # The shards' artifacts are merged into wasi-probes and wasi-probe-modules by wasi-artifacts.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wasi-probes-${{ matrix.shard }}
           path: |
             supa-out/wasi-probes/*/*.log
             supa-out/wasi-probes/*/*.out
@@ -274,25 +414,140 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: wasi-probe-modules
+          name: wasi-probe-modules-${{ matrix.shard }}
           path: supa-out/wasi-probes/*/*.wasm
+          if-no-files-found: ignore
+
+  # Every probe and sjlj cell of the plan ran exactly once across the shards, and passed.
+  wasi-verify:
+    if: ${{ !cancelled() && needs.plan.outputs.wasi == 'true' }}
+    needs: [plan, wasi-linux]
+    runs-on: blacksmith-2vcpu-ubuntu-2404-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wasi-ran-*
+          path: wasi-ran
+      - name: Union of the shards
+        env:
+          EXPECTED_PROBES: ${{ needs.plan.outputs.wasi_probes }}
+          EXPECTED_SJLJ: ${{ needs.plan.outputs.wasi_sjlj }}
+        run: .github/supa/wasi-verify.sh wasi-ran
+
+  # wasi-probes and wasi-probe-modules as one artifact each, as before the sharding.
+  wasi-artifacts:
+    if: ${{ !cancelled() && needs.plan.outputs.wasi == 'true' }}
+    needs: [plan, wasi-linux]
+    runs-on: blacksmith-2vcpu-ubuntu-2404-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/upload-artifact/merge@v4
+        with:
+          name: wasi-probes
+          pattern: wasi-probes-*
+          delete-merged: true
+      - uses: actions/upload-artifact/merge@v4
+        with:
+          name: wasi-probe-modules
+          pattern: wasi-probe-modules-*
+          delete-merged: true
+          compression-level: 1
+
+  # The cache keys of the two storage-wasi jobs (see the header for what goes in), and the module
+  # itself when its key is already cached: this job re-publishes the artifacts of the hit, so
+  # the compile job below only runs on a miss.
+  storage-wasi-cache:
+    if: ${{ needs.plan.outputs.storage_wasi == 'true' }}
+    needs: [plan, build-perry, storage-prep]
+    runs-on: blacksmith-4vcpu-ubuntu-2404-arm
+    timeout-minutes: 30
+    outputs:
+      hit: ${{ steps.module.outputs.cache-hit }}
+      key: ${{ steps.keys.outputs.module }}
+      render_hit: ${{ steps.renderers.outputs.cache-hit }}
+      render_key: ${{ steps.keys.outputs.renderers }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache keys
+        id: keys
+        run: |
+          # Files of .github/supa that cannot change the module or its checks: the probe programs
+          # and drivers, the other jobs' scripts, the CI plumbing and notes.
+          common="perry=${{ needs.build-perry.outputs.key }}"
+          common+=" storage=${{ needs.storage-prep.outputs.sha }}"
+          common+=" variant=$SUPA_STORAGE_VARIANT schemas=$SUPA_LAZY_SCHEMAS ajv=$SUPA_LAZY_AJV"
+          common+=" actions=${{ hashFiles('.github/actions/**') }} runtime-script=${{ hashFiles('scripts/wasi_build_runtime.*') }}"
+          common+=" flags=[$STORAGE_WASI_FLAGS] entry=$STORAGE_WASI_ENTRY"
+          common+=" sdk=$WASI_SDK_VERSION wasmtime=$WASMTIME_VERSION wasmtime-p1=$WASMTIME_P1_VERSION wasm-tools=$WASM_TOOLS_VERSION"
+          supa='${{ hashFiles('.github/supa/**', '!.github/supa/wasi-probes/**', '!.github/supa/probes/**', '!.github/supa/probes.sh', '!.github/supa/probe.js', '!.github/supa/regressions.sh', '!.github/supa/wasi-probes.sh', '!.github/supa/wasi-probe-weights.txt', '!.github/supa/wasi-shards.py', '!.github/supa/wasi-verify.sh', '!.github/supa/wasi-smoke.sh', '!.github/supa/sjlj-size.sh', '!.github/supa/smoke.sh', '!.github/supa/compare.sh', '!.github/supa/serve.sh', '!.github/supa/diagnose.sh', '!.github/supa/simulate.sh', '!.github/supa/prune-caches.sh', '!.github/supa/ci-*.sh', '!.github/supa/storage-info*', '!.github/supa/*.md') }}'
+          # the renderer programs and their driver only matter to the renderers job
+          renderers='${{ hashFiles('.github/supa/storage-info*') }}'
+          sha() { printf '%s' "$1" | sha256sum | cut -c1-40; }
+          echo "module=storage-wasi-module-${{ runner.arch }}-$(sha "$common supa=$supa recipe=$MODULE_RECIPE")" >> "$GITHUB_OUTPUT"
+          echo "renderers=storage-wasi-renderers-ok-${{ runner.arch }}-$(sha "$common supa=$supa renderers=$renderers recipe=$RENDERERS_RECIPE")" >> "$GITHUB_OUTPUT"
+          echo "$common supa=$supa renderers=$renderers"
+      - name: Cached module
+        id: module
+        uses: actions/cache/restore@v4
+        with:
+          path: module-cache
+          key: ${{ steps.keys.outputs.module }}
+      - name: Renderers already passed?
+        id: renderers
+        uses: actions/cache/restore@v4
+        with:
+          path: renderers-ok
+          key: ${{ steps.keys.outputs.renderers }}
+          lookup-only: true
+      - name: Summary
+        run: |
+          {
+            echo "### storage-wasi-cache"
+            echo "- module: \`${{ steps.keys.outputs.module }}\`: **${{ steps.module.outputs.cache-hit == 'true' && 'hit' || 'miss' }}**"
+            echo "- renderers: \`${{ steps.keys.outputs.renderers }}\`: **${{ steps.renderers.outputs.cache-hit == 'true' && 'hit' || 'miss' }}**"
+          } >> "$GITHUB_STEP_SUMMARY"
+          [ "${{ steps.module.outputs.cache-hit }}" != true ] || ls -l module-cache
+      # The artifacts the compile job uploads on a miss.
+      - uses: actions/upload-artifact@v4
+        if: steps.module.outputs.cache-hit == 'true'
+        with:
+          name: storage-wasi-module
+          path: |
+            module-cache/storage.wasm
+            module-cache/storage.stripped.wasm
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        if: steps.module.outputs.cache-hit == 'true'
+        with:
+          name: storage-dist
+          path: module-cache/storage-dist.tar.zst
+          retention-days: 90
+          compression-level: 0
+      - uses: actions/upload-artifact@v4
+        if: steps.module.outputs.cache-hit == 'true'
+        with:
+          name: storage-wasi-logs
+          path: |
+            module-cache/imports.txt
+            module-cache/strip-sizes.txt
+            module-cache/storage-dist.files.txt
           if-no-files-found: ignore
 
   # Storage's server-minimal entry compiled to a wasip1 core module for the supa-wasm
   # host. CI only compiles and checks the module (the host's socket imports are not
-  # available to wasmtime); it runs under supa-host on a dev machine.
+  # available to wasmtime); it runs under supa-host on a dev machine. Runs on a module cache
+  # miss only (storage-wasi-cache); a success saves the module and its checks to the cache.
   storage-wasi:
-    if: ${{ github.ref_name == 'supa/wasip1' || (github.event_name == 'workflow_dispatch' && inputs.storage_wasi) }}
-    needs: [build-perry, storage-prep]
+    if: ${{ needs.plan.outputs.storage_wasi == 'true' && needs.storage-wasi-cache.outputs.hit != 'true' }}
+    needs: [plan, build-perry, storage-prep, wasi-setup, storage-wasi-cache]
     runs-on: blacksmith-32vcpu-ubuntu-2404-arm
     timeout-minutes: 240
     env:
       OUT: ${{ github.workspace }}/supa-out
-      WASI_TOOLS: /home/runner/wasi-tools
-      WASI_SDK_VERSION: "34"
-      WASMTIME_VERSION: 49.0.2
-      WASMTIME_P1_VERSION: 46.0.3
-      WASM_TOOLS_VERSION: 1.261.0
       CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: cc
       PERRY_RUNTIME_DIR: ${{ github.workspace }}/target/wasm32-wasip1/release
       PERRY_MODULE_JOBS: ${{ inputs.module_jobs || '8' }}
@@ -307,6 +562,8 @@ jobs:
           fail-on-cache-miss: true
       - run: mkdir -p target/release && cp perry-dist/perry target/release/perry && target/release/perry --version
       - uses: ./.github/actions/supa-wasi-env
+        with:
+          build-runtime: "false"
       - uses: actions/setup-node@v4
         with:
           node-version: 24
@@ -339,14 +596,11 @@ jobs:
           mkdir -p "$OUT"
           "$GITHUB_WORKSPACE/.github/supa/shims.sh" .
           export PERRY_OBJECT_CACHE_BUILD_ID=${{ steps.objid.outputs.id }}
-          export PERRY_NO_AUTO_OPTIMIZE=1 PERRY_KEEP_SYMBOLS=1
-          # Keep `function name(params) { /* source elided */ }` instead of each function's full source:
-          # fn-tostring-scan.txt lists every reader of a function's text in Storage's dependencies.
-          export PERRY_FUNCTION_SOURCE=header
+          export $STORAGE_WASI_FLAGS
           echo "jobs: modules=$PERRY_MODULE_JOBS units=$PERRY_CODEGEN_UNIT_JOBS"
           set +e
           /usr/bin/time -v -o "$OUT/compile.time" \
-            "$GITHUB_WORKSPACE/target/release/perry" compile --target wasip1 dist/start/server-minimal.js -o "$OUT/storage.wasm" 2>&1 \
+            "$GITHUB_WORKSPACE/target/release/perry" compile --target wasip1 "$STORAGE_WASI_ENTRY" -o "$OUT/storage.wasm" 2>&1 \
             | while IFS= read -r l; do printf '%(%T)T %s\n' -1 "$l"; done > "$OUT/compile.log"
           rc=${PIPESTATUS[0]}
           echo "compile exit=$rc"; tail -n 25 "$OUT/compile.log"
@@ -360,41 +614,7 @@ jobs:
           key: perry-wobj-${{ runner.arch }}-${{ steps.objid.outputs.id }}-${{ needs.storage-prep.outputs.sha }}-${{ github.run_id }}
       - name: Prune old object caches
         if: always() && steps.compile.conclusion != 'skipped' && steps.compile.outputs.codegen == 'true'
-        run: .github/supa/prune-caches.sh perry-wobj- 2
-      - name: Storage renderers under wasmtime
-        # The info and HEAD renderers from the real build, driven by a stand-in
-        # reply (.github/supa/storage-info.js): same stdout as node or the job fails.
-        working-directory: ${{ env.STORAGE_DIR }}
-        run: |
-          set -o pipefail
-          export PERRY_NO_AUTO_OPTIMIZE=1 PERRY_KEEP_SYMBOLS=1
-          export PERRY_OBJECT_CACHE_BUILD_ID=${{ steps.objid.outputs.id }}
-          cp "$GITHUB_WORKSPACE/.github/supa/storage-info.js" storage-info.js
-          "$GITHUB_WORKSPACE/.github/supa/env.sh" > "$RUNNER_TEMP/driver.env"
-          { echo "DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/none"
-            echo "STORAGE_FILE_BACKEND_PATH=$RUNNER_TEMP/data-driver"
-            echo "NODE_ENV=production"; } >> "$RUNNER_TEMP/driver.env"
-          mkdir -p "$RUNNER_TEMP/data-driver"
-          env_flags=(); while IFS= read -r kv; do env_flags+=(--env "$kv"); done < "$RUNNER_TEMP/driver.env"
-          set -a; . "$RUNNER_TEMP/driver.env"; set +a
-          node storage-info.js > "$OUT/info-driver.node.out" 2>&1 || true
-          echo "--- node ---"; cat "$OUT/info-driver.node.out"
-          "$GITHUB_WORKSPACE/target/release/perry" compile --target wasip1 storage-info.js -o "$OUT/info-driver.wasm" 2>&1 | tail -n 5
-          set +e
-          wasmtime run -W exceptions=y -W unknown-imports-trap "${env_flags[@]}" --env PERRY_TRACE_THROW=1 "$OUT/info-driver.wasm" > "$OUT/info-driver.wasm.out" 2> "$OUT/info-driver.wasm.err"
-          echo "wasm exit=$?"
-          echo "--- wasm ---"; cat "$OUT/info-driver.wasm.out"; echo "--- wasm stderr (tail) ---"; tail -n 40 "$OUT/info-driver.wasm.err"
-          diff -u "$OUT/info-driver.node.out" "$OUT/info-driver.wasm.out"
-      - name: Storage renderers behind Fastify under wasmtime
-        # The same renderers behind real Fastify routes on the listener wasmtime
-        # hands the guest; curl asks node and the module the same questions.
-        working-directory: ${{ env.STORAGE_DIR }}
-        run: |
-          export PERRY_NO_AUTO_OPTIMIZE=1 PERRY_KEEP_SYMBOLS=1
-          export PERRY_OBJECT_CACHE_BUILD_ID=${{ steps.objid.outputs.id }}
-          export PERRY_BIN="$GITHUB_WORKSPACE/target/release/perry" WASM_ENV_FILE="$RUNNER_TEMP/driver.env"
-          set -a; . "$WASM_ENV_FILE"; set +a
-          "$GITHUB_WORKSPACE/.github/supa/storage-info-server.sh"
+        run: .github/supa/prune-caches.sh perry-wobj-${{ runner.arch }}- 2
       - name: Module checks
         run: |
           set -o pipefail
@@ -429,6 +649,21 @@ jobs:
           ls -l "$OUT/storage-dist.tar.zst"
           tar -I zstd -tf "$OUT/storage-dist.tar.zst" | grep -v '/$' | sed 's/^/  /' > "$OUT/storage-dist.files.txt"
           { echo "- storage-dist: $(stat -c %s "$OUT/storage-dist.tar.zst") bytes, variant \`$SUPA_STORAGE_VARIANT\`, $(wc -l < "$OUT/storage-dist.files.txt") files"; } >> "$GITHUB_STEP_SUMMARY"
+      # Everything above passed: keep the module, the dist and the check logs under the key
+      # storage-wasi-cache computed, so a run that changes none of its inputs skips all of it.
+      - name: Collect the module cache
+        run: |
+          mkdir module-cache
+          cp "$OUT/storage.wasm" "$OUT/storage.stripped.wasm" "$OUT/storage-dist.tar.zst" \
+             "$OUT/imports.txt" "$OUT/strip-sizes.txt" "$OUT/storage-dist.files.txt" module-cache/
+          ls -l module-cache
+      - name: Save the module
+        uses: actions/cache/save@v4
+        with:
+          path: module-cache
+          key: ${{ needs.storage-wasi-cache.outputs.key }}
+      - name: Prune old modules
+        run: .github/supa/prune-caches.sh storage-wasi-module-${{ runner.arch }}- 3
       - name: Function source consumers
         if: always()
         run: |
@@ -440,7 +675,7 @@ jobs:
         run: |
           {
             echo "### storage-wasi"
-            echo "- perry: \`${GITHUB_SHA::8}\`, storage: \`${{ needs.storage-prep.outputs.sha }}\` (\`$STORAGE_REF\`), objects: \`${{ steps.objid.outputs.id }}\`"
+            echo "- perry: \`${GITHUB_SHA::8}\`, storage: \`${{ needs.storage-prep.outputs.sha }}\` (\`$STORAGE_REF\`), objects: \`${{ steps.objid.outputs.id }}\`, module cache key: \`${{ needs.storage-wasi-cache.outputs.key }}\` (miss)"
             echo "- jobs: modules=$PERRY_MODULE_JOBS units=$PERRY_CODEGEN_UNIT_JOBS, storage variant: \`$SUPA_STORAGE_VARIANT\`"
             [ -f "$OUT/compile.time" ] && grep -E 'Elapsed|Maximum resident' "$OUT/compile.time" | sed 's/^\s*/- compile: /'
             [ -f "$OUT/storage.wasm" ] && echo "- module: $(stat -c %s "$OUT/storage.wasm") bytes, $(stat -c %s "$OUT/storage.stripped.wasm" 2>/dev/null || echo ?) bytes stripped"
@@ -461,7 +696,7 @@ jobs:
             supa-out/storage-dist.files.txt
           if-no-files-found: ignore
       # The compiler and the wasm runtime archive, for compiling small repros in a Linux
-      # arm64 container on a dev machine (no LLVM 22 there).
+      # arm64 container on a dev machine (no LLVM 22 there). Not re-published on a module cache hit.
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -488,6 +723,115 @@ jobs:
           retention-days: 90
           compression-level: 0
 
+  # The info and HEAD renderers from the real Storage build, run under wasmtime against node.
+  # They compile two small programs next to Storage, which took 6.5 min cold on every run (their
+  # objects were never cached): they now have their own object cache, and a pass is recorded
+  # under a key of its inputs so that a run that changes none of them skips the job.
+  storage-wasi-renderers:
+    if: ${{ needs.plan.outputs.storage_wasi == 'true' && needs.storage-wasi-cache.outputs.render_hit != 'true' }}
+    needs: [plan, build-perry, storage-prep, wasi-setup, storage-wasi-cache]
+    runs-on: blacksmith-16vcpu-ubuntu-2404-arm
+    timeout-minutes: 90
+    env:
+      OUT: ${{ github.workspace }}/supa-out
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: cc
+      PERRY_RUNTIME_DIR: ${{ github.workspace }}/target/wasm32-wasip1/release
+    steps:
+      - uses: actions/checkout@v4
+      - name: Perry build
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/perry-dist
+          key: ${{ needs.build-perry.outputs.key }}
+          fail-on-cache-miss: true
+      - run: mkdir -p target/release && cp perry-dist/perry target/release/perry && target/release/perry --version
+      - uses: ./.github/actions/supa-wasi-env
+        with:
+          build-runtime: "false"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Built Storage
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.STORAGE_DIR }}
+          key: storage-built-${{ runner.arch }}-${{ needs.storage-prep.outputs.sha }}
+          fail-on-cache-miss: true
+      - name: Object cache id
+        id: objid
+        run: |
+          id=$(echo '${{ hashFiles('crates/perry-codegen/**', 'crates/perry-hir/**', 'crates/perry-transform/**', 'crates/perry-types/**', 'crates/perry-parser/**', 'crates/perry-diagnostics/**', 'crates/perry-api-manifest/**', 'crates/perry-dispatch/**', 'crates/perry-abi/**', 'crates/perry-ui-model/**', 'crates/perry/src/**', '!crates/*/tests/**', '!crates/**/*_tests.rs', '!crates/**/tests.rs', '!crates/perry/src/commands/compile/link/**', '!crates/perry/src/commands/compile/optimized_libs/**', '!crates/perry/src/commands/compile/optimized_libs.rs', '!crates/perry/src/commands/compile/strip_dedup/**', '!crates/perry/src/commands/compile/strip_dedup.rs', '!crates/perry/src/commands/compile/library_search/**', '!crates/perry/src/commands/compile/library_search.rs', '!crates/perry/src/commands/compile/post_link.rs', '!crates/perry/src/commands/compile/compressed_libs.rs', '!crates/perry/src/commands/compile/size_report.rs', '!crates/perry/src/commands/compile/bundle_*.rs') }}' | cut -c1-16)
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+      - name: Restore the renderers' object cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.STORAGE_DIR }}/node_modules/.cache/perry
+          key: perry-wobj-render-${{ runner.arch }}-${{ steps.objid.outputs.id }}-${{ needs.storage-prep.outputs.sha }}-${{ github.run_id }}
+          restore-keys: |
+            perry-wobj-render-${{ runner.arch }}-${{ steps.objid.outputs.id }}-${{ needs.storage-prep.outputs.sha }}-
+            perry-wobj-render-${{ runner.arch }}-${{ steps.objid.outputs.id }}-
+      - name: Shims
+        working-directory: ${{ env.STORAGE_DIR }}
+        run: |
+          mkdir -p "$OUT"
+          "$GITHUB_WORKSPACE/.github/supa/shims.sh" .
+      - name: Storage renderers under wasmtime
+        # The info and HEAD renderers from the real build, driven by a stand-in
+        # reply (.github/supa/storage-info.js): same stdout as node or the job fails.
+        working-directory: ${{ env.STORAGE_DIR }}
+        run: |
+          set -o pipefail
+          export PERRY_NO_AUTO_OPTIMIZE=1 PERRY_KEEP_SYMBOLS=1
+          export PERRY_OBJECT_CACHE_BUILD_ID=${{ steps.objid.outputs.id }}
+          cp "$GITHUB_WORKSPACE/.github/supa/storage-info.js" storage-info.js
+          "$GITHUB_WORKSPACE/.github/supa/env.sh" > "$RUNNER_TEMP/driver.env"
+          { echo "DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/none"
+            echo "STORAGE_FILE_BACKEND_PATH=$RUNNER_TEMP/data-driver"
+            echo "NODE_ENV=production"; } >> "$RUNNER_TEMP/driver.env"
+          mkdir -p "$RUNNER_TEMP/data-driver"
+          env_flags=(); while IFS= read -r kv; do env_flags+=(--env "$kv"); done < "$RUNNER_TEMP/driver.env"
+          set -a; . "$RUNNER_TEMP/driver.env"; set +a
+          node storage-info.js > "$OUT/info-driver.node.out" 2>&1 || true
+          echo "--- node ---"; cat "$OUT/info-driver.node.out"
+          "$GITHUB_WORKSPACE/target/release/perry" compile --target wasip1 storage-info.js -o "$OUT/info-driver.wasm" 2>&1 | tail -n 5
+          set +e
+          wasmtime run -W exceptions=y -W unknown-imports-trap "${env_flags[@]}" --env PERRY_TRACE_THROW=1 "$OUT/info-driver.wasm" > "$OUT/info-driver.wasm.out" 2> "$OUT/info-driver.wasm.err"
+          echo "wasm exit=$?"
+          echo "--- wasm ---"; cat "$OUT/info-driver.wasm.out"; echo "--- wasm stderr (tail) ---"; tail -n 40 "$OUT/info-driver.wasm.err"
+          diff -u "$OUT/info-driver.node.out" "$OUT/info-driver.wasm.out"
+      - name: Storage renderers behind Fastify under wasmtime
+        # The same renderers behind real Fastify routes on the listener wasmtime
+        # hands the guest; curl asks node and the module the same questions.
+        working-directory: ${{ env.STORAGE_DIR }}
+        run: |
+          export PERRY_NO_AUTO_OPTIMIZE=1 PERRY_KEEP_SYMBOLS=1
+          export PERRY_OBJECT_CACHE_BUILD_ID=${{ steps.objid.outputs.id }}
+          export PERRY_BIN="$GITHUB_WORKSPACE/target/release/perry" WASM_ENV_FILE="$RUNNER_TEMP/driver.env"
+          set -a; . "$WASM_ENV_FILE"; set +a
+          "$GITHUB_WORKSPACE/.github/supa/storage-info-server.sh"
+      # Both compiles are done, whatever the comparisons said: the objects stay.
+      - name: Renderers' objects present?
+        id: wobj
+        if: always()
+        run: '[ -d "$STORAGE_DIR/node_modules/.cache/perry" ] && echo "present=true" >> "$GITHUB_OUTPUT" || true'
+      - name: Save the renderers' object cache
+        if: always() && steps.wobj.outputs.present == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.STORAGE_DIR }}/node_modules/.cache/perry
+          key: perry-wobj-render-${{ runner.arch }}-${{ steps.objid.outputs.id }}-${{ needs.storage-prep.outputs.sha }}-${{ github.run_id }}
+      - name: Prune old object caches
+        if: always() && steps.wobj.outputs.present == 'true'
+        run: .github/supa/prune-caches.sh perry-wobj-render-${{ runner.arch }}- 2
+      - name: Record the pass
+        run: mkdir -p renderers-ok && date -u > renderers-ok/passed
+      - uses: actions/cache/save@v4
+        with:
+          path: renderers-ok
+          key: ${{ needs.storage-wasi-cache.outputs.render_key }}
+      - name: Prune old markers
+        run: .github/supa/prune-caches.sh storage-wasi-renderers-ok-${{ runner.arch }}- 3
+
   # Storage compiled to wasip1, run under supa-host (the host of supabase/supa-wasm) against
   # Postgres and compared with the node reference: three fresh instances (100 KB upload, 5 MiB upload,
   # GC verifier forced), each timed to /status and driven by smoke.sh. The host's source for this job
@@ -495,8 +839,9 @@ jobs:
   # token). With smoke_baseline_run the module of that run goes through the same host on the same
   # runner, so the .cwasm size and the ready times compare like with like.
   storage-wasi-smoke:
-    if: ${{ github.ref_name == 'supa/wasip1' || (github.event_name == 'workflow_dispatch' && inputs.storage_wasi) }}
-    needs: [storage-prep, storage-wasi]
+    # storage-wasi is skipped on a module cache hit, and storage-wasi-cache then published the artifact
+    if: ${{ !cancelled() && needs.plan.outputs.storage_wasi == 'true' && needs.storage-wasi-cache.result == 'success' && (needs.storage-wasi.result == 'success' || (needs.storage-wasi.result == 'skipped' && needs.storage-wasi-cache.outputs.hit == 'true')) }}
+    needs: [plan, storage-prep, storage-wasi-cache, storage-wasi]
     runs-on: blacksmith-16vcpu-ubuntu-2404-arm
     timeout-minutes: 90
     env:
@@ -614,8 +959,8 @@ jobs:
 
   # Tiny programs that isolate runtime behaviour on Linux arm without Storage.
   probes-linux:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.probes }}
-    needs: build-perry
+    if: ${{ needs.plan.outputs.probes == 'true' }}
+    needs: [plan, build-perry]
     runs-on: blacksmith-16vcpu-ubuntu-2404-arm
     timeout-minutes: 90
     env:
@@ -650,7 +995,8 @@ jobs:
   # Builds Storage once per SHA and records the node reference transcript.
   # Runs next to build-perry.
   storage-prep:
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.storage || inputs.storage_wasi }}
+    if: ${{ needs.plan.outputs.storage_prep == 'true' }}
+    needs: plan
     runs-on: blacksmith-4vcpu-ubuntu-2404-arm
     timeout-minutes: 60
     env:
@@ -786,8 +1132,8 @@ jobs:
           if-no-files-found: ignore
 
   storage-linux:
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.storage }}
-    needs: [build-perry, storage-prep]
+    if: ${{ needs.plan.outputs.storage == 'true' }}
+    needs: [plan, build-perry, storage-prep]
     runs-on: blacksmith-32vcpu-ubuntu-2404-arm
     timeout-minutes: 300
     env:
@@ -1025,8 +1371,8 @@ jobs:
           retention-days: 7
 
   regressions-linux:
-    if: ${{ !inputs.skip_regressions }}
-    needs: build-perry
+    if: ${{ needs.plan.outputs.regressions == 'true' }}
+    needs: [plan, build-perry]
     runs-on: blacksmith-16vcpu-ubuntu-2404-arm
     timeout-minutes: 240
     steps:
@@ -1077,3 +1423,28 @@ jobs:
       - name: Summary
         if: steps.done.outputs.cache-hit == 'true'
         run: echo "regressions already passed for this source hash" >> "$GITHUB_STEP_SUMMARY"
+
+  # Fails the run when a job's result disagrees with the plan: a selected job that did not
+  # succeed (including one skipped because a dependency was skipped or failed), or a job that
+  # was not selected but ran.
+  gate:
+    if: ${{ always() }}
+    needs: [plan, build-perry, regressions-linux, wasi-setup, wasi-linux, wasi-verify, wasi-artifacts, storage-prep, storage-wasi-cache, storage-wasi, storage-wasi-renderers, storage-wasi-smoke, storage-linux, probes-linux]
+    runs-on: blacksmith-2vcpu-ubuntu-2404-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+      - name: Results against the plan
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          PLAN_BUILD_PERRY: ${{ needs.plan.outputs.build_perry }}
+          PLAN_REGRESSIONS: ${{ needs.plan.outputs.regressions }}
+          PLAN_WASI_SETUP: ${{ needs.plan.outputs.wasi_setup }}
+          PLAN_WASI: ${{ needs.plan.outputs.wasi }}
+          PLAN_STORAGE_PREP: ${{ needs.plan.outputs.storage_prep }}
+          PLAN_STORAGE_WASI: ${{ needs.plan.outputs.storage_wasi }}
+          PLAN_STORAGE: ${{ needs.plan.outputs.storage }}
+          PLAN_PROBES: ${{ needs.plan.outputs.probes }}
+        run: .github/supa/ci-gate.sh

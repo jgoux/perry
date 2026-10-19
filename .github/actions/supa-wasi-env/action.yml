@@ -3,8 +3,15 @@
 # runtime archive (built or restored from cache). Not part of upstream.
 # The calling job sets WASI_TOOLS, WASI_SDK_VERSION, WASMTIME_VERSION,
 # WASMTIME_P1_VERSION and WASM_TOOLS_VERSION in its env.
+# The runtime archive is built by exactly one job (the workflow's wasi-setup, build-runtime
+# "true"), which saves it to the cache; every other job restores it ("false") and fails on a
+# miss instead of building the same archive again in parallel.
 name: supa-wasi-env
 description: wasm32-wasip1 toolchain, wasi tools and runtime archive for the supa-storage wasip1 jobs
+inputs:
+  build-runtime:
+    description: '"true" builds the runtime archive on a cache miss and saves it; "false" only restores it'
+    default: 'true'
 runs:
   using: composite
   steps:
@@ -58,14 +65,26 @@ runs:
         wasmtime --version
         "$WASI_TOOLS/wasmtime-v${WASMTIME_P1_VERSION}-aarch64-linux/wasmtime" --version
         wasm-tools --version
+    - name: Runtime cache key
+      id: rtkey
+      shell: bash
+      run: echo "key=perry-wasip1-runtime-${{ runner.arch }}-${{ hashFiles('crates/perry-runtime/**', 'crates/perry-runtime-static/**', 'crates/perry-ext-net/**', 'crates/perry-ext-http/**', 'crates/perry-http-server/**', 'crates/perry-ext-undici/**', 'crates/perry-ext-zlib/**', 'crates/perry-ext-ws/**', 'crates/perry-stdlib/**', 'crates/perry-ffi/**', 'crates/perry-native-registration/**', 'crates/perry-abi/**', 'crates/perry-parser/**', 'crates/perry-diagnostics/**', 'crates/perry-dispatch/**', 'Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/**', 'scripts/wasi_build_runtime.*') }}" >> "$GITHUB_OUTPUT"
+    - name: Runtime cache (restore only)
+      if: inputs.build-runtime != 'true'
+      uses: actions/cache/restore@v4
+      with:
+        path: target/wasm32-wasip1/release/libperry_runtime.a
+        key: ${{ steps.rtkey.outputs.key }}
+        fail-on-cache-miss: true
     - name: Runtime cache
       id: runtime
+      if: inputs.build-runtime == 'true'
       uses: actions/cache@v4
       with:
         path: target/wasm32-wasip1/release/libperry_runtime.a
-        key: perry-wasip1-runtime-${{ runner.arch }}-${{ hashFiles('crates/perry-runtime/**', 'crates/perry-runtime-static/**', 'crates/perry-ext-net/**', 'crates/perry-ext-http/**', 'crates/perry-http-server/**', 'crates/perry-ext-undici/**', 'crates/perry-ext-zlib/**', 'crates/perry-ext-ws/**', 'crates/perry-stdlib/**', 'crates/perry-ffi/**', 'crates/perry-native-registration/**', 'crates/perry-abi/**', 'crates/perry-parser/**', 'crates/perry-diagnostics/**', 'crates/perry-dispatch/**', 'Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/**', 'scripts/wasi_build_runtime.*') }}
+        key: ${{ steps.rtkey.outputs.key }}
     - name: Build the wasm32-wasip1 runtime
-      if: steps.runtime.outputs.cache-hit != 'true'
+      if: inputs.build-runtime == 'true' && steps.runtime.outputs.cache-hit != 'true'
       shell: bash
       run: |
         start=$(date +%s)
