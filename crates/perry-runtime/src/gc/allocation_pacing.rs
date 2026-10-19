@@ -10,6 +10,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 const MIB: usize = 1024 * 1024;
 const PUBLISH_BYTES: usize = MIB;
 const PROCESS_BYTES: usize = 64 * MIB;
+/// Smallest amount of large-birth garbage worth a full. Native buffers are
+/// born in the old generation and only a full trace can prove one dead, so a
+/// request loop that streams 1-6 MiB bodies owes a full for every band of
+/// them. A full costs a trace of the whole live set (about 3 ms per MiB on a
+/// WASI host), so the band is the knob that trades resident garbage for
+/// collector time; it grows with the live set so a large heap pays
+/// proportionally fewer fulls.
+const LARGE_BAND_FLOOR: usize = 32 * MIB;
 static PROCESS_DEBT: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy, Default)]
@@ -93,7 +101,7 @@ fn due_arm(old_pressure: usize, burst_boundary: bool) -> Option<&'static str> {
     ACCOUNT.with(|account| {
         let debt = account.0.get();
         let band = (128 * MIB).max(debt.live_after_full.saturating_mul(2));
-        let large_band = (8 * MIB).max(debt.live_after_full / 2);
+        let large_band = LARGE_BAND_FLOOR.max(debt.live_after_full);
         let scale = 1usize << debt.backoff;
         let burst_scale = 1usize << debt.burst_backoff;
         let mature = old_pressure.saturating_add(super::malloc::malloc_resident_bytes());
