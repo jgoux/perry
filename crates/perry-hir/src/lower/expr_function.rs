@@ -1236,6 +1236,14 @@ fn lower_fn_expr_anon(ctx: &mut LoweringContext, fn_expr: &ast::FnExpr) -> Resul
                 combined.extend(std::mem::take(&mut nested_var_prologue));
                 combined.extend(func_decls);
                 combined.extend(exec_stmts);
+                // Plain function expressions skip `lower_stmts_using_aware`, so
+                // the forward reads of a per-evaluation class declaration are
+                // redirected here (see `forward_class_reads`).
+                crate::lower_decl::redirect_forward_reads_of_fresh_classes(
+                    ctx,
+                    &block.stmts,
+                    &mut combined,
+                );
                 // Issue #633: prealloc-box for sibling/forward captures. Merge the
                 // forward-captured `let`/`const` boxes (kept out of `hoisted_id_set`
                 // to avoid hoist-reordering their non-hoistable declarations) so

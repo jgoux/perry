@@ -410,6 +410,10 @@ pub struct LoweringContext {
     /// declaration (a forward reference) read the shared template; the body
     /// funnel redirects those reads through this binding once it is known.
     pub(crate) fresh_class_decl_bindings: HashMap<String, LocalId>,
+    /// Class declaration bindings a closure lowered before the declaration
+    /// captures by box (see `lower_decl::forward_class_reads`); their box
+    /// allocation is hoisted with the function declarations.
+    pub(crate) forward_class_box_ids: HashSet<LocalId>,
     /// #11759 (c′): locals that hold an evaluation of a class declaration
     /// whose later evaluations are fresh (the declaration's binding and its
     /// members' self-binding) → (template, its declared static field names).

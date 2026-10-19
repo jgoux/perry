@@ -838,15 +838,17 @@ fn lower_fn_body_block_stmt_inner(
         // generator/async-generator FnDecl lowers to a `Let { init: FuncRef }`
         // (the body lives in a hoisted top-level function). Both forms are
         // hoisted to the front per spec function-declaration semantics.
-        let is_hoisted = matches!(
-            &s,
-            Stmt::Let { id, init: Some(Expr::Closure { .. }), .. }
-                if hoisted_id_set.contains(id)
-        ) || matches!(
-            &s,
-            Stmt::Let { id, init: Some(Expr::FuncRef(_)), .. }
-                if hoisted_id_set.contains(id)
-        );
+        let is_hoisted = is_forward_class_box_prealloc(ctx, &s)
+            || matches!(
+                &s,
+                Stmt::Let { id, init: Some(Expr::Closure { .. }), .. }
+                    if hoisted_id_set.contains(id)
+            )
+            || matches!(
+                &s,
+                Stmt::Let { id, init: Some(Expr::FuncRef(_)), .. }
+                    if hoisted_id_set.contains(id)
+            );
         if is_hoisted {
             hoisted_lets.push(s);
         } else {
@@ -1222,11 +1224,12 @@ fn lower_block_fn_decls(ctx: &mut LoweringContext, block: &ast::BlockStmt) -> Re
     let mut hoisted = Vec::new();
     let mut other = Vec::new();
     for stmt in body {
-        let is_hoisted = matches!(
-            &stmt,
-            Stmt::Let { id, init: Some(Expr::Closure { .. } | Expr::FuncRef(_)), .. }
-                if hoisted_ids.contains(id)
-        );
+        let is_hoisted = is_forward_class_box_prealloc(ctx, &stmt)
+            || matches!(
+                &stmt,
+                Stmt::Let { id, init: Some(Expr::Closure { .. } | Expr::FuncRef(_)), .. }
+                    if hoisted_ids.contains(id)
+            );
         if is_hoisted {
             hoisted.push(stmt);
         } else {
@@ -1435,21 +1438,50 @@ pub fn lower_stmts_using_aware(
 }
 
 /// A closure lowered before a per-evaluation class declaration of this block
-/// read the class's shared template; point those reads at the evaluation.
-fn redirect_forward_reads_of_fresh_classes(
-    ctx: &LoweringContext,
+/// read the class's shared template; make it capture the declaration's binding
+/// instead. The binding's box is allocated at the head of this statement list,
+/// so each evaluation of the scope has its own, ahead of any closure. The box
+/// is a plain one, not a TDZ one: capture registration reads the binding
+/// (`ClassIsFirstEvaluation`) before the declaration, where it must see
+/// `undefined`, not throw. The hoisting splits keep a leading
+/// `PreallocateBoxes` of these ids first.
+pub(crate) fn redirect_forward_reads_of_fresh_classes(
+    ctx: &mut LoweringContext,
     stmts: &[ast::Stmt],
     body: &mut Vec<Stmt>,
 ) {
+    let mut boxes = Vec::new();
     for stmt in stmts {
         let ast::Stmt::Decl(ast::Decl::Class(class_decl)) = stmt else {
             continue;
         };
         let template = ctx.resolve_class_name(class_decl.ident.sym.as_str());
-        if let Some(&binding) = ctx.fresh_class_decl_bindings.get(&template) {
-            super::forward_class_reads::redirect_forward_class_reads(body, &template, binding);
+        let Some(&binding) = ctx.fresh_class_decl_bindings.get(&template) else {
+            continue;
+        };
+        if ctx.module_level_ids.contains(&binding) {
+            continue;
+        }
+        if super::forward_class_reads::capture_forward_class_reads(body, &template, binding) {
+            ctx.var_hoisted_ids.insert(binding);
+            ctx.forward_class_box_ids.insert(binding);
+            boxes.push(binding);
         }
     }
+    if !boxes.is_empty() {
+        body.insert(0, Stmt::PreallocateBoxes(boxes));
+    }
+}
+
+/// A leading box allocation for forward-captured class bindings
+/// ([`redirect_forward_reads_of_fresh_classes`]): it must stay ahead of the
+/// hoisted function closures that may capture the box.
+pub(crate) fn is_forward_class_box_prealloc(ctx: &LoweringContext, stmt: &Stmt) -> bool {
+    matches!(
+        stmt,
+        Stmt::PreallocateBoxes(ids)
+            if !ids.is_empty() && ids.iter().all(|id| ctx.forward_class_box_ids.contains(id))
+    )
 }
 
 fn lower_stmts_using_aware_inner(
