@@ -74,9 +74,6 @@ norm '.'
 step "POST /bucket (wrong type)" 400 -X POST "$base/bucket" -H "${auth[0]}" -H 'Content-Type: application/json' \
   -d '{"name":"smoke2","public":"maybe"}' || exit 1
 norm '.'
-step "POST /bucket (invalid name)" 400 -X POST "$base/bucket" -H "${auth[0]}" -H 'Content-Type: application/json' \
-  -d '{"name":"bad/name","public":false}' || exit 1
-norm '.'
 step "GET /bucket (bad query)" 400 "$base/bucket?limit=abc" -H "${auth[0]}" || exit 1
 norm '.'
 step "POST /object/list/smoke (invalid body)" 400 -X POST "$base/object/list/smoke" -H "${auth[0]}" \
@@ -87,6 +84,16 @@ if [ -n "${S3_PROTOCOL_ACCESS_KEY_ID:-}" ]; then
   step "GET /s3/smoke (ListObjectsV2)" 200 "${s3[@]}" "$base/s3/smoke?list-type=2" || exit 1
   step "GET /s3/smoke (bad max-keys)" 400 "${s3[@]}" "$base/s3/smoke?list-type=2&max-keys=abc" || exit 1
   cat "$work/body" >> "$out"; echo >> "$out"
+fi
+# A StorageBackendError thrown by the handler (a renderable error, not a schema failure): the
+# error handler's {...error.render(), error: error.error} needs the derived instance's own
+# fields, which a runtime that loses them turns into a 500 FST_ERR_FAILED_ERROR_SERIALIZATION.
+# Runs by default now that super() into a native Error initialises them; SMOKE_RENDERABLE_ERRORS=0
+# skips it.
+if [ "${SMOKE_RENDERABLE_ERRORS:-1}" != 0 ]; then
+  step "POST /bucket (invalid name)" 400 -X POST "$base/bucket" -H "${auth[0]}" -H 'Content-Type: application/json' \
+    -d '{"name":"bad/name","public":false}' || exit 1
+  norm '.'
 fi
 # Object info and HEAD, authenticated and public. A failing step does not stop the flow, so
 # one run reports every route; a route that kills the server shows as curl-failed after it.
