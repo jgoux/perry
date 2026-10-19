@@ -12,9 +12,19 @@ inputs:
   build-runtime:
     description: '"true" builds the runtime archive on a cache miss and saves it; "false" only restores it'
     default: 'true'
+  fast-build:
+    description: 'true is the plan fast build (no thin LTO, 16 codegen units), cached under its own key. Every job of a run passes the same value, the plan fast_build output'
+    default: 'false'
+  simulate:
+    description: 'The workflow simulate input (.github/supa/simulate.sh), applied before the cache key is computed so that the key sees the simulated change'
+    default: ''
 runs:
   using: composite
   steps:
+    - name: Simulated change
+      if: inputs.simulate != '' && inputs.simulate != 'none'
+      shell: bash
+      run: .github/supa/simulate.sh "${{ inputs.simulate }}"
     - name: Rust toolchain with the wasm32-wasip1 target
       shell: bash
       run: |
@@ -68,7 +78,7 @@ runs:
     - name: Runtime cache key
       id: rtkey
       shell: bash
-      run: echo "key=perry-wasip1-runtime-${{ runner.arch }}-${{ hashFiles('crates/perry-runtime/**', 'crates/perry-runtime-static/**', 'crates/perry-ext-net/**', 'crates/perry-ext-http/**', 'crates/perry-http-server/**', 'crates/perry-ext-undici/**', 'crates/perry-ext-zlib/**', 'crates/perry-ext-ws/**', 'crates/perry-stdlib/**', 'crates/perry-ffi/**', 'crates/perry-native-registration/**', 'crates/perry-abi/**', 'crates/perry-parser/**', 'crates/perry-diagnostics/**', 'crates/perry-dispatch/**', 'Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/**', 'scripts/wasi_build_runtime.*') }}" >> "$GITHUB_OUTPUT"
+      run: echo "key=perry-wasip1-runtime-${{ inputs.fast-build == 'true' && 'fast-' || '' }}${{ runner.arch }}-${{ hashFiles('crates/perry-runtime/**', 'crates/perry-runtime-static/**', 'crates/perry-ext-net/**', 'crates/perry-ext-http/**', 'crates/perry-http-server/**', 'crates/perry-ext-undici/**', 'crates/perry-ext-zlib/**', 'crates/perry-ext-ws/**', 'crates/perry-stdlib/**', 'crates/perry-ffi/**', 'crates/perry-native-registration/**', 'crates/perry-abi/**', 'crates/perry-parser/**', 'crates/perry-diagnostics/**', 'crates/perry-dispatch/**', 'Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/**', 'scripts/wasi_build_runtime.*') }}" >> "$GITHUB_OUTPUT"
     - name: Runtime cache (restore only)
       if: inputs.build-runtime != 'true'
       uses: actions/cache/restore@v4
@@ -88,11 +98,21 @@ runs:
       shell: bash
       run: |
         start=$(date +%s)
+        # The fast profile (iteration presets only) or the real release: see ci-build-profile.sh.
+        . .github/supa/ci-build-profile.sh "${{ inputs.fast-build }}"
         scripts/wasi_build_runtime.sh wasm32-wasip1
         {
           echo "### wasm32-wasip1 runtime"
-          echo "- build: $(( $(date +%s) - start )) s"
+          echo "- build: $(( $(date +%s) - start )) s, profile: $FAST_BUILD_PROFILE"
           echo '```'; sccache --show-stats | sed -n 1,12p; echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+    - name: Runtime cache hit summary
+      if: inputs.build-runtime == 'true' && steps.runtime.outputs.cache-hit == 'true'
+      shell: bash
+      run: |
+        {
+          echo "### wasm32-wasip1 runtime"
+          echo "- reused \`${{ steps.rtkey.outputs.key }}\`, profile: ${{ inputs.fast-build == 'true' && 'fast' || 'release' }}"
         } >> "$GITHUB_STEP_SUMMARY"
     - name: Runtime archive
       shell: bash
