@@ -304,15 +304,15 @@ fn process_pressure_combines_heaps_and_thread_exit_removes_their_debt() {
     ready_rx.recv().unwrap();
     allocation_pacing::note_allocation(12 * MIB, false);
     assert!(
-        !due(8 * MIB, true),
+        !due(16 * MIB, true),
         "shared pressure must not turn nursery-only churn into a full"
     );
     allocation_pacing::note_allocation(4 * MIB, true);
-    assert!(due(8 * MIB, true), "another heap's pressure must count");
+    assert!(due(16 * MIB, true), "another heap's pressure must count");
     exit_tx.send(()).unwrap();
     worker.join().unwrap();
     assert!(
-        !due(8 * MIB, true),
+        !due(16 * MIB, true),
         "retired heaps must not leave process pressure behind"
     );
 }
@@ -442,6 +442,39 @@ fn stable_mature_heap_does_not_turn_nursery_debt_into_old_reclaim() {
     );
     // Genuine old growth still supplies a full-trace opportunity.
     assert!(due(old.saturating_add(80 * MIB), false));
+    js_shadow_frame_pop(frame);
+    gc_collect_full_mark_sweep_with_trigger(GcTriggerSnapshot::capture(GcTriggerKind::Direct));
+}
+
+#[test]
+fn large_births_that_leave_the_mature_heap_unchanged_do_not_owe_a_full() {
+    let _placement = policy::ByteStorePolicyTestGuard::new(usize::MAX);
+    let _isolation = GcTestIsolationGuard::new();
+    let _moving = policy::force_moving_gc_pacing();
+    let _thresholds = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+    let frame = js_shadow_frame_push(1);
+    let keep = crate::buffer::js_buffer_alloc(12 * MIB as i32, 7);
+    js_shadow_slot_set(0, ptr_bits(keep as usize));
+    {
+        let _boundary = allocation_pacing::BurstBoundaryGuard::enter();
+        gc_collect_full_mark_sweep_with_trigger(GcTriggerSnapshot::capture(GcTriggerKind::Direct));
+    }
+    let old = policy::old_gen_reclaimable_pressure_bytes();
+    assert!(old >= 8 * MIB, "fixture must exceed the mature pressure guard");
+    // A request loop whose large buffers all die young: plenty of large
+    // births, no mature growth. A full would pay a trace of the whole live
+    // set to free nothing, so neither burst arm may ask for one.
+    for _ in 0..8 {
+        note_allocation(64 * MIB, true);
+    }
+    assert!(
+        !due(old, true),
+        "volume of large births alone must not owe a full"
+    );
+    assert!(
+        due(old + 16 * MIB, true),
+        "large births that left the mature heap bigger still owe one"
+    );
     js_shadow_frame_pop(frame);
     gc_collect_full_mark_sweep_with_trigger(GcTriggerSnapshot::capture(GcTriggerKind::Direct));
 }
