@@ -110,6 +110,7 @@ Conventions in this file:
 | P83 | (this commit) | fix(perry): key the build caches on PERRY_WASM_SJLJ_DEMOTE | cli (`compile/compile_env.rs`) | all (the variable only changes wasm32 output) | the existing `compile_env::tests::codegen_env_vars_are_build_cache_inputs` audit (it failed on this branch before the change) | not tried | PR-BH |
 | P84 | (this commit) | fix(runtime): hand a native Error super() the refreshed receiver after its init ran user code | runtime (`object/class_registry/construct/site.rs`) | all (visible under a moving collection) | wasi probe `error-subclass-dynamic-gc.js` (compared with node; `PERRY_GC_SCAVENGE_NURSERY_MB=1 PERRY_GC_FORCE_EVACUATE=1`) | not tried | PR-BI |
 | P85 | (this commit) | fix(hir): give each evaluation of a scope its own binding for forward reads of a per-evaluation class declaration | HIR (`lower_decl/forward_class_reads.rs`, `block.rs`, `lower/expr_function.rs`) | all | wasi probe `forward-class-binding-reinvoke.js` (compared with node), `forward-class-binding.js` | not tried | PR-BJ |
+| P86 | (this commit) | feat(codegen): PERRY_WASM_STATIC_RELOC selects static relocation for wasm32 | codegen (`inprocess.rs`, `inprocess/optimize_emit.rs`), cli (`compile/compile_env.rs`) | wasm32 only; opt-in, default unchanged (PIC) | the whole wasi probe suite and the Storage smoke (compared with node) run with `PERRY_WASM_STATIC_RELOC=1` on `supa-storage.yml` dispatches (`extra_env` default); the `compile_env` audit | not tried | PR-BK |
 
 All 22 patches except P12's `.github` hunks, P05 and P06 cherry-pick cleanly.
 A stack of every patch except P05 and P06, with P12 limited to `crates/`, also applies cleanly in sequence on `1fd8ca2ae`.
@@ -180,6 +181,7 @@ Ordered by value and independence. Each PR carries its patches' tests.
 60. **PR-BH `PERRY_WASM_SJLJ_DEMOTE` is a build-cache input** (P83). Prerequisite: PR-AM (P56, the pass the variable switches).
 61. **PR-BI A native Error `super()` returns the receiver as it is after the init's user code ran** (P84). Prerequisite: the Error-family receiver init `75654d1a3` (fork-only, not yet proposed; this fix folds into whichever PR carries it).
 62. **PR-BJ Forward reads of a per-evaluation class declaration use a per-invocation binding** (P85). Refines P60 (PR-AQ), which this replaces; written against upstream's `shares_first_evaluation` (#11759) machinery.
+63. **PR-BK `PERRY_WASM_STATIC_RELOC` selects static relocation on wasm32** (P86). No prerequisite.
 
 Not proposed: P03, P04, P05, P06, P07, P10, P15, P16, P47, P51. Upstream fixed the same bugs independently (`c4bf643f6` for P04, `4ed616f5e` for P05, `79aae9aa7` for P06 and P15, `09e7861b4` for P10, `c1671d39d` for P16, `b0d159c8c` for P47, `db8dce5ec` for P03 and P07, `ef659654f` for P51); the 2026-10-18 and 2026-10-19 merges took upstream's versions and kept the fork's tests as regression tests.
 
@@ -1053,6 +1055,13 @@ Not proposed: P03, P04, P05, P06, P07, P10, P15, P16, P47, P51. Upstream fixed t
 - Test: wasi probe `forward-class-binding-reinvoke.js` (getter exported by two invocations, a constructor and static method naming the class, a forward function declaration, a two-level nested closure, a loop body block, a function expression, and a class with static state and captured variables), compared with node; `forward-class-binding.js` keeps covering the single-invocation shapes.
 - Limitations: a plain box, not a TDZ box: lowering reads the binding before the declaration (the `ClassIsFirstEvaluation` guard of capture registration), where a TDZ box threw `Cannot access 'Cluster' before initialization` in the Storage build (run 39302728586), so an early read of the class from a closure gives `undefined` rather than a `ReferenceError` (it gave the template before). A forward `new B()` in a closure still constructs the template, as with P60.
 - Upstream: not cherry-picked. Depends on: none. PR-BJ, a candidate for upstream Perry.
+
+### P86 (this commit) feat(codegen): PERRY_WASM_STATIC_RELOC selects static relocation for wasm32
+- Area / platform: LLVM TargetMachine creation (`perry-codegen/src/inprocess/optimize_emit.rs`, `reloc_mode_for` in `inprocess.rs`) / wasm32 targets only.
+- Problem: the wasm32 modules are emitted with PIC relocation, which routes every global through `__memory_base`/`__table_base` adds and GOT-style imports; a statically linked, non-PIC module needs none of them and is smaller.
+- Fix: `reloc_mode_for(effective_target)` returns `RelocMode::Static` only when the target starts with `wasm32` and `PERRY_WASM_STATIC_RELOC=1`, and `PIC` in every other case, so the default and every other target are unchanged. The name is registered in `COMPILE_ENV_VARS` (it changes the object bytes, so it is a build-cache input).
+- Test: no dedicated probe: the switch changes no language behavior, so every wasi probe is its test. On a `supa-storage.yml` dispatch the default `extra_env` is `PERRY_TYPED_BODIES=0 PERRY_WASM_STATIC_RELOC=1` and `runtime_opt_level` is `s`; the composite action `supa-wasi-env` exports both to wasi-setup, wasi-linux (all shards, with the 78 probes and the 12 sjlj cells), storage-wasi and the renderers, and the runtime archive key (`perry-wasip1-runtime`) and the Storage module key (`storage-wasi-cache`) include both, so no job reuses an artifact built with other settings. The Storage smoke runs on the shipped, stripped and `wasm-opt -Oz` module and diffs its transcripts with node. Pushes use the compiler defaults (PIC). Fast mode composes with the runtime opt-level override (`ci-build-profile.sh` checks the unit graph with the override), and the `compile_env` audit is in `regressions.sh`.
+- Upstream: not cherry-picked. PR-BK, a candidate for upstream PerryTS/perry once its own wasm32 CI runs the probe suite with it.
 
 ## Not for upstream
 
