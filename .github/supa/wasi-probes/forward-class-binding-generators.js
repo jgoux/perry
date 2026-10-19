@@ -12,6 +12,14 @@ function rec(depth) {
   return { read, C, inner };
 }
 
+async function attempt(label, fn) {
+  try {
+    console.log(label, await fn());
+  } catch (e) {
+    console.log(label, 'threw', e && e.name);
+  }
+}
+
 async function main() {
   // 1. async loop: the iteration's getter is created before the declaration
   const results = [];
@@ -24,21 +32,55 @@ async function main() {
   console.log('async for', results.join(','));
 
   // 2. for...of in an async function, closures kept past the loop
-  const kept = [];
-  for (const n of [1, 2, 3]) {
-    const read = () => C;
-    class C extends Error {
-      static n = n;
+  await attempt('async for-of', async () => {
+    const kept = [];
+    for (const n of [1, 2, 3]) {
+      const read = () => C;
+      class C extends Error {
+        static n = n;
+      }
+      await 0;
+      kept.push({ read, C });
     }
-    await 0;
-    kept.push({ read, C });
-  }
-  console.log(
-    'async for-of',
-    kept.map((k) => k.read() === k.C).join(','),
-    kept.map((k) => k.read().n).join(','),
-    kept[0].C !== kept[1].C,
-  );
+    return [
+      kept.map((k) => k.read() === k.C).join(','),
+      kept.map((k) => k.read().n).join(','),
+      kept[0].C !== kept[1].C,
+    ].join(' ');
+  });
+  await attempt('async for-of plain', async () => {
+    const kept = [];
+    for (const n of [1, 2, 3]) {
+      const read = () => C;
+      class C extends Error {}
+      await 0;
+      kept.push({ read, C });
+    }
+    return kept.map((k) => k.read() === k.C).join(',');
+  });
+  await attempt('async for static', async () => {
+    const kept = [];
+    for (let n = 1; n < 4; n++) {
+      const read = () => C;
+      class C extends Error {
+        static n = n;
+      }
+      await 0;
+      kept.push({ read, C });
+    }
+    return kept.map((k) => (k.read() === k.C) + ':' + k.C.n).join(',');
+  });
+  await attempt('async for-of no read', async () => {
+    const kept = [];
+    for (const n of [1, 2, 3]) {
+      class C extends Error {
+        static n = n;
+      }
+      await 0;
+      kept.push(C);
+    }
+    return kept.map((c) => c.n).join(',');
+  });
 
   // 3. async arrows across an await, declaration before and after the await
   const arrowAfter = async () => {
