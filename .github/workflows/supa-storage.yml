@@ -366,7 +366,7 @@ jobs:
           echo "--- node ---"; cat "$OUT/info-driver.node.out"
           "$GITHUB_WORKSPACE/target/release/perry" compile --target wasip1 storage-info.js -o "$OUT/info-driver.wasm" 2>&1 | tail -n 5
           set +e
-          wasmtime run -W exceptions=y "${env_flags[@]}" --env PERRY_TRACE_THROW=1 "$OUT/info-driver.wasm" > "$OUT/info-driver.wasm.out" 2> "$OUT/info-driver.wasm.err"
+          wasmtime run -W exceptions=y -W unknown-imports-trap "${env_flags[@]}" --env PERRY_TRACE_THROW=1 "$OUT/info-driver.wasm" > "$OUT/info-driver.wasm.out" 2> "$OUT/info-driver.wasm.err"
           echo "wasm exit=$?"
           echo "--- wasm ---"; cat "$OUT/info-driver.wasm.out"; echo "--- wasm stderr (tail) ---"; tail -n 40 "$OUT/info-driver.wasm.err"
           diff -u "$OUT/info-driver.node.out" "$OUT/info-driver.wasm.out"
