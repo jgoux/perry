@@ -47,11 +47,10 @@ serve_requests() {  # outfile, server stdout file
   done
 }
 
-wasm_env=()   # extra --env flags for the wasm run
 run_wasm() {  # label
   local label=$1
   (timeout 300 "$wasmtime" run -W exceptions=y -W unknown-imports-trap -S preview2=n -S "tcplisten=127.0.0.1:$port" \
-     "${env_flags[@]}" "${wasm_env[@]}" "$out/info-server.wasm" > "$out/srv.$label.out" 2> "$out/srv.$label.err"; echo $? > "$out/srv.$label.rc") &
+     "${env_flags[@]}" "$out/info-server.wasm" > "$out/srv.$label.out" 2> "$out/srv.$label.err"; echo $? > "$out/srv.$label.rc") &
   local pid=$!; serve_requests "$out/srv.$label.serve" "$out/srv.$label.out"; wait $pid
   cat "$out/srv.$label.serve" "$out/srv.$label.out" > "$out/srv.$label.all"
 }
@@ -69,13 +68,4 @@ rc=0
 diff -u "$out/srv.node.all" "$out/srv.wasm.all" || rc=1
 [ "$(cat "$out/srv.node.rc")" = "$(cat "$out/srv.wasm.rc")" ] || rc=1
 
-# Diagnostics (never gating): the same run with other collector settings.
-if [ -n "${INFO_SERVER_DIAG:-}" ]; then
-  for variant in "PERRY_GEN_GC=0" "PERRY_GC_FORCE_EVACUATE=1" "PERRY_GC_SCAVENGE=0"; do
-    wasm_env=(--env "$variant"); label=diag-${variant%%=*}
-    run_wasm "$label"
-    echo "=== $variant: exit $(cat "$out/srv.$label.rc")"
-    diff -u "$out/srv.node.all" "$out/srv.$label.all" | head -n 30 || true
-  done
-fi
 exit $rc
