@@ -370,6 +370,16 @@ jobs:
           echo "wasm exit=$?"
           echo "--- wasm ---"; cat "$OUT/info-driver.wasm.out"; echo "--- wasm stderr (tail) ---"; tail -n 40 "$OUT/info-driver.wasm.err"
           diff -u "$OUT/info-driver.node.out" "$OUT/info-driver.wasm.out"
+      - name: Storage renderers behind Fastify under wasmtime
+        # The same renderers behind real Fastify routes on the listener wasmtime
+        # hands the guest; curl asks node and the module the same questions.
+        working-directory: ${{ env.STORAGE_DIR }}
+        run: |
+          export PERRY_NO_AUTO_OPTIMIZE=1 PERRY_KEEP_SYMBOLS=1
+          export PERRY_OBJECT_CACHE_BUILD_ID=${{ steps.objid.outputs.id }}
+          export PERRY_BIN="$GITHUB_WORKSPACE/target/release/perry" WASM_ENV_FILE="$RUNNER_TEMP/driver.env"
+          set -a; . "$WASM_ENV_FILE"; set +a
+          "$GITHUB_WORKSPACE/.github/supa/storage-info-server.sh"
       - name: Module checks
         run: |
           set -o pipefail
