@@ -71,6 +71,8 @@ pub const ATOM_KIND_BINDING_SYMBOL: u8 = 4;
 /// `PerryLayoutDesc.variant` of a carried prototype layout (object model
 /// §3.6): a marked prototype's, registered under its own semantic generation.
 pub const LAYOUT_VARIANT_PROTOTYPE_IMAGE: u16 = 1;
+/// Ordinary function constructor family, with a live per-object prototype.
+pub const LAYOUT_VARIANT_FUNCTION_CONSTRUCTOR: u16 = 2;
 /// The well-known symbols by number (`StaticAtom.index` of a kind-1 atom),
 /// spelled as `Symbol.<name>`.
 pub const WELL_KNOWN_SYMBOLS: [&str; 15] = [
@@ -168,8 +170,15 @@ pub const SHAPE_RECORD_SIZE: usize = 120;
 /// data at its colour slot).
 pub const SHAPE_RECORD_COLOUR_MASK: usize = 88;
 /// Offset of a record's two-word coloured-key store mask (the key is also a
-/// plain writable `Any`-lane slot of a store-admitted, non-frozen layout).
+/// plain writable `Any`- or `F64`-lane slot of a store-admitted, non-frozen
+/// layout; an `F64` lane takes only a plain double, so a site tests the lane
+/// when its value may be anything else).
 pub const SHAPE_RECORD_COLOUR_STORE_MASK: usize = 104;
+/// Offset of a record's per-slot representation word (two bits per inline
+/// slot 0..32, `Any` = 0; a slot at or past 32 is `Any`).
+pub const SHAPE_RECORD_REP: usize = 48;
+/// The number of inline slots a record's `rep` word describes.
+pub const SHAPE_REP_SLOTS: u32 = 32;
 /// Offset of the flat record base in the agent's shape directory.
 pub const SHAPE_DIR_FLAT_BASE: usize = 24;
 /// The layout word's shadow bit (`perry-runtime` `layout_desc.rs`).
@@ -609,6 +618,8 @@ pub const FN_HAS_NAME: u32 = 1 << 21;
 /// string, whose `StringHeader` immediately precedes them. That string is
 /// the function's own `name` value, static data of its body.
 pub const FN_NAME_IMAGE: u32 = 1 << 22;
+/// An immutable constructor-layout record follows source/name tails.
+pub const FN_HAS_CONSTRUCTOR_LAYOUT: u32 = 1 << 23;
 
 /// Byte offsets of the fields codegen emits and emitted code reads.
 pub const JS_FUNCTION_INFO_CODE_OFFSET: usize = 0;

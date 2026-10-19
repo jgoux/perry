@@ -2450,7 +2450,7 @@ js_node_http_method_fallback	f64	ptr,i64,f64,f64,f64
 js_node_http_outgoing_message_init	void	f64
 js_node_http_outgoing_message_new	i64	
 js_node_http_res_add_trailers	void	i64,f64
-js_node_http_res_append_header	i64	i64,ptr,ptr
+js_node_http_res_append_header	i64	i64,ptr,f64
 js_node_http_res_assign_socket	void	i64,f64
 js_node_http_res_cork	void	i64
 js_node_http_res_detach_socket	void	i64,f64
@@ -2460,8 +2460,8 @@ js_node_http_res_end_with_cb	void	i64,f64,i64
 js_node_http_res_finished	i32s	i64
 js_node_http_res_flush_headers	void	i64
 js_node_http_res_get_header	f64	i64,ptr
-js_node_http_res_get_header_names_json	ptr	i64
-js_node_http_res_get_headers_json	ptr	i64
+js_node_http_res_get_header_names	f64	i64
+js_node_http_res_get_headers	f64	i64
 js_node_http_res_get_status	f64	i64
 js_node_http_res_get_status_message	f64	i64
 js_node_http_res_has_header	i32s	i64,ptr
@@ -2488,7 +2488,7 @@ js_node_http_res_write	i32s	i64,f64
 js_node_http_res_write_continue	void	i64
 js_node_http_res_write_early_hints	void	i64,f64,i64
 js_node_http_res_write_full	f64	i64,f64,i64,i64
-js_node_http_res_write_head	void	i64,f64,i64,i64
+js_node_http_res_write_head	i64	i64,f64,i64,i64
 js_node_http_res_write_processing	void	i64
 js_node_http_res_write_with_cb	i32s	i64,f64,i64
 js_node_http_response_layout_receiver	i32s	f64
@@ -2574,7 +2574,7 @@ js_node_inspector_session_post	f64	i64,f64,f64,f64
 js_node_inspector_session_remove_all_listeners	f64	i64,f64
 js_node_inspector_url	f64	
 js_node_inspector_wait_for_debugger	f64	
-js_node_setheaders_entries_json	ptr	f64
+js_node_setheaders_entries	f64	f64
 js_node_sqlite_backup	ptr	f64,f64,f64
 js_node_sqlite_database_sync_call	f64	f64,f64
 js_node_sqlite_database_sync_new	f64	f64,f64
@@ -2744,6 +2744,7 @@ js_object_alloc_class_with_keys	ptr	i32u,i32u,i32u,ptr,i32u
 js_object_alloc_fast	ptr	i32u,i32u
 js_object_alloc_fast_with_parent	ptr	i32u,i32u,i32u
 js_object_alloc_null_proto	ptr	i32u,i32u
+js_object_alloc_null_proto_entries	ptr	ptr,ptr,ptr,i32u
 js_object_alloc_plain	ptr	i32u
 js_object_alloc_with_parent	ptr	i32u,i32u,i32u
 js_object_alloc_with_shape	ptr	i32u,i32u,ptr,i32u
@@ -3471,7 +3472,6 @@ js_regexp_exec_get_index	f64
 js_regexp_get_flags	ptr	ptr
 js_regexp_get_source	ptr	ptr
 js_regexp_literal	ptr	i64
-js_regexp_literal_loaded	ptr	i64,f64,f64
 js_regexp_new	ptr	ptr,ptr
 js_regexp_test	i32s	ptr,ptr
 js_regexp_to_string	ptr	ptr
@@ -5076,6 +5076,7 @@ perry_ffi_promise_resolve_bits	void	ptr,i64
 perry_ffi_promise_resolve_deferred	void	ptr,ptr,ptr
 perry_ffi_run_pending	void	i64
 perry_ffi_spawn_blocking	void	ptr,ptr
+perry_function_family_symbol_set	f64	ptr,i32u,f64,f64,f64,i32s
 perry_geisterhand_find_by_shortcut	f64	ptr,usize
 perry_geisterhand_free_string	void	ptr,usize
 perry_geisterhand_get_closure	f64	i64,i8u

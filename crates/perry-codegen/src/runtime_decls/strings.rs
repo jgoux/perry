@@ -1236,6 +1236,11 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     );
     module.declare_function("perry_alloc_layout", PTR, &[PTR]);
     module.declare_function("perry_alloc_class_family", PTR, &[PTR, I32, I32]);
+    module.declare_function(
+        "perry_function_family_symbol_set",
+        DOUBLE,
+        &[PTR, I32, DOUBLE, DOUBLE, DOUBLE, I32],
+    );
     module.declare_function("perry_create_family", DOUBLE, &[PTR, DOUBLE]);
     module.declare_function(
         "perry_bind_family_prototype",
@@ -1429,7 +1434,6 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     // unit tests. `runtime_decls::tests` asserts the name AND the arity: a
     // wrong arity parses and miscompiles.
     module.declare_function("js_regexp_literal", I64, &[I64]);
-    module.declare_function("js_regexp_literal_loaded", I64, &[I64, DOUBLE, DOUBLE]);
     // Full ECMAScript RegExp constructor: NaN-boxed pattern + flags in, handles
     // RegExp/undefined/object patterns and ToString-coerced flags.
     module.declare_function("js_regexp_construct", I64, &[DOUBLE, DOUBLE]);

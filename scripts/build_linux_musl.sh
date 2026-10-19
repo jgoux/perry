@@ -24,12 +24,18 @@ case "$target" in
     rustflags="-C force-unwind-tables=yes -Zuse-sync-unwind=yes -C target-feature=+crt-static -L native=/opt/perry-musl/lib"
     export CC_x86_64_unknown_linux_musl=musl-gcc
     export AR_x86_64_unknown_linux_musl=ar
+    # cc-rs' default, x86_64-linux-musl-ranlib, does not exist (CMake's static
+    # archive step in libz-ng-sys).
+    export RANLIB_x86_64_unknown_linux_musl=ranlib
     ;;
   aarch64-unknown-linux-musl)
     expected_machine=aarch64
     rustflags="-C force-unwind-tables=yes -Zuse-sync-unwind=yes -C target-feature=+crt-static -L native=/opt/perry-musl/lib"
     export CC_aarch64_unknown_linux_musl=musl-gcc
     export AR_aarch64_unknown_linux_musl=ar
+    # cc-rs' default, aarch64-linux-musl-ranlib, does not exist (CMake's static
+    # archive step in libz-ng-sys).
+    export RANLIB_aarch64_unknown_linux_musl=ranlib
     ;;
   *)
     echo "unsupported musl release target: $target" >&2
@@ -119,7 +125,10 @@ cp "$abort_target_dir/$target/prod/libperry_runtime.a" \
    "$target_dir/$target/prod/libperry_runtime_abort.a"
 
 # GC effects sidecars (<archive>.gc-effects) over the final runtime bytes.
-bash scripts/gc_call_effects/sidecars.sh "$target_dir/$target/prod"
+# The analyzer runs on the glibc host, so it links the host's LLVM 22, not the
+# musl-built tree the target binaries use.
+LLVM_SYS_221_PREFIX="${PERRY_HOST_LLVM_PREFIX:?musl image names no host LLVM}" \
+  bash scripts/gc_call_effects/sidecars.sh "$target_dir/$target/prod"
 
 # A dynamically linked binary can run on the glibc build host and still fail
 # immediately for users on Alpine. Gate the artifact itself, not just the

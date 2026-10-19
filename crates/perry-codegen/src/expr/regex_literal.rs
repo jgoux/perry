@@ -1,13 +1,13 @@
 //! A RegExp literal's evaluation: a fresh ordinary RegExp around the site's
 //! immutable matcher data (`perry-runtime/src/regex/literal.rs`).
 //!
-//! The site is a static descriptor: source/flags global addresses and matcher
+//! The site is a static descriptor: source/flags string descriptors and matcher
 //! data, registered as a global root on the first evaluation. Every evaluation is one
 //! call to the shared entry `js_regexp_literal(site)`, whose
 //! birth is the runtime's ordinary RegExp birth (`regex/instance.rs`); the
 //! site carries no birth sequence and no birth state of its own.
 use super::FnCtx;
-use crate::types::{DOUBLE, I64};
+use crate::types::I64;
 
 /// The descriptor keeps operand loads on the shared cold miss, so every
 /// evaluation emits only the descriptor address and the shared call.
@@ -30,25 +30,13 @@ fn emit_regexp_site(ctx: &mut FnCtx<'_>, pattern_global: &str, flags_global: &st
 pub(crate) fn lower_regexp_literal(ctx: &mut FnCtx<'_>, pattern: &str, flags: &str) -> String {
     let pattern_idx = ctx.strings.intern(pattern);
     let flags_idx = ctx.strings.intern(flags);
-    let pattern_global = format!("@{}", ctx.strings.entry(pattern_idx).handle_global);
-    let flags_global = format!("@{}", ctx.strings.entry(flags_idx).handle_global);
+    // The site is static data: it names the immutable dispatch descriptors,
+    // never a string handle (thread-local under agents, and a thread-local's
+    // address is not a pointer to its value on Mach-O).
+    let pattern_global = format!("@{}", ctx.strings.static_dispatch_global(pattern_idx));
+    let flags_global = format!("@{}", ctx.strings.static_dispatch_global(flags_idx));
     let site = emit_regexp_site(ctx, &pattern_global, &flags_global);
-    // A program with agents keeps its string handle globals thread-local, so
-    // the descriptor's static address of one would name the TLS descriptor
-    // (not the executing agent's slot) and the cold miss would read garbage as
-    // the pattern/flags ("Invalid flags supplied to RegExp constructor").
-    // Such a program loads the executing agent's own handles at the site.
-    let agent_strings = ctx.program_has_worker || ctx.program_has_thread_agents;
     let blk = ctx.block();
     let site_key = blk.ptrtoint(&site, I64);
-    if agent_strings {
-        let pattern = blk.load(DOUBLE, &pattern_global);
-        let flags = blk.load(DOUBLE, &flags_global);
-        return blk.call(
-            I64,
-            "js_regexp_literal_loaded",
-            &[(I64, &site_key), (DOUBLE, &pattern), (DOUBLE, &flags)],
-        );
-    }
     blk.call(I64, "js_regexp_literal", &[(I64, &site_key)])
 }

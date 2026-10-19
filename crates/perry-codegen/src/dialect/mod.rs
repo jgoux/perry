@@ -221,8 +221,6 @@ fn parse_header(header: &str) -> Result<ParsedHeader> {
                 linkage = Some(Linkage::LinkOnceODR);
                 toks.next();
             }
-            // `define_header(true)` promotes a shared `linkonce_odr` helper
-            // to `weak_odr` when it is split across codegen units.
             "weak_odr" => {
                 linkage = Some(Linkage::WeakODR);
                 toks.next();

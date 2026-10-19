@@ -75,6 +75,7 @@ FROM ${GLIBC_IMAGE}
 RUN printf '%s\n' \
       'deb [check-valid-until=no] https://archive.debian.org/debian bullseye main' \
       'deb https://archive.debian.org/debian-security bullseye-security main' \
+      'deb [check-valid-until=no] https://archive.debian.org/debian bullseye-backports main' \
       > /etc/apt/sources.list \
     && apt-get -o Acquire::https::Verify-Peer=false update \
     && DEBIAN_FRONTEND=noninteractive apt-get \
@@ -82,8 +83,12 @@ RUN printf '%s\n' \
       install -y --no-install-recommends ca-certificates \
     && apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      bash build-essential cmake curl file git gnupg libclang-dev musl-tools \
+      bash build-essential curl file git gnupg libclang-dev musl-tools \
       perl pkg-config python3 \
+    # bullseye's CMake 3.18 finds no ar/ranlib behind mbx's compiler shim
+    # (CMAKE_AR-NOTFOUND: libz-ng-sys's static archive step); 3.25 does.
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      -t bullseye-backports cmake \
     && curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key \
       -o /etc/apt/trusted.gpg.d/apt.llvm.org.asc \
     && printf '%s\n' \
@@ -91,13 +96,16 @@ RUN printf '%s\n' \
       > /etc/apt/sources.list.d/llvm22.list \
     && apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      clang-22 \
+      clang-22 libpolly-22-dev llvm-22-dev libxml2-dev libzstd-dev zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # perry-runtime's build script compiles its LLVM IR shim (perry_trap.ll) with
 # clang. The Alpine LLVM tree below ships no clang, so name a glibc clang 22
-# from apt.llvm.org, the release glibc image's source.
+# from apt.llvm.org, the release glibc image's source. The GC effects
+# analyzer (a host program) links this glibc LLVM 22 too: the Alpine tree is
+# musl-built (build_linux_musl.sh points the sidecars step at it).
 ENV PERRY_TRAP_CLANG=/usr/lib/llvm-22/bin/clang
+ENV PERRY_HOST_LLVM_PREFIX=/usr/lib/llvm-22
 
 # llvm-config itself is an Alpine/musl executable. Copy its tiny runtime to a
 # private directory so the glibc host can query it without treating target
@@ -121,7 +129,9 @@ RUN set -eu; \
     musl_arch="${musl_loader#ld-musl-}"; \
     musl_arch="${musl_arch%.so.1}"; \
     printf '%s\n' /opt/perry-musl-runtime > "/etc/ld-musl-$musl_arch.path"; \
-    host_libclang="$(find -L /usr/lib -path '*/llvm-*/lib/libclang.so' -print -quit)"; \
+    # A glob, not find -L: llvm-22-dev's build/ links loop. Only Debian's
+    # libclang-dev (LLVM 11) ships an unversioned libclang.so.
+    host_libclang="$(ls /usr/lib/llvm-*/lib/libclang.so 2>/dev/null | head -n 1)"; \
     if [ -z "$host_libclang" ]; then \
       echo "Debian libclang-dev installed no libclang.so" >&2; \
       exit 1; \

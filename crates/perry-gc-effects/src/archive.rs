@@ -69,8 +69,7 @@ impl Disassembler {
     }
     fn instruction(&self, bytes: &[u8], addr: u64) -> (usize, Insn) {
         self.branch.set(None);
-        // `c_char` is u8 on aarch64 Linux and i8 elsewhere; the C API takes `char *`.
-        let mut out = [0 as std::ffi::c_char; 1024];
+        let mut out: [std::ffi::c_char; 1024] = [0; 1024];
         // LLVM does not write to Bytes (the C API predates const correctness).
         // The output is NUL-terminated in the fixed-size buffer.
         let len = unsafe {

@@ -1645,6 +1645,22 @@ fn lower_module(
             typed_layout.pointer_mask_words,
         ));
     }
+    // Every key a class key list above names is one of this module's pool
+    // literals. A key text's image literal is the program's atom of that text
+    // (`js_string_register_property_atom`), and read sites pass the image
+    // itself. The lists are built in this module's string init, which can run
+    // before the module whose pool holds the text (an imported class's keys
+    // are built by the importer, which initializes first); the runtime then
+    // minted a second atom for the text, which the objects' key lists held and
+    // no read site passed (zod's `spa` under a marked import: the probe
+    // answered absent and `this.spa.bind(this)` threw). As this module's own
+    // literal, the key's image is registered as the atom before any list
+    // holds it.
+    for (_, packed_keys, _, _, _) in &class_keys_init_data {
+        for key in packed_keys.split('\0').filter(|k| !k.is_empty()) {
+            strings.intern(key);
+        }
+    }
 
     // Derive __platform__ number from target triple:
     //   0 = macOS, 1 = iOS, 2 = Android, 3 = Windows, 4 = Linux,
@@ -3335,6 +3351,16 @@ fn lower_module(
         closure_lengths,
         closure_arrow_functions,
     } = closure_collect::collect_module_closures(hir);
+    crate::layout_desc::function_families::collect(
+        hir,
+        &module_prefix,
+        &module_globals,
+        &closures,
+        &module_boxed_vars,
+        &cross_module.scope_map,
+        crate::layout_desc::layouts_enabled(&opts.output_type, &triple)
+            && !crate::target_layout::target_is_ilp32(&triple),
+    );
     // Step 5C: a method site whose static lane names one of these bodies
     // calls it directly, so it needs each body's exact parameter count.
     static_constfn::set_module_body_arities(&module_prefix, &closure_arities);

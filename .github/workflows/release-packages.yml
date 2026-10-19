@@ -81,13 +81,15 @@ jobs:
       mode: ${{ steps.resolve.outputs.mode }}
       tag: ${{ steps.resolve.outputs.tag }}
       version: ${{ steps.resolve.outputs.version }}
-      # Pinned commit every downstream job must check out. Empty for
-      # release/cut-release/stage (the triggering ref is already correct —
-      # cut-release in particular has NO tag yet to pin to); set to the tag
-      # for republish, so a `main` that has drifted since the tag was cut
-      # cannot silently republish a different version under the old tag's
-      # label (#confirmed republish version-drift finding).
+      # Pinned commit every downstream job must check out: the run's exact
+      # SHA (cut-release: the candidate_sha input, which preflight requires
+      # to equal it); the tag for republish, so a `main` that has drifted
+      # since the tag was cut cannot silently republish a different version
+      # under the old tag's label (#confirmed republish version-drift
+      # finding). checkout-sha is that ref's commit; every downstream
+      # checkout fails unless its tree's HEAD is exactly it.
       checkout-ref: ${{ steps.resolve.outputs.checkout-ref }}
+      checkout-sha: ${{ steps.resolve.outputs.checkout-sha }}
     steps:
       - name: Checkout repository (inline git)
         shell: bash
@@ -129,7 +131,12 @@ jobs:
           RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
-          CHECKOUT_REF=""
+          # Every downstream job checks out this ref. The inline checkout
+          # fetches `origin <ref>`, so an empty one is the default branch's
+          # HEAD, not this run's commit: a dry run or a cut from a candidate
+          # branch would build main. Default to the run's exact SHA;
+          # republish pins the tag below.
+          CHECKOUT_REF="$SHA"
           if [ "$EVENT" = "release" ]; then
             MODE=release
             TAG="$RELEASE_TAG"
@@ -215,14 +222,27 @@ jobs:
             MODE=stage
             TAG=""
           fi
+          if [ "$MODE" = cut-release ]; then
+            CHECKOUT_REF="$CANDIDATE_SHA"
+          fi
+          if [ "$MODE" = republish ]; then
+            CHECKOUT_SHA=$(git rev-parse "refs/tags/$TAG^{commit}")
+          else
+            CHECKOUT_SHA="$CHECKOUT_REF"
+          fi
+          if [[ ! "$CHECKOUT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::could not resolve the commit to build (checkout-ref=$CHECKOUT_REF)."
+            exit 1
+          fi
           VERSION="${TAG#v}"
           {
             echo "mode=$MODE"
             echo "tag=$TAG"
             echo "version=$VERSION"
             echo "checkout-ref=$CHECKOUT_REF"
+            echo "checkout-sha=$CHECKOUT_SHA"
           } >> "$GITHUB_OUTPUT"
-          echo "mode=$MODE  tag=${TAG:-<none — stage-only build>}  checkout-ref=${CHECKOUT_REF:-<default>}"
+          echo "mode=$MODE  tag=${TAG:-<none — stage-only build>}  checkout-ref=$CHECKOUT_REF  checkout-sha=$CHECKOUT_SHA"
 
   # ---------------------------------------------------------------------------
   # Gate: wait for Tests + Simulator Tests to pass on this commit before we
@@ -570,6 +590,26 @@ jobs:
           cache-on-failure: true
           workspaces: |
             . -> target
+      # Same repair as the build job's eviction step: rust-cache deleted the
+      # mbx build-script shims its restored wrappers exec.
+      - name: Restore mbx build-script shims
+        shell: bash
+        run: |
+          set -euo pipefail
+          mbx_bin=$(command -v mbx)
+          # A wrapper names its shim relative to its own directory
+          # (<dir>/../../../../.mbx-build-script-shims/<id>/mbx).
+          { grep -rlI --include=build_script_build '\.mbx-build-script-shims/' target*/ 2>/dev/null || true; } \
+            | while IFS= read -r wrapper; do
+                rel=$(grep -oE '(\.\./)*\.mbx-build-script-shims/[0-9a-f]+/mbx' "$wrapper" | head -1)
+                [ -n "$rel" ] || continue
+                shim="$(dirname "$wrapper")/$rel"
+                if [ ! -e "$shim" ]; then
+                  mkdir -p "$(dirname "$shim")"
+                  cp "$mbx_bin" "$shim"
+                  echo "restored mbx build-script shim: $shim"
+                fi
+              done
       - name: Compile dependencies for x86_64-apple-darwin
         run: mbx build --profile prod --target x86_64-apple-darwin -p perry
 
@@ -663,6 +703,7 @@ jobs:
         shell: bash
         env:
           CHECKOUT_REF: ${{ needs.preflight.outputs.checkout-ref }}
+          EXPECTED_SHA: ${{ needs.preflight.outputs.checkout-sha }}
           CHECKOUT_DEPTH: "1"
           CHECKOUT_TOKEN: ${{ github.token }}
           CHECKOUT_PERSIST_CREDENTIALS: "true"
@@ -677,6 +718,14 @@ jobs:
           else
             git -c http.https://github.com/.extraheader="$auth_header" fetch --no-tags --force --depth "$CHECKOUT_DEPTH" origin "$CHECKOUT_REF"
             git checkout --force --detach FETCH_HEAD
+          fi
+          # Build exactly the commit preflight resolved, or nothing.
+          : "${EXPECTED_SHA:?preflight resolved no checkout-sha}"
+          built=$(git rev-parse HEAD)
+          echo "built tree: $built  expected: $EXPECTED_SHA  (ref: $CHECKOUT_REF)"
+          if [ "$built" != "$EXPECTED_SHA" ]; then
+            echo "::error::checked out $built, not $EXPECTED_SHA — refusing to build or publish a different commit."
+            exit 1
           fi
           if [[ "$CHECKOUT_PERSIST_CREDENTIALS" == "true" ]]; then
             git config http.https://github.com/.extraheader "$auth_header"
@@ -726,6 +775,25 @@ jobs:
                    target-musl-abort/prod/.fingerprint/"$pkg"-* \
                    target-musl-abort/*/prod/.fingerprint/"$pkg"-*
           done < <(cargo metadata --no-deps --format-version 1 | jq -r '.packages[].name')
+          # rust-cache's target cleanup deletes mbx's per-file build-script
+          # shims (target/.mbx-build-script-shims/<id>/mbx) but keeps the
+          # wrappers that exec them; cargo then finds those build scripts
+          # fresh and mbx never recreates the shim (psm: exit 126). Put the
+          # pinned mbx back at every shim path a restored wrapper names.
+          mbx_bin=$(command -v mbx)
+          # A wrapper names its shim relative to its own directory
+          # (<dir>/../../../../.mbx-build-script-shims/<id>/mbx).
+          { grep -rlI --include=build_script_build '\.mbx-build-script-shims/' target*/ 2>/dev/null || true; } \
+            | while IFS= read -r wrapper; do
+                rel=$(grep -oE '(\.\./)*\.mbx-build-script-shims/[0-9a-f]+/mbx' "$wrapper" | head -1)
+                [ -n "$rel" ] || continue
+                shim="$(dirname "$wrapper")/$rel"
+                if [ ! -e "$shim" ]; then
+                  mkdir -p "$(dirname "$shim")"
+                  cp "$mbx_bin" "$shim"
+                  echo "restored mbx build-script shim: $shim"
+                fi
+              done
 
       # Closes #394: Homebrew bottle was missing libperry_ui_ios.a so
       # `perry compile foo.ts -o app --target ios[-simulator]` failed at link
@@ -853,6 +921,8 @@ jobs:
       # the now-default in-process backend enabled.
       - name: Build Linux GNU core artifacts on glibc 2.31
         if: matrix.old_glibc_image != ''
+        # A hung container build fails here, not at the 6 h job limit.
+        timeout-minutes: 150
         env:
           OLD_GLIBC_IMAGE: ${{ matrix.old_glibc_image }}
           TARGET: ${{ matrix.target }}
@@ -864,12 +934,29 @@ jobs:
             --file scripts/linux-glibc-2.31.Dockerfile \
             .
           # build_linux_*.sh build with mbx, which perry-mbx-cache installed on
-          # the runner (a static musl binary): hand the container that binary
-          # and its object store.
+          # the runner (a static musl binary): hand the container that binary.
+          # Its object store stays inside the container: the runner's store
+          # carries the host session's settings (links, GC, export group) and
+          # gave the containers no hits. In the glibc container mbx's
+          # build-script shim for llvm-sys spun at 100% CPU for the whole
+          # 150 minutes (watchdog, run 39129046553; earlier runs hung until
+          # the job limit), so the containers run build scripts directly and
+          # without mbx's scheduler.
           mbx_bin=$(command -v mbx)
-          mbx_cache=$(mbx cache dir)
-          mkdir -p "$mbx_cache"
+          # If the build is still running after 100 min, log what the
+          # container's processes are doing (every 20 min after that).
+          (
+            sleep 6000
+            while :; do
+              echo "::warning::container build still running; process table:"
+              docker top perry-glibc-build -eo pid,ppid,etime,time,stat,wchan:24,rss,args || true
+              sleep 1200
+            done
+          ) &
+          watchdog=$!
+          trap 'kill "$watchdog" 2>/dev/null || true' EXIT
           docker run --rm \
+            --name perry-glibc-build \
             --user "$(id -u):$(id -g)" \
             --env HOME=/tmp/perry-home \
             --env CARGO_HOME=/tmp/cargo-home \
@@ -882,7 +969,8 @@ jobs:
             --volume "$HOME/.rustup:/tmp/rustup-home" \
             --volume "$mbx_bin:/usr/local/bin/mbx:ro" \
             --env MBX_CACHE_DIR=/tmp/mbx-cache \
-            --volume "$mbx_cache:/tmp/mbx-cache" \
+            --env MBX_BUILD_SCRIPT_EXECUTION=false \
+            --env MBX_SCHEDULER=false \
             --volume "$GITHUB_WORKSPACE:/work" \
             --workdir /work \
             perry-glibc-2.31-llvm22 \
@@ -908,6 +996,8 @@ jobs:
       # with the runner's pinned GNU-host Rust toolchain.
       - name: Build Linux musl core artifacts from a glibc host
         if: matrix.musl_image != ''
+        # A hung container build fails here, not at the 6 h job limit.
+        timeout-minutes: 150
         env:
           MUSL_IMAGE: ${{ matrix.musl_image }}
           MUSL_GLIBC_IMAGE: ${{ matrix.musl_glibc_image }}
@@ -921,12 +1011,29 @@ jobs:
             --file scripts/linux-musl-llvm22.Dockerfile \
             .
           # build_linux_*.sh build with mbx, which perry-mbx-cache installed on
-          # the runner (a static musl binary): hand the container that binary
-          # and its object store.
+          # the runner (a static musl binary): hand the container that binary.
+          # Its object store stays inside the container: the runner's store
+          # carries the host session's settings (links, GC, export group) and
+          # gave the containers no hits. In the glibc container mbx's
+          # build-script shim for llvm-sys spun at 100% CPU for the whole
+          # 150 minutes (watchdog, run 39129046553; earlier runs hung until
+          # the job limit), so the containers run build scripts directly and
+          # without mbx's scheduler.
           mbx_bin=$(command -v mbx)
-          mbx_cache=$(mbx cache dir)
-          mkdir -p "$mbx_cache"
+          # If the build is still running after 100 min, log what the
+          # container's processes are doing (every 20 min after that).
+          (
+            sleep 6000
+            while :; do
+              echo "::warning::container build still running; process table:"
+              docker top perry-musl-build -eo pid,ppid,etime,time,stat,wchan:24,rss,args || true
+              sleep 1200
+            done
+          ) &
+          watchdog=$!
+          trap 'kill "$watchdog" 2>/dev/null || true' EXIT
           docker run --rm \
+            --name perry-musl-build \
             --user "$(id -u):$(id -g)" \
             --env HOME=/tmp/perry-home \
             --env CARGO_HOME=/tmp/cargo-home \
@@ -938,7 +1045,8 @@ jobs:
             --volume "$HOME/.rustup:/tmp/rustup-home" \
             --volume "$mbx_bin:/usr/local/bin/mbx:ro" \
             --env MBX_CACHE_DIR=/tmp/mbx-cache \
-            --volume "$mbx_cache:/tmp/mbx-cache" \
+            --env MBX_BUILD_SCRIPT_EXECUTION=false \
+            --env MBX_SCHEDULER=false \
             --volume "$GITHUB_WORKSPACE:/work" \
             --workdir /work \
             perry-musl-llvm22 \
@@ -1044,9 +1152,61 @@ jobs:
             $linkerxx = Join-Path $toolchain "aarch64-linux-android$($env:ANDROID_API_LEVEL)-clang++.exe"
           }
           $env:CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER = $linker
-          $env:CC_aarch64_linux_android = $linker
-          $env:CXX_aarch64_linux_android = $linkerxx
-          $env:AR_aarch64_linux_android = Join-Path $toolchain "llvm-ar.exe"
+          # perry-stdlib's crypto feature builds vendored OpenSSL, whose
+          # Unix-target Configure needs a perl with Unix paths (not
+          # Strawberry's) and whose build runs `make` recipes under sh. Take
+          # both from MSYS2, first on PATH: Git's stripped perl (no
+          # Pod::Usage) must not answer the recipes' `perl`. rustc and cc-rs
+          # find MSVC's link.exe through Visual Studio, not PATH.
+          # sh cannot run the NDK's .cmd wrappers or backslash paths, so the C
+          # tools are the NDK's clang/llvm executables by forward-slash path;
+          # the API level comes from the --target flags below.
+          $msys = "C:\msys64\usr\bin"
+          if (-not (Test-Path (Join-Path $msys "bash.exe"))) {
+            Write-Error "::error::MSYS2 not found at C:\msys64 (vendored OpenSSL needs its perl and make)"
+            exit 1
+          }
+          & (Join-Path $msys "bash.exe") -lc "pacman -S --noconfirm --needed make perl"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:PATH = "$msys;$env:PATH"
+          $env:OPENSSL_SRC_PERL = Join-Path $msys "perl.exe"
+          & $env:OPENSSL_SRC_PERL -MPod::Usage -MLocale::Maketext::Simple -e 1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "::error::MSYS2 perl lacks a module OpenSSL's build needs"
+            exit 1
+          }
+          Write-Host "OpenSSL perl: $env:OPENSSL_SRC_PERL (Pod::Usage, Locale::Maketext::Simple present)"
+          $tools = $toolchain -replace '\\', '/'
+          $env:CC_aarch64_linux_android = "$tools/clang.exe"
+          $env:CXX_aarch64_linux_android = "$tools/clang++.exe"
+          $env:AR_aarch64_linux_android = "$tools/llvm-ar.exe"
+          $env:RANLIB_aarch64_linux_android = "$tools/llvm-ranlib.exe"
+          # As on the Linux Android legs: CMake's Android support compiles with
+          # the NDK's bare clang (API 21), and cc-rs' `--target=<triple>` (no
+          # API) overrides the wrapper's level. Name the API last.
+          $env:CFLAGS_aarch64_linux_android = "--target=aarch64-linux-android$($env:ANDROID_API_LEVEL)"
+          $env:CXXFLAGS_aarch64_linux_android = "--target=aarch64-linux-android$($env:ANDROID_API_LEVEL)"
+          # CMake defaults to the Visual Studio generator on Windows, which
+          # cannot configure an Android target (libz-ng-sys: MSBuild fails to
+          # get VCTargetsPath). Use Ninja: on PATH, else Visual Studio's copy.
+          $ninja = (Get-Command ninja -ErrorAction SilentlyContinue).Source
+          if (-not $ninja) {
+            $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio/Installer/vswhere.exe"
+            $vs = & $vswhere -latest -products * -property installationPath
+            $candidate = Join-Path $vs "Common7/IDE/CommonExtensions/Microsoft/CMake/Ninja/ninja.exe"
+            if (Test-Path $candidate) { $ninja = $candidate }
+          }
+          if (-not $ninja) {
+            choco install ninja -y --no-progress
+            $ninja = (Get-Command ninja -ErrorAction SilentlyContinue).Source
+          }
+          if (-not $ninja) {
+            Write-Error "::error::no ninja for the Android CMake builds"
+            exit 1
+          }
+          $env:PATH = "$(Split-Path $ninja);$env:PATH"
+          $env:CMAKE_GENERATOR_aarch64_linux_android = "Ninja"
+          Write-Host "Android CMake generator: Ninja ($ninja)"
           # pwsh has no `set -e`; these two are mandatory, so fail the step on a
           # non-zero exit (otherwise the best-effort UI build below, which resets
           # $LASTEXITCODE, could mask a runtime/stdlib failure).
@@ -1525,6 +1685,7 @@ jobs:
         shell: bash
         env:
           CHECKOUT_REF: ${{ needs.preflight.outputs.checkout-ref }}
+          EXPECTED_SHA: ${{ needs.preflight.outputs.checkout-sha }}
           CHECKOUT_DEPTH: "1"
           CHECKOUT_TOKEN: ${{ github.token }}
           CHECKOUT_PERSIST_CREDENTIALS: "true"
@@ -1539,6 +1700,14 @@ jobs:
           else
             git -c http.https://github.com/.extraheader="$auth_header" fetch --no-tags --force --depth "$CHECKOUT_DEPTH" origin "$CHECKOUT_REF"
             git checkout --force --detach FETCH_HEAD
+          fi
+          # Build exactly the commit preflight resolved, or nothing.
+          : "${EXPECTED_SHA:?preflight resolved no checkout-sha}"
+          built=$(git rev-parse HEAD)
+          echo "built tree: $built  expected: $EXPECTED_SHA  (ref: $CHECKOUT_REF)"
+          if [ "$built" != "$EXPECTED_SHA" ]; then
+            echo "::error::checked out $built, not $EXPECTED_SHA — refusing to build or publish a different commit."
+            exit 1
           fi
           if [[ "$CHECKOUT_PERSIST_CREDENTIALS" == "true" ]]; then
             git config http.https://github.com/.extraheader "$auth_header"
@@ -1567,6 +1736,25 @@ jobs:
             rm -rf target/prod/.fingerprint/"$pkg"-* \
                    target/*/prod/.fingerprint/"$pkg"-*
           done < <(cargo metadata --no-deps --format-version 1 | jq -r '.packages[].name')
+          # rust-cache's target cleanup deletes mbx's per-file build-script
+          # shims (target/.mbx-build-script-shims/<id>/mbx) but keeps the
+          # wrappers that exec them; cargo then finds those build scripts
+          # fresh and mbx never recreates the shim (psm: exit 126). Put the
+          # pinned mbx back at every shim path a restored wrapper names.
+          mbx_bin=$(command -v mbx)
+          # A wrapper names its shim relative to its own directory
+          # (<dir>/../../../../.mbx-build-script-shims/<id>/mbx).
+          { grep -rlI --include=build_script_build '\.mbx-build-script-shims/' target*/ 2>/dev/null || true; } \
+            | while IFS= read -r wrapper; do
+                rel=$(grep -oE '(\.\./)*\.mbx-build-script-shims/[0-9a-f]+/mbx' "$wrapper" | head -1)
+                [ -n "$rel" ] || continue
+                shim="$(dirname "$wrapper")/$rel"
+                if [ ! -e "$shim" ]; then
+                  mkdir -p "$(dirname "$shim")"
+                  cp "$mbx_bin" "$shim"
+                  echo "restored mbx build-script shim: $shim"
+                fi
+              done
 
       # --- Per-runner toolchain wiring --------------------------------------
       # Each of these blocks installs what the cross target needs that's NOT
@@ -1862,7 +2050,8 @@ jobs:
       - name: Checkout repository (inline git)
         shell: bash
         env:
-          CHECKOUT_REF: ${{ github.sha }}
+          CHECKOUT_REF: ${{ needs.preflight.outputs.checkout-ref }}
+          EXPECTED_SHA: ${{ needs.preflight.outputs.checkout-sha }}
           CHECKOUT_DEPTH: "1"
           CHECKOUT_TOKEN: ${{ github.token }}
           CHECKOUT_PERSIST_CREDENTIALS: "true"
@@ -1877,6 +2066,14 @@ jobs:
           else
             git -c http.https://github.com/.extraheader="$auth_header" fetch --no-tags --force --depth "$CHECKOUT_DEPTH" origin "$CHECKOUT_REF"
             git checkout --force --detach FETCH_HEAD
+          fi
+          # Build exactly the commit preflight resolved, or nothing.
+          : "${EXPECTED_SHA:?preflight resolved no checkout-sha}"
+          built=$(git rev-parse HEAD)
+          echo "built tree: $built  expected: $EXPECTED_SHA  (ref: $CHECKOUT_REF)"
+          if [ "$built" != "$EXPECTED_SHA" ]; then
+            echo "::error::checked out $built, not $EXPECTED_SHA — refusing to build or publish a different commit."
+            exit 1
           fi
           if [[ "$CHECKOUT_PERSIST_CREDENTIALS" == "true" ]]; then
             git config http.https://github.com/.extraheader "$auth_header"
@@ -2007,7 +2204,8 @@ jobs:
       - name: Checkout repository (inline git)
         shell: bash
         env:
-          CHECKOUT_REF: ${{ github.sha }}
+          CHECKOUT_REF: ${{ needs.preflight.outputs.checkout-ref }}
+          EXPECTED_SHA: ${{ needs.preflight.outputs.checkout-sha }}
           CHECKOUT_DEPTH: "1"
           CHECKOUT_TOKEN: ${{ github.token }}
           CHECKOUT_PERSIST_CREDENTIALS: "true"
@@ -2022,6 +2220,14 @@ jobs:
           else
             git -c http.https://github.com/.extraheader="$auth_header" fetch --no-tags --force --depth "$CHECKOUT_DEPTH" origin "$CHECKOUT_REF"
             git checkout --force --detach FETCH_HEAD
+          fi
+          # Build exactly the commit preflight resolved, or nothing.
+          : "${EXPECTED_SHA:?preflight resolved no checkout-sha}"
+          built=$(git rev-parse HEAD)
+          echo "built tree: $built  expected: $EXPECTED_SHA  (ref: $CHECKOUT_REF)"
+          if [ "$built" != "$EXPECTED_SHA" ]; then
+            echo "::error::checked out $built, not $EXPECTED_SHA — refusing to build or publish a different commit."
+            exit 1
           fi
           if [[ "$CHECKOUT_PERSIST_CREDENTIALS" == "true" ]]; then
             git config http.https://github.com/.extraheader "$auth_header"
@@ -2663,6 +2869,7 @@ jobs:
         shell: bash
         env:
           CHECKOUT_REF: ${{ needs.preflight.outputs.checkout-ref }}
+          EXPECTED_SHA: ${{ needs.preflight.outputs.checkout-sha }}
           CHECKOUT_DEPTH: "1"
           CHECKOUT_TOKEN: ${{ github.token }}
           CHECKOUT_PERSIST_CREDENTIALS: "true"
@@ -2677,6 +2884,14 @@ jobs:
           else
             git -c http.https://github.com/.extraheader="$auth_header" fetch --no-tags --force --depth "$CHECKOUT_DEPTH" origin "$CHECKOUT_REF"
             git checkout --force --detach FETCH_HEAD
+          fi
+          # Build exactly the commit preflight resolved, or nothing.
+          : "${EXPECTED_SHA:?preflight resolved no checkout-sha}"
+          built=$(git rev-parse HEAD)
+          echo "built tree: $built  expected: $EXPECTED_SHA  (ref: $CHECKOUT_REF)"
+          if [ "$built" != "$EXPECTED_SHA" ]; then
+            echo "::error::checked out $built, not $EXPECTED_SHA — refusing to build or publish a different commit."
+            exit 1
           fi
           if [[ "$CHECKOUT_PERSIST_CREDENTIALS" == "true" ]]; then
             git config http.https://github.com/.extraheader "$auth_header"

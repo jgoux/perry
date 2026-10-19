@@ -63,6 +63,18 @@ fn emit_mask_test(
     miss_label: &str,
     mask_offset: usize,
 ) -> String {
+    emit_mask_test_record(ctx, biased, bit, miss_label, mask_offset).0
+}
+
+/// [`emit_mask_test`], also returning the record's address (valid in the
+/// block it leaves).
+fn emit_mask_test_record(
+    ctx: &mut FnCtx<'_>,
+    biased: &str,
+    bit: u32,
+    miss_label: &str,
+    mask_offset: usize,
+) -> (String, String) {
     let blk = ctx.block();
     let word_ptr = crate::expr::receiver_range::emit_field_ptr(blk, biased, 4);
     let word = blk.load(I32, &word_ptr);
@@ -117,7 +129,7 @@ fn emit_mask_test(
     );
     let mask_word = blk.load(I64, &mask_at);
     let bit_value = blk.and(I64, &mask_word, &((1u64 << (bit % 64)) as i64).to_string());
-    blk.icmp_ne(I64, &bit_value, "0")
+    (blk.icmp_ne(I64, &bit_value, "0"), rec)
 }
 
 /// Emit the 2c arm for `receiver_bits.property` if the key is coloured.
@@ -240,14 +252,48 @@ pub(crate) fn begin_store(
         .cond_br(&recv.is_object_pointer, &word_label, &miss_label);
 
     ctx.current_block = word_idx;
-    let holds = emit_mask_test(
+    let (holds, rec) = emit_mask_test_record(
         ctx,
         &recv.biased,
         bit,
         &miss_label,
         crate::runtime_abi::SHAPE_RECORD_COLOUR_STORE_MASK,
     );
-    ctx.block().cond_br(&holds, &meta_label, &miss_label);
+    if slot >= crate::runtime_abi::SHAPE_REP_SLOTS {
+        // A slot past the lane word is `Any`: the mask is the whole proof.
+        ctx.block().cond_br(&holds, &meta_label, &miss_label);
+    } else {
+        // The mask admits an `Any` or an `F64` lane. A plain double fits
+        // either; anything else needs the record's lane for this slot to be
+        // `Any` (`rep` bits 2*slot..2*slot+1 are zero).
+        let lane_idx = ctx.new_block("l2s.lane");
+        let rep_idx = ctx.new_block("l2s.rep");
+        let lane_label = ctx.block_label(lane_idx);
+        let rep_label = ctx.block_label(rep_idx);
+        ctx.block().cond_br(&holds, &lane_label, &miss_label);
+
+        ctx.current_block = lane_idx;
+        let blk = ctx.block();
+        let stored_bits = blk.bitcast_double_to_i64(value_double);
+        let plain = crate::expr::class_field_inline_guard::emit_plain_finite_number_check(
+            blk,
+            &stored_bits,
+        );
+        blk.cond_br(&plain, &meta_label, &rep_label);
+
+        ctx.current_block = rep_idx;
+        let blk = ctx.block();
+        let rep_ptr = blk.gep(
+            I8,
+            &rec,
+            &[(I64, &crate::runtime_abi::SHAPE_RECORD_REP.to_string())],
+        );
+        let rep = blk.load(I64, &rep_ptr);
+        let lane = blk.lshr(I64, &rep, &(2 * slot).to_string());
+        let lane = blk.and(I64, &lane, "3");
+        let any = blk.icmp_eq(I64, &lane, "0");
+        blk.cond_br(&any, &meta_label, &miss_label);
+    }
 
     // `ObjectHeader.meta` is the header's last word.
     ctx.current_block = meta_idx;
@@ -426,7 +472,39 @@ pub(crate) fn family_run_plan(
     property: &str,
     value: &Expr,
 ) -> Option<RunPlan> {
-    if ctx.inline_ctor_return.is_empty() || !family_stores_enabled(ctx) {
+    if ctx.inline_ctor_return.is_empty() {
+        return None;
+    }
+    let mut plan = run_target(ctx, property, value)?;
+    let body = ctx.inline_ctor_return.last_mut()?;
+    plan.run_in = body.family_run.take();
+    body.bind_watch = (plan.value == RunValue::Bind && plan.run_in.is_some()).then_some(None);
+    Some(plan)
+}
+
+/// [`family_run_plan`] for a field definition (`lower_call::field_init`).
+/// A base class's fields are defined at its constructor's entry, before the
+/// body exists: their run is the phase's own, kept in `local`, and ends with
+/// the phase. Inside a body (a derived class's fields, at its `super()`) it
+/// is the body's run.
+pub(crate) fn field_run_plan(
+    ctx: &mut FnCtx<'_>,
+    property: &str,
+    value: &Expr,
+    local: &mut Option<FamilyRun>,
+) -> Option<RunPlan> {
+    if !ctx.inline_ctor_return.is_empty() {
+        return family_run_plan(ctx, property, value);
+    }
+    let mut plan = run_target(ctx, property, value)?;
+    plan.run_in = local.take();
+    Some(plan)
+}
+
+/// The key position, slot and value class of a run store of `property`
+/// (see [`family_run_plan`]), with no run taken yet.
+fn run_target(ctx: &mut FnCtx<'_>, property: &str, value: &Expr) -> Option<RunPlan> {
+    if !family_stores_enabled(ctx) {
         return None;
     }
     let class_name = ctx.class_stack.last()?.clone();
@@ -472,16 +550,13 @@ pub(crate) fn family_run_plan(
             return None;
         }
     }
-    let body = ctx.inline_ctor_return.last_mut()?;
-    let run_in = body.family_run.take();
-    body.bind_watch = (value == RunValue::Bind && run_in.is_some()).then_some(None);
     Some(RunPlan {
         pos: pos as u32,
         order_known,
         class_id,
         slot,
         value,
-        run_in,
+        run_in: None,
     })
 }
 
@@ -496,6 +571,36 @@ pub(crate) fn family_run_arm(
     this_bits: &str,
     property: &str,
 ) -> Option<RunArm> {
+    let (out, run) = run_arm(ctx, plan, this_bits, property);
+    if let Some(body) = ctx.inline_ctor_return.last_mut() {
+        body.family_run = Some(run);
+    }
+    out
+}
+
+/// [`family_run_arm`] for a field definition planned by [`field_run_plan`]:
+/// the run that follows it goes back where the plan took it from.
+pub(crate) fn field_run_arm(
+    ctx: &mut FnCtx<'_>,
+    plan: RunPlan,
+    this_bits: &str,
+    property: &str,
+    local: &mut Option<FamilyRun>,
+) -> Option<RunArm> {
+    if !ctx.inline_ctor_return.is_empty() {
+        return family_run_arm(ctx, plan, this_bits, property);
+    }
+    let (out, run) = run_arm(ctx, plan, this_bits, property);
+    *local = Some(run);
+    out
+}
+
+fn run_arm(
+    ctx: &mut FnCtx<'_>,
+    plan: RunPlan,
+    this_bits: &str,
+    property: &str,
+) -> (Option<RunArm>, FamilyRun) {
     let watched = ctx
         .inline_ctor_return
         .last_mut()
@@ -587,10 +692,7 @@ pub(crate) fn family_run_arm(
         ok: run.ok.clone(),
         slot: plan.slot,
     });
-    if let Some(body) = ctx.inline_ctor_return.last_mut() {
-        body.family_run = Some(run);
-    }
-    out
+    (out, run)
 }
 
 /// Object model step 2c (A): a constructor key's store through `this` in a
