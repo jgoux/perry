@@ -10,6 +10,8 @@
 #   5mb    a 5 MiB upload
 #   gc     a 100000-byte upload with the collector forced to evacuate every cycle and to verify it
 #          (PERRY_GC_FORCE_EVACUATE=1 PERRY_GC_VERIFY_EVACUATION=1)
+#   warm   warm.sh: repeated 1 MiB and 6 MiB downloads and uploads on one instance, with the median
+#          request time and the collections (PERRY_GC_LOG=1) each phase cost; not diffed against node
 # One line per run: ready time, smoke exit status, verdict against node, whether the host survived,
 # RSS idle and after the smoke. Exits non-zero if any run is not IDENTICAL, died or never became ready; the module labelled base
 # is informational and does not count.
@@ -22,7 +24,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 : "${STORAGE_DIR:?}" "${ENV_FILE:?}"
 pgport=${PG_PORT:-5432}; port=${SMOKE_PORT:-18080}
 export PGPASSWORD=postgres
-mkdir -p "$out"; : > "$out/results.txt"
+mkdir -p "$out"; : > "$out/results.txt"; : > "$out/warm.txt"
 set -a; . "$ENV_FILE"; set +a
 env_args=()
 load_env() { env_args=(); while IFS= read -r l; do [ -n "$l" ] && env_args+=(--env "$l"); done < "$1"; }
@@ -58,11 +60,18 @@ run() { # label cwasm tag bytes [guest env...]
     rc=1
   else
     local idle; idle=$(rss_mb "$pid")
-    SMOKE_BYTES=$bytes "$here/smoke.sh" "$port" "$smoke" > "$out/smoke_$name.err" 2>&1; local src=$?
-    local verdict=DIFF; diff -q "$node_ref" "$smoke" > /dev/null 2>&1 && verdict=IDENTICAL
+    local verdict=DIFF src
+    if [ "$tag" = warm ]; then
+      "$here/warm.sh" "$port" "$smoke" "$log" > "$out/smoke_$name.err" 2>&1; src=$?
+      verdict=n/a
+      { echo "$name:"; sed 's/^/  /' "$smoke"; } >> "$out/warm.txt"
+    else
+      SMOKE_BYTES=$bytes "$here/smoke.sh" "$port" "$smoke" > "$out/smoke_$name.err" 2>&1; src=$?
+      diff -q "$node_ref" "$smoke" > /dev/null 2>&1 && verdict=IDENTICAL
+    fi
     local alive=DEAD; kill -0 "$pid" 2>/dev/null && alive=alive
     line="$name ready=${ready}ms smoke_rc=$src vs_node=$verdict host=$alive rss_idle=${idle}MB rss_after=$(rss_mb "$pid")MB"
-    { [ "$src" = 0 ] && [ "$verdict" = IDENTICAL ] && [ "$alive" = alive ]; } || { rc=1; diff -u "$node_ref" "$smoke" | head -n 40 >&2; tail -n 40 "$log" | cut -c1-300 >&2; }
+    { [ "$src" = 0 ] && [ "$verdict" != DIFF ] && [ "$alive" = alive ]; } || { rc=1; diff -u "$node_ref" "$smoke" | head -n 40 >&2; tail -n 40 "$log" | cut -c1-300 >&2; }
   fi
   kill "$pid" 2>/dev/null
   for _ in $(seq 1 25); do kill -0 "$pid" 2>/dev/null || break; sleep 0.2; done
@@ -85,6 +94,7 @@ for spec in "$@"; do
   run "$label" "$cwasm" 100k 100000
   run "$label" "$cwasm" 5mb 5242880
   run "$label" "$cwasm" gc 100000 PERRY_GC_FORCE_EVACUATE=1 PERRY_GC_VERIFY_EVACUATION=1
+  run "$label" "$cwasm" warm 0 PERRY_GC_LOG=1
   [ "$label" = base ] && rc=$saved_rc
   rm -f "$cwasm"
 done

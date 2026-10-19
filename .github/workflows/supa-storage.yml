@@ -596,6 +596,8 @@ jobs:
             echo "### storage-wasi-smoke"
             echo "- perry: \`${GITHUB_SHA::8}\`, storage: \`${{ needs.storage-prep.outputs.sha }}\`, storage variant: \`$SUPA_STORAGE_VARIANT\`, baseline run: \`${{ inputs.smoke_baseline_run || 'none' }}\`"
             echo '```'; cat "$OUT/smoke/results.txt" 2>/dev/null; echo '```'
+            echo "#### warm requests (median and mean per request, collections each phase cost)"
+            echo '```'; cat "$OUT/smoke/warm.txt" 2>/dev/null; echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           true
       - uses: actions/upload-artifact@v4
@@ -604,6 +606,7 @@ jobs:
           name: storage-wasi-smoke
           path: |
             supa-out/smoke/results.txt
+            supa-out/smoke/warm.txt
             supa-out/smoke/smoke_*.txt
             supa-out/smoke/smoke_*.err
             supa-out/smoke/host_*.log
