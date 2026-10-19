@@ -7,6 +7,8 @@
 #
 # Markers in a probe's comments:
 #   // stderr-contains: TEXT   the wasm run's stderr must contain TEXT
+#   // stderr-max-count: N TEXT  at most N lines of the wasm run's stderr may contain TEXT
+#                              (a bound on logged collections, with wasm-env PERRY_GC_LOG=1)
 #   // max-rss-mb: N           the wasmtime process must stay under N MB
 #   // optional: REASON        a compile or link failure is recorded as MISSING,
 #                              not a failure (a probe that compiles must still match)
@@ -51,7 +53,7 @@ for n in "${names[@]}"; do
   d="$work/$n"; rm -rf "$d"; mkdir -p "$d"
   src="$here/wasi-probes/$n.js"; cp "$src" "$d/$n.js"
   marker() { sed -n "s|^// $1: ||p" "$src" | head -1; }
-  optional=$(marker optional); want_err=$(marker stderr-contains); max_rss=$(marker max-rss-mb)
+  optional=$(marker optional); want_err=$(marker stderr-contains); err_bound=$(marker stderr-max-count); max_rss=$(marker max-rss-mb)
   network=$(marker network); compile_only=$(marker compile-only); npm_pkg=$(marker npm)
   wasm_env=$(marker wasm-env); env_flags=(); for kv in $wasm_env; do env_flags+=(--env "$kv"); done
   port=$(marker server-port); requests=$(sed -n "s|^// request: ||p" "$src")
@@ -137,6 +139,8 @@ for n in "${names[@]}"; do
       verdict="FAIL (stdout differs)"
     elif [ -n "$want_err" ] && ! grep -qF -- "$want_err" "$d/run.err"; then
       verdict="FAIL (stderr lacks: $want_err)"
+    elif [ -n "$err_bound" ] && [ "$(grep -cF -- "${err_bound#* }" "$d/run.err")" -gt "${err_bound%% *}" ]; then
+      verdict="FAIL (stderr has $(grep -cF -- "${err_bound#* }" "$d/run.err") lines with '${err_bound#* }', at most ${err_bound%% *})"
     elif [ -n "$max_rss" ] && [ "$rss" -gt "$max_rss" ]; then
       verdict="FAIL (peak RSS ${rss} MB > ${max_rss} MB)"
     fi
