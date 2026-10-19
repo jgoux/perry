@@ -5,6 +5,8 @@
 // sends the same requests to node and to the wasm module and compares.
 "use strict";
 require("./dist/start/minimal-defaults"); // stdout logging, no pino worker thread
+require("./dist/app"); // the real module graph, loaded in Storage's own order
+const { Storage } = require("./dist/storage/storage");
 const { HeadRenderer } = require("./dist/storage/renderer/head");
 const { InfoRenderer } = require("./dist/storage/renderer/info");
 const { setErrorHandler } = require("./dist/http/error-handler");
@@ -45,7 +47,7 @@ const q = {
   asSuperUser() { return q; },
   async findBucket(id) { return id === "nobucket" ? undefined : { id, public: id === "pub" }; },
   from() { return { async findObject() { return object; } }; },
-  renderer(type) { return type === "info" ? new InfoRenderer() : new HeadRenderer(); },
+  renderer(type) { return Storage.prototype.renderer.call({ backend: {} }, type); },
 };
 app.addHook("onRequest", async (request) => {
   request.storage = q;
