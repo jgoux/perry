@@ -1,23 +1,15 @@
-// stream/promises pipeline(source, transform, finalFn) reached through require(),
-// bisecting the specifier, the call form and the transform. The final function
-// must run and the promise must resolve with its return value in every variant.
+// stream/promises pipeline(source, transform, finalFn) reached through
+// require("stream/promises"): the final function must run and the promise must
+// resolve with its return value, whichever way the export is read. Storage's
+// S3 PutObject calls it as `(0, import_promises.pipeline)(body, limit, handler)`.
 "use strict";
 const stream = require("stream");
-const util = require("util");
 const bare = require("stream/promises");
 const prefixed = require("node:stream/promises");
 const { pipeline: destructured } = require("stream/promises");
 
-class Limit extends stream.Transform {
-  constructor(limit) {
-    super();
-    this.limit = limit;
-  }
-  _transform(chunk, enc, cb) {
-    cb(null, chunk);
-  }
-}
-const plain = () => new stream.Transform({ transform(chunk, enc, cb) { cb(null, chunk); } });
+const passThrough = () =>
+  new stream.Transform({ transform(chunk, enc, cb) { cb(null, chunk); } });
 const body = () => {
   const proxy = new stream.PassThrough();
   stream.Readable.from([Buffer.alloc(1000), Buffer.alloc(500)]).pipe(proxy);
@@ -32,14 +24,12 @@ const timeout = (p, ms) =>
   Promise.race([p, new Promise((resolve) => setTimeout(() => resolve("TIMEOUT"), ms))]);
 
 const tests = {
-  bareMember: () => bare.pipeline(body(), new Limit(9), total),
-  prefixedMember: () => prefixed.pipeline(body(), new Limit(9), total),
-  bareComma: () => (0, bare.pipeline)(body(), new Limit(9), total),
-  destructured: () => destructured(body(), new Limit(9), total),
-  streamPromises: () => stream.promises.pipeline(body(), new Limit(9), total),
-  promisified: () => util.promisify(stream.pipeline)(body(), new Limit(9), total),
-  plainTransform: () => bare.pipeline(body(), plain(), total),
-  twoStages: () => bare.pipeline(body(), total),
+  member: () => bare.pipeline(body(), passThrough(), total),
+  prefixedMember: () => prefixed.pipeline(body(), passThrough(), total),
+  comma: () => (0, bare.pipeline)(body(), passThrough(), total),
+  destructured: () => destructured(body(), passThrough(), total),
+  streamPromises: () => stream.promises.pipeline(body(), passThrough(), total),
+  sameFunction: () => Promise.resolve(bare.pipeline === stream.promises.pipeline),
 };
 (async () => {
   for (const [name, run] of Object.entries(tests)) {

@@ -324,6 +324,24 @@ pub(crate) unsafe fn dispatch_native_module_method(
         ""
     };
     let (module_name, assert_skip_prototype) = normalize_dispatch_module_name(module_name);
+    // `require("stream/promises").pipeline(...)`: a direct method call on the
+    // module value. The module has no dispatch bucket (the namespace is the
+    // `stream_promises` submodule registry), so run the promise implementation
+    // the property read resolves to instead of answering `undefined`.
+    if module_name == "stream/promises" && matches!(method_name, "pipeline" | "finished") {
+        let promise_impl = crate::node_submodules::stream_promises_export_callable(method_name);
+        let impl_bits = promise_impl.to_bits();
+        if (impl_bits & crate::value::TAG_MASK) == crate::value::POINTER_TAG
+            && crate::closure::is_closure_ptr((impl_bits & crate::value::POINTER_MASK) as usize)
+        {
+            return crate::closure::js_native_call_value(
+                promise_impl,
+                crate::closure::plain_call_receiver(),
+                args_ptr,
+                args_len,
+            );
+        }
+    }
     let ctx = NmCtx {
         obj,
         args_ptr,

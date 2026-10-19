@@ -69,6 +69,20 @@ pub fn bound_native_callable_export_value(module_name: &str, property_name: &str
     {
         return f64::from_bits(crate::value::TAG_UNDEFINED);
     }
+    // `require("stream/promises").pipeline` / `.finished`: the module value is
+    // the `stream_promises` submodule registry, whose exports are the real
+    // promise-returning implementations. A BOUND_METHOD closure minted here
+    // would dispatch through `("stream/promises", _)`, a module with no
+    // dispatch bucket, and resolve `undefined` without running any stage.
+    if module_name == "stream/promises" && matches!(property_name, "pipeline" | "finished") {
+        let promise_impl = crate::node_submodules::stream_promises_export_callable(property_name);
+        let impl_bits = promise_impl.to_bits();
+        if (impl_bits & crate::value::TAG_MASK) == crate::value::POINTER_TAG
+            && crate::closure::is_closure_ptr((impl_bits & crate::value::POINTER_MASK) as usize)
+        {
+            return promise_impl;
+        }
+    }
     // node:inspector/promises is the callback namespace with Session replaced.
     if module_name == "inspector/promises" && property_name != "Session" {
         return bound_native_callable_export_value("inspector", property_name);
