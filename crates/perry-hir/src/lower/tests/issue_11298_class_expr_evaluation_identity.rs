@@ -67,16 +67,18 @@ fn module_top_class_expr_keeps_the_shared_template() {
 }
 
 #[test]
-fn native_module_parent_keeps_the_shared_template() {
-    // #10623: an implicit constructor over a native-module base forwards its
-    // `new` arguments only on the shared-template construct path.
+fn native_module_parent_class_is_a_fresh_evaluation_over_its_live_parent() {
+    // #10623: an implicit constructor over a native-module base must forward
+    // its `new` arguments to the base's init. A native-module parent lowers
+    // into the evaluated parent value, so the class is a fresh evaluation;
+    // test_gap_10623_implicit_ctor_native_super covers the runtime behaviour.
     let module = lower(
         r#"import { EventEmitter } from "node:events";
         function make() { return class extends EventEmitter {}; }"#,
     );
     let body = body_of(&module, "make");
     assert!(
-        !body.contains("ClassExprFresh{"),
-        "a native-module parent must stay on the shared template: {body}"
+        body.contains("ClassExprFresh{") && body.contains("evaluated_parent:Some("),
+        "a native-module parent must be evaluated per class evaluation: {body}"
     );
 }

@@ -253,7 +253,6 @@ pub(crate) fn lower_class_expr(
             || computed_statics.iter().any(|(_, value)| uses_self(value))
             || computed_name_evaluations.iter().any(uses_self)
     });
-    let native_parent = class.native_extends.is_some();
     ctx.pending_classes.push(class);
     // #1772/#5893: a class EXPRESSION that carries per-evaluation static
     // fields, captures, or private elements lowers to a
@@ -291,12 +290,12 @@ pub(crate) fn lower_class_expr(
     // statically-parented class expression in a function used to return the one
     // shared `ClassRef`, so `makeClass() === makeClass()` and a property
     // defined on the second evaluation's prototype leaked into instances of
-    // the first. A native-module parent (`extends AsyncResource`) stays on
-    // the shared template: an implicit constructor constructed through a
-    // fresh class value does not forward its `new` arguments to the native
-    // base's init (#10623).
-    let identity_only =
-        !at_module_top && !per_evaluation_state && parent_expr.is_none() && !native_parent;
+    // the first. A native-module parent (`extends AsyncResource`) is not
+    // exempt: its heritage lowers into `parent_expr`, so `per_evaluation_state`
+    // already routes it through a fresh class value, and the implicit
+    // constructor forwards its `new` arguments to the native base's init there
+    // (#10623, guarded by test_gap_10623_implicit_ctor_native_super).
+    let identity_only = !at_module_top && !per_evaluation_state && parent_expr.is_none();
     let fresh_evaluation = per_evaluation_state || identity_only;
     if fresh_evaluation {
         // The alias names this evaluated class object, not just its shared
