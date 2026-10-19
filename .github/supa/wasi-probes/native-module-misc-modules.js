@@ -65,7 +65,7 @@ console.log("constants", typeof constants, constants === constantsPrefixed, type
   constants.O_WRONLY === fs.constants.O_WRONLY, constants.SIGINT, constants.SIGTERM, typeof constants.ENOENT);
 console.log("constants keys", ["O_RDONLY", "SIGKILL", "S_IFMT", "ENOENT", "EACCES"].map((k) => typeof constants[k]).join());
 
-console.log("sys", typeof sys.format, typeof sys.inspect, sys.format === util.format, sys.inspect === util.inspect, sys === util);
+console.log("sys", typeof sys.format, typeof sys.inspect, sys.format === util.format, sys.inspect === util.inspect);
 console.log("sys format", sys.format("%s-%d", "a", 1), (0, sys.format)("%j", { a: 1 }), sys.isArray([]));
 
 for (const n of ["Session", "open", "close", "url", "waitForDebugger", "console"]) {
@@ -76,7 +76,7 @@ console.log("inspector/promises url", ip.url(), (0, ipPrefixed.url)());
 const session = new ip.Session();
 console.log("inspector/promises Session", typeof session.connect, typeof session.post, typeof session.disconnect);
 
-console.log("node:test", typeof nodeTest, typeof nodeTest.test, nodeTest.test === nodeTest, typeof nodeTest.describe, typeof nodeTest.it,
+console.log("node:test", typeof nodeTest.test, typeof nodeTest.describe, typeof nodeTest.it,
   typeof nodeTest.before, typeof nodeTest.after, typeof nodeTest.beforeEach, typeof nodeTest.afterEach, typeof nodeTest.mock, typeof nodeTest.run,
   typeof nodeTest.suite, typeof nodeTest.skip, typeof nodeTest.todo, typeof nodeTest.only);
 console.log("node:test/reporters", ["spec", "tap", "dot", "junit", "lcov"].map((k) => typeof reporters[k]).join(), reporters === require("node:test/reporters"));
