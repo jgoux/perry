@@ -986,7 +986,81 @@ pub(crate) fn rewrite_written_captures_to_cells(body: &mut [Stmt], cells: &HashS
         return;
     }
     for s in body.iter_mut() {
+        each_child_stmt_list_mut(s, &mut |list| hoist_forward_cell_inits(list, cells));
+    }
+    for s in body.iter_mut() {
         rewrite_cells_in_stmt(s, cells);
+    }
+}
+
+/// A binding that closures capture BEFORE its declaration (a forward read of a
+/// per-evaluation class declaration, `forward_class_reads`) has its box
+/// allocated by a `PreallocateBoxes` ahead of the first such closure and filled
+/// by the declaration. Backed by a cell, the cell must likewise exist before
+/// the closure is created (the snapshot pass hands the closure the cell
+/// reference), and the declaration must fill THAT cell: a declaration that
+/// built a fresh cell would leave every earlier closure with a stale one.
+/// So the cell is created where the box was preallocated (`let c = [undefined]`
+/// after the rewrite) and the declaration becomes a write to its element.
+/// Only a `Prealloc` and a declaration in the same statement list qualify.
+fn hoist_forward_cell_inits(stmts: &mut Vec<Stmt>, cells: &HashSet<LocalId>) {
+    for s in stmts.iter_mut() {
+        each_child_stmt_list_mut(s, &mut |list| hoist_forward_cell_inits(list, cells));
+    }
+    let mut at = 0;
+    while at < stmts.len() {
+        let forward: Vec<LocalId> = match &stmts[at] {
+            Stmt::PreallocateBoxes(ids) => ids
+                .iter()
+                .copied()
+                .filter(|id| cells.contains(id))
+                .collect(),
+            _ => Vec::new(),
+        };
+        let mut predeclared: Vec<Stmt> = Vec::new();
+        for id in forward {
+            let Some(decl_at) = stmts[at + 1..]
+                .iter()
+                .position(|s| matches!(s, Stmt::Let { id: d, .. } if *d == id))
+                .map(|i| at + 1 + i)
+            else {
+                continue;
+            };
+            let Stmt::Let {
+                name,
+                ty,
+                mutable,
+                init,
+                ..
+            } = std::mem::replace(&mut stmts[decl_at], Stmt::Break)
+            else {
+                unreachable!("position matched a Let");
+            };
+            stmts[decl_at] = Stmt::Expr(Expr::LocalSet(
+                id,
+                Box::new(init.unwrap_or(Expr::Undefined)),
+            ));
+            predeclared.push(Stmt::Let {
+                id,
+                name,
+                ty,
+                mutable,
+                init: None,
+            });
+            if let Stmt::PreallocateBoxes(ids) = &mut stmts[at] {
+                ids.retain(|i| *i != id);
+            }
+        }
+        let emptied = matches!(&stmts[at], Stmt::PreallocateBoxes(ids) if ids.is_empty());
+        let at_next = at + predeclared.len() + usize::from(!emptied);
+        let insert_at = at + usize::from(!emptied);
+        if emptied {
+            stmts.remove(at);
+        }
+        for (k, decl) in predeclared.into_iter().enumerate() {
+            stmts.insert(insert_at + k, decl);
+        }
+        at = at_next;
     }
 }
 

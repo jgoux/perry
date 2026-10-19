@@ -61,7 +61,13 @@ impl Redirect<'_> {
                 true
             }
             // The declaration's own evaluation names the template on purpose.
-            Expr::ClassExprFresh { .. } => false,
+            // Any OTHER fresh class expression in a closure before the
+            // declaration (`() => class { static base = C }`) evaluates its
+            // static initializers, computed keys, captured arguments and
+            // evaluated parent in that closure, so a read of the forward
+            // class there is a read of the binding too: fall through to the
+            // children, which keeps the expression's own template.
+            Expr::ClassExprFresh { template, .. } if template == self.template => false,
             Expr::Closure {
                 body,
                 params,

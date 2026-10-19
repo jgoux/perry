@@ -82,9 +82,22 @@ pub(super) fn nested_generator_references_outer_locals(
     for stmt in &body.stmts {
         collect_idents_stmt(stmt, &mut names);
     }
-    names
-        .iter()
-        .any(|n| !bound.contains(n) && ctx.lookup_local(n).is_some())
+    names.iter().any(|n| {
+        !bound.contains(n)
+            && (ctx.lookup_local(n).is_some() || names_forward_class_declaration(ctx, n))
+    })
+}
+
+/// Is `name` a class declared LATER in an enclosing body (registered for the
+/// body by the forward-class pre-scan, not lowered yet, no local of that name
+/// yet)? When that declaration turns out to be evaluated per invocation, the
+/// read becomes a capture of its binding once the body is lowered
+/// (`forward_class_reads`), which only an `Expr::Closure` can carry: the
+/// capture-less hoisted `Function` would keep reading the shared template.
+fn names_forward_class_declaration(ctx: &LoweringContext, name: &str) -> bool {
+    ctx.forward_class_names.contains(name)
+        && ctx.lookup_local(name).is_none()
+        && ctx.lookup_class(&ctx.resolve_class_name(name)).is_none()
 }
 
 fn collect_pat_bound_names(pat: &ast::Pat, out: &mut std::collections::HashSet<String>) {
