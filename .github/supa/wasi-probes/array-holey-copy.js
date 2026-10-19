@@ -132,3 +132,68 @@ const getterLength = {
 };
 console.log('length getter ' + show(Array.from(getterLength)));
 delete Object.prototype[0];
+
+// A prototype swapped in with setPrototypeOf, whose index property exists
+// already (data, then getter), must be seen by every copy.
+// The array-like gets a plain object, the holey array an object that still
+// inherits Array.prototype (so slice and spread keep working).
+function swapped(label, makeProto) {
+  const arrayLike = Object.setPrototypeOf({ length: 4 }, makeProto());
+  const holey = Object.setPrototypeOf([1, , 3, , 5], Object.setPrototypeOf(makeProto(), Array.prototype));
+  const show2 = (name, f) => {
+    let r;
+    try {
+      r = f();
+    } catch (e) {
+      r = 'threw ' + (e && e.constructor && e.constructor.name);
+    }
+    console.log(label + ' ' + name + ' ' + r);
+  };
+  show2('from(arrayLike)', () => show(Array.from(arrayLike)));
+  show2('slice.call(arrayLike)', () => show(Array.prototype.slice.call(arrayLike)));
+  show2('concat(arrayLike)', () => show([].concat(arrayLike)));
+  show2('from(holey)', () => show(Array.from(holey)));
+  show2('slice(holey)', () => show(holey.slice()));
+  show2('spread(holey)', () => show([...holey]));
+  show2('concat(holey)', () => show([0].concat(holey)));
+}
+swapped('swap data', () => ({ 1: 'p1' }));
+swapped('swap getter', () => ({
+  get 1() {
+    return 'g1';
+  },
+}));
+// The swap happens after copies of the same shape already ran.
+const early = { length: 3 };
+console.log('swap before ' + show(Array.from(early)) + ' ' + show(Array.prototype.slice.call(early)));
+Object.setPrototypeOf(early, { 2: 'p2' });
+console.log('swap after ' + show(Array.from(early)) + ' ' + show(Array.prototype.slice.call(early)));
+
+// An Array subclass gets an indexed property on its prototype after instances exist.
+class A extends Array {}
+const made = new A();
+made.length = 4;
+made[0] = 'a0';
+const copyOf = (name, f) => console.log('subclass ' + name + ' ' + f());
+copyOf('before slice', () => show(made.slice()));
+copyOf('before from', () => show(Array.from(made)));
+copyOf('before spread', () => show([...made]));
+copyOf('before concat', () => show([9].concat(made)));
+A.prototype[2] = 'a2';
+copyOf('after slice', () => show(made.slice()));
+copyOf('after from', () => show(Array.from(made)));
+copyOf('after spread', () => show([...made]));
+copyOf('after concat', () => show([9].concat(made)));
+copyOf('after plain slice.call', () => show(Array.prototype.slice.call(made)));
+Object.defineProperty(A.prototype, 3, {
+  configurable: true,
+  get() {
+    return 'getter3';
+  },
+});
+copyOf('getter slice', () => show(made.slice()));
+copyOf('getter from', () => show(Array.from(made)));
+copyOf('getter concat', () => show([9].concat(made)));
+delete A.prototype[2];
+delete A.prototype[3];
+copyOf('removed slice', () => show(made.slice()));
