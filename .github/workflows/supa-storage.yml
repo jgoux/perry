@@ -1370,9 +1370,11 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  # Builds the test binaries while build-perry builds the release libraries (the two do not
+  # depend on each other until the tests run), then waits for build-perry to finish.
   regressions-linux:
     if: ${{ needs.plan.outputs.regressions == 'true' }}
-    needs: [plan, build-perry]
+    needs: plan
     runs-on: blacksmith-16vcpu-ubuntu-2404-arm
     timeout-minutes: 240
     steps:
@@ -1380,6 +1382,10 @@ jobs:
       - name: Simulated change
         if: ${{ inputs.simulate && inputs.simulate != 'none' }}
         run: .github/supa/simulate.sh "${{ inputs.simulate }}"
+      - name: Perry libraries key
+        id: perrykey
+        # Same expression as build-perry's key step (a mismatch fails the cache restore below).
+        run: echo "key=perry-dist-${{ runner.arch }}-wasi-gcfx2-${{ hashFiles('crates/**', 'Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/**', '!crates/*/tests/**', '!**/*.md') }}" >> "$GITHUB_OUTPUT"
       - name: Already passed for this source?
         id: done
         # The marker is keyed by everything the tests depend on: the crates,
@@ -1391,17 +1397,9 @@ jobs:
           lookup-only: true
       - uses: ./.github/actions/supa-rust-env
         if: steps.done.outputs.cache-hit != 'true'
-      - name: Runtime libraries for the integration tests
-        if: steps.done.outputs.cache-hit != 'true'
-        uses: actions/cache/restore@v4
-        with:
-          path: ${{ github.workspace }}/perry-dist
-          key: ${{ needs.build-perry.outputs.key }}
-          fail-on-cache-miss: true
       - name: Build the test binaries
         if: steps.done.outputs.cache-hit != 'true'
         run: |
-          mkdir -p target/release && cp perry-dist/lib* target/release/
           start=$(date +%s)
           .github/supa/regressions.sh build
           {
@@ -1409,6 +1407,29 @@ jobs:
             echo "- test build: $(( $(date +%s) - start )) s"
             echo '```'; sccache --show-stats | sed -n 1,12p; echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: Wait for the Perry libraries
+        if: steps.done.outputs.cache-hit != 'true'
+        # build-perry saves perry-dist as its last step, so its success means the cache exists.
+        run: |
+          for _ in $(seq 1 360); do
+            r=$(gh run view "$GITHUB_RUN_ID" --json jobs --jq '.jobs[] | select(.name == "build-perry") | .conclusion')
+            case "$r" in
+              success) exit 0 ;;
+              failure|cancelled|skipped) echo "::error::build-perry ended as $r"; exit 1 ;;
+            esac
+            sleep 10
+          done
+          echo "::error::build-perry did not finish in an hour"; exit 1
+      - name: Runtime libraries for the integration tests
+        if: steps.done.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/perry-dist
+          key: ${{ steps.perrykey.outputs.key }}
+          fail-on-cache-miss: true
+      - name: Place the runtime libraries
+        if: steps.done.outputs.cache-hit != 'true'
+        run: mkdir -p target/release && cp perry-dist/lib* target/release/
       - name: Run the regression tests
         if: steps.done.outputs.cache-hit != 'true'
         run: .github/supa/regressions.sh run
