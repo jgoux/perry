@@ -869,80 +869,32 @@ mod length_handle_band_tests {
         assert_eq!(js_value_length_property_f64(42.0).to_bits(), TAG_UNDEFINED);
     }
 
+    /// The #10271 floor rejected legitimate macOS heap addresses between the
+    /// handle band and 2 TiB. The cell must be a real byte cell: byte-family
+    /// admission asks the allocator, so a bare mapping carrying a `GcHeader`
+    /// is (correctly) not a typed array and answers 0. A live typed array is
+    /// the only fixture that reaches both dispatch arms.
     #[cfg(target_os = "macos")]
     #[test]
     fn low_macos_mapping_reaches_both_length_dispatch_paths() {
-        struct Mapping {
-            raw: *mut libc::c_void,
-            len: usize,
-        }
-
-        impl Drop for Mapping {
-            fn drop(&mut self) {
-                unsafe {
-                    assert_eq!(libc::munmap(self.raw, self.len), 0);
-                }
-            }
-        }
-
-        unsafe {
-            let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
-            let raw = libc::mmap(
-                std::ptr::null_mut(),
-                page,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_ANON | libc::MAP_PRIVATE,
-                -1,
-                0,
-            );
-            assert_ne!(raw, libc::MAP_FAILED);
-            let _mapping = Mapping { raw, len: page };
-            // A typed array is recognised by its `GcHeader` (#10694), so the
-            // fixture carries one in front of the `TypedArrayHeader`.
-            // GC_STORE_AUDIT(POINTER_FREE): a GcHeader is type/flag/size
-            // numerics, written into this test's own private anonymous mmap
-            // page, not arena-managed memory; no heap edge is created.
-            std::ptr::write(
-                raw.cast::<crate::gc::GcHeader>(),
-                crate::gc::GcHeader {
-                    obj_type: crate::gc::GC_TYPE_TYPED_ARRAY,
-                    gc_flags: 0,
-                    _reserved: 0,
-                    size: (crate::gc::GC_HEADER_SIZE + crate::codegen_abi::BYTES_STORE + 37) as u32,
-                },
-            );
-            let ptr = raw
-                .cast::<u8>()
-                .add(crate::gc::GC_HEADER_SIZE)
-                .cast::<crate::typedarray::TypedArrayHeader>();
-            let addr = ptr as usize;
-            assert!(
-                (addr_class::HANDLE_BAND_MAX..0x200_0000_0000).contains(&addr),
-                "fixture must exercise the macOS address range that the old 2 TiB floor rejected; got {addr:#x}"
-            );
-
-            // GC_STORE_AUDIT(POINTER_FREE): TypedArrayHeader is
-            // length/capacity/kind/elem_size/_pad numerics with no pointer
-            // field, and the destination is this test's own private anonymous
-            // mmap page rather than arena-managed memory, so the store creates
-            // no heap edge for the collector to trace.
-            // The header's fields are private to the buffer store; write its
-            // `length: u32, capacity: u32, link: usize` layout directly.
-            ptr.cast::<u32>().write(37);
-            ptr.cast::<u32>().add(1).write(37);
-            ptr.cast::<usize>().add(1).write(0);
-
-            assert_eq!(
-                js_value_length_f64(crate::value::js_nanbox_pointer(addr as i64)),
-                37.0,
-                "POINTER_TAG length dispatch must accept a live low macOS mapping"
-            );
-            assert_eq!(
-                js_value_length_f64(f64::from_bits(addr as u64)),
-                37.0,
-                "raw-bitcast length dispatch must accept the same mapping"
-            );
-        }
+        let _no_gc = crate::gc::GcSuppressScope::new();
+        let ta =
+            crate::typedarray::js_typed_array_new_empty(crate::typedarray::KIND_UINT8 as i32, 37);
+        let addr = ta as usize;
+        assert!(
+            (addr_class::HANDLE_BAND_MAX..0x200_0000_0000).contains(&addr),
+            "fixture must exercise the macOS address range that the old 2 TiB floor rejected; got {addr:#x}"
+        );
+        assert_eq!(
+            js_value_length_f64(crate::value::js_nanbox_pointer(addr as i64)),
+            37.0,
+            "POINTER_TAG length dispatch must accept a live low macOS mapping"
+        );
+        assert_eq!(
+            js_value_length_f64(f64::from_bits(addr as u64)),
+            37.0,
+            "raw-bitcast length dispatch must accept the same mapping"
+        );
     }
 
     /// A POINTER_TAG-boxed *handle-band* value (Web Fetch
