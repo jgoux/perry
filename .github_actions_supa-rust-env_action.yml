@@ -1,0 +1,32 @@
+# Toolchain for the supa-storage workflow: pinned nightly, LLVM 22, lld, and an
+# sccache backed by the Actions cache so unchanged workspace crates are not
+# recompiled on a fresh checkout. Not part of upstream.
+name: supa-rust-env
+description: Rust nightly, LLVM 22, lld and sccache for the supa-storage jobs
+runs:
+  using: composite
+  steps:
+    - name: Machine
+      shell: bash
+      run: |
+        df -h /
+        nproc; free -m
+    - name: Install Rust toolchain
+      shell: bash
+      run: rustup toolchain install nightly-2026-10-04 --profile minimal --component rustfmt --component clippy
+    - uses: ./.github/actions/setup-llvm22
+    - name: Install lld
+      # Used to link Perry itself (faster) and the Storage binary (GNU ld cannot
+      # place range-extension stubs in a ~200 MB aarch64 image, so
+      # R_AARCH64_CALL26 truncates; lld inserts thunks).
+      shell: bash
+      run: sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq lld-22
+    - uses: mozilla-actions/sccache-action@v0.0.9
+    - uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+        key: cargo-registry-${{ hashFiles('Cargo.lock') }}
+        restore-keys: cargo-registry-

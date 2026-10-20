@@ -1,0 +1,3141 @@
+name: Publish to npm / GitHub Release
+
+on:
+  schedule:
+    - cron: "37 6 * * *"
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      cut_release:
+        description: "Release the dispatched candidate: gates/builds, npm OIDC publish, registry verification, then tag + GitHub Release."
+        type: boolean
+        default: false
+      nightly:
+        description: "Build this exact commit and publish its host/cross archives as a GitHub prerelease. Does not run stable release gates or publish to npm."
+        type: boolean
+        default: false
+      candidate_sha:
+        description: "Required with cut_release: exact pushed candidate SHA. Prevents a moved branch from publishing or being tagged."
+        type: string
+        default: ""
+      dist_tag:
+        description: "npm dist-tag for a cut release (normally latest)."
+        type: string
+        default: "latest"
+      socket_scan:
+        description: "Run the optional Socket tarball scan before npm publication."
+        type: boolean
+        default: false
+      existing_tag:
+        description: "Re-publish an existing release (e.g. v0.5.1300): rebuild and re-upload assets / re-run publish legs for that tag. Replaces the old implicit 'latest release' fallback."
+        type: string
+        default: ""
+      publish_npm:
+        description: "With existing_tag: also (re-)publish the npm packages. release / cut_release runs always publish npm."
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  # `write` (was `read`): the await-tests gate dispatches test.yml /
+  # simctl-tests.yml when a cut_release run has no test run on its SHA yet,
+  # and create-release dispatches the tag-rider workflows (docs, benchmark,
+  # container-tests) on the new tag — a GITHUB_TOKEN-created tag emits no
+  # push event, so those must be fired explicitly.
+  actions: write
+
+# Serialize runs that target the same tag/version, so two dispatches can't
+# race npm-publish's `npm view` idempotency check (a TOCTOU otherwise: both
+# can pass the check before either publishes) or create-release's tag
+# creation. A plain stage-mode dispatch (build-only, no publish) has no tag
+# to key on and falls back to its own run id, so unrelated stage builds are
+# never blocked. `cancel-in-progress: false` — never cancel a release/publish
+# leg that's already running.
+concurrency:
+  group: release-packages-${{ github.event.release.tag_name || inputs.existing_tag || ((inputs.cut_release || inputs.nightly) && inputs.candidate_sha) || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Resolve the run mode + release tag ONCE, up front. Every downstream job
+  # takes tag/version from these outputs — there is deliberately no "latest
+  # release" fallback anywhere anymore (pre-tag dispatches used to upload new
+  # binaries onto the PREVIOUS release through that fallback).
+  #
+  # Modes:
+  #   release      release: published event (legacy tag-first path — a human
+  #                created the tag + release; still fully supported)
+  #   cut-release  workflow_dispatch with cut_release=true — canonical route:
+  #                exact-SHA gates + builds, npm Trusted Publisher/OIDC publish,
+  #                public-registry byte verification, then tag + release LAST.
+  #   republish    workflow_dispatch with existing_tag=vX.Y.Z — rebuild and
+  #                re-run the publish legs for an already-published release
+  #                (the old "bypass" lever, now with an explicit tag)
+  #   stage        plain workflow_dispatch — build-only smoke run; archives
+  #                land as workflow artifacts, nothing touches any release
+  # ---------------------------------------------------------------------------
+  preflight:
+    runs-on: ubuntu-latest
+    outputs:
+      mode: ${{ steps.resolve.outputs.mode }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+      # Pinned commit every downstream job must check out: the run's exact
+      # SHA (cut-release: the candidate_sha input, which preflight requires
+      # to equal it); the tag for republish, so a `main` that has drifted
+      # since the tag was cut cannot silently republish a different version
+      # under the old tag's label (#confirmed republish version-drift
+      # finding). checkout-sha is that ref's commit; every downstream
+      # checkout fails unless its tree's HEAD is exactly it.
+      checkout-ref: ${{ steps.resolve.outputs.checkout-ref }}
+      checkout-sha: ${{ steps.resolve.outputs.checkout-sha }}
+    steps:
+      - name: Checkout repository (inline git)
+        shell: bash
+        env:
+          CHECKOUT_REF: ${{ github.sha }}
+          CHECKOUT_DEPTH: "0"
+          CHECKOUT_TOKEN: ${{ github.token }}
+          CHECKOUT_PERSIST_CREDENTIALS: "true"
+        run: |
+          set -euo pipefail
+          git init
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          auth_header="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$CHECKOUT_TOKEN" | base64 | tr -d '\n')"
+          if [[ "$CHECKOUT_DEPTH" == "0" ]]; then
+            git -c http.https://github.com/.extraheader="$auth_header" fetch --force --tags origin
+            git checkout --force --detach "$CHECKOUT_REF"
+          else
+            git -c http.https://github.com/.extraheader="$auth_header" fetch --no-tags --force --depth "$CHECKOUT_DEPTH" origin "$CHECKOUT_REF"
+            git checkout --force --detach FETCH_HEAD
+          fi
+          if [[ "$CHECKOUT_PERSIST_CREDENTIALS" == "true" ]]; then
+            git config http.https://github.com/.extraheader "$auth_header"
+          fi
+      - name: Resolve run mode + tag
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          CUT_RELEASE: ${{ inputs.cut_release }}
+          NIGHTLY: ${{ inputs.nightly || github.event_name == 'schedule' }}
+          CANDIDATE_SHA: ${{ inputs.candidate_sha || github.sha }}
+          EXISTING_TAG: ${{ inputs.existing_tag }}
+          SHA: ${{ github.sha }}
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+          RUN_NUMBER: ${{ github.run_number }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          # Every downstream job checks out this ref. The inline checkout
+          # fetches `origin <ref>`, so an empty one is the default branch's
+          # HEAD, not this run's commit: a dry run or a cut from a candidate
+          # branch would build main. Default to the run's exact SHA;
+          # republish pins the tag below.
+          CHECKOUT_REF="$SHA"
+          if [ "$EVENT" = "release" ]; then
+            MODE=release
+            TAG="$RELEASE_TAG"
+          elif [ "$NIGHTLY" = "true" ]; then
+            MODE=nightly
+            if [ "$CUT_RELEASE" = "true" ] || [ -n "$EXISTING_TAG" ]; then
+              echo "::error::nightly cannot be combined with cut_release or existing_tag."
+              exit 1
+            fi
+            if [ -z "$CANDIDATE_SHA" ] || [ "$CANDIDATE_SHA" != "$SHA" ]; then
+              echo "::error::candidate_sha must equal this workflow run's exact SHA."
+              exit 1
+            fi
+            if [[ "$REF" != refs/heads/* ]]; then
+              echo "::error::nightly builds must run from a branch ref."
+              exit 1
+            fi
+            if [ "$EVENT" = "schedule" ] && [ "$REF_NAME" != "main" ]; then
+              echo "::error::scheduled nightly builds must use main; got $REF_NAME."
+              exit 1
+            fi
+            VERSION=$(sed -n '/^\[workspace\.package\]/,/^\[/p' Cargo.toml | grep -m1 '^version' | sed -E 's/.*"([^"]+)".*/\1/')
+            if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::could not resolve a stable workspace version for the nightly build."
+              exit 1
+            fi
+            TAG="nightly-v${VERSION}-$(date -u +%Y%m%d)-r${RUN_NUMBER}a${RUN_ATTEMPT}-${SHA:0:8}"
+          elif [ "$CUT_RELEASE" = "true" ] && [ -n "$EXISTING_TAG" ]; then
+            echo "::error::cut_release and existing_tag are mutually exclusive — cut_release derives the tag from Cargo.toml."
+            exit 1
+          elif [ "$CUT_RELEASE" = "true" ]; then
+            MODE=cut-release
+            if [ -z "$CANDIDATE_SHA" ]; then
+              echo "::error::candidate_sha is required with cut_release=true. Use npm run publish:release."
+              exit 1
+            fi
+            if [ "$CANDIDATE_SHA" != "$SHA" ]; then
+              echo "::error::candidate_sha=$CANDIDATE_SHA, but this workflow runs at $SHA. The candidate branch moved or the wrong SHA was supplied."
+              exit 1
+            fi
+            if [[ "$REF" != refs/heads/* ]] || [ "$REF_NAME" = "main" ]; then
+              echo "::error::cut_release requires a named non-main release-candidate branch; got $REF."
+              exit 1
+            fi
+            VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+            TAG="v$VERSION"
+            # Same STOP conditions the /release skill enforces, checked here
+            # so a bad dispatch fails in seconds instead of after 40 min of
+            # builds.
+            if ! grep -qF "**Current Version:** $VERSION" CLAUDE.md; then
+              echo "::error::Cargo.toml says $VERSION but CLAUDE.md's Current Version line disagrees — fix the drift before releasing."
+              exit 1
+            fi
+            if gh api "repos/$REPO/git/ref/tags/$TAG" --silent 2>/dev/null; then
+              echo "::error::tag $TAG already exists — the version in Cargo.toml was already released. Land a version bump or use existing_tag to re-publish."
+              exit 1
+            fi
+            if [ -z "$(find changelog.d -maxdepth 1 -type f -name '[0-9]*.md' -print -quit)" ]; then
+              echo "::error::no fragments in changelog.d/ — the release notes are cut from them; nothing to release."
+              exit 1
+            fi
+          elif [ -n "$EXISTING_TAG" ]; then
+            MODE=republish
+            TAG="$EXISTING_TAG"
+            if ! gh release view "$TAG" -R "$REPO" --json tagName >/dev/null; then
+              echo "::error::existing_tag=$TAG has no published GitHub release."
+              exit 1
+            fi
+            git fetch --quiet --force origin "refs/tags/$TAG:refs/tags/$TAG"
+            TAG_CARGO_VERSION=$(git show "$TAG:Cargo.toml" | grep -m1 '^version' | sed -E 's/.*"([^"]+)".*/\1/')
+            if [ "$TAG_CARGO_VERSION" != "${TAG#v}" ]; then
+              echo "::error::Cargo.toml at $TAG reads version $TAG_CARGO_VERSION, but the tag name implies ${TAG#v} — refusing to republish a mistagged version." >&2
+              exit 1
+            fi
+            # Pin every downstream checkout to the tag's exact commit. Without
+            # this, every job checks out whatever ref the dispatch ran on —
+            # if `main` has advanced past the tag, the rebuild silently
+            # compiles a DIFFERENT Cargo.toml version than the tag/release
+            # label says, and npm (which reads the version from Cargo.toml on
+            # disk) publishes that drifted version attributed to this tag.
+            CHECKOUT_REF="$TAG"
+          else
+            MODE=stage
+            TAG=""
+          fi
+          if [ "$MODE" = cut-release ]; then
+            CHECKOUT_REF="$CANDIDATE_SHA"
+          fi
+          if [ "$MODE" = republish ]; then
+            CHECKOUT_SHA=$(git rev-parse "refs/tags/$TAG^{commit}")
+          else
+            CHECKOUT_SHA="$CHECKOUT_REF"
+          fi
+          if [[ ! "$CHECKOUT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::could not resolve the commit to build (checkout-ref=$CHECKOUT_REF)."
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+          {
+            echo "mode=$MODE"
+            echo "tag=$TAG"
+            echo "version=$VERSION"
+            echo "checkout-ref=$CHECKOUT_REF"
+            echo "checkout-sha=$CHECKOUT_SHA"
+          } >> "$GITHUB_OUTPUT"
+          echo "mode=$MODE  tag=${TAG:-<none — stage-only build>}  checkout-ref=$CHECKOUT_REF  checkout-sha=$CHECKOUT_SHA"
+
+  # ---------------------------------------------------------------------------
+  # Gate: wait for Tests + Simulator Tests to pass on this commit before we
+  # publish anything downstream (Homebrew bottle, apt .deb, npm tarballs).
+  # The poll matches ANY successful run on this head SHA, event-agnostic:
+  # on the legacy path the `push: tags: ['v*']` event fires both workflows in
+  # parallel with this run; on the cut-release (tag-last) path there is no tag
+  # yet, so the step below dispatches them on this ref if no run exists.
+  # Fails fast if either workflow failed — npm publish is not reversible.
+  #
+  # Bypassed for republish (assets already shipped once for that tag) and
+  # stage (nothing publishes) — the old workflow_dispatch bypass lever.
+  # ---------------------------------------------------------------------------
+  await-tests:
+    needs: preflight
+    runs-on: ubuntu-latest
+    # Job-level timeout must match the bash `deadline=$(( SECONDS + N * 60 ))`
+    # below. Both must move together.
+    # - v0.5.876: 60 → 90 (Tests had grown past 60 min wall)
+    # - v0.5.883: 90 → 120 (macOS-14 runners queue 30-60+ min during
+    #   busy hours; Tests itself takes ~30 min, but the release pipeline
+    #   starts at the same time as Tests and runs out of budget before
+    #   Tests gets dequeued + executes. 120 absorbs typical runner
+    #   queue + Tests wall-time).
+    timeout-minutes: 120
+    steps:
+      - name: Wait for Tests + Simulator Tests (iOS) to pass
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          REF_NAME: ${{ github.ref_name }}
+          MODE: ${{ needs.preflight.outputs.mode }}
+        run: |
+          set -euo pipefail
+          case "$MODE" in
+            republish|stage|nightly)
+              echo "$MODE mode — bypassing test gate (manual lever)."
+              exit 0
+              ;;
+          esac
+          # ---------------------------------------------------------------
+          # Which SHA must carry the green gate?
+          #
+          # Normally the exact candidate. But `test.yml` does not build the
+          # glibc image, read changelog fragments, or run this workflow, so a
+          # candidate that differs from an already-validated ancestor ONLY in
+          # those files is covered by that ancestor's gate. Re-running a ~5h
+          # tier to re-prove untouched code is pure latency, and this campaign
+          # paid it four times over a Dockerfile.
+          #
+          # Fail-closed by construction:
+          #   * the file list comes from GitHub's compare API, computed from
+          #     the commits themselves — not from any dispatch input;
+          #   * ANY path outside the allowlist keeps the exact-SHA requirement;
+          #   * an EMPTY diff is refused too (it should be impossible here, so
+          #     it means the comparison did not do what we think);
+          #   * `.github/workflows/test.yml` is deliberately NOT allowlisted —
+          #     changing the tier's own definition must re-run the tier.
+          GATE_SHA="$SHA"
+          if [ "$MODE" = "cut-release" ]; then
+            gate_green() {
+              local sha="$1" out rid
+              out=$(gh api "/repos/$REPO/actions/workflows/test.yml/runs?head_sha=$sha&per_page=20" 2>/dev/null) || return 1
+              for rid in $(echo "$out" | jq -r '.workflow_runs[]|select(.status=="completed" and .conclusion=="success")|.id' 2>/dev/null); do
+                jobs=$(gh api --paginate "/repos/$REPO/actions/runs/$rid/jobs?per_page=100" 2>/dev/null) || continue
+                if echo "$jobs" | jq -s -e '[.[].jobs[]] | any(.name=="full-suite-gate" and .conclusion=="success")' >/dev/null; then return 0; fi
+              done
+              return 1
+            }
+            plumbing_only() {
+              # The compare API caps files at 300, even with pagination. At
+              # that boundary completeness is unknown: require the exact SHA.
+              # A rename must also allow its OLD path, or moving code into
+              # changelog.d/ would hide its removal from the tested tree.
+              jq -e --arg base "$2" '
+                def allowed:
+                  type == "string" and
+                  (test("(^/|[\\\\\\r\\n]|(^|/)\\.\\.?(/|$)|//)") | not) and
+                  (test("^changelog[.]d/[^/]+.*$") or
+                   test("^scripts/linux-[^/]+[.]Dockerfile$") or
+                   . == ".github/workflows/release-packages.yml");
+                .status == "ahead" and .behind_by == 0 and
+                .base_commit.sha == $base and .merge_base_commit.sha == $base and
+                (.files | type == "array" and length > 0 and length < 300) and
+                all(.files[];
+                  (.filename | allowed) and
+                  (.status == "added" or .status == "modified" or
+                   .status == "removed" or
+                   (.status == "renamed" and (.previous_filename | allowed))))
+              ' <<< "$1" >/dev/null
+            }
+            if gate_green "$SHA"; then
+              echo "gate: exact SHA $SHA already has a green full-suite-gate."
+            else
+              echo "gate: no green full-tier run on $SHA — checking ancestors."
+              for cand in $(gh api "/repos/$REPO/commits?sha=$SHA&per_page=15" --jq '.[].sha' 2>/dev/null | tail -n +2); do
+                gate_green "$cand" || continue
+                echo "  ancestor $cand has a green full-suite-gate; comparing trees"
+                comparison=$(gh api "/repos/$REPO/compare/$cand...$SHA" 2>/dev/null) || continue
+                if plumbing_only "$comparison" "$cand"; then
+                  echo "    accepted — diff is release-plumbing only:"
+                  jq -r '.files[].filename | "      " + .' <<< "$comparison"
+                  GATE_SHA="$cand"
+                  break
+                fi
+              done
+              [ "$GATE_SHA" = "$SHA" ] && echo "gate: no usable ancestor — requiring a run on $SHA."
+            fi
+          fi
+          echo "gate: validating against $GATE_SHA"
+
+          if [ "$MODE" = "cut-release" ]; then
+            # Tag-last: no tag push fired the gate workflows, so make sure a
+            # run exists on this exact commit — dispatch one if none is there.
+            # Operator pre-flighted runs on the same SHA also satisfy the
+            # poll below (it matches by head SHA, event-agnostic).
+            # NOTE: test.yml's concurrency group is `test-<ref>` with
+            # cancel-in-progress — dispatching on `main` cancels a running
+            # nightly. The /release skill dispatches cut_release runs on a
+            # pinned release/vX.Y.Z branch for exactly that reason.
+            export GITHUB_REPOSITORY="$REPO"
+            for wf_file in "test.yml" "compiler-runtime.yml"; do
+              # Only test.yml may reuse the ancestor. Simulator tests still
+              # run on the candidate, which is where dispatch below runs them.
+              WF_SHA="$SHA"
+              if [ "$wf_file" = "test.yml" ]; then
+                WF_SHA="$GATE_SHA"
+                [ "$GATE_SHA" != "$SHA" ] && continue
+              fi
+              # test.yml: only a FULL-tier run counts (see the poll below), so
+              # look for one of those rather than any run on the SHA -- a
+              # push-to-main sweep on the same commit must not suppress the
+              # dispatch.
+              if [ "$wf_file" = "test.yml" ]; then
+                count=$(gh api \
+                  "/repos/$REPO/actions/workflows/$wf_file/runs?head_sha=$WF_SHA&per_page=20" \
+                  --jq '[.workflow_runs[] | select(.event == "workflow_dispatch" or .event == "schedule" or .event == "push" and (.head_branch | startswith("v")))] | length')
+              else
+                runs_file=$(mktemp)
+                jobs_dir=$(mktemp -d)
+                gh api "/repos/$REPO/actions/workflows/$wf_file/runs?head_sha=$WF_SHA&per_page=20" > "$runs_file"
+                simulator_state=$(python3 scripts/release_gate_runs.py \
+                  --runs "$runs_file" --jobs-dir "$jobs_dir" --sha "$WF_SHA" --fetch-jobs --repo "$REPO")
+                rm -rf "$runs_file" "$jobs_dir"
+                count=1
+                [ "$simulator_state" = "dispatch-needed" ] && count=0
+              fi
+              if [ "$count" = "0" ]; then
+                # workflow_dispatch runs on the ref TIP — if the ref moved past
+                # our SHA, a dispatched run would test the wrong commit and the
+                # poll below would hang for 120 min. Fail fast instead.
+                tip=$(gh api "/repos/$REPO/git/ref/heads/$REF_NAME" --jq '.object.sha')
+                if [ "$tip" != "$SHA" ]; then
+                  echo "::error::$REF_NAME moved to $tip (this run is on $SHA) — re-dispatch on a branch pinned at the release candidate."
+                  exit 1
+                fi
+                echo "No $wf_file run on $WF_SHA yet — dispatching on $REF_NAME."
+                if [ "$wf_file" = "test.yml" ]; then
+                  # The tiered CI workflow: `tier=full` is its dispatch default,
+                  # but say so explicitly -- this is the release gate.
+                  gh workflow run "$wf_file" --ref "$REF_NAME" -R "$REPO" -f tier=full
+                else
+                  gh workflow run "$wf_file" --ref "$REF_NAME" -R "$REPO" -f suite=simctl-tests
+                fi
+              fi
+            done
+          fi
+          echo "Gating release on commit $SHA"
+          # Query by workflow *filename* via `gh api`, not by display name via
+          # `gh run list --workflow`. v0.5.155 shipped the latter and watched
+          # both gate workflows succeed while the poller logged "no run found
+          # yet" for 45 straight minutes — the `gh run list` name→id lookup
+          # silently returned [] in the release-event context, and the
+          # `2>/dev/null || echo '[]'` fallback made it look identical to an
+          # empty page. `gh api /repos/{repo}/actions/workflows/<file>/runs`
+          # skips the lookup, and we no longer swallow gh's stderr — a real
+          # API error now gets one retry then fails the gate loudly instead
+          # of burning the 45-min budget.
+          for wf_file in "test.yml" "compiler-runtime.yml"; do
+            WF_SHA="$SHA"
+            [ "$wf_file" = "test.yml" ] && WF_SHA="$GATE_SHA"
+            echo "::group::Waiting for $wf_file"
+            # 120-min budget per workflow.
+            # - v0.5.876: 60 → 90 (Tests wall-time grew past 60).
+            # - v0.5.883: 90 → 120. v0.5.882 hit 90-min wall because
+            #   macOS-14 runner queue delayed doc-tests start by an
+            #   hour. Tests itself runs ~30 min, but the release pipeline
+            #   starts at tag-time and runs out of budget waiting for
+            #   queue + execution. 120 absorbs typical busy-hour queue.
+            deadline=$(( SECONDS + 120 * 60 ))
+            retry_on_error=1
+            while :; do
+              set +e
+              # `per_page=20` (was 1) — return the LAST 20 runs on this SHA
+              # ordered by created_at desc, then `select(.conclusion ==
+              # "success")` to find the first successful one. Pre-fix
+              # per_page=1 returned only the newest run on the SHA, which
+              # might be in_progress while an older run on the SAME SHA was
+              # already green — the gate hung until timeout. Happened twice
+              # during v0.5.386's release-packages cycle (the main-branch
+              # Tests run was green, but a tag-triggered Tests run on the
+              # same SHA was newer + still running, locking the gate).
+              api_out=$(gh api \
+                "/repos/$REPO/actions/workflows/$wf_file/runs?head_sha=$WF_SHA&per_page=20" \
+                2>&1)
+              rc=$?
+              set -e
+              if [ $rc -ne 0 ]; then
+                echo "  gh api failed (rc=$rc):"
+                echo "$api_out" | sed 's/^/    /'
+                if [ $retry_on_error -gt 0 ]; then
+                  retry_on_error=0
+                  echo "  retrying once after 10s"
+                  sleep 10
+                  continue
+                fi
+                echo "  gh api still failing after retry — failing gate."
+                exit 1
+              fi
+              retry_on_error=1
+              # Look for ANY successful run on this SHA (order-independent).
+              success_url=$(echo "$api_out" | jq -r '.workflow_runs[] | select(.head_sha == "'"$WF_SHA"'") | .html_url' | head -1)
+              # test.yml is tiered (scripts/ci_plan.py): a push-to-main SWEEP
+              # or a PR-tier run on this SHA is green too, but only a FULL-tier
+              # run carries the release-grade suites (parity, compile-smoke,
+              # doc-tests, ...). Its fan-in job is NAMED `full-suite-gate` for
+              # exactly this check: keep only successful runs that have it.
+              if [ "$wf_file" = "compiler-runtime.yml" ]; then
+                runs_file=$(mktemp)
+                jobs_dir=$(mktemp -d)
+                echo "$api_out" > "$runs_file"
+                state=$(python3 scripts/release_gate_runs.py --runs "$runs_file" \
+                  --jobs-dir "$jobs_dir" --sha "$WF_SHA" --fetch-jobs)
+                rm -rf "$runs_file" "$jobs_dir"
+                case "$state" in
+                  success) success_url="simctl-tests / simctl succeeded on $WF_SHA" ;;
+                  failed) fail_url="simctl-tests / simctl failed on $WF_SHA" ;;
+                  pending|absent) success_url="" ;;
+                esac
+              fi
+              if [ "$wf_file" = "test.yml" ] && [ -n "$success_url" ]; then
+                success_url=""
+                for run_id in $(echo "$api_out" | jq -r '.workflow_runs[] | select(.status == "completed" and .conclusion == "success") | .id'); do
+                  jobs=$(gh api --paginate "/repos/$REPO/actions/runs/$run_id/jobs?per_page=100" 2>/dev/null) || continue
+                  if echo "$jobs" | jq -s -e '[.[].jobs[]] | any(.name == "full-suite-gate" and .conclusion == "success")' >/dev/null; then
+                    success_url="https://github.com/$REPO/actions/runs/$run_id"
+                    break
+                  fi
+                done
+                if [ -z "$success_url" ]; then
+                  echo "  test.yml has green run(s) on $SHA but none is a full-tier run (no successful full-suite-gate job) — waiting for the dispatched one"
+                fi
+              fi
+              # Look for any failed/cancelled/timed-out completed run as a
+              # FAIL signal — but only if there's NO successful run for
+              # this SHA. This way a flaky run that someone reran to green
+              # doesn't block the release.
+              if [ "$wf_file" != "compiler-runtime.yml" ]; then
+                fail_url=$(echo "$api_out" | jq -r '.workflow_runs[] | select(.head_sha == "'"$WF_SHA"'" and .status == "completed" and .conclusion != "success") | .html_url' | head -1)
+              fi
+              # Newest run for the "still running" status line.
+              latest_status=$(echo "$api_out" | jq -r '[.workflow_runs[] | select(.head_sha == "'"$WF_SHA"'")][0].status // empty')
+              latest_url=$(echo "$api_out" | jq -r '[.workflow_runs[] | select(.head_sha == "'"$WF_SHA"'")][0].html_url // empty')
+              if [ -n "$success_url" ]; then
+                echo "  OK  $wf_file passed: $success_url"
+                break
+              elif [ -z "$latest_status" ]; then
+                echo "  no run found yet for $wf_file on $SHA — waiting"
+              elif [ "$latest_status" = "completed" ] && [ -n "$fail_url" ]; then
+                echo "  FAIL  $wf_file: every completed run on this SHA failed"
+                echo "        most-recent: $fail_url"
+                exit 1
+              else
+                echo "  $wf_file: latest=$latest_status ($latest_url) — waiting"
+              fi
+              if [ $SECONDS -ge $deadline ]; then
+                echo "  timed out waiting for $wf_file"
+                exit 1
+              fi
+              sleep 30
+            done
+            echo "::endgroup::"
+          done
+          echo "All gate workflows passed — proceeding to build/publish."
+
+  # ---------------------------------------------------------------------------
+  # Warm the x86_64-apple-darwin dependency cache before `build` runs.
+  #
+  # The macOS x86_64 leg must run on an Intel runner: the bare `macos-15` label
+  # is the Arm64 image, whose arm64-only LLVM cannot link an x86_64 binary.
+  # Intel runners are materially slower -- the arm64 leg takes ~3h40m WITH a
+  # warm cache -- and a cold `dist` build there ran to GitHub's hard 6h job
+  # ceiling and was cancelled. A cancelled job SKIPS its post-steps, so
+  # `rust-cache` saved nothing, leaving that leg unable to warm its own cache:
+  # it cannot finish without a cache and cannot cache without finishing.
+  #
+  # This job breaks the loop. Compile with mbx and save completed
+  # content-addressed objects so `build` can reuse dependency work.
+  #
+  # `continue-on-error` is deliberate: this is an optimization, never a gate.
+  # If it fails or times out, `build` runs exactly as it would have.
+  prime-macos-x86_64-cache:
+    needs: [preflight]
+    runs-on: macos-15-intel
+    timeout-minutes: 330
+    continue-on-error: true
+    steps:
+      - name: Checkout repository (inline git)
+        shell: bash
+        env:
+          CHECKOUT_REF: ${{ github.sha }}
+          CHECKOUT_DEPTH: "1"
+          CHECKOUT_TOKEN: ${{ github.token }}
+          CHECKOUT_PERSIST_CREDENTIALS: "true"
+        run: |
+          set -euo pipefail
+          git init
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          auth_header="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$CHECKOUT_TOKEN" | base64 | tr -d '\n')"
+          if [[ "$CHECKOUT_DEPTH" == "0" ]]; then
+            git -c http.https://github.com/.extraheader="$auth_header" fetch --force --tags origin
+            git checkout --force --detach "$CHECKOUT_REF"
+          else
+            git -c http.https://github.com/.extraheader="$auth_header" fetch --no-tags --force --depth "$CHECKOUT_DEPTH" origin "$CHECKOUT_REF"
+            git checkout --force --detach FETCH_HEAD
+          fi
+          if [[ "$CHECKOUT_PERSIST_CREDENTIALS" == "true" ]]; then
+            git config http.https://github.com/.extraheader "$auth_header"
+          fi
+      - name: Install Rust toolchain
+        run: rustup toolchain install nightly-2026-10-04 --profile minimal --target x86_64-apple-darwin
+      - uses: ./.github/actions/perry-mbx-cache
+        with:
+          cache-generation: perry-release-x86_64-apple-darwin
+          save-on-workflow-dispatch: true
+      - uses: ./.github/actions/setup-llvm22
+      # Keep the proven partial-failure cache for this exceptionally slow
+      # Intel leg. mbx's object bundle is saved only after a successful job.
+      - uses: ./.github/actions/perry/Swatinem/rust-cache # v2
+        with:
+          # MUST match the build job's key for this target, or this warms a
+          # cache nothing reads.
+          shared-key: "release-x86_64-apple-darwin"
+          cache-on-failure: true
+          workspaces: |
+            . -> target
+      # Same repair as the build job's eviction step: rust-cache deleted the
+      # mbx build-script shims its restored wrappers exec.
+      - name: Restore mbx build-script shims
+        shell: bash
+        run: |
+          set -euo pipefail
+          mbx_bin=$(command -v mbx)
+          # A wrapper names its shim relative to its own directory
+          # (<dir>/../../../../.mbx-build-script-shims/<id>/mbx).
+          { grep -rlI --include=build_script_build '\.mbx-build-script-shims/' target*/ 2>/dev/null || true; } \
+            | while IFS= read -r wrapper; do
+                rel=$(grep -oE '(\.\./)*\.mbx-build-script-shims/[0-9a-f]+/mbx' "$wrapper" | head -1)
+                [ -n "$rel" ] || continue
+                shim="$(dirname "$wrapper")/$rel"
+                if [ ! -e "$shim" ]; then
+                  mkdir -p "$(dirname "$shim")"
+                  cp "$mbx_bin" "$shim"
+                  echo "restored mbx build-script shim: $shim"
+                fi
+              done
+      - name: Compile dependencies for x86_64-apple-darwin
+        run: mbx build --profile prod --target x86_64-apple-darwin -p perry
+
+  # ---------------------------------------------------------------------------
+  # Build release binaries for all platforms
+  # ---------------------------------------------------------------------------
+  build:
+    # preflight is only in `needs` for its outputs (the update-manifest signing
+    # steps bake the release tag into the signed URL); await-tests is the gate.
+    needs: [preflight, await-tests, prime-macos-x86_64-cache]
+    # `prime-macos-x86_64-cache` is a cache warmer, never a gate, so its result
+    # must not decide whether the release builds. `continue-on-error` keeps a
+    # failure there from failing the RUN, but this is the repository's first
+    # JOB-level use of it and GitHub's `needs` semantics for that case are not
+    # worth a silently skipped release to find out. State the gate explicitly:
+    # await-tests decides, preflight must have produced its outputs, and the
+    # warmer's outcome is deliberately unexamined.
+    if: >-
+      ${{ !cancelled()
+      && needs.preflight.result == 'success'
+      && needs.await-tests.result == 'success' }}
+    strategy:
+      # Don't let one platform's build failure cancel the others (mirrors
+      # build-cross). A broken cross-host target should not strand the
+      # binaries that did build — partial publish beats no publish.
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+            artifact: perry-macos-aarch64
+            old_glibc_image: ""
+          # macos-15-intel, NOT macos-15: the bare label is the Arm64 image
+          # (see actions/runner-images). Building x86_64-apple-darwin there
+          # links brew's arm64-only LLVM, so every LLVM symbol is undefined at
+          # link once the in-process backend became default — the artifact
+          # shipped in v0.5.1220 and has been failing since. LLVM publishes no
+          # x86_64 macOS binary, so a native Intel runner is the only source of
+          # an x86_64 libLLVM.
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            artifact: perry-macos-x86_64
+            old_glibc_image: ""
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            artifact: perry-linux-x86_64
+            old_glibc_image: debian:bullseye-slim@sha256:f313b4bd62667092a59b3a664d7d3ab8b5e65f41675f48e81455a15dc5abe792
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: perry-linux-aarch64
+            old_glibc_image: debian:bullseye-slim@sha256:f313b4bd62667092a59b3a664d7d3ab8b5e65f41675f48e81455a15dc5abe792
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            artifact: perry-linux-x86_64-musl
+            old_glibc_image: ""
+            # Cargo build scripts stay on glibc so bindgen can dlopen the host
+            # libclang (#9382); Alpine supplies only the musl-target LLVM and
+            # static C/C++ archives to the cross-build image.
+            musl_image: alpine:edge
+            musl_glibc_image: debian:bullseye-slim@sha256:f313b4bd62667092a59b3a664d7d3ab8b5e65f41675f48e81455a15dc5abe792
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            artifact: perry-linux-aarch64-musl
+            old_glibc_image: ""
+            # Use the architecture-matched runner so both the GNU Rust host
+            # toolchain and Alpine's harvested musl libraries remain native.
+            musl_image: alpine:edge
+            musl_glibc_image: debian:bullseye-slim@sha256:f313b4bd62667092a59b3a664d7d3ab8b5e65f41675f48e81455a15dc5abe792
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: perry-windows-x86_64
+            old_glibc_image: ""
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            artifact: perry-windows-aarch64
+            old_glibc_image: ""
+
+    runs-on: ${{ matrix.os }}
+    env:
+      # Public, rotation-capable CLI update keyring baked into every release.
+      # It is intentionally a repository variable (not fetched at runtime).
+      PERRY_CLI_UPDATE_PUBLIC_KEYS: ${{ vars.PERRY_CLI_UPDATE_PUBLIC_KEYS }}
+      # Pin the macOS deployment target so bottle object files carry a
+      # stable LC_VERSION_MIN / LC_BUILD_VERSION tag regardless of which
+      # GitHub runner OS built them. Otherwise users linking against the
+      # bottle on macOS 14 see `ld: warning: ... was built for newer 'macOS'
+      # version (15.x) than being linked (14.x)` across every stdlib .o.
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+    steps:
+      - name: Checkout repository (inline git)
+        shell: bash
+        env:
+          CHECKOUT_REF: ${{ needs.preflight.outputs.checkout-ref }}
+          EXPECTED_SHA: ${{ needs.preflight.outputs.checkout-sha }}
+          CHECKOUT_DEPTH: "1"
+          CHECKOUT_TOKEN: ${{ github.token }}
+          CHECKOUT_PERSIST_CREDENTIALS: "true"
+        run: |
+          set -euo pipefail
+          git init
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          auth_header="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$CHECKOUT_TOKEN" | base64 | tr -d '\n')"
+          if [[ "$CHECKOUT_DEPTH" == "0" ]]; then
+            git -c http.https://github.com/.extraheader="$auth_header" fetch --force --tags origin
+            git checkout --force --detach "$CHECKOUT_REF"
+          else
+            git -c http.https://github.com/.extraheader="$auth_header" fetch --no-tags --force --depth "$CHECKOUT_DEPTH" origin "$CHECKOUT_REF"
+            git checkout --force --detach FETCH_HEAD
+          fi
+          # Build exactly the commit preflight resolved, or nothing.
+          : "${EXPECTED_SHA:?preflight resolved no checkout-sha}"
+          built=$(git rev-parse HEAD)
+          echo "built tree: $built  expected: $EXPECTED_SHA  (ref: $CHECKOUT_REF)"
+          if [ "$built" != "$EXPECTED_SHA" ]; then
+            echo "::error::checked out $built, not $EXPECTED_SHA — refusing to build or publish a different commit."
+            exit 1
+          fi
+          if [[ "$CHECKOUT_PERSIST_CREDENTIALS" == "true" ]]; then
+            git config http.https://github.com/.extraheader "$auth_header"
+          fi
+      - name: Install Rust toolchain
+        run: rustup toolchain install nightly-2026-10-04 --profile minimal --target ${{ matrix.target }}
+      # The old-sysroot image carries LLVM 22 under /usr/lib/llvm-22.
+      # Its host-side GTK4 build does not depend on perry-codegen, so avoid
+      # installing a second LLVM copy on the noble runner for these two legs.
+      - uses: ./.github/actions/setup-llvm22
+        if: matrix.old_glibc_image == '' && matrix.musl_image == ''
+
+      # Preserve the current third-party dependency cache during the mbx
+      # rollout. Workspace fingerprints are evicted below for #4856 safety.
+      - uses: ./.github/actions/perry/Swatinem/rust-cache # v2
+        with:
+          shared-key: "release-${{ matrix.target }}"
+          workspaces: |
+            . -> target
+            . -> target-glibc231
+            . -> target-glibc231-abort
+            . -> target-musl
+            . -> target-musl-abort
+
+      # Content-addressed object caches are separated by target so concurrent
+      # matrix legs do not race to save the same immutable cache entry.
+      - uses: ./.github/actions/perry-mbx-cache
+        with:
+          cache-generation: perry-release-${{ matrix.target }}
+          save-on-workflow-dispatch: true
+
+      # Cached workspace fingerprints once allowed stale runtime archives to
+      # ship (#4856). Keep the established eviction while using mbx objects.
+      - name: Evict workspace crates from restored cache (#4856)
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r pkg; do
+            rm -rf target/prod/.fingerprint/"$pkg"-* \
+                   target/*/prod/.fingerprint/"$pkg"-* \
+                   target-glibc231/prod/.fingerprint/"$pkg"-* \
+                   target-glibc231/*/prod/.fingerprint/"$pkg"-* \
+                   target-glibc231-abort/prod/.fingerprint/"$pkg"-* \
+                   target-glibc231-abort/*/prod/.fingerprint/"$pkg"-* \
+                   target-musl/prod/.fingerprint/"$pkg"-* \
+                   target-musl/*/prod/.fingerprint/"$pkg"-* \
+                   target-musl-abort/prod/.fingerprint/"$pkg"-* \
+                   target-musl-abort/*/prod/.fingerprint/"$pkg"-*
+          done < <(cargo metadata --no-deps --format-version 1 | jq -r '.packages[].name')
+          # rust-cache's target cleanup deletes mbx's per-file build-script
+          # shims (target/.mbx-build-script-shims/<id>/mbx) but keeps the
+          # wrappers that exec them; cargo then finds those build scripts
+          # fresh and mbx never recreates the shim (psm: exit 126). Put the
+          # pinned mbx back at every shim path a restored wrapper names.
+          mbx_bin=$(command -v mbx)
+          # A wrapper names its shim relative to its own directory
+          # (<dir>/../../../../.mbx-build-script-shims/<id>/mbx).
+          { grep -rlI --include=build_script_build '\.mbx-build-script-shims/' target*/ 2>/dev/null || true; } \
+            | while IFS= read -r wrapper; do
+                rel=$(grep -oE '(\.\./)*\.mbx-build-script-shims/[0-9a-f]+/mbx' "$wrapper" | head -1)
+                [ -n "$rel" ] || continue
+                shim="$(dirname "$wrapper")/$rel"
+                if [ ! -e "$shim" ]; then
+                  mkdir -p "$(dirname "$shim")"
+                  cp "$mbx_bin" "$shim"
+                  echo "restored mbx build-script shim: $shim"
+                fi
+              done
+
+      # Closes #394: Homebrew bottle was missing libperry_ui_ios.a so
+      # `perry compile foo.ts -o app --target ios[-simulator]` failed at link
+      # with `perry/ui imported but libperry_ui_ios.a not found`. Both macOS
+      # legs of the matrix now also cross-compile perry-runtime / perry-stdlib
+      # / perry-ui-ios for BOTH the iOS device and simulator triples and ship
+      # the resulting .a files alongside the host artifacts. Device libs use
+      # the canonical _ios suffix (`libperry_ui_ios.a`); simulator libs use
+      # `_ios_sim` (`libperry_ui_ios_sim.a`) so they don't collide in the
+      # bottle's flat lib dir. library_search.rs's cross-compile branch
+      # picks the right variant per --target. tvOS/visionOS/watchOS
+      # (Rust Tier-3, needed -Zbuild-std) are no longer built here — that
+      # unstable-cargo-feature build is dropped entirely, independent of
+      # which channel the toolchain step above pins.
+      - name: Install iOS Rust targets (macOS)
+        if: runner.os == 'macOS'
+        run: rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+
+      - name: Install GTK4 development libraries (Linux glibc)
+        if: runner.os == 'Linux' && !endsWith(matrix.target, '-musl')
+        # libgstreamer1.0-dev added in v0.5.456 — perry-ui-gtk4 pulls in
+        # gstreamer-sys via the perry/media (#351, v0.5.440) GTK4 backend
+        # for streaming audio playback. Mirrors the doc-tests-gtk4 fix
+        # from v0.5.441 (commit a535a984).
+        # libunwind-dev added in v0.5.461 — on ubuntu-22.04 (jammy)
+        # libgstreamer1.0-dev hard-depends on libunwind-dev which is held
+        # back in the runner image, so apt-get install fails with "Unable
+        # to correct problems" unless libunwind-dev is named explicitly.
+        # ubuntu-24.04-arm doesn't have this issue but the explicit name
+        # is harmless there.
+        # libwebkitgtk-6.0-dev + libshumate-dev added v0.5.855 — perry-ui-gtk4
+        # builds (via the workflow's `-p perry-ui-gtk4` step) pull in webkit6
+        # (which transitively needs javascriptcoregtk-6.0.pc + webkitgtk-6.0.pc
+        # + libsoup-3.0.pc) and libshumate-sys (#517 MapView). Mirrors the
+        # apt step in test.yml's doc-tests-gtk4 job.
+        run: |
+          # See test.yml: a broken third-party index (Chrome) fails
+          # `apt-get update` for everyone. Drop those sources by CONTENT
+          # (deb822 `.sources` now, not `.list`) and let the install gate.
+          if _bad=$(sudo grep -rlE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/ 2>/dev/null); then
+            printf '%s\n' "$_bad" | sudo xargs -r rm -f
+          fi
+          sudo apt-get update || echo "::warning::apt-get update reported errors; the install below is the real gate"
+          sudo apt-get install -y libgtk-4-dev libunwind-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libwebkitgtk-6.0-dev libshumate-dev
+
+      - name: Install musl tools (Linux musl)
+        if: endsWith(matrix.target, '-musl') && matrix.musl_image == ''
+        run: |
+          # See test.yml: a broken third-party index (Chrome) fails
+          # `apt-get update` for everyone. Drop those sources by CONTENT
+          # (deb822 `.sources` now, not `.list`) and let the install gate.
+          if _bad=$(sudo grep -rlE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/ 2>/dev/null); then
+            printf '%s\n' "$_bad" | sudo xargs -r rm -f
+          fi
+          sudo apt-get update || echo "::warning::apt-get update reported errors; the install below is the real gate"
+          sudo apt-get install -y musl-tools
+
+      - name: Build perry
+        # Build only the CLI crate; the runtime libraries are built in
+        # the next step. (Perry is V8-free — the former perry-jsruntime
+        # crate, which downloaded a prebuilt V8 that 404'd on musl, was
+        # removed.)
+        if: matrix.old_glibc_image == '' && matrix.musl_image == ''
+        run: ${{ runner.os == 'Windows' && 'cargo' || 'mbx' }} build --profile prod --target ${{ matrix.target }} -p perry
+
+      - name: Build runtime libraries
+        if: matrix.old_glibc_image == '' && matrix.musl_image == ''
+        run: |
+          ${{ runner.os == 'Windows' && 'cargo' || 'mbx' }} build --profile prod --target ${{ matrix.target }} -p perry-runtime -p perry-runtime-static
+          ${{ runner.os == 'Windows' && 'cargo' || 'mbx' }} build --profile prod --target ${{ matrix.target }} -p perry-stdlib -p perry-stdlib-static
+          # The WebAssembly host archive, co-built with the archives it links
+          # beside: perry links it for a WebAssembly program and never builds
+          # it while compiling one.
+          ${{ runner.os == 'Windows' && 'cargo' || 'mbx' }} build --profile prod --target ${{ matrix.target }} -p perry -p perry-runtime-static -p perry-stdlib-static -p perry-wasm-host
+
+      - name: Build panic=abort runtime variant (Unix)
+        # Out-of-tree installs can't rebuild the runtime, so ship the
+        # panic=abort profile prebuilt: `perry compile` links it for
+        # runtime-only apps with no catch_unwind callers (games, CLIs),
+        # dropping unwind tables/landing pads (~12-18% of the binary).
+        # See optimized_libs.rs (find_runtime_abort_library selection).
+        # Separate CARGO_TARGET_DIR so the profile override doesn't
+        # invalidate the main build's incremental cache.
+        if: runner.os != 'Windows' && matrix.old_glibc_image == '' && matrix.musl_image == ''
+        run: |
+          CARGO_TARGET_DIR=target-abort CARGO_PROFILE_PROD_PANIC=abort \
+            mbx build --profile prod --target ${{ matrix.target }} -p perry-runtime -p perry-runtime-static
+          cp "target-abort/${{ matrix.target }}/prod/libperry_runtime.a" \
+             "target/${{ matrix.target }}/prod/libperry_runtime_abort.a"
+
+      - name: Build native ext libraries (Unix)
+        # #2532 — the perry-ext-* wrapper crates ship the host functions for
+        # node:http (server), ws, net, zlib, fastify, the db drivers, etc.
+        # They are NOT dependencies of perry-stdlib, so `cargo build -p
+        # perry-stdlib` above does not produce them. An out-of-tree install
+        # needs the prebuilt `libperry_ext_*.a` sitting next to
+        # libperry_runtime.a so `perry compile` can link them without a
+        # workspace checkout (see optimized_libs.rs::resolve_prebuilt_ext_libs).
+        # #7358: keep the compiler and both shipped wrapper archives in each
+        # Cargo invocation. Building an ext staticlib alone gives its bundled
+        # runtime/shared dependencies a different feature union from stdlib;
+        # the link deduper then cannot remove the whole second copy, and the
+        # HTTP accept loop reads a different async reactor from the one the JS
+        # event loop drives.
+        # #5716: the governance inventory is the explicit shipping set; adding
+        # a crate requires a recorded retain/migration decision. Best-effort
+        # per crate: a wrapper that can't build on this host must not fail the
+        # whole release — packaging below ships whatever was produced.
+        if: runner.os != 'Windows' && matrix.old_glibc_image == '' && matrix.musl_image == ''
+        run: |
+          set -euo pipefail
+          governed_ext_packages=$(./scripts/release_ext_packages.sh)
+          while IFS= read -r name; do
+            echo "::group::build $name"
+            mbx build --profile prod --target ${{ matrix.target }} \
+              -p perry -p perry-runtime-static -p perry-stdlib-static -p perry-wasm-host -p "$name" \
+              || echo "  (skipped $name — failed to build on this host)"
+            echo "::endgroup::"
+          done <<< "$governed_ext_packages"
+
+      # #6351: only GTK4 needs noble. Build the compiler, runtime, stdlib and
+      # extension archives in a Debian 11 container so their ABI floor is
+      # glibc 2.31, then let the ordinary host step below add GTK4 to the same
+      # package. apt.llvm.org still publishes LLVM 22 for this sysroot, keeping
+      # the now-default in-process backend enabled.
+      - name: Build Linux GNU core artifacts on glibc 2.31
+        if: matrix.old_glibc_image != ''
+        # A hung container build fails here, not at the 6 h job limit.
+        timeout-minutes: 150
+        env:
+          OLD_GLIBC_IMAGE: ${{ matrix.old_glibc_image }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          docker build \
+            --build-arg "OLD_GLIBC_IMAGE=$OLD_GLIBC_IMAGE" \
+            --tag perry-glibc-2.31-llvm22 \
+            --file scripts/linux-glibc-2.31.Dockerfile \
+            .
+          # build_linux_*.sh build with mbx, which perry-mbx-cache installed on
+          # the runner (a static musl binary): hand the container that binary.
+          # Its object store stays inside the container: the runner's store
+          # carries the host session's settings (links, GC, export group) and
+          # gave the containers no hits. In the glibc container mbx's
+          # build-script shim for llvm-sys spun at 100% CPU for the whole
+          # 150 minutes (watchdog, run 39129046553; earlier runs hung until
+          # the job limit), so the containers run build scripts directly and
+          # without mbx's scheduler.
+          mbx_bin=$(command -v mbx)
+          # If the build is still running after 100 min, log what the
+          # container's processes are doing (every 20 min after that).
+          (
+            sleep 6000
+            while :; do
+              echo "::warning::container build still running; process table:"
+              docker top perry-glibc-build -eo pid,ppid,etime,time,stat,wchan:24,rss,args || true
+              sleep 1200
+            done
+          ) &
+          watchdog=$!
+          trap 'kill "$watchdog" 2>/dev/null || true' EXIT
+          docker run --rm \
+            --name perry-glibc-build \
+            --user "$(id -u):$(id -g)" \
+            --env HOME=/tmp/perry-home \
+            --env CARGO_HOME=/tmp/cargo-home \
+            --env RUSTUP_HOME=/tmp/rustup-home \
+            --env LLVM_SYS_221_PREFIX=/usr/lib/llvm-22 \
+            --env CARGO_TARGET_DIR=/work/target-glibc231 \
+            --env PERRY_ABORT_TARGET_DIR=/work/target-glibc231-abort \
+            --env PERRY_CLI_UPDATE_PUBLIC_KEYS \
+            --volume "$HOME/.cargo:/tmp/cargo-home" \
+            --volume "$HOME/.rustup:/tmp/rustup-home" \
+            --volume "$mbx_bin:/usr/local/bin/mbx:ro" \
+            --env MBX_CACHE_DIR=/tmp/mbx-cache \
+            --env MBX_BUILD_SCRIPT_EXECUTION=false \
+            --env MBX_SCHEDULER=false \
+            --volume "$GITHUB_WORKSPACE:/work" \
+            --workdir /work \
+            perry-glibc-2.31-llvm22 \
+            bash scripts/build_linux_glibc_2_31.sh "$TARGET"
+
+          # Keep old-sysroot objects isolated from the noble GTK4 build. Only
+          # the outputs release packaging consumes cross that boundary.
+          src="target-glibc231/$TARGET/prod"
+          dst="target/$TARGET/prod"
+          mkdir -p "$dst"
+          for artifact in perry libperry_runtime.a libperry_runtime_abort.a libperry_stdlib.a \
+              libperry_runtime.a.gc-effects libperry_runtime_abort.a.gc-effects; do
+            test -s "$src/$artifact"
+            cp "$src/$artifact" "$dst/$artifact"
+          done
+          for archive in "$src"/libperry_ext_*.a "$src"/libperry_wasm_host.a; do
+            [ -f "$archive" ] && cp "$archive" "$dst/"
+          done
+
+      # Perry needs a musl-BUILT LLVM, but bindgen needs a dynamically linked
+      # build script so it can dlopen libclang (#9382). The image harvests LLVM
+      # and static target libraries from Alpine, then cross-builds from glibc
+      # with the runner's pinned GNU-host Rust toolchain.
+      - name: Build Linux musl core artifacts from a glibc host
+        if: matrix.musl_image != ''
+        # A hung container build fails here, not at the 6 h job limit.
+        timeout-minutes: 150
+        env:
+          MUSL_IMAGE: ${{ matrix.musl_image }}
+          MUSL_GLIBC_IMAGE: ${{ matrix.musl_glibc_image }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          docker build \
+            --build-arg "ALPINE_IMAGE=$MUSL_IMAGE" \
+            --build-arg "GLIBC_IMAGE=$MUSL_GLIBC_IMAGE" \
+            --tag perry-musl-llvm22 \
+            --file scripts/linux-musl-llvm22.Dockerfile \
+            .
+          # build_linux_*.sh build with mbx, which perry-mbx-cache installed on
+          # the runner (a static musl binary): hand the container that binary.
+          # Its object store stays inside the container: the runner's store
+          # carries the host session's settings (links, GC, export group) and
+          # gave the containers no hits. In the glibc container mbx's
+          # build-script shim for llvm-sys spun at 100% CPU for the whole
+          # 150 minutes (watchdog, run 39129046553; earlier runs hung until
+          # the job limit), so the containers run build scripts directly and
+          # without mbx's scheduler.
+          mbx_bin=$(command -v mbx)
+          # If the build is still running after 100 min, log what the
+          # container's processes are doing (every 20 min after that).
+          (
+            sleep 6000
+            while :; do
+              echo "::warning::container build still running; process table:"
+              docker top perry-musl-build -eo pid,ppid,etime,time,stat,wchan:24,rss,args || true
+              sleep 1200
+            done
+          ) &
+          watchdog=$!
+          trap 'kill "$watchdog" 2>/dev/null || true' EXIT
+          docker run --rm \
+            --name perry-musl-build \
+            --user "$(id -u):$(id -g)" \
+            --env HOME=/tmp/perry-home \
+            --env CARGO_HOME=/tmp/cargo-home \
+            --env RUSTUP_HOME=/tmp/rustup-home \
+            --env CARGO_TARGET_DIR=/work/target-musl \
+            --env PERRY_ABORT_TARGET_DIR=/work/target-musl-abort \
+            --env PERRY_CLI_UPDATE_PUBLIC_KEYS \
+            --volume "$HOME/.cargo:/tmp/cargo-home" \
+            --volume "$HOME/.rustup:/tmp/rustup-home" \
+            --volume "$mbx_bin:/usr/local/bin/mbx:ro" \
+            --env MBX_CACHE_DIR=/tmp/mbx-cache \
+            --env MBX_BUILD_SCRIPT_EXECUTION=false \
+            --env MBX_SCHEDULER=false \
+            --volume "$GITHUB_WORKSPACE:/work" \
+            --workdir /work \
+            perry-musl-llvm22 \
+            bash scripts/build_linux_musl.sh "$TARGET"
+
+          # Same boundary as the old-sysroot leg: only the artifacts packaging
+          # consumes cross back into target/.
+          src="target-musl/$TARGET/prod"
+          dst="target/$TARGET/prod"
+          mkdir -p "$dst"
+          for artifact in perry libperry_runtime.a libperry_runtime_abort.a libperry_stdlib.a \
+              libperry_runtime.a.gc-effects libperry_runtime_abort.a.gc-effects \
+              libperry_wasm_host.a; do
+            test -s "$src/$artifact"
+            cp "$src/$artifact" "$dst/$artifact"
+          done
+
+      - name: Build UI library (macOS)
+        if: runner.os == 'macOS'
+        run: mbx build --profile prod --target ${{ matrix.target }} -p perry-ui-macos
+
+      # Closes #394: cross-compile the runtime + stdlib + UI for both the
+      # iOS device and simulator triples (both Tier-2 stable). Library
+      # filenames are disambiguated in the staging step — device libs keep
+      # the canonical `_ios` name, simulator libs get a `_sim` variant
+      # suffix so the bottle can ship both side-by-side. tvOS/visionOS/
+      # watchOS (Rust Tier-3, needed -Zbuild-std) are no longer built —
+      # that unstable-cargo-feature build is dropped entirely.
+      - name: Build iOS cross-compile libraries (macOS)
+        # Only on the arm64 mac job. These iOS/Apple cross-libs are aarch64 and
+        # identical regardless of host, so building them on the x86_64 mac runner
+        # is redundant — and the macos-15 x86_64 runner fails `libsqlite3-sys`
+        # bindgen on the iOS target (libclang/SDK env). The macOS staging step
+        # copies these libs only `if [ -f ]`, so the x86_64 bottle degrades
+        # gracefully; the arm64 bottle + the build-cross tarballs still ship them.
+        if: runner.os == 'macOS' && matrix.target == 'aarch64-apple-darwin'
+        run: |
+          for triple in aarch64-apple-ios aarch64-apple-ios-sim; do
+            mbx build --profile prod --target "$triple" -p perry-runtime -p perry-runtime-static
+            mbx build --profile prod --target "$triple" -p perry-stdlib -p perry-stdlib-static
+            mbx build --profile prod --target "$triple" -p perry-ui-ios
+          done
+
+      - name: Build UI library (Linux glibc)
+        if: runner.os == 'Linux' && !endsWith(matrix.target, '-musl')
+        run: mbx build --profile prod --target ${{ matrix.target }} -p perry-ui-gtk4
+
+      - name: Build UI library (Windows)
+        if: runner.os == 'Windows'
+        run: ${{ runner.os == 'Windows' && 'cargo' || 'mbx' }} build --profile prod --target ${{ matrix.target }} -p perry-ui-windows
+
+      # Closes #872 / #4823: cross-compile the Android runtime libs (and the
+      # perry-ui-android UI backend) on the Windows leg so the WinGet zip
+      # includes `libperry_runtime.a` / `libperry_stdlib.a` /
+      # `libperry_ui_android.a` for `aarch64-linux-android`. Without the
+      # runtime libs, `perry compile --target android` from a WinGet-installed
+      # perry bails with "Could not find libperry_runtime.a"; without the UI
+      # lib, any app importing `perry/ui` bails with "libperry_ui_android.a
+      # not found" (#4823).
+      # GitHub-hosted Windows runners pre-install the Android NDK at
+      # `%ANDROID_NDK_HOME%`; we point cargo at its `aarch64-linux-android-*`
+      # clang as the cross-linker.
+      # X64 only: the step below resolves the NDK toolchain under
+      # `prebuilt/windows-x86_64`, and the NDK ships no Windows-arm64 host
+      # toolchain, so `windows-11-arm` cannot run it. It also has no NDK
+      # installed, which is how this surfaced — the leg failed with
+      # "ANDROID_NDK_HOME not set" and blocked `create-release`, which requires
+      # every matrix leg to succeed. The same library is already produced by
+      # the `aarch64-linux-android` build-cross leg on Linux.
+      - name: Install aarch64-linux-android Rust target (Windows)
+        if: runner.os == 'Windows' && runner.arch == 'X64'
+        shell: pwsh
+        run: rustup target add aarch64-linux-android
+      - name: Build Android cross-compile libraries (Windows)
+        if: runner.os == 'Windows' && runner.arch == 'X64'
+        shell: pwsh
+        env:
+          # API level 24 matches every other Android leg we cross-build for
+          # elsewhere (perry-ui-android's build.rs assumes the same NDK
+          # surface).
+          ANDROID_API_LEVEL: "24"
+        run: |
+          if (-not $env:ANDROID_NDK_HOME) {
+            $env:ANDROID_NDK_HOME = $env:ANDROID_NDK_LATEST_HOME
+          }
+          if (-not $env:ANDROID_NDK_HOME) {
+            Write-Error "ANDROID_NDK_HOME not set on this Windows runner — needed for #872 android cross-build."
+            exit 1
+          }
+          $toolchain = Join-Path $env:ANDROID_NDK_HOME "toolchains/llvm/prebuilt/windows-x86_64/bin"
+          $linker = Join-Path $toolchain "aarch64-linux-android$($env:ANDROID_API_LEVEL)-clang.cmd"
+          if (-not (Test-Path $linker)) {
+            $linker = Join-Path $toolchain "aarch64-linux-android$($env:ANDROID_API_LEVEL)-clang.exe"
+          }
+          if (-not (Test-Path $linker)) {
+            Write-Error "Android NDK linker not found at $linker — NDK layout drifted; update the version-suffixed path."
+            exit 1
+          }
+          # perry-ui-android pulls in perry-audio-miniaudio (C) and aws-lc-rs
+          # (via tungstenite/rustls), so the C++ wrapper must be wired too.
+          $linkerxx = Join-Path $toolchain "aarch64-linux-android$($env:ANDROID_API_LEVEL)-clang++.cmd"
+          if (-not (Test-Path $linkerxx)) {
+            $linkerxx = Join-Path $toolchain "aarch64-linux-android$($env:ANDROID_API_LEVEL)-clang++.exe"
+          }
+          $env:CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER = $linker
+          # perry-stdlib's crypto feature builds vendored OpenSSL, whose
+          # Unix-target Configure needs a perl with Unix paths (not
+          # Strawberry's) and whose build runs `make` recipes under sh. Take
+          # both from MSYS2, first on PATH: Git's stripped perl (no
+          # Pod::Usage) must not answer the recipes' `perl`. rustc and cc-rs
+          # find MSVC's link.exe through Visual Studio, not PATH.
+          # sh cannot run the NDK's .cmd wrappers or backslash paths, so the C
+          # tools are the NDK's clang/llvm executables by forward-slash path;
+          # the API level comes from the --target flags below.
+          $msys = "C:\msys64\usr\bin"
+          if (-not (Test-Path (Join-Path $msys "bash.exe"))) {
+            Write-Error "::error::MSYS2 not found at C:\msys64 (vendored OpenSSL needs its perl and make)"
+            exit 1
+          }
+          & (Join-Path $msys "bash.exe") -lc "pacman -S --noconfirm --needed make perl"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:PATH = "$msys;$env:PATH"
+          $env:OPENSSL_SRC_PERL = Join-Path $msys "perl.exe"
+          & $env:OPENSSL_SRC_PERL -MPod::Usage -MLocale::Maketext::Simple -e 1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "::error::MSYS2 perl lacks a module OpenSSL's build needs"
+            exit 1
+          }
+          Write-Host "OpenSSL perl: $env:OPENSSL_SRC_PERL (Pod::Usage, Locale::Maketext::Simple present)"
+          $tools = $toolchain -replace '\\', '/'
+          $env:CC_aarch64_linux_android = "$tools/clang.exe"
+          $env:CXX_aarch64_linux_android = "$tools/clang++.exe"
+          $env:AR_aarch64_linux_android = "$tools/llvm-ar.exe"
+          $env:RANLIB_aarch64_linux_android = "$tools/llvm-ranlib.exe"
+          # As on the Linux Android legs: CMake's Android support compiles with
+          # the NDK's bare clang (API 21), and cc-rs' `--target=<triple>` (no
+          # API) overrides the wrapper's level. Name the API last.
+          $env:CFLAGS_aarch64_linux_android = "--target=aarch64-linux-android$($env:ANDROID_API_LEVEL)"
+          $env:CXXFLAGS_aarch64_linux_android = "--target=aarch64-linux-android$($env:ANDROID_API_LEVEL)"
+          # CMake defaults to the Visual Studio generator on Windows, which
+          # cannot configure an Android target (libz-ng-sys: MSBuild fails to
+          # get VCTargetsPath). Use Ninja: on PATH, else Visual Studio's copy.
+          $ninja = (Get-Command ninja -ErrorAction SilentlyContinue).Source
+          if (-not $ninja) {
+            $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio/Installer/vswhere.exe"
+            $vs = & $vswhere -latest -products * -property installationPath
+            $candidate = Join-Path $vs "Common7/IDE/CommonExtensions/Microsoft/CMake/Ninja/ninja.exe"
+            if (Test-Path $candidate) { $ninja = $candidate }
+          }
+          if (-not $ninja) {
+            choco install ninja -y --no-progress
+            $ninja = (Get-Command ninja -ErrorAction SilentlyContinue).Source
+          }
+          if (-not $ninja) {
+            Write-Error "::error::no ninja for the Android CMake builds"
+            exit 1
+          }
+          $env:PATH = "$(Split-Path $ninja);$env:PATH"
+          $env:CMAKE_GENERATOR_aarch64_linux_android = "Ninja"
+          Write-Host "Android CMake generator: Ninja ($ninja)"
+          # pwsh has no `set -e`; these two are mandatory, so fail the step on a
+          # non-zero exit (otherwise the best-effort UI build below, which resets
+          # $LASTEXITCODE, could mask a runtime/stdlib failure).
+          cargo build --profile prod --target aarch64-linux-android -p perry-runtime -p perry-runtime-static
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build --profile prod --target aarch64-linux-android -p perry-stdlib -p perry-stdlib-static
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # #4823 (option 1): the Android UI backend so a WinGet/Scoop-installed
+          # perry can link `perry/ui` apps for android without a source tree.
+          # This is mandatory for every Windows archive: matrix legs package
+          # independently, so another leg cannot backfill a missing library.
+          # Mirrors the ubuntu cross-bundle leg: `--profile prod` build for the
+          # staticlib (UI crates are already staticlib — no -static wrapper); the
+          # global-dynamic TLS rustflag only matters at the consumer's final
+          # cdylib link, not here.
+          cargo build --profile prod --target aarch64-linux-android -p perry-ui-android
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # #4856 — defense in depth behind the cache eviction above: assert
+      # every runtime archive this leg built (host triple + any Apple/
+      # Android cross triples) defines the sentinel #[no_mangle] symbols.
+      # A stale cached archive fails the release here instead of breaking
+      # consumer links with `undefined symbol: _perry_macos_bundle_chdir`.
+      # GC effects sidecars (design 4.3): one `<archive>.gc-effects` beside
+      # every runtime archive (default, _abort, iOS, Android, ...),
+      # computed over the exact bytes staged below and after the last cargo
+      # call. The rules the analyzer enforces make this the release gate for
+      # the effects tables. The glibc 2.31 and musl legs run the same script
+      # inside their containers (build_linux_*.sh) and copy the results out.
+      - name: Write GC effects sidecars
+        if: matrix.old_glibc_image == '' && matrix.musl_image == ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            # The analyzer imports LLVM-C.dll.
+            export PATH="$(cygpath -u "$LLVM_SYS_221_PREFIX")/bin:$PATH"
+          fi
+          # mbx makes target/ a symlink into its store: -H follows it.
+          dirs=$(find -H target \( -path "*/prod/libperry_runtime.a" -o -path "*/prod/perry_runtime.lib" \) -exec dirname {} \; | sort -u)
+          if [ -z "$dirs" ]; then
+            echo "::error::no built runtime archives found under target/ -- nothing to analyze"
+            exit 1
+          fi
+          for dir in $dirs; do
+            echo "::group::sidecars $dir"
+            time ./scripts/gc_call_effects/sidecars.sh "$dir"
+            echo "::endgroup::"
+          done
+
+      - name: Verify runtime archives are fresh (#4856)
+        shell: bash
+        run: |
+          set -euo pipefail
+          libs=$(find -H target -path "*/prod/libperry_runtime.a" -o -path "*/prod/perry_runtime.lib")
+          if [ -z "$libs" ]; then
+            echo "::error::no built runtime archives found under target/ — nothing to verify"
+            exit 1
+          fi
+          # shellcheck disable=SC2086
+          ./scripts/check_runtime_symbols.sh $libs
+
+      - name: Package release archive (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p staging
+          cp target/${{ matrix.target }}/prod/perry staging/
+          # Include static libraries for linking (runtime, stdlib, UI)
+          for lib in libperry_runtime.a libperry_runtime_abort.a libperry_stdlib.a libperry_wasm_host.a libperry_ui_macos.a libperry_ui_gtk4.a; do
+            if [ -f "target/${{ matrix.target }}/prod/$lib" ]; then
+              cp "target/${{ matrix.target }}/prod/$lib" staging/
+              # The GC effects sidecar travels beside its runtime archive.
+              case "$lib" in
+                libperry_runtime*) cp "target/${{ matrix.target }}/prod/$lib.gc-effects" staging/ ;;
+              esac
+            fi
+          done
+          # #2532 — ship the perry-ext-* staticlibs so an out-of-tree install
+          # can link node:http server / ws / net / zlib / fastify / db
+          # drivers without the workspace source. `perry compile` finds them
+          # via the same exe-dir / PERRY_LIB_DIR search as the runtime/stdlib
+          # libs (optimized_libs.rs::resolve_prebuilt_ext_libs).
+          for lib in target/${{ matrix.target }}/prod/libperry_ext_*.a; do
+            [ -f "$lib" ] && cp "$lib" staging/
+          done
+          # Closes #394: macOS legs also ship iOS-cross-compiled libs.
+          # Device variant uses the canonical `_ios` suffix; simulator
+          # variant gets a `_sim` suffix so both can coexist in the
+          # bottle's flat lib dir. library_search.rs's cross-compile
+          # branch composes the right name based on --target.
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            dev_dir="target/aarch64-apple-ios/prod"
+            if [ -f "$dev_dir/libperry_runtime.a" ]; then
+              cp "$dev_dir/libperry_runtime.a" "staging/libperry_runtime_ios.a"
+              cp "$dev_dir/libperry_runtime.a.gc-effects" "staging/libperry_runtime_ios.a.gc-effects"
+            fi
+            if [ -f "$dev_dir/libperry_stdlib.a" ]; then
+              cp "$dev_dir/libperry_stdlib.a" "staging/libperry_stdlib_ios.a"
+            fi
+            if [ -f "$dev_dir/libperry_ui_ios.a" ]; then
+              cp "$dev_dir/libperry_ui_ios.a" "staging/libperry_ui_ios.a"
+            fi
+            sim_dir="target/aarch64-apple-ios-sim/prod"
+            if [ -f "$sim_dir/libperry_runtime.a" ]; then
+              cp "$sim_dir/libperry_runtime.a" "staging/libperry_runtime_ios_sim.a"
+              cp "$sim_dir/libperry_runtime.a.gc-effects" "staging/libperry_runtime_ios_sim.a.gc-effects"
+            fi
+            if [ -f "$sim_dir/libperry_stdlib.a" ]; then
+              cp "$sim_dir/libperry_stdlib.a" "staging/libperry_stdlib_ios_sim.a"
+            fi
+            if [ -f "$sim_dir/libperry_ui_ios.a" ]; then
+              cp "$sim_dir/libperry_ui_ios.a" "staging/libperry_ui_ios_sim.a"
+            fi
+          fi
+          # Every runtime archive in the package has its sidecar.
+          for lib in staging/libperry_runtime*.a; do
+            [ -f "$lib.gc-effects" ] || { echo "::error::$lib has no .gc-effects sidecar"; exit 1; }
+          done
+          cd staging
+          tar czf ../${{ matrix.artifact }}.tar.gz *
+
+      # Bundle xwin.exe so `perry setup windows` can download the MS CRT + Windows
+      # SDK without requiring users to have Rust installed. xwin is pinned here to
+      # control updates — bump the version when switching to a newer xwin release.
+      # See crates/perry/src/commands/setup.rs::windows_wizard for the consumer.
+      - name: Build xwin.exe for bundling (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo install xwin --locked --version 0.9.0 --root xwin-install --target ${{ matrix.target }}
+
+      # Optional Authenticode signing. Configure a base64-encoded PFX and its
+      # password to enable this; repositories without a certificate continue
+      # to publish the VERSIONINFO-bearing unsigned binary.
+      - name: Sign perry.exe with Authenticode (when configured)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          WINDOWS_CODE_SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_CODE_SIGNING_PFX_BASE64 }}
+          WINDOWS_CODE_SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_CODE_SIGNING_PFX_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:WINDOWS_CODE_SIGNING_PFX_BASE64) {
+            Write-Host 'WINDOWS_CODE_SIGNING_PFX_BASE64 is not configured; leaving perry.exe unsigned.'
+            exit 0
+          }
+          if (-not $env:WINDOWS_CODE_SIGNING_PFX_PASSWORD) {
+            throw 'WINDOWS_CODE_SIGNING_PFX_BASE64 is configured but WINDOWS_CODE_SIGNING_PFX_PASSWORD is missing.'
+          }
+
+          $binary = "target/${{ matrix.target }}/prod/perry.exe"
+          $certificate = Join-Path $env:RUNNER_TEMP 'perry-code-signing.pfx'
+          try {
+            $certificateBytes = [Convert]::FromBase64String($env:WINDOWS_CODE_SIGNING_PFX_BASE64)
+            [IO.File]::WriteAllBytes($certificate, $certificateBytes)
+
+            $signtoolCommand = Get-Command signtool.exe -ErrorAction SilentlyContinue
+            if ($signtoolCommand) {
+              $signtool = $signtoolCommand.Source
+            } else {
+              $kitsBin = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
+              $signtool = Get-ChildItem "$kitsBin\*\arm64\signtool.exe", "$kitsBin\*\x64\signtool.exe" |
+                Sort-Object { [version]$_.Directory.Parent.Name } -Descending |
+                Select-Object -First 1 -ExpandProperty FullName
+            }
+            if (-not $signtool) {
+              throw 'signtool.exe was not found in PATH or the Windows 10 SDK.'
+            }
+
+            & $signtool sign /fd SHA256 /tr https://timestamp.digicert.com /td SHA256 `
+              /d 'Perry native TypeScript compiler' /f $certificate `
+              /p $env:WINDOWS_CODE_SIGNING_PFX_PASSWORD $binary
+            if ($LASTEXITCODE -ne 0) {
+              throw "signtool sign failed with exit code $LASTEXITCODE"
+            }
+
+            & $signtool verify /pa /v $binary
+            if ($LASTEXITCODE -ne 0) {
+              throw "signtool verify failed with exit code $LASTEXITCODE"
+            }
+          } finally {
+            if (Test-Path $certificate) {
+              Remove-Item -Force $certificate
+            }
+          }
+
+      - name: Package release archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $binary = "target/${{ matrix.target }}/prod/perry.exe"
+          $llvmBin = Join-Path $env:LLVM_SYS_221_PREFIX 'bin'
+          $llvmReadObj = Join-Path $llvmBin 'llvm-readobj.exe'
+          $llvmRuntime = Join-Path $llvmBin 'LLVM-C.dll'
+
+          foreach ($required in @($binary, $llvmReadObj, $llvmRuntime)) {
+            if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
+              throw "Windows release prerequisite is missing: $required"
+            }
+          }
+
+          # #7985: the official LLVM archive's static libraries use /MT and
+          # bundle rpmalloc, so Perry links its LLVM C surface dynamically on
+          # Windows. Prove the release binary has the expected import before
+          # copying the matching DLL; otherwise this step could ship either a
+          # loader-broken executable or a stale, unused 70 MB runtime.
+          $imports = (& $llvmReadObj --coff-imports $binary | Out-String)
+          if ($LASTEXITCODE -ne 0) {
+            throw "llvm-readobj failed while inspecting $binary"
+          }
+          if ($imports -notmatch '(?m)^\s*Name:\s+LLVM-C\.dll\s*$') {
+            throw "$binary does not import LLVM-C.dll; refusing to package an unverified LLVM runtime"
+          }
+
+          New-Item -ItemType Directory -Force -Path staging
+          Copy-Item $binary staging/
+          Copy-Item $llvmRuntime staging/
+          Copy-Item "xwin-install/bin/xwin.exe" staging/
+          # Include static libraries for linking (runtime, stdlib, UI)
+          $libs = @("perry_runtime.lib", "perry_stdlib.lib", "perry_wasm_host.lib", "perry_ui_windows.lib")
+          foreach ($lib in $libs) {
+            $path = "target/${{ matrix.target }}/prod/$lib"
+            if (Test-Path $path) {
+              Copy-Item $path staging/
+              if ($lib -like "perry_runtime*") {
+                Copy-Item "$path.gc-effects" staging/
+              }
+            }
+          }
+          # #872: stage the Android cross-compiled archives next to the
+          # Windows libs. perry's library_search.rs walks
+          # `<install-dir>/<triple>/release/<libname>.a` so we mirror that
+          # layout inside the zip — the `aarch64-linux-android/release/`
+          # subdir lives alongside `perry.exe`.
+          # Only the x86_64 Windows runner builds these: the NDK ships no
+          # Windows-arm64 host toolchain (the step resolves its compiler under
+          # `prebuilt/windows-x86_64`) and the ARM runner has no NDK at all.
+          # Requiring them unconditionally made the ARM leg fail in packaging
+          # once the build step was correctly skipped. `perry-windows-aarch64`
+          # has never shipped -- v0.5.1220 carries only `perry-windows-x86_64`
+          # -- so this does not remove anything users have; it makes the leg
+          # internally consistent. Android cross-compilation from a Windows
+          # ARM host needs an NDK that supports that host.
+          if ($env:RUNNER_ARCH -eq "X64") {
+            $androidLibDir = "staging/aarch64-linux-android/release"
+            New-Item -ItemType Directory -Force -Path $androidLibDir | Out-Null
+            $androidLibs = @("libperry_runtime.a", "libperry_stdlib.a", "libperry_ui_android.a")
+            foreach ($lib in $androidLibs) {
+              $src = "target/aarch64-linux-android/prod/$lib"
+              if (-not (Test-Path -LiteralPath $src -PathType Leaf)) {
+                Write-Error "Required Android library missing from ${{ matrix.artifact }}: $src"
+                exit 1
+              }
+              Copy-Item $src $androidLibDir
+              if ($lib -eq "libperry_runtime.a") {
+                Copy-Item "$src.gc-effects" $androidLibDir
+              }
+            }
+          }
+          Compress-Archive -Path staging/* -DestinationPath "${{ matrix.artifact }}.zip"
+
+      # SHA256 sidecars uploaded next to each archive so package-manager
+      # manifests (Scoop autoupdate, future winget/chocolatey/Homebrew bumps)
+      # can resolve hashes by URL without re-downloading the archive on the
+      # bumper machine. The sidecar format is `<hash>  <filename>` (two
+      # spaces — same as `sha256sum`'s default), which Scoop's hash.url
+      # mode parses out of the box.
+      - name: Compute SHA256 sidecar (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          # Linux ships `sha256sum` (coreutils); macOS ships `shasum -a 256`
+          # but no `sha256sum`. Both produce the same `<hash>  <filename>`
+          # output format that Scoop / Homebrew / dpkg parse from the first
+          # whitespace-separated field. Pre-fix the macOS legs of this matrix
+          # bombed at v0.5.386's release-packages.yml run with
+          # `sha256sum: command not found` (exit 127), cancelling the
+          # x86_64-apple-darwin sibling via fail-fast and shipping a release
+          # without macOS binaries.
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${{ matrix.artifact }}.tar.gz" > "${{ matrix.artifact }}.tar.gz.sha256"
+          else
+            shasum -a 256 "${{ matrix.artifact }}.tar.gz" > "${{ matrix.artifact }}.tar.gz.sha256"
+          fi
+          cat "${{ matrix.artifact }}.tar.gz.sha256"
+
+      - name: Compute SHA256 sidecar (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash -Algorithm SHA256 "${{ matrix.artifact }}.zip").Hash.ToLower()
+          # Match `sha256sum` output exactly (two-space separator) for cross-platform
+          # tooling that grep-cuts the first field.
+          "$hash  ${{ matrix.artifact }}.zip" | Out-File -Encoding ascii "${{ matrix.artifact }}.zip.sha256"
+          Get-Content "${{ matrix.artifact }}.zip.sha256"
+
+      # The archive SHA sidecar helps package managers but is not an update
+      # authority. Sign a domain-separated, version/platform/URL/digest/size
+      # bound manifest with the protected Ed25519 release key instead.
+      - name: Sign authenticated CLI update manifest (Unix)
+        # The signed manifest binds the download URL, so it needs the release
+        # tag — preflight resolves it for every publishing mode (in cut-release
+        # mode the tag doesn't exist yet but its name is already fixed).
+        # Skipped on stage-only runs (no tag → nothing to bind to).
+        if: runner.os != 'Windows' && needs.preflight.outputs.tag != ''
+        env:
+          PERRY_CLI_UPDATE_SIGNING_KEY: ${{ secrets.PERRY_CLI_UPDATE_SIGNING_KEY }}
+          PERRY_CLI_UPDATE_KEY_ID: ${{ vars.PERRY_CLI_UPDATE_KEY_ID }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${PERRY_CLI_UPDATE_SIGNING_KEY:?configure the protected 32-byte base64 Ed25519 signing secret}"
+          : "${PERRY_CLI_UPDATE_KEY_ID:?configure the matching trusted public-key id}"
+          : "${PERRY_CLI_UPDATE_PUBLIC_KEYS:?configure the compiled public-key keyring}"
+          jq -e --arg id "$PERRY_CLI_UPDATE_KEY_ID" '.[] | select(.key_id == $id and (.public_key | length > 0))' <<< "$PERRY_CLI_UPDATE_PUBLIC_KEYS" >/dev/null
+          TAG="$RELEASE_TAG"
+          ARCHIVE="${{ matrix.artifact }}.tar.gz"
+          URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/${ARCHIVE}"
+          "target/${{ matrix.target }}/prod/perry" updater sign-cli-manifest \
+            --artifact "$ARCHIVE" --platform "$ARCHIVE" --url "$URL" \
+            --release-version "${TAG#v}" --key-id "$PERRY_CLI_UPDATE_KEY_ID" \
+            --secret-key-b64 "$PERRY_CLI_UPDATE_SIGNING_KEY" > "$ARCHIVE.update.json"
+
+      - name: Sign authenticated CLI update manifest (Windows)
+        if: runner.os == 'Windows' && needs.preflight.outputs.tag != ''
+        env:
+          PERRY_CLI_UPDATE_SIGNING_KEY: ${{ secrets.PERRY_CLI_UPDATE_SIGNING_KEY }}
+          PERRY_CLI_UPDATE_KEY_ID: ${{ vars.PERRY_CLI_UPDATE_KEY_ID }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:PERRY_CLI_UPDATE_SIGNING_KEY) { throw 'configure PERRY_CLI_UPDATE_SIGNING_KEY' }
+          if (-not $env:PERRY_CLI_UPDATE_KEY_ID) { throw 'configure PERRY_CLI_UPDATE_KEY_ID' }
+          if (-not $env:PERRY_CLI_UPDATE_PUBLIC_KEYS) { throw 'configure PERRY_CLI_UPDATE_PUBLIC_KEYS' }
+          if (-not (($env:PERRY_CLI_UPDATE_PUBLIC_KEYS | ConvertFrom-Json) | Where-Object { $_.key_id -eq $env:PERRY_CLI_UPDATE_KEY_ID -and $_.public_key })) { throw 'configured key id is not in PERRY_CLI_UPDATE_PUBLIC_KEYS' }
+          $tag = $env:RELEASE_TAG
+          $archive = "${{ matrix.artifact }}.zip"
+          $url = "https://github.com/${{ github.repository }}/releases/download/$tag/$archive"
+          & "target/${{ matrix.target }}/prod/perry.exe" updater sign-cli-manifest `
+            --artifact $archive --platform $archive --url $url `
+            --release-version $tag.TrimStart('v') --key-id $env:PERRY_CLI_UPDATE_KEY_ID `
+            --secret-key-b64 $env:PERRY_CLI_UPDATE_SIGNING_KEY | Out-File -Encoding utf8 "$archive.update.json"
+
+      # Release-asset uploads moved to the publish-assets job: in cut-release
+      # (tag-last) mode there is no release to upload to while the matrix is
+      # still building, and the old per-leg upload with its "latest release"
+      # fallback was exactly what made pre-tag dispatches dangerous. The
+      # packaged archive + sidecar + update manifest travel as a workflow
+      # artifact instead.
+      - name: Upload packaged archive (Unix, for publish-assets job)
+        if: runner.os != 'Windows'
+        uses: ./.github/actions/perry/actions/upload-artifact # v7
+        with:
+          name: release-archive-${{ matrix.artifact }}
+          # update.json only exists when a tag was resolved (not on stage-only
+          # runs) — the default `if-no-files-found: warn` tolerates that gap.
+          path: |
+            ${{ matrix.artifact }}.tar.gz
+            ${{ matrix.artifact }}.tar.gz.sha256
+            ${{ matrix.artifact }}.tar.gz.update.json
+
+      - name: Upload packaged archive (Windows, for publish-assets job)
+        if: runner.os == 'Windows'
+        uses: ./.github/actions/perry/actions/upload-artifact # v7
+        with:
+          name: release-archive-${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}.zip
+            ${{ matrix.artifact }}.zip.sha256
+            ${{ matrix.artifact }}.zip.update.json
+
+      - name: Upload build artifact (Unix, for deb + npm-publish jobs)
+        if: runner.os != 'Windows'
+        uses: ./.github/actions/perry/actions/upload-artifact # v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: staging/
+
+      - name: Upload build artifact (Windows, for npm-publish job)
+        if: runner.os == 'Windows'
+        uses: ./.github/actions/perry/actions/upload-artifact # v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: staging/
+
+  # ---------------------------------------------------------------------------
+  # Build per-target cross-compile staticlib bundles (issue #1083)
+  #
+  # The host bundles emitted by `build:` above ship only host-triple .a's, so
+  # every consumer build worker that cross-compiles to a non-host target has
+  # to re-derive the cross toolchain env on each `perry update` (Apple
+  # sysroot vars, NDK clang paths, MSVC `lib.exe` shims, alsa/audio dev
+  # headers, aws-lc-sys jitterentropy disable, etc.) and pay a 5-25 min
+  # cargo rebuild per target. We already build these libs correctly in
+  # release CI's `build:` matrix — this job just packages them into
+  # standalone tarballs so the worker can `tar xzf` instead of rebuild.
+  #
+  # Each `perry-cross-<triple>.tar.gz` ships:
+  #   libperry_runtime.a    (the cross-compiled runtime)
+  #   libperry_stdlib.a     (the cross-compiled stdlib)
+  #   libperry_ui_<plat>.a  (the cross-compiled UI backend, when applicable)
+  #   manifest.json         (perry_version + target_triple + sha256+size per file)
+  #
+  # Each matrix entry runs on the natural host runner for its toolchain:
+  #   - Apple targets: macos-14 (real Xcode + SDKs)
+  #   - Android      : ubuntu-24.04 + pre-installed NDK
+  #   - Windows MSVC : windows-latest (clang-cl + lib.exe)
+  # — so no Linux→Apple sysroot or Linux→Windows VM dance is needed inside
+  # this workflow.
+  # ---------------------------------------------------------------------------
+  build-cross:
+    needs: [preflight, await-tests]
+    strategy:
+      # Each leg is independent; let one cross-target failure not cancel
+      # the other targets so we still ship the bundles that did build.
+      fail-fast: false
+      matrix:
+        include:
+          # --- Apple, Tier-2 (stable) ---------------------------------------
+          - os: macos-14
+            target: aarch64-apple-darwin
+            ui_crate: perry-ui-macos
+            ui_lib: libperry_ui_macos.a
+          - os: macos-15
+            target: x86_64-apple-darwin
+            ui_crate: perry-ui-macos
+            ui_lib: libperry_ui_macos.a
+          - os: macos-14
+            target: aarch64-apple-ios
+            ui_crate: perry-ui-ios
+            ui_lib: libperry_ui_ios.a
+          - os: macos-14
+            target: aarch64-apple-ios-sim
+            ui_crate: perry-ui-ios
+            ui_lib: libperry_ui_ios.a
+          # tvOS/visionOS/watchOS (Rust Tier-3, needed -Zbuild-std) are no
+          # longer built here — that unstable-cargo-feature build is
+          # dropped entirely, along with the matrix's `tier3` field and its
+          # two build-step branches; if Tier-3 support returns, re-add both
+          # rather than reviving a dead flag.
+          # --- Android (NDK on Linux runner) --------------------------------
+          # perry-ui-android requires the NDK clang++ wrapper and JNI; the
+          # existing test.yml leg already cross-compiles it on ubuntu-24.04,
+          # so we mirror that env here. x86_64 included so emulator builds
+          # also have prebuilt libs.
+          - os: ubuntu-24.04
+            target: aarch64-linux-android
+            ui_crate: perry-ui-android
+            ui_lib: libperry_ui_android.a
+          - os: ubuntu-24.04
+            target: x86_64-linux-android
+            ui_crate: perry-ui-android
+            ui_lib: libperry_ui_android.a
+          # --- Windows MSVC (native runner) ---------------------------------
+          # Both native Windows architectures use their matching hosted runner
+          # so Rust, LLVM, MSVC, and the packaged executable all agree.
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            ui_crate: perry-ui-windows
+            ui_lib: perry_ui_windows.lib
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            ui_crate: perry-ui-windows
+            ui_lib: perry_ui_windows.lib
+
+    runs-on: ${{ matrix.os }}
+    env:
+      # Match `build:` for macOS object-file version tags so bottle-linked
+      # .a's don't emit "built for newer 'macOS' version" warnings against
+      # users on macOS 13.
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+    steps:
+      - name: Checkout repository (inline git)
+        shell: bash
+        env:
+          CHECKOUT_REF: ${{ needs.preflight.outputs.checkout-ref }}
+          EXPECTED_SHA: ${{ needs.preflight.outputs.checkout-sha }}
+          CHECKOUT_DEPTH: "1"
+          CHECKOUT_TOKEN: ${{ github.token }}
+          CHECKOUT_PERSIST_CREDENTIALS: "true"
+        run: |
+          set -euo pipefail
+          git init
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          auth_header="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$CHECKOUT_TOKEN" | base64 | tr -d '\n')"
+          if [[ "$CHECKOUT_DEPTH" == "0" ]]; then
+            git -c http.https://github.com/.extraheader="$auth_header" fetch --force --tags origin
+            git checkout --force --detach "$CHECKOUT_REF"
+          else
+            git -c http.https://github.com/.extraheader="$auth_header" fetch --no-tags --force --depth "$CHECKOUT_DEPTH" origin "$CHECKOUT_REF"
+            git checkout --force --detach FETCH_HEAD
+          fi
+          # Build exactly the commit preflight resolved, or nothing.
+          : "${EXPECTED_SHA:?preflight resolved no checkout-sha}"
+          built=$(git rev-parse HEAD)
+          echo "built tree: $built  expected: $EXPECTED_SHA  (ref: $CHECKOUT_REF)"
+          if [ "$built" != "$EXPECTED_SHA" ]; then
+            echo "::error::checked out $built, not $EXPECTED_SHA — refusing to build or publish a different commit."
+            exit 1
+          fi
+          if [[ "$CHECKOUT_PERSIST_CREDENTIALS" == "true" ]]; then
+            git config http.https://github.com/.extraheader "$auth_header"
+          fi
+      - name: Install Rust toolchain + cross target
+        run: rustup toolchain install nightly-2026-10-04 --profile minimal --target ${{ matrix.target }}
+      - uses: ./.github/actions/setup-llvm22
+
+      - uses: ./.github/actions/perry/Swatinem/rust-cache # v2
+        with:
+          shared-key: "release-cross-${{ matrix.target }}"
+
+      # Keep cross-target caches isolated from native release builds.
+      - uses: ./.github/actions/perry-mbx-cache
+        with:
+          cache-generation: perry-release-cross-${{ matrix.target }}
+          save-on-workflow-dispatch: true
+
+      # Keep workspace crates fresh while the legacy Cargo target cache is
+      # still enabled; mbx's content-addressed objects remain reusable.
+      - name: Evict workspace crates from restored cache (#4856)
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r pkg; do
+            rm -rf target/prod/.fingerprint/"$pkg"-* \
+                   target/*/prod/.fingerprint/"$pkg"-*
+          done < <(cargo metadata --no-deps --format-version 1 | jq -r '.packages[].name')
+          # rust-cache's target cleanup deletes mbx's per-file build-script
+          # shims (target/.mbx-build-script-shims/<id>/mbx) but keeps the
+          # wrappers that exec them; cargo then finds those build scripts
+          # fresh and mbx never recreates the shim (psm: exit 126). Put the
+          # pinned mbx back at every shim path a restored wrapper names.
+          mbx_bin=$(command -v mbx)
+          # A wrapper names its shim relative to its own directory
+          # (<dir>/../../../../.mbx-build-script-shims/<id>/mbx).
+          { grep -rlI --include=build_script_build '\.mbx-build-script-shims/' target*/ 2>/dev/null || true; } \
+            | while IFS= read -r wrapper; do
+                rel=$(grep -oE '(\.\./)*\.mbx-build-script-shims/[0-9a-f]+/mbx' "$wrapper" | head -1)
+                [ -n "$rel" ] || continue
+                shim="$(dirname "$wrapper")/$rel"
+                if [ ! -e "$shim" ]; then
+                  mkdir -p "$(dirname "$shim")"
+                  cp "$mbx_bin" "$shim"
+                  echo "restored mbx build-script shim: $shim"
+                fi
+              done
+
+      # --- Per-runner toolchain wiring --------------------------------------
+      # Each of these blocks installs what the cross target needs that's NOT
+      # already on the runner image. Apple runners get Xcode for free; Linux
+      # runners get GTK/audio dev headers for the host build, but we don't
+      # need those here because we're cross-compiling.
+
+      - name: Wire Android NDK (Linux runner, android targets)
+        if: startsWith(matrix.target, 'aarch64-linux-android') || startsWith(matrix.target, 'x86_64-linux-android')
+        run: |
+          set -euo pipefail
+          # Reuse test.yml's NDK discovery — same precedence chain.
+          NDK=""
+          if [ -n "${ANDROID_NDK_HOME:-}" ]; then
+            NDK="$ANDROID_NDK_HOME"
+          elif [ -d "${ANDROID_HOME:-}/ndk-bundle" ]; then
+            NDK="$ANDROID_HOME/ndk-bundle"
+          elif [ -d "${ANDROID_HOME:-}/ndk" ]; then
+            NDK=$(ls -1d "$ANDROID_HOME/ndk/"*/ 2>/dev/null | sort -V | tail -1)
+            NDK="${NDK%/}"
+          fi
+          if [ -z "$NDK" ]; then
+            echo "::error::No Android NDK found on runner — cannot cross-build ${{ matrix.target }}"
+            exit 1
+          fi
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          HOST_TAG=linux-x86_64
+          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/$HOST_TAG/bin"
+          TRIPLE="${{ matrix.target }}"
+          # NDK clang wrappers are named `<triple><api>-clang` (e.g.
+          # `aarch64-linux-android24-clang`); the API suffix is mandatory
+          # — `<triple>-clang` (no API) doesn't exist. We glob the highest
+          # API present on the runner image, matching test.yml's logic.
+          CLANG=$(ls "$TOOLCHAIN"/${TRIPLE}*-clang 2>/dev/null | sort -V | tail -1)
+          CLANGXX=$(ls "$TOOLCHAIN"/${TRIPLE}*-clang++ 2>/dev/null | sort -V | tail -1)
+          if [ -z "$CLANG" ]; then
+            echo "::error::Could not locate NDK clang under $TOOLCHAIN for $TRIPLE"
+            exit 1
+          fi
+          # cc-rs lookup vars: `CC_<triple>` / `CXX_<triple>` / `AR_<triple>`
+          # with `-` → `_`. The cargo-target linker var uses uppercase + `_`.
+          API=${CLANG##*/"$TRIPLE"}
+          API=${API%-clang}
+          TRIPLE_UNDER=$(echo "$TRIPLE" | tr '-' '_')
+          TRIPLE_UPPER=$(echo "$TRIPLE_UNDER" | tr '[:lower:]' '[:upper:]')
+          {
+            echo "CC_${TRIPLE_UNDER}=$CLANG"
+            echo "CXX_${TRIPLE_UNDER}=$CLANGXX"
+            echo "AR_${TRIPLE_UNDER}=$TOOLCHAIN/llvm-ar"
+            # NDK r23+ ships no <triple>-ranlib, the default cc-rs hands the
+            # vendored OpenSSL's `make install`.
+            echo "RANLIB_${TRIPLE_UNDER}=$TOOLCHAIN/llvm-ranlib"
+            echo "CARGO_TARGET_${TRIPLE_UPPER}_LINKER=$CLANG"
+            # cc-rs adds `--target=<triple>` (no API level) to every C flag
+            # list. Under mbx, CMake gets mbx's compiler shim, not the NDK
+            # wrapper, so its Android support picks the NDK's bare clang and
+            # that flag overrides the API: no crtbegin_dynamic.o (libz-ng-sys).
+            # Name the wrapper's API level last.
+            echo "CFLAGS_${TRIPLE_UNDER}=--target=${TRIPLE}${API}"
+            echo "CXXFLAGS_${TRIPLE_UNDER}=--target=${TRIPLE}${API}"
+          } >> "$GITHUB_ENV"
+          echo "NDK wired for $TRIPLE: $CLANG"
+
+      # The aarch64 MSVC target is Tier-2 but Rust still requires the cross
+      # std component to be installed by name (the matrix `targets:` field
+      # above handles that). Nothing else needed — windows-latest already
+      # ships clang-cl + lib.exe through Visual Studio.
+
+      # --- Build the three (or two, when UI is N/A) static libs ------------
+      - name: Build runtime + stdlib + UI
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            # The vendored OpenSSL's Configure needs Locale::Maketext::Simple,
+            # which Git Bash's msys perl lacks, and Git's perl comes first on
+            # this shell's PATH (pwsh inherits it). Take the first perl on
+            # PATH, then Strawberry's, that loads the module.
+            OPENSSL_SRC_PERL=
+            while IFS= read -r perl_exe; do
+              perl_exe=${perl_exe%$'\r'}
+              [ -n "$perl_exe" ] || continue
+              if "$(cygpath -u "$perl_exe")" -MLocale::Maketext::Simple -e1 2>/dev/null; then
+                OPENSSL_SRC_PERL=$perl_exe
+                break
+              fi
+            done < <(where.exe perl 2>/dev/null; echo 'C:\Strawberry\perl\bin\perl.exe')
+            if [ -z "$OPENSSL_SRC_PERL" ]; then
+              echo "::error::no Windows perl with Locale::Maketext::Simple for the vendored OpenSSL Configure"
+              exit 1
+            fi
+            export OPENSSL_SRC_PERL
+            echo "OPENSSL_SRC_PERL=$OPENSSL_SRC_PERL"
+          fi
+          ${{ runner.os == 'Windows' && 'cargo' || 'mbx' }} build --profile prod --target ${{ matrix.target }} -p perry-runtime -p perry-runtime-static
+          ${{ runner.os == 'Windows' && 'cargo' || 'mbx' }} build --profile prod --target ${{ matrix.target }} -p perry-stdlib -p perry-stdlib-static
+          # UI crate is matrix-driven. perry-ui-android needs the NDK env
+          # we wired above; perry-ui-windows builds against the MSVC SDK
+          # already on windows-latest. Both go through plain `cargo build`.
+          ${{ runner.os == 'Windows' && 'cargo' || 'mbx' }} build --profile prod --target ${{ matrix.target }} -p ${{ matrix.ui_crate }}
+
+      # #4856 — defense in depth behind the cache eviction above: a stale
+      # cached runtime archive fails the release here instead of breaking
+      # every consumer executable link on the build workers.
+      # GC effects sidecar for the runtime archive built above (same step as
+      # the native legs; the analyzer runs on the host for any target triple).
+      - name: Write GC effects sidecars
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            export PATH="$(cygpath -u "$LLVM_SYS_221_PREFIX")/bin:$PATH"
+          fi
+          time ./scripts/gc_call_effects/sidecars.sh "target/${{ matrix.target }}/prod"
+
+      - name: Verify runtime archive is fresh (#4856)
+        shell: bash
+        run: |
+          set -euo pipefail
+          lib="target/${{ matrix.target }}/prod/libperry_runtime.a"
+          # Windows MSVC emits perry_runtime.lib (no `lib` prefix).
+          [ -f "$lib" ] || lib="target/${{ matrix.target }}/prod/perry_runtime.lib"
+          ./scripts/check_runtime_symbols.sh "$lib"
+
+      # --- Package + manifest ----------------------------------------------
+      # Manifest schema (per issue #1083):
+      #   { "perry_version": "<x.y.z>", "target_triple": "<triple>",
+      #     "files": [{"path": "...", "sha256": "...", "size": N}, ...] }
+      # Computed on the runner (sha256sum on Linux, shasum on macOS,
+      # PowerShell Get-FileHash on Windows). We write the manifest with a
+      # plain shell here-doc + jq concatenation; jq is on every GHA runner
+      # so we don't pull in a separate scripting dep.
+      - name: Stage cross artifacts + manifest (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARGET="${{ matrix.target }}"
+          UI_LIB="${{ matrix.ui_lib }}"
+          PERRY_VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          STAGING="cross-staging"
+          rm -rf "$STAGING"
+          mkdir -p "$STAGING"
+          # Required runtime + stdlib (always present on a successful build).
+          for lib in libperry_runtime.a libperry_stdlib.a libperry_runtime.a.gc-effects; do
+            src="target/${TARGET}/prod/${lib}"
+            if [ ! -f "$src" ]; then
+              echo "::error::Expected $src after build but it's missing — aborting bundle."
+              exit 1
+            fi
+            cp "$src" "$STAGING/$lib"
+          done
+          # UI lib (optional — perry-ui-android failures are non-fatal in
+          # principle, but we built it above so this should exist; we hard-fail
+          # if it's missing so the worker doesn't see a silently-degraded
+          # bundle).
+          UI_SRC="target/${TARGET}/prod/${UI_LIB}"
+          if [ ! -f "$UI_SRC" ]; then
+            echo "::error::UI lib $UI_SRC missing after build — aborting bundle."
+            exit 1
+          fi
+          cp "$UI_SRC" "$STAGING/$UI_LIB"
+          # SHA256 + size for each staged file. macOS ships `shasum -a 256`,
+          # Linux ships `sha256sum` — wrap both behind one alias.
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha() { sha256sum "$1" | cut -d' ' -f1; }
+          else
+            sha() { shasum -a 256 "$1" | cut -d' ' -f1; }
+          fi
+          # `stat -c %s` (GNU) / `stat -f %z` (BSD) — choose at runtime.
+          if stat -c %s "$STAGING/libperry_runtime.a" >/dev/null 2>&1; then
+            sz() { stat -c %s "$1"; }
+          else
+            sz() { stat -f %z "$1"; }
+          fi
+          # Build the manifest with jq so we get correct JSON escaping
+          # (paths and triples are safe ASCII today, but the schema is the
+          # contract — let jq own it).
+          files_json=$(jq -n '[]')
+          for f in libperry_runtime.a libperry_stdlib.a libperry_runtime.a.gc-effects "$UI_LIB"; do
+            files_json=$(jq -n --argjson acc "$files_json" \
+              --arg path "$f" \
+              --arg sha "$(sha "$STAGING/$f")" \
+              --argjson size "$(sz "$STAGING/$f")" \
+              '$acc + [{path: $path, sha256: $sha, size: $size}]')
+          done
+          jq -n --arg v "$PERRY_VERSION" --arg t "$TARGET" --argjson files "$files_json" \
+            '{perry_version: $v, target_triple: $t, files: $files}' \
+            > "$STAGING/manifest.json"
+          cat "$STAGING/manifest.json"
+          tar czf "perry-cross-${TARGET}.tar.gz" -C "$STAGING" .
+
+      - name: Stage cross artifacts + manifest (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $target = "${{ matrix.target }}"
+          $uiLib  = "${{ matrix.ui_lib }}"
+          $perryVersion = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' |
+            Select-Object -First 1).Matches[0].Groups[1].Value
+          $staging = "cross-staging"
+          if (Test-Path $staging) { Remove-Item $staging -Recurse -Force }
+          New-Item -ItemType Directory -Path $staging | Out-Null
+          # Windows MSVC builds emit `perry_runtime.lib` / `perry_stdlib.lib`
+          # (no `lib` prefix, `.lib` extension) — match the host-build
+          # behavior at line ~448 above.
+          $libs = @("perry_runtime.lib", "perry_stdlib.lib", "perry_runtime.lib.gc-effects", $uiLib)
+          foreach ($lib in $libs) {
+            $src = "target/$target/prod/$lib"
+            if (-not (Test-Path $src)) {
+              Write-Error "Expected $src after build but it's missing — aborting bundle."
+              exit 1
+            }
+            Copy-Item $src (Join-Path $staging $lib)
+          }
+          # Build manifest with sha256 + size for each file.
+          $entries = @()
+          foreach ($lib in $libs) {
+            $path = Join-Path $staging $lib
+            $hash = (Get-FileHash -Algorithm SHA256 $path).Hash.ToLower()
+            $size = (Get-Item $path).Length
+            $entries += [pscustomobject]@{ path = $lib; sha256 = $hash; size = $size }
+          }
+          $manifest = [pscustomobject]@{
+            perry_version = $perryVersion
+            target_triple = $target
+            files         = $entries
+          }
+          $manifest | ConvertTo-Json -Depth 5 | Out-File -Encoding utf8 (Join-Path $staging "manifest.json")
+          Get-Content (Join-Path $staging "manifest.json")
+          # tar is available on windows-latest (BSD tar 3.x preinstalled by
+          # MS since 2018); produce the same .tar.gz extension as Unix so
+          # consumers only have one filename pattern to handle.
+          tar czf "perry-cross-$target.tar.gz" -C $staging .
+
+      - name: Compute SHA256 sidecar (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARCHIVE="perry-cross-${{ matrix.target }}.tar.gz"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
+          else
+            shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
+          fi
+          cat "$ARCHIVE.sha256"
+
+      - name: Compute SHA256 sidecar (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $archive = "perry-cross-${{ matrix.target }}.tar.gz"
+          $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLower()
+          "$hash  $archive" | Out-File -Encoding ascii "$archive.sha256"
+          Get-Content "$archive.sha256"
+
+      # Release-asset upload happens in the publish-assets job (which pulls
+      # this artifact) — in cut-release mode no release exists while the
+      # matrix runs, and the old "latest release" fallback uploaded pre-tag
+      # dispatches onto the PREVIOUS release. The artifact also lets a
+      # maintainer pull the bundle off a stage-only run directly.
+      - name: Upload cross build artifact (for publish-assets job + inspection)
+        uses: ./.github/actions/perry/actions/upload-artifact # v7
+        with:
+          name: perry-cross-${{ matrix.target }}
+          path: |
+            perry-cross-${{ matrix.target }}.tar.gz
+            perry-cross-${{ matrix.target }}.tar.gz.sha256
+
+  # ---------------------------------------------------------------------------
+  # Tag-last core (cut-release mode only): every build leg is green and
+  # every exact npm tarball is public + registry-verified, so NOW create the
+  # tag + GitHub Release. Release notes are cut from changelog.d/
+  # fragments — same contract as scripts/cut_release_notes.sh, whose
+  # --notes-only mode this job calls. The fragment-removal commit stays a
+  # maintainer step afterwards (GITHUB_TOKEN can't push to protected main):
+  #   ./scripts/cut_release_notes.sh --fold vX.Y.Z
+  # ---------------------------------------------------------------------------
+  create-release:
+    needs: [preflight, build, build-cross, npm-publish]
+    # Strict by design: npm-publish succeeds only after every required build
+    # and exact registry-sha verification succeeds. Until then there is no tag.
+    if: >
+      !cancelled() &&
+      needs.preflight.outputs.mode == 'cut-release' &&
+      needs.build.result == 'success' &&
+      needs.build-cross.result == 'success' &&
+      needs.npm-publish.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository (inline git)
+        shell: bash
+        env:
+          CHECKOUT_REF: ${{ needs.preflight.outputs.checkout-ref }}
+          EXPECTED_SHA: ${{ needs.preflight.outputs.checkout-sha }}
+          CHECKOUT_DEPTH: "1"
+          CHECKOUT_TOKEN: ${{ github.token }}
+          CHECKOUT_PERSIST_CREDENTIALS: "true"
+        run: |
+          set -euo pipefail
+          git init
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          auth_header="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$CHECKOUT_TOKEN" | base64 | tr -d '\n')"
+          if [[ "$CHECKOUT_DEPTH" == "0" ]]; then
+            git -c http.https://github.com/.extraheader="$auth_header" fetch --force --tags origin
+            git checkout --force --detach "$CHECKOUT_REF"
+          else
+            git -c http.https://github.com/.extraheader="$auth_header" fetch --no-tags --force --depth "$CHECKOUT_DEPTH" origin "$CHECKOUT_REF"
+            git checkout --force --detach FETCH_HEAD
+          fi
+          # Build exactly the commit preflight resolved, or nothing.
+          : "${EXPECTED_SHA:?preflight resolved no checkout-sha}"
+          built=$(git rev-parse HEAD)
+          echo "built tree: $built  expected: $EXPECTED_SHA  (ref: $CHECKOUT_REF)"
+          if [ "$built" != "$EXPECTED_SHA" ]; then
+            echo "::error::checked out $built, not $EXPECTED_SHA — refusing to build or publish a different commit."
+            exit 1
+          fi
+          if [[ "$CHECKOUT_PERSIST_CREDENTIALS" == "true" ]]; then
+            git config http.https://github.com/.extraheader "$auth_header"
+          fi
+      - name: Create tag + GitHub Release (notes from changelog.d)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # Preflight checked this earlier; re-check so a concurrent manual
+          # release of the same version fails here instead of clobbering.
+          #
+          # A tag pointing at THIS EXACT candidate is not a conflict, it is our
+          # own previous attempt: `gh release create` creates the tag and then
+          # POSTs the release, so a failure in the POST leaves the tag behind
+          # and the old unconditional abort made the job permanently
+          # unrerunnable. That is exactly what happened in run 34451289395.
+          # Abort only if the tag points somewhere else.
+          # Gate on gh's EXIT STATUS, not its stdout: on a 404 `gh api` prints
+          # the error JSON to STDOUT and exits non-zero, so capturing stdout
+          # with `|| true` yields `{"message":"Not Found",...}` rather than an
+          # empty string. That made the "tag exists at a different SHA" branch
+          # fire on the NORMAL path (tag absent) and aborted v0.5.1520's
+          # create-release with `already exists at {"message":"Not Found"...}`.
+          existing=""
+          # One request, including status headers: only an actual 404 means
+          # absent. Authentication/server failures and malformed data must
+          # not fall through to a release write. Annotated tags fail closed.
+          if tag_response=$(gh api --include "repos/$REPO/git/ref/tags/$TAG" \
+               --jq '.object | select(.type == "commit") | .sha' 2>&1); then
+            existing="${tag_response##*$'\n'}"
+            existing="${existing%$'\r'}"
+            if [[ ! "$existing" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::tag $TAG returned no valid commit SHA — aborting." >&2
+              exit 1
+            fi
+          else
+            http_status="${tag_response%%$'\n'*}"
+            if [[ ! "$http_status" =~ ^HTTP/[0-9.]+\ 404([[:space:]]|$) ]]; then
+              echo "::error::could not determine whether tag $TAG exists — aborting." >&2
+              exit 1
+            fi
+          fi
+          reuse_tag=0
+          if [ -n "$existing" ]; then
+            if [ "$existing" != "$SHA" ]; then
+              echo "::error::tag $TAG already exists at $existing, not the candidate $SHA — aborting." >&2
+              exit 1
+            fi
+            echo "tag $TAG already exists at the exact candidate $SHA (previous attempt) — reusing it."
+            reuse_tag=1
+          fi
+
+          ./scripts/cut_release_notes.sh --notes-only > /tmp/release-notes-full.md
+          # GitHub rejects a release body over 125,000 characters with
+          # `HTTP 422: body is too long`. v0.5.1519 carried 1505 changelog.d
+          # fragments -- the first tag since v0.5.1220 on 2026-07-04 -- and
+          # generated 2.8 MB of notes. The POST failed AFTER the tag was
+          # created, which is the worst place for it to fail.
+          LIMIT=120000
+          if [ "$(wc -c < /tmp/release-notes-full.md)" -gt "$LIMIT" ]; then
+            frags=$(find changelog.d -name '*.md' ! -name 'README.md' | wc -l | tr -d ' ')
+            # Cut on a line boundary so the body never ends mid-sentence.
+            head -c "$LIMIT" /tmp/release-notes-full.md | sed '$d' > /tmp/release-notes.md
+            {
+              echo
+              echo '---'
+              echo
+              echo "**These notes are truncated.** This release carries ${frags} changelog"
+              echo "fragments and the full text exceeds GitHub's 125,000-character limit for a"
+              echo "release body. The complete set is in \`changelog.d/\` at [\`$TAG\`](https://github.com/$REPO/tree/$TAG/changelog.d)."
+            } >> /tmp/release-notes.md
+            echo "::notice::release notes truncated from $(wc -c < /tmp/release-notes-full.md) to $(wc -c < /tmp/release-notes.md) bytes (${frags} fragments)"
+          else
+            cp /tmp/release-notes-full.md /tmp/release-notes.md
+          fi
+          # Created with GITHUB_TOKEN: GitHub suppresses events triggered by a
+          # workflow's own token, so this `release: published` does NOT fire a
+          # second release-packages run (publishing continues in THIS run),
+          # and the tag emits no `push: tags` event either — the step below
+          # dispatches the tag-rider workflows explicitly.
+          if [ "$reuse_tag" -eq 1 ]; then
+            # The tag already exists at this SHA; do not pass --target.
+            gh release create "$TAG" -R "$REPO" \
+              --title "$TAG" --notes-file /tmp/release-notes.md
+          else
+            gh release create "$TAG" -R "$REPO" \
+              --target "$SHA" --title "$TAG" --notes-file /tmp/release-notes.md
+          fi
+          echo "Created release $TAG at $SHA"
+
+      - name: Dispatch tag-rider workflows (docs, benchmark, container-tests)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # These normally ride `push: tags: ['v*']`. test.yml/simctl already
+          # ran on this SHA (await-tests gated on them), so only the rest are
+          # fired. benchmark.yml keys its hard-fail release gate off
+          # `startsWith(github.ref, 'refs/tags/v')`, which holds when
+          # dispatched with --ref <tag>. Best-effort: a failed dispatch must
+          # not fail the release itself.
+          for rider in maintenance.yml:docs compiler-runtime.yml:benchmark compiler-runtime.yml:container-tests; do
+            wf="${rider%%:*}"
+            suite="${rider#*:}"
+            gh workflow run "$wf" --ref "$TAG" -R "$REPO" -f "suite=$suite" \
+              || echo "::warning::could not dispatch $wf / $suite on $TAG — run it manually"
+          done
+
+  # Fast preview lane: the package matrices still build the real release
+  # archives, but no full-suite/simulator gate or npm publication is required.
+  # Keep the GitHub prerelease as a draft until publish-assets has uploaded the
+  # exact outputs for this SHA.
+  create-nightly:
+    needs: [preflight, build, build-cross]
+    if: >
+      !cancelled() &&
+      needs.preflight.outputs.mode == 'nightly' &&
+      needs.build.result == 'success' &&
+      needs.build-cross.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository (inline git)
+        shell: bash
+        env:
+          CHECKOUT_REF: ${{ needs.preflight.outputs.checkout-ref }}
+          EXPECTED_SHA: ${{ needs.preflight.outputs.checkout-sha }}
+          CHECKOUT_DEPTH: "1"
+          CHECKOUT_TOKEN: ${{ github.token }}
+          CHECKOUT_PERSIST_CREDENTIALS: "true"
+        run: |
+          set -euo pipefail
+          git init
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          auth_header="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$CHECKOUT_TOKEN" | base64 | tr -d '\n')"
+          if [[ "$CHECKOUT_DEPTH" == "0" ]]; then
+            git -c http.https://github.com/.extraheader="$auth_header" fetch --force --tags origin
+            git checkout --force --detach "$CHECKOUT_REF"
+          else
+            git -c http.https://github.com/.extraheader="$auth_header" fetch --no-tags --force --depth "$CHECKOUT_DEPTH" origin "$CHECKOUT_REF"
+            git checkout --force --detach FETCH_HEAD
+          fi
+          # Build exactly the commit preflight resolved, or nothing.
+          : "${EXPECTED_SHA:?preflight resolved no checkout-sha}"
+          built=$(git rev-parse HEAD)
+          echo "built tree: $built  expected: $EXPECTED_SHA  (ref: $CHECKOUT_REF)"
+          if [ "$built" != "$EXPECTED_SHA" ]; then
+            echo "::error::checked out $built, not $EXPECTED_SHA — refusing to build or publish a different commit."
+            exit 1
+          fi
+          if [[ "$CHECKOUT_PERSIST_CREDENTIALS" == "true" ]]; then
+            git config http.https://github.com/.extraheader "$auth_header"
+          fi
+      - name: Create draft prerelease for the exact commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if gh api "repos/$REPO/git/ref/tags/$TAG" --silent 2>/dev/null; then
+            echo "::error::nightly tag $TAG already exists; rerun tomorrow or use a new commit."
+            exit 1
+          fi
+          gh release create "$TAG" -R "$REPO" --target "$SHA" \
+            --title "Perry $TAG" --notes "Automated nightly build from commit $SHA." \
+            --draft --prerelease
+
+  # ---------------------------------------------------------------------------
+  # Upload every packaged archive to the GitHub Release. Runs for all
+  # publishing modes (single upload path — the build legs no longer touch the
+  # release): release/republish upload to the pre-existing release,
+  # cut-release to the one create-release just made. Host archives are a hard
+  # requirement; cross bundles are best-effort on the legacy paths (workers
+  # rebuild from source when a bundle is missing), matching the old per-leg
+  # upload semantics where a red cross leg didn't sink the release.
+  # ---------------------------------------------------------------------------
+  publish-assets:
+    needs: [preflight, build, build-cross, create-release, create-nightly]
+    if: >
+      !cancelled() &&
+      needs.preflight.outputs.tag != '' &&
+      needs.build.result == 'success' &&
+      contains(fromJSON('["success", "failure"]'), needs.build-cross.result) &&
+      (
+        (needs.preflight.outputs.mode == 'cut-release' && needs.create-release.result == 'success') ||
+        (needs.preflight.outputs.mode == 'nightly' && needs.create-nightly.result == 'success') ||
+        (needs.preflight.outputs.mode != 'cut-release' && needs.preflight.outputs.mode != 'nightly')
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download packaged host archives
+        uses: ./.github/actions/perry/actions/download-artifact # v8
+        with:
+          pattern: release-archive-*
+          merge-multiple: true
+          path: assets/
+
+      - name: Download cross bundles
+        # continue-on-error: a fully-red build-cross (legacy modes) must not
+        # stop the host archives from shipping.
+        continue-on-error: true
+        uses: ./.github/actions/perry/actions/download-artifact # v8
+        with:
+          pattern: perry-cross-*
+          merge-multiple: true
+          path: assets/
+
+      - name: Upload all assets to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(assets/*)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::no archives downloaded — nothing to upload to $TAG"
+            exit 1
+          fi
+          for f in "${files[@]}"; do
+            echo "uploading $(basename "$f")"
+            gh release upload "$TAG" "$f" -R "$REPO" --clobber
+          done
+          if [ "${{ needs.preflight.outputs.mode }}" = "nightly" ]; then
+            gh release edit "$TAG" -R "$REPO" --draft=false --prerelease
+            echo "Published prerelease $TAG with ${#files[@]} build asset(s)."
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Update Homebrew tap
+  # ---------------------------------------------------------------------------
+  homebrew:
+    # publish-assets success implies: a tag exists, host builds are green, and
+    # the bottles this job downloads from the release are actually there.
+    needs: [preflight, publish-assets]
+    if: needs.preflight.outputs.mode != 'nightly'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get release info
+        id: release
+        run: |
+          TAG="${{ needs.preflight.outputs.tag }}"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Download source tarball and compute SHA256
+        id: sha
+        run: |
+          curl -sL "https://github.com/${{ github.repository }}/archive/refs/tags/${{ steps.release.outputs.tag }}.tar.gz" -o source.tar.gz
+          SHA256=$(sha256sum source.tar.gz | cut -d' ' -f1)
+          echo "sha256=${SHA256}" >> "$GITHUB_OUTPUT"
+
+      - name: Download macOS ARM64 bottle and compute SHA256
+        id: bottle_arm64
+        run: |
+          curl -sL "https://github.com/${{ github.repository }}/releases/download/${{ steps.release.outputs.tag }}/perry-macos-aarch64.tar.gz" -o perry-macos-aarch64.tar.gz
+          SHA256=$(sha256sum perry-macos-aarch64.tar.gz | cut -d' ' -f1)
+          echo "sha256=${SHA256}" >> "$GITHUB_OUTPUT"
+
+      - name: Download macOS x86_64 bottle and compute SHA256
+        id: bottle_x64
+        run: |
+          curl -sL "https://github.com/${{ github.repository }}/releases/download/${{ steps.release.outputs.tag }}/perry-macos-x86_64.tar.gz" -o perry-macos-x86_64.tar.gz
+          SHA256=$(sha256sum perry-macos-x86_64.tar.gz | cut -d' ' -f1)
+          echo "sha256=${SHA256}" >> "$GITHUB_OUTPUT"
+
+      - name: Update Homebrew tap
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/PerryTS/homebrew-perry.git" tap
+          cd tap
+
+          mkdir -p Formula
+
+          cat > Formula/perry.rb << 'FORMULA_EOF'
+          class Perry < Formula
+            desc "Native TypeScript compiler — compiles TypeScript to native executables"
+            homepage "https://github.com/PerryTS/perry"
+            version "${{ steps.release.outputs.version }}"
+            license "MIT"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "https://github.com/PerryTS/perry/releases/download/${{ steps.release.outputs.tag }}/perry-macos-aarch64.tar.gz"
+                sha256 "${{ steps.bottle_arm64.outputs.sha256 }}"
+              else
+                url "https://github.com/PerryTS/perry/releases/download/${{ steps.release.outputs.tag }}/perry-macos-x86_64.tar.gz"
+                sha256 "${{ steps.bottle_x64.outputs.sha256 }}"
+              end
+            end
+
+            on_linux do
+              url "https://github.com/PerryTS/perry/archive/refs/tags/${{ steps.release.outputs.tag }}.tar.gz"
+              sha256 "${{ steps.sha.outputs.sha256 }}"
+              depends_on "rust" => :build
+            end
+
+            def install
+              if OS.mac?
+                bin.install "perry"
+                lib.install Dir["libperry_*.a"] + Dir["libperry_*.a.gc-effects"]
+              else
+                system "cargo", "build", "--profile", "prod"
+                system "cargo", "build", "--profile", "prod", "-p", "perry-runtime", "-p", "perry-stdlib", "-p", "perry-runtime-static", "-p", "perry-stdlib-static"
+                system "cargo", "run", "--release", "-p", "perry-gc-effects", "--", "sidecars", "target/prod"
+                bin.install "target/prod/perry"
+                lib.install Dir["target/prod/libperry_*.a"] + Dir["target/prod/libperry_*.a.gc-effects"]
+              end
+            end
+
+            def caveats
+              <<~EOS
+                Perry requires a C linker to link compiled executables.
+
+                macOS:  Xcode Command Line Tools (xcode-select --install)
+                Linux:  GCC or Clang (sudo apt install build-essential)
+
+                Quick start:
+                  echo 'console.log("hello")' > hello.ts
+                  perry hello.ts -o hello && ./hello
+              EOS
+            end
+
+            test do
+              assert_match "perry", shell_output("#{bin}/perry --version")
+              (testpath/"test.ts").write('console.log("works");')
+              system bin/"perry", testpath/"test.ts", "-o", testpath/"test"
+              assert_equal "works\n", shell_output(testpath/"test")
+            end
+          end
+          FORMULA_EOF
+
+          # Remove leading whitespace from heredoc indentation
+          sed -i 's/^          //' Formula/perry.rb
+
+          git config user.name "perry-bot"
+          git config user.email "bot@perryts.com"
+          git add Formula/perry.rb
+          # (pre-fix this said "$VERSION", a shell var that was never set in
+          # this step — every tap commit was titled just "perry ".)
+          git commit -m "perry ${{ steps.release.outputs.version }}" || echo "No changes"
+          git push
+
+  # ---------------------------------------------------------------------------
+  # Build .deb packages and update APT repository
+  # ---------------------------------------------------------------------------
+  apt:
+    # Builds .debs from the build job's staging artifacts and uploads them to
+    # the release — so it needs the tag to EXIST (create-release in cut mode,
+    # pre-existing otherwise) but not publish-assets, letting it run in
+    # parallel with the archive uploads.
+    needs: [preflight, build, create-release]
+    if: >
+      !cancelled() &&
+      needs.preflight.outputs.mode != 'nightly' &&
+      needs.preflight.outputs.tag != '' &&
+      needs.build.result == 'success' &&
+      (needs.preflight.outputs.mode != 'cut-release' || needs.create-release.result == 'success')
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - artifact: perry-linux-x86_64
+            arch: amd64
+          - artifact: perry-linux-aarch64
+            arch: arm64
+    steps:
+      - name: Get release info
+        id: release
+        run: |
+          TAG="${{ needs.preflight.outputs.tag }}"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Download build artifact
+        uses: ./.github/actions/perry/actions/download-artifact # v8
+        with:
+          name: ${{ matrix.artifact }}
+          path: staging/
+
+      - name: Build .deb packages
+        run: |
+          VERSION="${{ steps.release.outputs.version }}"
+          ARCH="${{ matrix.arch }}"
+          umask 022
+
+          require_staging_file() {
+            local path="staging/$1"
+            if [ ! -f "$path" ]; then
+              echo "Missing required release artifact: $path" >&2
+              exit 1
+            fi
+          }
+
+          write_control() {
+            local pkg_dir="$1"
+            local package="$2"
+            local depends="$3"
+            local description="$4"
+            local details="$5"
+
+            {
+              echo "Package: ${package}"
+              echo "Version: ${VERSION}"
+              echo "Section: devel"
+              echo "Priority: optional"
+              echo "Architecture: ${ARCH}"
+              if [ -n "$depends" ]; then
+                echo "Depends: ${depends}"
+              fi
+              echo "Maintainer: Perry Team <hello@perryts.com>"
+              echo "Homepage: https://github.com/PerryTS/perry"
+              echo "Description: ${description}"
+              echo " ${details}"
+            } > "${pkg_dir}/DEBIAN/control"
+          }
+
+          init_package() {
+            local pkg_dir="$1"
+            local package="$2"
+            local depends="$3"
+            local description="$4"
+            local details="$5"
+
+            rm -rf "$pkg_dir"
+            mkdir -p "${pkg_dir}/DEBIAN"
+            chmod 755 "$pkg_dir" "${pkg_dir}/DEBIAN"
+            write_control "$pkg_dir" "$package" "$depends" "$description" "$details"
+          }
+
+          copy_static_archive() {
+            local lib="$1"
+            local pkg_dir="$2"
+
+            require_staging_file "$lib"
+            mkdir -p "${pkg_dir}/usr/lib/perry"
+            cp "staging/$lib" "${pkg_dir}/usr/lib/perry/"
+
+            # Strip DWARF debug info but keep the symbol table. Perry's
+            # codegen linker still needs the #[no_mangle] symbols, while
+            # release users do not need archive debug sections.
+            strip --strip-debug "${pkg_dir}/usr/lib/perry/$lib" || true
+            chmod 644 "${pkg_dir}/usr/lib/perry/$lib"
+          }
+
+          # The GC effects sidecar rides in the same package as its runtime
+          # archive. NOTE: the strip above rewrites the archive bytes, so the
+          # SHA-256 in this sidecar names the unstripped archive that was
+          # analyzed (the rows hold: --strip-debug removes no code).
+          copy_runtime_sidecar() {
+            local lib="$1"
+            local pkg_dir="$2"
+
+            require_staging_file "$lib.gc-effects"
+            cp "staging/$lib.gc-effects" "${pkg_dir}/usr/lib/perry/"
+            chmod 644 "${pkg_dir}/usr/lib/perry/$lib.gc-effects"
+          }
+
+          build_deb() {
+            local pkg_dir="$1"
+
+            # `-Zxz -z9` overrides dpkg-deb's default (zstd on noble) with
+            # xz level 9. xz is consistently smaller on the libperry_*.a
+            # archive bodies, and every dpkg version Perry targets supports it.
+            dpkg-deb --build -Zxz -z9 "$pkg_dir"
+          }
+
+          check_deb_sizes() {
+            local max_git_blob_bytes=99000000
+            local failed=0
+
+            shopt -s nullglob
+            local debs=( *.deb )
+            if [ "${#debs[@]}" -eq 0 ]; then
+              echo "No .deb packages were produced" >&2
+              exit 1
+            fi
+
+            for deb in "${debs[@]}"; do
+              local size
+              size=$(stat -c %s "$deb")
+              if [ "$size" -gt "$max_git_blob_bytes" ]; then
+                echo "$deb is $size bytes; GitHub rejects git blobs near 100 MB" >&2
+                failed=1
+              fi
+            done
+
+            if [ "$failed" -ne 0 ]; then
+              exit 1
+            fi
+          }
+
+          require_staging_file perry
+          require_staging_file libperry_runtime.a
+          require_staging_file libperry_stdlib.a
+
+          MAIN_DEPENDS="libc6 (>= 2.31), gcc | clang, perry-runtime (= ${VERSION}), perry-stdlib (= ${VERSION})"
+          if [ -f staging/libperry_ui_gtk4.a ]; then
+            MAIN_DEPENDS="${MAIN_DEPENDS}, perry-ui-gtk4 (= ${VERSION})"
+          fi
+
+          MAIN_PKG="perry_${VERSION}_${ARCH}"
+          init_package "$MAIN_PKG" \
+            "perry" \
+            "$MAIN_DEPENDS" \
+            "Native TypeScript compiler" \
+            "Perry compiles TypeScript source code directly to native executables using Cranelift for code generation."
+          mkdir -p "${MAIN_PKG}/usr/bin" "${MAIN_PKG}/etc/perry"
+          install -m 755 staging/perry "${MAIN_PKG}/usr/bin/perry"
+          echo "/usr/lib/perry" > "${MAIN_PKG}/etc/perry/lib-path"
+          build_deb "$MAIN_PKG"
+
+          RUNTIME_PKG="perry-runtime_${VERSION}_${ARCH}"
+          init_package "$RUNTIME_PKG" \
+            "perry-runtime" \
+            "" \
+            "Perry runtime static library" \
+            "Static runtime archive required by the Perry compiler when linking generated executables."
+          copy_static_archive libperry_runtime.a "$RUNTIME_PKG"
+          copy_runtime_sidecar libperry_runtime.a "$RUNTIME_PKG"
+          build_deb "$RUNTIME_PKG"
+
+          STDLIB_PKG="perry-stdlib_${VERSION}_${ARCH}"
+          init_package "$STDLIB_PKG" \
+            "perry-stdlib" \
+            "" \
+            "Perry standard library static archive" \
+            "Static standard library archive required by the Perry compiler when linking generated executables."
+          copy_static_archive libperry_stdlib.a "$STDLIB_PKG"
+          build_deb "$STDLIB_PKG"
+
+          if [ -f staging/libperry_ui_gtk4.a ]; then
+            UI_PKG="perry-ui-gtk4_${VERSION}_${ARCH}"
+            init_package "$UI_PKG" \
+              "perry-ui-gtk4" \
+              "" \
+              "Perry GTK4 UI static archive" \
+              "Static GTK4 UI archive used by Perry programs that import the Linux UI backend."
+            copy_static_archive libperry_ui_gtk4.a "$UI_PKG"
+            build_deb "$UI_PKG"
+          fi
+
+          check_deb_sizes
+
+      - name: Upload .deb release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.release.outputs.tag }}"
+          shopt -s nullglob
+          debs=( *.deb )
+          if [ "${#debs[@]}" -eq 0 ]; then
+            echo "No .deb packages were produced" >&2
+            exit 1
+          fi
+
+          for deb in "${debs[@]}"; do
+            gh release upload "$TAG" "$deb" \
+              --repo "${{ github.repository }}" --clobber
+          done
+
+      - name: Upload .deb artifacts (for apt-repo job)
+        uses: ./.github/actions/perry/actions/upload-artifact # v7
+        with:
+          name: deb-${{ matrix.arch }}
+          path: "*.deb"
+
+  # ---------------------------------------------------------------------------
+  # Update APT repository (GitHub Pages)
+  # ---------------------------------------------------------------------------
+  apt-repo:
+    # Default needs-semantics: runs only when apt succeeded (and is skipped
+    # whenever apt was skipped — stage mode, red builds, missing tag).
+    needs: [preflight, apt]
+    if: needs.preflight.outputs.mode != 'nightly'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get release info
+        id: release
+        run: |
+          TAG="${{ needs.preflight.outputs.tag }}"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Download .deb packages
+        uses: ./.github/actions/perry/actions/download-artifact # v8
+        with:
+          pattern: deb-*
+          merge-multiple: true
+          path: debs/
+
+      - name: Clone APT repo
+        env:
+          APT_TOKEN: ${{ secrets.APT_REPO_TOKEN }}
+        run: git clone "https://x-access-token:${APT_TOKEN}@github.com/PerryTS/perry-apt.git" apt-repo
+
+      - name: Import GPG key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+        run: echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+
+      - name: Update repository
+        env:
+          GPG_KEY_ID: ${{ secrets.APT_GPG_KEY_ID }}
+        run: |
+          cd apt-repo
+
+          max_git_blob_bytes=99000000
+          oversized=0
+          for deb in ../debs/*.deb; do
+            size=$(stat -c %s "$deb")
+            if [ "$size" -gt "$max_git_blob_bytes" ]; then
+              echo "$deb is $size bytes; GitHub rejects git blobs near 100 MB" >&2
+              oversized=1
+            fi
+          done
+          if [ "$oversized" -ne 0 ]; then
+            exit 1
+          fi
+
+          # Copy new .deb files into pool
+          mkdir -p pool/main/p/perry
+          cp ../debs/*.deb pool/main/p/perry/
+
+          # Generate Packages index for each architecture
+          for ARCH in amd64 arm64; do
+            mkdir -p dists/stable/main/binary-${ARCH}
+            dpkg-scanpackages --arch ${ARCH} pool/ > dists/stable/main/binary-${ARCH}/Packages
+            gzip -9c dists/stable/main/binary-${ARCH}/Packages > dists/stable/main/binary-${ARCH}/Packages.gz
+          done
+
+          # Generate Release file
+          cd dists/stable
+          cat > Release << EOF
+          Origin: PerryTS
+          Label: Perry
+          Suite: stable
+          Codename: stable
+          Architectures: amd64 arm64
+          Components: main
+          Description: Perry native TypeScript compiler
+          EOF
+          sed -i 's/^          //' Release
+
+          # Add checksums
+          {
+            echo "MD5Sum:"
+            find main/ -type f | while read f; do
+              echo " $(md5sum "$f" | cut -d' ' -f1) $(wc -c < "$f") $f"
+            done
+            echo "SHA256:"
+            find main/ -type f | while read f; do
+              echo " $(sha256sum "$f" | cut -d' ' -f1) $(wc -c < "$f") $f"
+            done
+          } >> Release
+
+          # Sign
+          gpg --batch --yes --default-key "${GPG_KEY_ID}" -abs -o Release.gpg Release
+          gpg --batch --yes --default-key "${GPG_KEY_ID}" --clearsign -o InRelease Release
+
+          cd ../..
+
+          # Export public key for users
+          gpg --armor --export "${GPG_KEY_ID}" > perry.gpg.pub
+
+          git config user.name "perry-bot"
+          git config user.email "bot@perryts.com"
+          git add -A
+          git commit -m "perry ${{ steps.release.outputs.version }}"
+          git push
+
+  # ---------------------------------------------------------------------------
+  # Publish to winget (Windows Package Manager)
+  # ---------------------------------------------------------------------------
+  winget:
+    # wingetcreate resolves the zip by its release-download URL, so the asset
+    # must already be on the release — hence publish-assets, not build.
+    needs: [preflight, publish-assets]
+    if: needs.preflight.outputs.mode != 'nightly'
+    runs-on: windows-latest
+    steps:
+      - name: Get release info
+        id: release
+        shell: pwsh
+        run: |
+          $tag = "${{ needs.preflight.outputs.tag }}"
+          $version = $tag -replace '^v', ''
+          echo "version=$version" >> $env:GITHUB_OUTPUT
+          echo "tag=$tag" >> $env:GITHUB_OUTPUT
+
+      - name: Download wingetcreate
+        shell: pwsh
+        run: |
+          Invoke-WebRequest "https://aka.ms/wingetcreate/latest" -OutFile wingetcreate.exe
+
+      - name: Sync WINGET_PAT-user's winget-pkgs fork with upstream
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.WINGET_PAT }}
+        # wingetcreate --submit uses the AUTHENTICATED USER'S fork of
+        # microsoft/winget-pkgs, not the org's (PerryTS/winget-pkgs was a
+        # red herring left over from a misread of how wingetcreate works).
+        # Query the token's current user, resolve `<user>/winget-pkgs`,
+        # then merge-upstream. microsoft/winget-pkgs gets thousands of
+        # commits per day — any fork untouched for a week is already behind
+        # enough that wingetcreate's internal SyncFork call will throw the
+        # opaque "forked repository could not be synced" error we saw on
+        # the v0.5.158 first-real-release run.
+        run: |
+          $user = (gh api /user --jq '.login').Trim()
+          Write-Host "Authenticated user: $user"
+          Write-Host "Syncing $user/winget-pkgs from microsoft/winget-pkgs"
+          gh repo sync "$user/winget-pkgs" --source microsoft/winget-pkgs --force
+
+      - name: Update winget manifest
+        shell: pwsh
+        env:
+          WINGET_PAT: ${{ secrets.WINGET_PAT }}
+        run: |
+          $url = "https://github.com/${{ github.repository }}/releases/download/${{ steps.release.outputs.tag }}/perry-windows-x86_64.zip"
+          ./wingetcreate.exe update PerryTS.Perry `
+            --urls $url `
+            --version "${{ steps.release.outputs.version }}" `
+            --token $env:WINGET_PAT `
+            --submit
+
+  # ---------------------------------------------------------------------------
+  # Notify build workers to update perry
+  # ---------------------------------------------------------------------------
+  update-workers:
+    # Workers pull the new binaries off the GitHub Release, so only ping them
+    # once the assets are actually up.
+    needs: [preflight, publish-assets]
+    if: needs.preflight.outputs.mode != 'nightly'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get release version
+        id: release
+        run: |
+          TAG="${{ needs.preflight.outputs.tag }}"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Trigger worker perry update
+        env:
+          HUB_ADMIN_SECRET: ${{ secrets.HUB_ADMIN_SECRET }}
+        run: |
+          echo "Triggering perry update on build workers (expected: ${{ steps.release.outputs.version }})..."
+          RESPONSE=$(curl -sf -X POST "https://hub.perryts.com/api/v1/admin/update-perry" \
+            -H "Authorization: Bearer ${HUB_ADMIN_SECRET}" \
+            -H "Content-Type: application/json" \
+            -d "{\"expected_version\": \"${{ steps.release.outputs.version }}\"}" 2>&1) || true
+          echo "Hub response: ${RESPONSE}"
+
+  # ---------------------------------------------------------------------------
+  # Publish npm packages (@perryts/perry + 8 per-platform packages)
+  #
+  # Uses OIDC / Trusted Publishers (no npm login, long-lived NPM_TOKEN, or
+  # GitHub Environment). release-packages.yml is the one publisher identity
+  # shared by every @perryts/* package.
+  # ---------------------------------------------------------------------------
+  npm-publish:
+    # The irreversible leg. Every build must be green in canonical cut-release
+    # mode. It runs BEFORE create-release; only exact registry verification can
+    # unblock the tag. Release-event and explicit republish modes stay
+    # idempotent for already-existing releases.
+    needs: [preflight, build, build-cross]
+    if: >
+      !cancelled() &&
+      needs.build.result == 'success' &&
+      (
+        (needs.preflight.outputs.mode == 'cut-release' && needs.build-cross.result == 'success') ||
+        (needs.preflight.outputs.mode == 'release' && contains(fromJSON('["success", "failure"]'), needs.build-cross.result)) ||
+        (needs.preflight.outputs.mode == 'republish' && inputs.publish_npm && contains(fromJSON('["success", "failure"]'), needs.build-cross.result))
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write          # REQUIRED for OIDC + npm --provenance
+    env:
+      DIST_TAG: ${{ inputs.dist_tag || 'latest' }}
+      SOCKET_SCAN: ${{ inputs.socket_scan || false }}
+    steps:
+      - name: Checkout repository (inline git)
+        shell: bash
+        env:
+          CHECKOUT_REF: ${{ needs.preflight.outputs.checkout-ref }}
+          EXPECTED_SHA: ${{ needs.preflight.outputs.checkout-sha }}
+          CHECKOUT_DEPTH: "1"
+          CHECKOUT_TOKEN: ${{ github.token }}
+          CHECKOUT_PERSIST_CREDENTIALS: "true"
+        run: |
+          set -euo pipefail
+          git init
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          auth_header="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$CHECKOUT_TOKEN" | base64 | tr -d '\n')"
+          if [[ "$CHECKOUT_DEPTH" == "0" ]]; then
+            git -c http.https://github.com/.extraheader="$auth_header" fetch --force --tags origin
+            git checkout --force --detach "$CHECKOUT_REF"
+          else
+            git -c http.https://github.com/.extraheader="$auth_header" fetch --no-tags --force --depth "$CHECKOUT_DEPTH" origin "$CHECKOUT_REF"
+            git checkout --force --detach FETCH_HEAD
+          fi
+          # Build exactly the commit preflight resolved, or nothing.
+          : "${EXPECTED_SHA:?preflight resolved no checkout-sha}"
+          built=$(git rev-parse HEAD)
+          echo "built tree: $built  expected: $EXPECTED_SHA  (ref: $CHECKOUT_REF)"
+          if [ "$built" != "$EXPECTED_SHA" ]; then
+            echo "::error::checked out $built, not $EXPECTED_SHA — refusing to build or publish a different commit."
+            exit 1
+          fi
+          if [[ "$CHECKOUT_PERSIST_CREDENTIALS" == "true" ]]; then
+            git config http.https://github.com/.extraheader "$auth_header"
+          fi
+      - uses: ./.github/actions/perry/actions/setup-node # v7
+        with:
+          node-version: "26"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Upgrade npm (OIDC Trusted Publisher requires >= 11.5.1)
+        # Node 26 already ships npm 11.x, which clears the floor; kept because
+        # it is free and pins the guarantee rather than inheriting it. Below
+        # 11.5.1 the OIDC handshake fails silently and the registry returns a
+        # misleading 404 ("'pkg@ver' is not in this registry") on PUT. See
+        # npm/cli#9088.
+        run: npm install -g npm@latest
+
+      - name: Download all build artifacts
+        uses: ./.github/actions/perry/actions/download-artifact # v8
+        with:
+          path: release-artifacts/
+
+      - name: Materialize npm packages
+        run: ./scripts/stage-npm.sh release-artifacts/
+
+      - name: Pack the exact publication tarballs
+        run: node scripts/publish/prepare-ci-packages.mts
+
+      - name: Install the Socket scan SDK
+        if: env.SOCKET_SCAN == 'true'
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Socket full-scan the exact publication tarballs
+        if: env.SOCKET_SCAN == 'true'
+        env:
+          # Repository/org Actions secret, exposed only to this scan step.
+          SOCKET_API_TOKEN: ${{ secrets.SOCKET_API_TOKEN }}
+        run: node scripts/publish/scan-ci-packages.mts
+
+      - name: Record that Socket is intentionally skipped
+        if: env.SOCKET_SCAN != 'true'
+        run: |
+          echo "::notice::Socket scan disabled for this dispatch."
+          node -e 'require("fs").writeFileSync("socket-scan-receipt.json", JSON.stringify({status:"skipped",reason:"workflow input socket_scan=false"}, null, 2) + "\n")'
+
+      - name: Bundle exact npm publication proofs
+        run: |
+          set -euo pipefail
+          # The expected set is DERIVED from the manifest the previous step
+          # generates from ALL_PACKAGES (scripts/publish/constants.mts) and
+          # already validates against it. This used to hardcode `9`, which went
+          # silently wrong when the musl legs were dropped pending #9382:
+          # ALL_PACKAGES became 6 platforms + wrapper = 7, stage-npm staged 6,
+          # prepare-ci-packages packed 7 and PASSED its own check -- and then
+          # this step failed the release with "Expected 9; found 7" AFTER a
+          # fully green 14-leg build (run 34438751300). Two expressions of the
+          # same fact, one of which nobody updated.
+          #
+          # Checked BY NAME, not by a count: a count cannot say WHICH package is
+          # missing, and that is the whole question when this fires. The count
+          # equality below still catches a stray EXTRA tarball.
+          # `while read` rather than `mapfile`: mapfile is bash 4+, and keeping
+          # this to bash 3.2 means it can be run and tested on a developer
+          # machine instead of only on a runner. This step failed a release once
+          # already; an untestable version of it is not an improvement.
+          proofs=()
+          while IFS= read -r line; do proofs+=("$line"); done \
+            < <(find npm -mindepth 2 -maxdepth 2 -type f -name '*.tgz' | sort)
+          want=()
+          while IFS= read -r line; do want+=("$line"); done < <(node -e '
+            const m = require("./npm-publish-manifest.json")
+            for (const p of m.packages) {
+              console.log(p.name.replace(/^@/, "").replace(/\//g, "-") + "-" + p.version + ".tgz")
+            }
+          ')
+          if [ "${#want[@]}" -lt 2 ]; then
+            echo "::error::manifest lists ${#want[@]} package(s); refusing to publish a set that small." >&2
+            exit 1
+          fi
+          missing=""
+          for w in ${want[@]+"${want[@]}"}; do
+            hit=0
+            for p in ${proofs[@]+"${proofs[@]}"}; do
+              if [ "$(basename "$p")" = "$w" ]; then hit=1; break; fi
+            done
+            if [ "$hit" -eq 0 ]; then missing="$missing $w"; fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::manifest package(s) have no packed tarball:$missing" >&2
+            printf '  on disk: %s\n' ${proofs[@]+"${proofs[@]}"} >&2
+            exit 1
+          fi
+          if [ "${#proofs[@]}" -ne "${#want[@]}" ]; then
+            echo "::error::found ${#proofs[@]} tarball(s) but the manifest lists ${#want[@]}; an unexpected tarball is present." >&2
+            printf '  on disk: %s\n' ${proofs[@]+"${proofs[@]}"} >&2
+            exit 1
+          fi
+          echo "${#want[@]} exact tarballs match the manifest by name."
+          tar -cf npm-publish-package-proofs.tar \
+            npm-publish-manifest.json socket-scan-receipt.json "${proofs[@]}"
+
+      - name: npm publish exact tarballs (OIDC; platforms first, wrapper last)
+        env:
+          # How long to wait for npm publish-time scanning to make the platform
+          # packages visible before giving up. Generous on purpose: a timeout
+          # here is a resumable rerun, while publishing the wrapper too early
+          # is not recoverable (npm versions are immutable).
+          VISIBILITY_WAIT_MIN: "45"
+        # No npm login and no NPM_TOKEN. npm exchanges this job's short-lived
+        # GitHub OIDC identity because id-token:write is set above. Reruns skip
+        # an already-public version only when its immutable registry sha1 is
+        # byte-for-byte identical to this run's packed tarball.
+        run: |
+          set -euo pipefail
+          for variable in NPM_TOKEN NODE_AUTH_TOKEN NPM_AUTH_TOKEN; do
+            if [ -n "$(printenv "$variable" 2>/dev/null || true)" ]; then
+              echo "::error::Refusing long-lived $variable; npm Trusted Publisher/OIDC is the only sanctioned authentication." >&2
+              exit 1
+            fi
+          done
+
+          failed=""
+          while IFS=$'\t' read -r name version tarball expected_sha; do
+            if [ "$name" = "@perryts/perry" ]; then
+              if [ -n "$failed" ]; then
+                echo "::error::Not publishing the wrapper because platform publication failed:$failed" >&2
+                failed="$failed $name@$version (blocked by platform failure)"
+                continue
+              fi
+              # npm can report a successful publish that never lands. On
+              # 2026-09-10 it printed "+ @perryts/perry-linux-x64@0.5.1519",
+              # exited 0 and signed provenance, while leaving the version
+              # STAGED: invisible (404, absent from the packument's `time`
+              # map) and un-republishable (E409 on every retry). The guard
+              # above trusted that exit code, so the wrapper shipped as
+              # `latest` with a platform dependency that did not resolve, and
+              # v0.5.1519 could not be completed at all.
+              #
+              # So do not take npm's word for it. Before the wrapper goes out,
+              # confirm every platform package is REALLY in the registry. The
+              # `time` map is the authoritative signal here: `npm view` and the
+              # publish exit status both reported success for a version npm had
+              # no record of.
+              # npm's publish-time scanning can hold a large binary for a
+              # long time -- its own notice says "may take longer than usual"
+              # and gives itself 24 h. So poll ROUND-ROBIN against a single
+              # global deadline rather than giving each package its own short
+              # budget: the packages settle in parallel, so a per-package
+              # timeout would fail the normal slow case while adding nothing
+              # for the broken one.
+              #
+              # Timing out here is SAFE and resumable. The platform packages
+              # are already published; a rerun skips them on matching sha1 and
+              # waits again. What must never happen is the wrapper going out
+              # over a platform that is not really there.
+              echo "=== verifying every platform package is visible before publishing the wrapper ==="
+              if ! node scripts/publish/platform-visibility.mjs npm-publish-manifest.json; then
+                echo "::error::Refusing to publish the wrapper: platform visibility verification failed. Rerun this job to resume." >&2
+                failed="$failed $name@$version (platform visibility failed)"
+                continue
+              fi
+            fi
+
+            public_sha=$(npm view "$name@$version" dist.shasum 2>/dev/null | tr -d '[:space:]' || true)
+            if [ -n "$public_sha" ]; then
+              if [ "$public_sha" != "$expected_sha" ]; then
+                echo "::error::$name@$version is already public with sha1 $public_sha; this run packed $expected_sha." >&2
+                failed="$failed $name@$version (sha1 mismatch)"
+              else
+                echo "=== $name@$version already public with matching sha1 — skipping ==="
+              fi
+              continue
+            fi
+
+            echo "=== publishing $name@$version from $tarball ==="
+            publish_log=$(mktemp)
+            set +e
+            npm publish "./$tarball" \
+              --access public --tag "$DIST_TAG" --ignore-scripts --provenance \
+              2>&1 | tee "$publish_log"
+            publish_code=${PIPESTATUS[0]}
+            set -e
+            if grep -Eq 'ERR_PNPM_AUTH_TOKEN_EXCHANGE|Skipped OIDC' "$publish_log"; then
+              echo "::error::npm reported a failed OIDC exchange for $name@$version." >&2
+              publish_code=1
+            fi
+            rm -f "$publish_log"
+            if [ "$publish_code" -ne 0 ]; then
+              echo "::error::npm publish failed for $name@$version — continuing with remaining platform packages." >&2
+              failed="$failed $name@$version"
+            fi
+          done < <(node -e '
+            const manifest = require("./npm-publish-manifest.json")
+            for (const pkg of manifest.packages) {
+              console.log([pkg.name, pkg.version, pkg.path, pkg.sha1].join("\t"))
+            }
+          ')
+          if [ -n "$failed" ]; then
+            echo "::error::npm publication failures:$failed" >&2
+            exit 1
+          fi
+
+      - name: Verify every public registry shasum
+        # npm's CDN can lag a successful PUT. Wait briefly, but a different
+        # sha1 fails immediately because published versions are immutable.
+        run: |
+          set -euo pipefail
+          deadline=$((SECONDS + 10 * 60))
+          while :; do
+            waiting=""
+            while IFS=$'\t' read -r name version expected_sha; do
+              public_sha=$(npm view "$name@$version" dist.shasum 2>/dev/null | tr -d '[:space:]' || true)
+              if [ -z "$public_sha" ]; then
+                waiting="$waiting $name@$version"
+              elif [ "$public_sha" != "$expected_sha" ]; then
+                echo "::error::$name@$version registry sha1 is $public_sha; expected $expected_sha." >&2
+                exit 1
+              else
+                echo "OK $name@$version $public_sha"
+              fi
+            done < <(node -e '
+              const manifest = require("./npm-publish-manifest.json")
+              for (const pkg of manifest.packages) {
+                console.log([pkg.name, pkg.version, pkg.sha1].join("\t"))
+              }
+            ')
+            if [ -z "$waiting" ]; then
+              echo "Every exact npm tarball is public and verified. The tag may now be created."
+              break
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::Timed out waiting for registry visibility:$waiting" >&2
+              exit 1
+            fi
+            echo "Waiting for npm registry visibility:$waiting"
+            sleep 10
+          done
+
+      - name: Retain exact npm publication proofs
+        if: always()
+        uses: ./.github/actions/perry/actions/upload-artifact # v7
+        with:
+          name: npm-publish-package-proofs
+          path: npm-publish-package-proofs.tar
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0

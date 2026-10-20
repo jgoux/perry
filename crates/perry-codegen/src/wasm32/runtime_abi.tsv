@@ -5051,6 +5051,7 @@ perry_debug_trace_init	void	i64,ptr,i64
 perry_debug_trace_init_done	void	i64
 perry_eh_personality	i32s	i32s,i32s,i64,ptr,ptr
 perry_family_run_admits	i32s	ptr,i64,i64,i32u,i32u,i32u
+perry_family_slot_verify	void	i64,i64,i32u
 perry_ffi_callback_dispatch	i64	usize,ptr,ptr
 perry_ffi_gc_register_fetch_trace	void	ptr,ptr
 perry_ffi_gc_register_mutable_root_scanner	void	ptr

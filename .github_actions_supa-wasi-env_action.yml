@@ -1,0 +1,143 @@
+# Toolchain for the wasip1 jobs of the supa-storage workflow: the nightly with the
+# wasm32-wasip1 target, sccache, wasi-sdk, wasmtime, wasm-tools and the wasm32-wasip1
+# runtime archive (built or restored from cache). Not part of upstream.
+# The calling job sets WASI_TOOLS, WASI_SDK_VERSION, WASMTIME_VERSION,
+# WASMTIME_P1_VERSION and WASM_TOOLS_VERSION in its env.
+# The runtime archive is built by exactly one job (the workflow's wasi-setup, build-runtime
+# "true"), which saves it to the cache; every other job restores it ("false") and fails on a
+# miss instead of building the same archive again in parallel.
+# The size settings (runtime-opt-level, extra-env) are inputs, so that every job of a run sees the
+# same values: the opt-level is part of the archive's cache key, and extra-env is exported to the
+# job's later steps (the compile gates of Perry's wasm32 backend).
+name: supa-wasi-env
+description: wasm32-wasip1 toolchain, wasi tools and runtime archive for the supa-storage wasip1 jobs
+inputs:
+  build-runtime:
+    description: '"true" builds the runtime archive on a cache miss and saves it; "false" only restores it'
+    default: 'true'
+  fast-build:
+    description: 'true is the plan fast build (no thin LTO, 16 codegen units), cached under its own key. Every job of a run passes the same value, the plan fast_build output'
+    default: 'false'
+  runtime-opt-level:
+    description: 'Opt-level (0-3, s, z) of the wasm32-wasip1 runtime archive; empty keeps the profile opt-level. Part of the archive cache key and of the fast-build guard expectation. Every job of a run passes the same value, the workflow runtime_opt_level input'
+    default: ''
+  extra-env:
+    description: 'Space-separated KEY=VAL pairs exported to the later steps of the job (the workflow extra_env input, compile gates such as PERRY_TYPED_BODIES=0)'
+    default: ''
+  simulate:
+    description: 'The workflow simulate input (.github/supa/simulate.sh), applied before the cache key is computed so that the key sees the simulated change'
+    default: ''
+runs:
+  using: composite
+  steps:
+    - name: Simulated change
+      if: inputs.simulate != '' && inputs.simulate != 'none'
+      shell: bash
+      run: .github/supa/simulate.sh "${{ inputs.simulate }}"
+    - name: Rust toolchain with the wasm32-wasip1 target
+      shell: bash
+      run: |
+        rustup toolchain install nightly-2026-10-04 --profile minimal --component rustfmt --component clippy --target wasm32-wasip1
+    - uses: mozilla-actions/sccache-action@v0.0.9
+    - uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+        key: cargo-registry-${{ hashFiles('Cargo.lock') }}
+        restore-keys: cargo-registry-
+    - name: Tools cache
+      id: tools
+      uses: actions/cache@v4
+      with:
+        path: ${{ env.WASI_TOOLS }}
+        key: wasi-tools-${{ runner.arch }}-sdk${{ env.WASI_SDK_VERSION }}-wasmtime${{ env.WASMTIME_VERSION }}-p1wasmtime${{ env.WASMTIME_P1_VERSION }}-wasmtools${{ env.WASM_TOOLS_VERSION }}
+    - name: Install wasi-sdk, wasmtime and wasm-tools
+      if: steps.tools.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        mkdir -p "$WASI_TOOLS" && cd "$WASI_TOOLS"
+        curl -fsSL "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_SDK_VERSION}/wasi-sdk-${WASI_SDK_VERSION}.0-arm64-linux.tar.gz" | tar xz
+        curl -fsSL "https://github.com/bytecodealliance/wasmtime/releases/download/v${WASMTIME_VERSION}/wasmtime-v${WASMTIME_VERSION}-aarch64-linux.tar.xz" | tar xJ
+        curl -fsSL "https://github.com/bytecodealliance/wasmtime/releases/download/v${WASMTIME_P1_VERSION}/wasmtime-v${WASMTIME_P1_VERSION}-aarch64-linux.tar.xz" | tar xJ
+        curl -fsSL "https://github.com/bytecodealliance/wasm-tools/releases/download/v${WASM_TOOLS_VERSION}/wasm-tools-${WASM_TOOLS_VERSION}-aarch64-linux.tar.gz" | tar xz
+        ls
+    - name: Tool environment
+      shell: bash
+      run: |
+        {
+          echo "WASI_SDK_PATH=$WASI_TOOLS/wasi-sdk-${WASI_SDK_VERSION}.0-arm64-linux"
+          echo "CC_wasm32_wasip1=$WASI_TOOLS/wasi-sdk-${WASI_SDK_VERSION}.0-arm64-linux/bin/clang"
+          echo "AR_wasm32_wasip1=$WASI_TOOLS/wasi-sdk-${WASI_SDK_VERSION}.0-arm64-linux/bin/llvm-ar"
+          echo "CFLAGS_wasm32_wasip1=--sysroot=$WASI_TOOLS/wasi-sdk-${WASI_SDK_VERSION}.0-arm64-linux/share/wasi-sysroot"
+        } >> "$GITHUB_ENV"
+        echo "$WASI_TOOLS/wasmtime-v${WASMTIME_VERSION}-aarch64-linux" >> "$GITHUB_PATH"
+        echo "WASMTIME_P1=$WASI_TOOLS/wasmtime-v${WASMTIME_P1_VERSION}-aarch64-linux/wasmtime" >> "$GITHUB_ENV"
+        echo "$WASI_TOOLS/wasm-tools-${WASM_TOOLS_VERSION}-aarch64-linux" >> "$GITHUB_PATH"
+        command -v /usr/bin/time >/dev/null || sudo apt-get install -y -qq time
+    - name: Tool versions
+      shell: bash
+      run: |
+        export PATH="$WASI_TOOLS/wasmtime-v${WASMTIME_VERSION}-aarch64-linux:$WASI_TOOLS/wasm-tools-${WASM_TOOLS_VERSION}-aarch64-linux:$PATH"
+        "$WASI_TOOLS/wasi-sdk-${WASI_SDK_VERSION}.0-arm64-linux/bin/clang" --version | head -n 1
+        wasmtime --version
+        "$WASI_TOOLS/wasmtime-v${WASMTIME_P1_VERSION}-aarch64-linux/wasmtime" --version
+        wasm-tools --version
+    - name: Runtime cache key
+      id: rtkey
+      shell: bash
+      run: echo "key=perry-wasip1-runtime-${{ inputs.fast-build == 'true' && 'fast-' || '' }}${{ runner.arch }}-${{ hashFiles('crates/perry-runtime/**', 'crates/perry-runtime-static/**', 'crates/perry-ext-net/**', 'crates/perry-ext-http/**', 'crates/perry-http-server/**', 'crates/perry-ext-undici/**', 'crates/perry-ext-zlib/**', 'crates/perry-ext-ws/**', 'crates/perry-stdlib/**', 'crates/perry-ffi/**', 'crates/perry-native-registration/**', 'crates/perry-abi/**', 'crates/perry-parser/**', 'crates/perry-diagnostics/**', 'crates/perry-dispatch/**', 'Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/**', 'scripts/wasi_build_runtime.*') }}${{ inputs.runtime-opt-level != '' && format('-opt{0}', inputs.runtime-opt-level) || '' }}" >> "$GITHUB_OUTPUT"
+    - name: Runtime cache (restore only)
+      if: inputs.build-runtime != 'true'
+      uses: actions/cache/restore@v4
+      with:
+        path: target/wasm32-wasip1/release/libperry_runtime.a
+        key: ${{ steps.rtkey.outputs.key }}
+        fail-on-cache-miss: true
+    - name: Runtime cache
+      id: runtime
+      if: inputs.build-runtime == 'true'
+      uses: actions/cache@v4
+      with:
+        path: target/wasm32-wasip1/release/libperry_runtime.a
+        key: ${{ steps.rtkey.outputs.key }}
+    - name: Build the wasm32-wasip1 runtime
+      if: inputs.build-runtime == 'true' && steps.runtime.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        # Read by scripts/wasi_build_runtime.py and by the fast-build guard of ci-build-profile.sh.
+        PERRY_WASI_RUNTIME_OPT_LEVEL: ${{ inputs.runtime-opt-level }}
+      run: |
+        start=$(date +%s)
+        # The fast profile (iteration presets only) or the real release: see ci-build-profile.sh.
+        . .github/supa/ci-build-profile.sh "${{ inputs.fast-build }}"
+        scripts/wasi_build_runtime.sh wasm32-wasip1
+        {
+          echo "### wasm32-wasip1 runtime"
+          echo "- build: $(( $(date +%s) - start )) s, profile: $FAST_BUILD_PROFILE, runtime opt-level: ${PERRY_WASI_RUNTIME_OPT_LEVEL:-profile}"
+          echo '```'; sccache --show-stats | sed -n 1,12p; echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+    - name: Runtime cache hit summary
+      if: inputs.build-runtime == 'true' && steps.runtime.outputs.cache-hit == 'true'
+      shell: bash
+      run: |
+        {
+          echo "### wasm32-wasip1 runtime"
+          echo "- reused \`${{ steps.rtkey.outputs.key }}\`, profile: ${{ inputs.fast-build == 'true' && 'fast' || 'release' }}"
+        } >> "$GITHUB_STEP_SUMMARY"
+    - name: Runtime archive
+      shell: bash
+      run: ls -l "$PERRY_RUNTIME_DIR"/libperry_runtime.a
+    # The compile gates of this run, for every later step of the job that compiles.
+    - name: Extra environment
+      if: inputs.extra-env != ''
+      shell: bash
+      env:
+        EXTRA_ENV: ${{ inputs.extra-env }}
+      run: |
+        for kv in $EXTRA_ENV; do
+          [[ "$kv" =~ ^[A-Z][A-Z0-9_]*=[A-Za-z0-9_.:/,-]*$ ]] || { echo "::error::extra-env: '$kv' is not NAME=VALUE"; exit 1; }
+          echo "$kv" >> "$GITHUB_ENV"
+          echo "extra env: $kv"
+        done

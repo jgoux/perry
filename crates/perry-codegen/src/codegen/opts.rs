@@ -361,7 +361,7 @@ pub struct CompileOptions {
     pub imported_async_funcs: std::collections::HashSet<String>,
     /// Type alias map (name → Type) aggregated from all modules. Codegen
     /// uses this to resolve `Named` types in function signatures.
-    pub type_aliases: std::collections::HashMap<String, perry_hir::types::Type>,
+    pub type_aliases: std::sync::Arc<std::collections::HashMap<String, perry_hir::types::Type>>,
     /// Imported function parameter counts, keyed by function name.
     pub imported_func_param_counts: std::collections::HashMap<String, usize>,
     /// Issue #608 — imported function names whose source-side signature
@@ -521,7 +521,7 @@ pub struct CompileOptions {
     /// module's `main` filters this set out of `non_entry_module_prefixes`
     /// when emitting the eager init call sequence. Empty when no module
     /// in the program is deferred.
-    pub deferred_module_prefixes: std::collections::HashSet<String>,
+    pub deferred_module_prefixes: std::sync::Arc<std::collections::HashSet<String>>,
 
     /// Issue #753: sanitized prefixes of THIS module's static-import +
     /// re-export source modules (non-entry only — the entry has no
@@ -1000,7 +1000,7 @@ pub(crate) struct CrossModuleCtx {
     /// class for `this` in that method body (see
     /// `collectors::literal_method_home_classes`), never a receiver proof.
     pub literal_method_home_classes: std::collections::HashMap<u32, String>,
-    pub type_aliases: std::collections::HashMap<String, perry_hir::types::Type>,
+    pub type_aliases: std::sync::Arc<std::collections::HashMap<String, perry_hir::types::Type>>,
     pub imported_func_param_counts: std::collections::HashMap<String, usize>,
     /// Issue #678: see `CompileOptions::import_function_origin_names`.
     /// Cloned from the same field so codegen helpers reachable via
@@ -1408,7 +1408,7 @@ pub(crate) struct CrossModuleCtx {
     /// dynamic `import()` edges. Their `<prefix>__init` is excluded
     /// from the entry-main eager init call sequence and fires lazily
     /// from each `Expr::DynamicImport` dispatch site.
-    pub deferred_module_prefixes: std::collections::HashSet<String>,
+    pub deferred_module_prefixes: std::sync::Arc<std::collections::HashSet<String>>,
     /// Issue #753: this module's static-import + re-export source
     /// prefixes (non-entry only). Consumed by `compile_module_entry`
     /// when emitting the wrapper for `<prefix>__init` so dep init

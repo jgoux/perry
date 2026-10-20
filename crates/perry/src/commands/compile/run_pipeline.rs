@@ -1249,6 +1249,11 @@ pub fn run_with_parse_cache(
             &modules,
         )));
     }
+    // A class field whose computed key names a string constant is that named
+    // field (one key list for every consumer of class keys).
+    for hir_module in ctx.native_modules.values_mut() {
+        perry_codegen::name_computed_class_fields(hir_module);
+    }
     // #11394: every method name the program writes onto a builtin prototype;
     // codegen routes those calls through a lookup-first runtime entry.
     for site in &ctx.patched_builtins.dynamic_code_reach.sites {
@@ -1694,6 +1699,12 @@ pub fn run_with_parse_cache(
             }
         }
     }
+    // One map for the program, shared by every module's options: all modules'
+    // options are prepared before codegen starts, so a copy per module held
+    // the whole program's aliases once per module.
+    let all_type_aliases: std::sync::Arc<
+        std::collections::HashMap<String, perry_hir::types::Type>,
+    > = std::sync::Arc::new(all_type_aliases.into_iter().collect());
 
     // Build a map of all exported classes from all modules
     // Key: (resolved_path, class_name) -> Class reference
@@ -3712,6 +3723,15 @@ pub fn run_with_parse_cache(
         .thread_name(|index| format!("perry-module-{index}"))
         .build()
         .map_err(|error| anyhow!("failed to create module codegen pool: {error}"))?;
+    // One set for the program; every module's options share it.
+    let program_deferred_module_prefixes: std::sync::Arc<std::collections::HashSet<String>> =
+        std::sync::Arc::new(
+            ctx.native_modules
+                .iter()
+                .filter(|(_, m)| m.init_kind == perry_hir::ModuleInitKind::Deferred)
+                .map(|(_, m)| sanitize_name(&m.name))
+                .collect(),
+        );
     // Reuse the exact import-route preparation in both passes. The contract
     // pass releases each module's metadata before visiting the next module;
     // the second pass prepares owned options before releasing the HIR graph.
@@ -3757,12 +3777,7 @@ pub fn run_with_parse_cache(
         // out of its eager init call sequence; non-entry modules
         // ignore it. Empty when no module in the program is
         // Deferred (i.e. no dynamic `import()` sites).
-        let deferred_module_prefixes: std::collections::HashSet<String> = ctx
-            .native_modules
-            .iter()
-            .filter(|(_, m)| m.init_kind == perry_hir::ModuleInitKind::Deferred)
-            .map(|(_, m)| sanitize_name(&m.name))
-            .collect();
+        let deferred_module_prefixes = std::sync::Arc::clone(&program_deferred_module_prefixes);
         // Next.js wall 54 (part 2): `(absolute_path, prefix)` for every
         // `.next/server/**` runtime module so the entry's `main` can record
         // its `__init` address by path (`js_register_path_init`). Only the
@@ -5652,6 +5667,28 @@ pub fn run_with_parse_cache(
             let parent_name_clone = imported_classes[idx].parent_name.clone();
             let child_source_prefix = imported_classes[idx].source_prefix.clone();
             let child_src_path = native_module_paths_by_prefix.get(&child_source_prefix);
+            // A member heritage (`class X extends ns.Base`) names a property,
+            // so its trailing name may be any module's class; a bare name
+            // resolves in the child's own scope. A bare global (`extends
+            // Error`) lowers to a read of the global object, like
+            // `globalThis.Error`, and both mean the global.
+            let child_heritage_is_member = child_src_path
+                .and_then(|path| ctx.native_modules.get(path))
+                .and_then(|module| {
+                    module
+                        .classes
+                        .iter()
+                        .find(|class| class.name == imported_classes[idx].name)
+                })
+                .is_some_and(|class| {
+                    match class.extends_expr.as_deref() {
+                        Some(
+                            perry_hir::Expr::PropertyGet { object, .. }
+                            | perry_hir::Expr::IndexGet { object, .. },
+                        ) => !matches!(object.as_ref(), perry_hir::Expr::GlobalGet(_)),
+                        _ => false,
+                    }
+                });
             // Issue #485: include the class's parent in the transitive
             // closure too. Without this, `import { Sub } from 'pkg'` where
             // `Sub extends Base` (and Base lives in another file inside
@@ -5773,7 +5810,18 @@ pub fn run_with_parse_cache(
                 //
                 // Issue #26: for a parent ref, prefer the same-named class
                 // in the CHILD's own source module before any global match.
+                // A bare parent named like a global that the child's module
+                // neither declares nor imports IS that global
+                // (`class MissingCredentialError extends Error`). Binding it
+                // by name to another module's exported `class Error` made
+                // `super(message)` run that class's constructor.
+                let global_parent = is_parent_ref
+                    && !child_heritage_is_member
+                    && perry_hir::analysis::is_global_intrinsic_value_name(&ref_name);
                 let found = scoped_found.or_else(|| {
+                    if global_parent {
+                        return None;
+                    }
                     exported_classes
                         .iter()
                         .find(|((path, cname), class)| {
@@ -5881,11 +5929,7 @@ pub fn run_with_parse_cache(
         }
 
         // Type aliases from all modules
-        let type_alias_map: std::collections::HashMap<String, perry_hir::types::Type> =
-            all_type_aliases
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
+        let type_alias_map = std::sync::Arc::clone(&all_type_aliases);
 
         // Resolve the CLI's short target name (ios/android/etc.) to
         // an LLVM triple. `None` falls through to the host default
@@ -6117,6 +6161,26 @@ pub fn run_with_parse_cache(
     // collision. A module then embeds the ids of its own contents; nothing
     // is keyed by class name.
     let static_shape_started = Instant::now();
+    // The whole-program steps between the front end and module codegen can
+    // run for minutes on a large graph. Each names itself when it starts and
+    // ends, with its time and resident memory, so a stalled or growing step
+    // shows in the log.
+    let program_step = |label: &str, started: Option<Instant>| {
+        if !codegen_progress_enabled {
+            return;
+        }
+        let resident = perry_codegen::workers::resident_bytes()
+            .map(|(rss, _)| format!(" (resident {:.0} MiB)", rss as f64 / 1_048_576.0))
+            .unwrap_or_default();
+        match started {
+            None => eprintln!("[perry] codegen: {label}{resident}"),
+            Some(started) => eprintln!(
+                "[perry] codegen: {label} done in {:.1}s{resident}",
+                started.elapsed().as_secs_f64()
+            ),
+        }
+    };
+    program_step("births pre-pass", None);
     let module_births: Vec<(&PathBuf, Vec<perry_codegen::ModuleBirth>)> = module_pool
         .install(|| {
             ctx.native_modules
@@ -6144,6 +6208,7 @@ pub fn run_with_parse_cache(
                 .collect::<Result<Vec<_>, String>>()
         })
         .map_err(|error| anyhow!(error))?;
+    program_step("births pre-pass", Some(static_shape_started));
     let static_shape_ids = perry_codegen::assign_static_shape_ids(
         module_births
             .iter()
@@ -6187,6 +6252,8 @@ pub fn run_with_parse_cache(
     // each module's codegen gets only the digest of the facts it can observe
     // (object-cache key) and, in a contract build, the claims section the
     // runtime checks. See `program_facts.rs` for the knobs.
+    let facts_started = Instant::now();
+    program_step("whole-program facts", None);
     let program_facts = super::program_facts::run(
         &ctx.native_modules,
         // The dyn-eval interpreter is installed (E14 possible): the same
@@ -6203,6 +6270,7 @@ pub fn run_with_parse_cache(
         &ctx.native_modules,
         super::program_facts::has_stable_classes(&program_facts),
     );
+    program_step("whole-program facts", Some(facts_started));
     #[allow(clippy::type_complexity)]
     let static_shape_ids_by_module: HashMap<
         PathBuf,
@@ -6268,6 +6336,32 @@ pub fn run_with_parse_cache(
     // Finish cross-module option preparation while the complete HIR graph is
     // available. Jobs then own their input, so lowering can release each HIR
     // before LLVM starts. The link phase needs only names and export metadata.
+    let options_started = Instant::now();
+    program_step("module options", None);
+    // A module's static shape ids and class shape slice are taken when its
+    // job starts, not here: the slice includes the producer classes of every
+    // short-spread candidate, so prepared for all modules at once it held
+    // the program's class shapes once per module.
+    let slice_shape_ids = |path: &PathBuf, opts: &mut perry_codegen::CompileOptions| {
+        if let Some((ids, class_ids)) = static_shape_ids_by_module.get(path) {
+            opts.static_shape_ids = ids.clone();
+            let foreign: BTreeSet<u32> = opts
+                .short_spread_method_candidates
+                .values()
+                .flatten()
+                .map(|c| c.class_id)
+                .collect();
+            for cid in class_ids.iter().chain(foreign.iter()) {
+                if let Some(finals) = class_final_shapes.get(cid) {
+                    opts.static_shape_ids.extend(finals.iter().cloned());
+                }
+            }
+            opts.static_shape_ids.sort();
+            opts.static_shape_ids.dedup();
+            opts.program_class_shape_ids =
+                program_class_shape_ids.restricted_to(class_ids.iter().copied().chain(foreign));
+        }
+    };
     let prepared_options: Vec<_> = module_pool.install(|| {
         codegen_modules
             .par_iter()
@@ -6279,24 +6373,6 @@ pub fn run_with_parse_cache(
                     hir_module,
                     &mut opts,
                 );
-                if let Some((ids, class_ids)) = static_shape_ids_by_module.get(path) {
-                    opts.static_shape_ids = ids.clone();
-                    let foreign: BTreeSet<u32> = opts
-                        .short_spread_method_candidates
-                        .values()
-                        .flatten()
-                        .map(|c| c.class_id)
-                        .collect();
-                    for cid in class_ids.iter().chain(foreign.iter()) {
-                        if let Some(finals) = class_final_shapes.get(cid) {
-                            opts.static_shape_ids.extend(finals.iter().cloned());
-                        }
-                    }
-                    opts.static_shape_ids.sort();
-                    opts.static_shape_ids.dedup();
-                    opts.program_class_shape_ids = program_class_shape_ids
-                        .restricted_to(class_ids.iter().copied().chain(foreign));
-                }
                 opts.program_facts =
                     super::program_facts::view_for(&program_facts, path, receiver_params.get(path));
                 opts.program_facts.dynamic_code_reach =
@@ -6308,6 +6384,7 @@ pub fn run_with_parse_cache(
             })
             .collect::<Vec<_>>()
     });
+    program_step("module options", Some(options_started));
     // Per-module options now own the facts needed by lowering. Release the
     // program's preparation inputs before any LLVM worker starts.
     drop((
@@ -6319,9 +6396,6 @@ pub fn run_with_parse_cache(
         receiver_params,
         program_layouts,
         constructor_contracts,
-        static_shape_ids_by_module,
-        class_final_shapes,
-        program_class_shape_ids,
         static_shape_ids,
         short_spread_method_candidates,
         program_class_accessor_names,
@@ -6655,11 +6729,14 @@ pub fn run_with_parse_cache(
             &module_memory_estimates,
             |index| {
                 let path = &codegen_modules[index];
-                let (hir_module, opts) = module_inputs[index]
+                let (hir_module, mut opts) = module_inputs[index]
                     .lock()
                     .expect("module input poisoned")
                     .take()
                     .expect("module job runs exactly once");
+                if let Ok(opts) = &mut opts {
+                    slice_shape_ids(path, opts);
+                }
                 let module_name = hir_module.name.clone();
                 let callable_count = module_codegen_callable_count(&hir_module);
                 let memory_trace = perry_codegen::workers::memory_trace_enabled();

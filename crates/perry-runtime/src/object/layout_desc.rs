@@ -1384,6 +1384,7 @@ const _: () = {
     assert!(k::ENTRY_ACCESSOR == abi::LAYOUT_KEY_ACCESSOR);
     assert!(k::ENTRY_HAS_GET == abi::LAYOUT_KEY_HAS_GET);
     assert!(k::ENTRY_HAS_SET == abi::LAYOUT_KEY_HAS_SET);
+    assert!(k::PRIVATE_FIELD_ENTRY == abi::LAYOUT_KEY_PRIVATE_FIELD);
 };
 
 /// Are `built`'s own properties and [[Prototype]] exactly `d`'s?
@@ -1748,13 +1749,6 @@ pub(crate) fn family_birth_desc(class_id: u32, args: &[f64]) -> Option<*const Pe
     }
 }
 
-/// The inline width an instance of `class_id` must be born with to adopt its
-/// family layout (0 when it has none).
-pub(crate) fn family_birth_width(class_id: u32) -> u32 {
-    // SAFETY: a record of this program's section.
-    family_of_class(class_id).map_or(0, |(_, d)| unsafe { (*d).slot_count })
-}
-
 /// Class births allocate the complete fixed layout directly.
 /// Retained for a runtime construction path that already made a keyless shell.
 pub(crate) unsafe fn adopt_family_layout(obj: *mut ObjectHeader) -> *mut ObjectHeader {
@@ -1973,7 +1967,7 @@ pub(crate) fn family_diag_init() {
 /// `PERRY_FAMILY_DIAG=2`: count out-of-order fills by (family, key written,
 /// first later key present) and print the most frequent at exit (measurement
 /// only: which key orders the census gets wrong).
-fn family_diag_pairs_on() -> bool {
+pub(crate) fn family_diag_pairs_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("PERRY_FAMILY_DIAG").as_deref() == Ok("2"))
 }
@@ -1983,7 +1977,7 @@ static OUT_OF_ORDER_PAIRS: std::sync::Mutex<
 > = std::sync::Mutex::new(None);
 
 #[cold]
-unsafe fn note_out_of_order_pair(obj: *const ObjectHeader, pos: u32) {
+pub(crate) unsafe fn note_out_of_order_pair(obj: *const ObjectHeader, pos: u32) {
     let Some(d) = family_desc_of(obj) else {
         return;
     };
@@ -2246,6 +2240,11 @@ pub(crate) unsafe fn family_store(
     if !family && !super::key_view::object_may_have_holes(obj) {
         return false;
     }
+    // A private field's by-name write is the private path's: it fills or
+    // overwrites the element, never a property of that spelling.
+    if super::field_get_set::private_namespace_bytes(bytes) {
+        return false;
+    }
     FAMILY_DIAG.seen.fetch_add(1, Relaxed);
     if family && family_overwrite(obj, bytes, value) {
         return true;
@@ -2394,19 +2393,25 @@ pub(crate) unsafe fn family_own_key_hashed(
         return None;
     }
     let keys = std::slice::from_raw_parts(d.keys, d.key_count as usize);
-    let at = |pos: usize| Some(Some((pos as u32, keys[pos].slot)));
+    // A private element is no own property (the index omits it too). A
+    // layout lists each spelling once, so only a match is checked.
+    let own = |pos: usize, k: &PerryLayoutKey| {
+        (k.attrs & super::key_attrs::ENTRY_PRIVATE == 0).then_some((pos as u32, k.slot))
+    };
     if let Some(pos) = leading_position(bytes).filter(|&pos| (pos as usize) < keys.len()) {
-        if atom_bytes(keys[pos as usize].atom) == Some(bytes) {
-            return at(pos as usize);
+        let k = &keys[pos as usize];
+        if atom_bytes(k.atom) == Some(bytes) {
+            return Some(own(pos as usize, k));
         }
     }
     // A short list: its keys' lengths, then their bytes, with no hashing.
     if keys.len() <= SHORT_FAMILY_KEYS {
-        return Some(
-            keys.iter()
-                .position(|k| atom_bytes(k.atom) == Some(bytes))
-                .map(|pos| (pos as u32, keys[pos].slot)),
-        );
+        for (pos, k) in keys.iter().enumerate() {
+            if atom_bytes(k.atom) == Some(bytes) {
+                return Some(own(pos, k));
+            }
+        }
+        return Some(None);
     }
     let hash = hash.unwrap_or_else(|| super::key_bytes_hash(bytes.as_ptr(), bytes.len()));
     Some(desc_position_hashed(d, bytes, hash).map(|pos| (pos, keys[pos as usize].slot)))

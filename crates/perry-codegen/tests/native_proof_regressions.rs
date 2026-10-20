@@ -72,7 +72,7 @@ fn empty_opts() -> CompileOptions {
         object_literal_method_candidates: std::sync::Arc::default(),
         imported_enums: Vec::new(),
         imported_async_funcs: std::collections::HashSet::new(),
-        type_aliases: std::collections::HashMap::new(),
+        type_aliases: Default::default(),
         imported_func_param_counts: std::collections::HashMap::new(),
         imported_func_has_rest: std::collections::HashSet::new(),
         imported_func_synthetic_arguments: std::collections::HashSet::new(),
@@ -99,7 +99,7 @@ fn empty_opts() -> CompileOptions {
         namespace_entries: Vec::new(),
         dynamic_import_path_to_prefix: std::collections::HashMap::new(),
         nextjs_path_init_modules: Vec::new(),
-        deferred_module_prefixes: std::collections::HashSet::new(),
+        deferred_module_prefixes: Default::default(),
         module_init_deps: Vec::new(),
         is_dynamic_import_target: false,
         debug_locations: false,
@@ -1097,7 +1097,7 @@ fn pod_layout_constant_opts() -> CompileOptions {
         ("count", Type::Named("PerryU32".to_string())),
     ]);
     let mut opts = empty_opts();
-    opts.type_aliases.insert("Packet".to_string(), packet_ty);
+    std::sync::Arc::make_mut(&mut opts.type_aliases).insert("Packet".to_string(), packet_ty);
     opts
 }
 
@@ -1118,8 +1118,8 @@ fn pod_layout_specialization_opts() -> CompileOptions {
         ("payload", Type::Number),
     ]);
     let mut opts = empty_opts();
-    opts.type_aliases.insert("Tiny".to_string(), tiny_ty);
-    opts.type_aliases.insert("Wide".to_string(), wide_ty);
+    std::sync::Arc::make_mut(&mut opts.type_aliases).insert("Tiny".to_string(), tiny_ty);
+    std::sync::Arc::make_mut(&mut opts.type_aliases).insert("Wide".to_string(), wide_ty);
     opts
 }
 
