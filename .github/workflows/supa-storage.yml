@@ -309,6 +309,11 @@ jobs:
           start=$(date +%s)
           # The fast profile (iteration presets only) or the real release: see ci-build-profile.sh.
           . .github/supa/ci-build-profile.sh "${{ needs.plan.outputs.fast_build }}"
+          # Start the sccache server once, before the two cargo builds below: both
+          # would otherwise autostart it at the same instant on a cold runner, and
+          # that race killed the server in run 39437377260 ("The server looks like
+          # it shut down unexpectedly ... Connection reset by peer"), failing the build.
+          sccache --start-server
           # Both ends are serial LTO links, so build them side by side; the
           # second graph gets its own target dir (cargo locks a shared one).
           # target-wasi adds the wasm32 backend for `--target wasi|wasip1`; it
