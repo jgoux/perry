@@ -23,6 +23,7 @@ mod flat_clone;
 mod forwarding;
 mod from_concat;
 mod generic;
+pub(crate) use generic::{al_get as arraylike_get, al_length as arraylike_length};
 mod generic_copy;
 pub use self::generic_copy::{js_arraylike_toReversed, js_arraylike_toSorted, js_arraylike_with};
 #[cfg(test)]
@@ -243,7 +244,9 @@ pub use self::iter_object::{
     js_array_values_iter_obj, ARRAY_ITERATOR_CLASS_ID,
 };
 pub(crate) use self::iterator::iter_bt_dump;
-pub(crate) use self::iterator::{array_from_spread_value, is_builtin_iterator_class_id};
+pub(crate) use self::iterator::{
+    array_from_spread_value, entries_array_for_small_handle_value, is_builtin_iterator_class_id,
+};
 pub use self::iterator::{
     js_array_spread_append, js_for_of_to_array, js_get_async_iterator,
     js_iterator_close_if_not_done, js_iterator_close_on_throw, js_iterator_delegate_kind,
