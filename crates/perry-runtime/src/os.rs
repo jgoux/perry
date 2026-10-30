@@ -577,6 +577,23 @@ pub unsafe extern "C" fn js_set_process_entry_path(ptr: *const u8, len: u32) {
     }
 }
 
+#[no_mangle]
+pub extern "C" fn js_process_argv_value() -> f64 {
+    if crate::process::worker_restrictions::in_node_worker() {
+        if let Some(value) = crate::object::native_namespace_prop_override_get("process", "argv") {
+            return value;
+        }
+    }
+    crate::value::js_nanbox_pointer(js_process_argv() as i64)
+}
+
+pub(crate) fn allocate_process_argv(capacity: u32) -> *mut ArrayHeader {
+    crate::realm_decl! {
+        birth crate::array::realm_array_alloc(capacity, perry_abi::realm_header::ArrayElements::Pointers, false);
+        realm { process.argv, value = dynamic, elements = string; "node:process.argv", value = dynamic, elements = string; }
+    }
+}
+
 /// Get command line arguments as an array of strings
 /// Returns: string[] (array of NaN-boxed string pointers)
 #[no_mangle]
@@ -592,7 +609,7 @@ pub extern "C" fn js_process_argv() -> *mut ArrayHeader {
     // Compiled: ["/path/to/binary", "/path/to/entry.ts", ...user_args]
     // If an older/foreign codegen does not seed the entry path, retain the
     // historical binary-path fallback while keeping user args at index 2+.
-    let arr = crate::realm_decl! { birth crate::array::realm_array_alloc((args.len() + 1) as u32, perry_abi::realm_header::ArrayElements::Pointers, false); realm { process.argv, value = dynamic, elements = string; "node:process.argv", value = dynamic, elements = string; } };
+    let arr = allocate_process_argv((args.len() + 1) as u32);
 
     let mut result = arr;
     if let Some(binary_path) = args.first() {
@@ -857,7 +874,8 @@ pub(crate) use process_streams::test_set_stdin_data_listener;
 pub use process_streams::{
     disable_process_stdin_keypress_events, enable_process_stdin_keypress_events,
     ensure_process_stdin_reader, is_process_stdin_handle, js_process_stderr, js_process_stdin,
-    js_process_stdout, mark_process_stdin_destroyed, pump_process_stdin,
+    js_process_stdout, mark_process_stdin_destroyed, note_process_stdin_listener,
+    note_process_stdin_paused, note_process_stdin_resumed, pump_process_stdin,
     reset_process_stdin_liveness_for_tests, scan_process_stream_singleton_roots_mut,
     set_process_stdin_raw_state, stdin_chunk_jsvalue, stdin_chunk_jsvalue_opt,
     stdin_encoding_flush_jsvalue, stdin_has_encoding, stdin_is_detached,
