@@ -156,7 +156,9 @@ pub(crate) fn filehandle_object_fd(value: f64) -> Option<i32> {
             return None;
         }
         let obj = addr as *const crate::object::ObjectHeader;
-        if (*obj).class_id != CLASS_ID_FS_FILEHANDLE || crate::meta_read!(crate::meta_obj_runtime_born!(obj as *mut _)).is_null() {
+        if (*obj).class_id != CLASS_ID_FS_FILEHANDLE
+            || crate::meta_read!(crate::meta_obj_runtime_born!(obj as *mut _)).is_null()
+        {
             return None;
         }
         let word = (*crate::meta_read!(crate::meta_obj_runtime_born!(obj as *mut _))).native_state;
@@ -220,7 +222,10 @@ pub(crate) fn is_fs_stats_instance_value(value: f64) -> bool {
 
 pub(crate) fn is_fs_stream_instance_value(value: f64, constructor_name: &str) -> bool {
     match constructor_name {
-        "ReadStream" | "FileReadStream" => object_class_id(value) == Some(CLASS_ID_FS_READ_STREAM),
+        "ReadStream" | "FileReadStream" => {
+            object_class_id(value) == Some(CLASS_ID_FS_READ_STREAM)
+                || stream::is_read_stream_instance(value)
+        }
         "WriteStream" | "FileWriteStream" => {
             object_class_id(value) == Some(CLASS_ID_FS_WRITE_STREAM)
         }
