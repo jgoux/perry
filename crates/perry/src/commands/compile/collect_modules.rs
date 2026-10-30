@@ -898,6 +898,8 @@ fn collect_module_one(
                 }),
                 property: "Bun".to_string(),
                 value: Box::new(perry_hir::Expr::NativeModuleRef("bun".to_string())),
+                byte_offset: 0,
+                byte_end: 0,
             }),
         );
         // #10360: tell the runtime too, for Web APIs whose Bun behavior
@@ -1147,15 +1149,14 @@ fn collect_module_one(
             // object at lowering (authoritative; handles single-line sources and
             // doesn't misclassify multi-line filenames).
             let eval_mode = *is_eval;
-            let mut visiting: std::collections::HashSet<u32> = std::collections::HashSet::new();
             let (resolution, partial) = if eval_mode {
                 (
-                    perry_hir::resolve_import_path_with_context(
+                    perry_hir::resolve_worker_eval_source(
                         filename.as_ref(),
+                        &hir_module,
                         &module_const_locals,
                         &dynamic_param_literals,
                         &dynamic_local_literals,
-                        &mut visiting,
                     ),
                     false,
                 )
@@ -2017,6 +2018,17 @@ fn collect_module_one(
 
     ctx.uses_dns |= hir_module.imports.iter().any(|i| is_dns(&i.source));
     ctx.reexport_pruner.imports(&hir_module.imports);
+
+    for export in hir_module.exports.iter_mut() {
+        if let perry_hir::Export::ReExport { source, .. }
+        | perry_hir::Export::ExportAll { source }
+        | perry_hir::Export::NamespaceReExport { source, .. } = export
+        {
+            if let Some(alias) = ctx.package_aliases.get(source.as_str()) {
+                *source = alias.clone();
+            }
+        }
+    }
 
     // Process re-exports
     for (export_index, export) in hir_module.exports.iter().enumerate() {
