@@ -641,6 +641,13 @@ pub fn object_static_prototype(obj_ptr: usize) -> Option<u64> {
     }
 }
 
+/// Does the receiver carry an explicitly recorded prototype? Function objects
+/// keep theirs in the closure side table rather than the object registry.
+pub(crate) fn has_recorded_prototype(addr: usize) -> bool {
+    object_static_prototype(addr).is_some()
+        || crate::closure::closure_static_prototype(addr).is_some()
+}
+
 /// True when this receiver's recorded prototype diverges from its class
 /// default, regardless of whether runtime wiring or a user-facing operation
 /// selected it. Cache guards use this conservative signal.
@@ -1245,6 +1252,42 @@ mod tests {
         assert_eq!(resolution_stack_depth(), base_depth);
     }
 }
+
+
+    /// `default_object_prototype_for_owner` reads a receiver's header, so it is
+    /// only valid for a heap address. The guard it relies on (`main`'s
+    /// `is_plausible_heap_addr`, added in 9ae3fec0a1) is exactly this: every
+    /// small-handle id must be rejected *before* the header read, and an
+    /// ordinary object must still resolve the default prototype. Nothing in the
+    /// suite asserted the rejection until this test, because the fix for it
+    /// landed without a regression.
+    #[test]
+    fn default_owner_prototype_rejects_handles_and_keeps_ordinary_objects() {
+        use crate::value::addr_class::*;
+        for address in [
+            0,
+            1,
+            COMMON_HANDLE_BAND_END - 1,
+            FETCH_HANDLE_BAND_START,
+            FETCH_HANDLE_BAND_END - 1,
+            PROXY_ID_BAND_START,
+            STREAM_ID_BAND_START,
+            HANDLE_BAND_MAX - 1,
+        ] {
+            assert_eq!(
+                unsafe { default_object_prototype_for_owner(address) },
+                None,
+                "handle {address:#x} must not be read as an object header"
+            );
+        }
+        let _no_move = crate::gc::GcSuppressScope::new();
+        let expected = default_object_prototype_bits().expect("Object prototype");
+        let object = crate::object::js_object_alloc(0, 0);
+        assert_eq!(
+            unsafe { default_object_prototype_for_owner(object as usize) },
+            Some(expected)
+        );
+    }
 
 #[cfg(test)]
 #[path = "proxy_reentry_tests.rs"]
