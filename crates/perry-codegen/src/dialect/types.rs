@@ -266,6 +266,31 @@ pub(super) fn constant<'ctx>(
         let source = constant(ctx, module, source_ty, source_value)?.into_pointer_value();
         return Ok(source.const_to_int(destination_ty).into());
     }
+    // `getelementptr (i8, ptr <constant>, i64 N)`: string-concat folding emits
+    // this around an image literal that is itself such a GEP.
+    if let Some(body) = tok
+        .strip_prefix("getelementptr (")
+        .and_then(|body| body.strip_suffix(')'))
+    {
+        let parts = super::text::split_top_level(body);
+        let [elem, base, rest @ ..] = parts.as_slice() else {
+            bail!("bad getelementptr constant `{tok}`");
+        };
+        let elem_ty = basic_type(ctx, elem.trim())?;
+        let (base_ty, base_value) = ty_and_val(base)?;
+        let base_ty = basic_type(ctx, base_ty)?;
+        let base = constant(ctx, module, base_ty, base_value)?.into_pointer_value();
+        let indexes = rest
+            .iter()
+            .map(|index| {
+                let (index_ty, index_value) = ty_and_val(index)?;
+                Ok(constant(ctx, module, basic_type(ctx, index_ty)?, index_value)?.into_int_value())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // SAFETY: the indexes are constant integers over a constant base, as
+        // in the textual IR the assembler would accept.
+        return Ok(unsafe { base.const_gep(elem_ty, &indexes) }.into());
+    }
     Ok(match tok {
         // The null of the OPERAND's type, not of address space 0: RS4GC emits
         // `store ptr addrspace(1) null, ptr %slot`, and an addrspace(0) null
