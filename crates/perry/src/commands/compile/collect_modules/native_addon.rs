@@ -248,6 +248,13 @@ pub(super) fn collect_or_refuse_node_addon(
     {
         return Ok(true);
     }
+    if canonical.extension().and_then(|ext| ext.to_str()) == Some("node")
+        && !ctx.native_addon_paths.contains_key(canonical)
+        && crate::commands::compile::host_target_triple()
+            .is_some_and(|triple| !discovery::matches_target(canonical, triple).unwrap_or(true))
+    {
+        return Ok(true);
+    }
     collect_node_addon_request(ctx, canonical).map(|request| request.is_some())
 }
 
