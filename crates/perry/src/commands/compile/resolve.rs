@@ -1734,8 +1734,12 @@ pub(super) fn resolve_import_with_bunfs(
             // Packages listed in perry.compilePackages are compiled natively
             if compile_packages.contains(&package_name) {
                 // Prefer TypeScript source over compiled JS
-                if let Some(src_entry) =
-                    resolve_package_source_entry(&package_dir, subpath.as_deref())
+                let prefer_emit = std::env::var("PERRY_PREFER_EMIT_PACKAGES").is_ok_and(|v| {
+                    v.split(',').any(|p| p.trim() == "*" || p.trim() == package_name)
+                });
+                if let Some(src_entry) = (!prefer_emit)
+                    .then(|| resolve_package_source_entry(&package_dir, subpath.as_deref()))
+                    .flatten()
                 {
                     return Some((src_entry.canonicalize().ok()?, ModuleKind::NativeCompiled));
                 }
