@@ -52,8 +52,9 @@ pub enum ClassFreshStaticInit {
     Block(u32),
 }
 
-/// Expression
-#[derive(Debug, Clone)]
+/// Expression. Its `Clone` (`walker/expr_clone.rs`) copies without
+/// recursion per nesting level.
+#[derive(Debug)]
 pub enum Expr {
     // Literals
     Undefined,
@@ -233,6 +234,10 @@ pub enum Expr {
         object: Box<Expr>,
         property: String,
         value: Box<Expr>,
+        /// Diagnostic source coordinates (SWC 1-based, end exclusive); set only with
+        /// `PERRY_FACTS_DUMP`, otherwise 0; ignored by stable hashing.
+        byte_offset: u32,
+        byte_end: u32,
     },
     // Property update (++/--)
     PropertyUpdate {
@@ -241,6 +246,10 @@ pub enum Expr {
         op: BinaryOp, // Add for ++, Sub for --
         prefix: bool, // true for ++x, false for x++
         strict: bool,
+        /// Diagnostic source coordinates (SWC 1-based, end exclusive); set only with
+        /// `PERRY_FACTS_DUMP`, otherwise 0; ignored by stable hashing.
+        byte_offset: u32,
+        byte_end: u32,
     },
 
     // Array/index access
@@ -255,6 +264,10 @@ pub enum Expr {
         object: Box<Expr>,
         index: Box<Expr>,
         value: Box<Expr>,
+        /// Diagnostic source coordinates (SWC 1-based, end exclusive); set only with
+        /// `PERRY_FACTS_DUMP`, otherwise 0; ignored by stable hashing.
+        byte_offset: u32,
+        byte_end: u32,
     },
     // Index update (arr[i]++ or obj[key]++)
     IndexUpdate {
@@ -263,6 +276,10 @@ pub enum Expr {
         op: BinaryOp, // Add for ++, Sub for --
         prefix: bool, // true for ++x, false for x++
         strict: bool,
+        /// Diagnostic source coordinates (SWC 1-based, end exclusive); set only with
+        /// `PERRY_FACTS_DUMP`, otherwise 0; ignored by stable hashing.
+        byte_offset: u32,
+        byte_end: u32,
     },
 
     // Object literal
@@ -2803,6 +2820,10 @@ pub enum Expr {
         value: Box<Expr>,
         receiver: Box<Expr>,
         strict: bool,
+        /// Diagnostic source coordinates (SWC 1-based, end exclusive); set only with
+        /// `PERRY_FACTS_DUMP`, otherwise 0; ignored by stable hashing.
+        byte_offset: u32,
+        byte_end: u32,
     },
     ReflectHas {
         target: Box<Expr>,

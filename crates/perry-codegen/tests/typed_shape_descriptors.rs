@@ -7,6 +7,7 @@ use perry_hir::{
 
 fn empty_opts() -> CompileOptions {
     CompileOptions {
+        namespace_self_import: false,
         static_shape_ids: Vec::new(),
         program_layout_ordinals: Default::default(),
         program_class_shape_ids: Default::default(),
@@ -316,6 +317,8 @@ fn scalar_object_literal_keeps_initializers_read_by_update() {
                 op: BinaryOp::Add,
                 prefix: false,
                 strict: true,
+                byte_offset: 0,
+                byte_end: 0,
             })),
         ],
         Vec::new(),
@@ -598,6 +601,8 @@ fn bounded_integer_array_store_omits_layout_note_and_barrier() {
                         left: Box::new(Expr::LocalGet(2)),
                         right: Box::new(Expr::Integer(1)),
                     }),
+                    byte_offset: 0,
+                    byte_end: 0,
                 })],
             },
             Stmt::Return(Some(Expr::LocalGet(1))),
@@ -680,6 +685,8 @@ fn numeric_iota_fill_loop_uses_bulk_helper_without_barrier() {
                     object: Box::new(Expr::LocalGet(1)),
                     index: Box::new(Expr::LocalGet(2)),
                     value: Box::new(Expr::LocalGet(2)),
+                    byte_offset: 0,
+                    byte_end: 0,
                 })],
             },
             Stmt::Return(Some(Expr::LocalGet(1))),
@@ -828,6 +835,8 @@ fn pointer_store_into_numeric_array_keeps_layout_note_and_barrier() {
                 object: Box::new(Expr::LocalGet(2)),
                 index: Box::new(Expr::Integer(0)),
                 value: Box::new(Expr::LocalGet(1)),
+                byte_offset: 0,
+                byte_end: 0,
             }),
             Stmt::Return(Some(Expr::LocalGet(2))),
         ],

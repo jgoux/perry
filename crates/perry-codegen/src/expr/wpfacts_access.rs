@@ -13,7 +13,8 @@
 //! which throws), no ShapeId compare, no miss call.
 //!
 //! The receiver facts come from the whole-program solve (`locals`,
-//! `this_of`).
+//! `this_of`, and, for a receiver that is itself a field read, the field's
+//! holder facts `FactsField::classes`).
 //! The GC write barrier stays for stores that can carry a pointer (F2 decides
 //! which can); the raw-f64 lane discipline stays for stores into an F64 lane.
 //!
@@ -97,9 +98,9 @@ pub(crate) struct FieldProof {
     /// Interpreted code can run: the site tests
     /// `PERRY_INTERP_PROTO_WRITTEN` (decision 150).
     pub interp_guard: bool,
-    /// The key is declared in some receiver class: present only once stored,
-    /// so the load is followed by the hole compare, whose miss is the site's
-    /// complete generic operation.
+    /// The key is declared or reserved in some receiver class: present only
+    /// once stored, so the load is followed by the hole compare, whose miss
+    /// is the site's complete generic operation.
     pub maybe_absent: bool,
 }
 
@@ -150,10 +151,10 @@ fn receiver(ctx: &FnCtx<'_>, object: &Expr) -> Option<(crate::codegen::FactsRecv
             if ctx.scalar_replaced.contains_key(id) || ctx.pod_records.contains_key(id) {
                 return None;
             }
-            ctx.wpfacts
-                .locals
-                .get(id)
-                .map(|r| (r.clone(), format!("local {id}")))
+            ctx.wpfacts.locals.get(id).map(|r| {
+                crate::facts_consumed::used();
+                (r.clone(), format!("local {id}"))
+            })
         }
         Expr::This => {
             if ctx.is_static_class_this(object) {
@@ -161,10 +162,48 @@ fn receiver(ctx: &FnCtx<'_>, object: &Expr) -> Option<(crate::codegen::FactsRecv
             }
             let top = ctx.this_stack.last()?;
             let (_, fid) = ctx.wpfacts_this.iter().rev().find(|(s, _)| s == top)?;
-            ctx.wpfacts
-                .this_of
-                .get(fid)
-                .map(|r| (r.clone(), format!("this of fn {fid}")))
+            ctx.wpfacts.this_of.get(fid).map(|r| {
+                crate::facts_consumed::used();
+                (r.clone(), format!("this of fn {fid}"))
+            })
+        }
+        // Holder facts: a read of a field of an unchecked proven receiver
+        // holds, in every class of that receiver, only instances of the
+        // field's classes (or null/undefined): their union is this value's
+        // receiver fact. No guard: an unchecked receiver needs none, and a
+        // field with ⊤ or interpreted writers has no classes.
+        Expr::PropertyGet {
+            object: inner,
+            property,
+            ..
+        } => {
+            if property.starts_with('#') || ctx.wpfacts.interp_guard {
+                return None;
+            }
+            let (r, binding) = receiver(ctx, inner)?;
+            if r.checked || r.class_ids.is_empty() {
+                return None;
+            }
+            let mut class_ids: Vec<u32> = Vec::new();
+            let mut nullable = false;
+            for &cid in &r.class_ids {
+                let f = ctx.wpfacts.field(cid, property)?;
+                if f.reserved || f.classes.is_empty() {
+                    return None;
+                }
+                class_ids.extend_from_slice(&f.classes);
+                nullable |= f.nullable;
+            }
+            class_ids.sort_unstable();
+            class_ids.dedup();
+            Some((
+                crate::codegen::FactsRecv {
+                    class_ids,
+                    nullable,
+                    checked: false,
+                },
+                format!("field {property} of {binding}"),
+            ))
         }
         _ => None,
     }
@@ -184,13 +223,17 @@ pub(crate) fn proven_receiver_classes(ctx: &FnCtx<'_>, object: &Expr) -> Option<
 /// definition for the program's life (no write, no escape of the class
 /// object, no interpreted code).
 pub(crate) fn proves_static(ctx: &FnCtx<'_>, cid: u32, key: &str) -> bool {
-    !ctx.wpfacts_off
+    let proved = !ctx.wpfacts_off
         && !ctx.wpfacts.interp_guard
         && ctx
             .wpfacts
             .class_statics
             .get(&cid)
-            .is_some_and(|ks| ks.iter().any(|k| k == key))
+            .is_some_and(|ks| ks.iter().any(|k| k == key));
+    if proved {
+        crate::facts_consumed::used();
+    }
+    proved
 }
 
 /// The class id of a receiver the facts prove one of their classes: one
@@ -400,6 +443,30 @@ pub(crate) fn prove(
             );
             return None;
         }
+        if f.reserved {
+            // The slot holds the hole until the constructor stores the key
+            // (object model §3.2: presence is the slot word). A read pairs
+            // the load with the hole compare; a store fills the hole, which
+            // adds the key, on the checked route. A raw-f64 lane has no
+            // hole word.
+            if access != Access::Get
+                || super::class_field_inline_guard::class_birth_slot_is_f64(ctx, &name, idx)
+            {
+                crate::fallback_diag::refuse(
+                    "reserved key: stores add it on the checked route; reads need a boxed slot",
+                );
+                return None;
+            }
+            maybe_absent = true;
+            slot.get_or_insert(idx);
+            slots.push(idx);
+            kind_mask |= f.kind_mask;
+            ta_stable = false;
+            ta_kind = Some(None);
+            all_f64 = false;
+            names.push(name);
+            continue;
+        }
         if access != Access::Get {
             let keys_global = ctx.class_keys_globals.get(&name)?;
             if crate::codegen::slot_may_be_constfn(keys_global, idx) {
@@ -522,8 +589,12 @@ pub(crate) fn emit_witness(
     let key_idx = ctx.strings.intern(property);
     let key_handle_global = format!("@{}", ctx.strings.entry(key_idx).handle_global);
     let (c01, c23) = pack_cids(&p.class_ids);
-    let slot = if p.agrees() {
-        p.slot.to_string()
+    // The slot names the key (F3); its byte offset is the address the
+    // access used, which the witness reads.
+    let (triple, form) = (ctx.target_triple, p.form());
+    let off_of = |s: u32| crate::target_layout::layout_key_off(triple, form, s).to_string();
+    let (slot, off) = if p.agrees() {
+        (p.slot.to_string(), off_of(p.slot))
     } else {
         let bits = ctx.block().bitcast_double_to_i64(recv_box);
         let biased = ctx.block().sub(
@@ -531,7 +602,8 @@ pub(crate) fn emit_witness(
             &bits,
             &(super::receiver_range::RECEIVER_BIAS as i64).to_string(),
         );
-        select_by_class(ctx, &biased, p, |s| s.to_string())
+        let slot = select_by_class(ctx, &biased, p, |s| s.to_string());
+        (slot, select_by_class(ctx, &biased, p, &off_of))
     };
     let blk = ctx.block();
     let key_box = blk.load(DOUBLE, &key_handle_global);
@@ -556,6 +628,7 @@ pub(crate) fn emit_witness(
             (I64, &c01),
             (I64, &c23),
             (I32, &slot),
+            (I32, &off),
             (I32, &(p.kind_mask as i32).to_string()),
             (I32, &flags.to_string()),
             (I64, &(site as i64).to_string()),

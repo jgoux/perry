@@ -30,6 +30,9 @@ mod entry_table;
 mod environment_data;
 mod inbox;
 mod message_port;
+#[cfg(test)]
+mod message_port_receiver_tests;
+pub(crate) use message_port::dispatch_core_operation as dispatch_message_port_core_operation;
 mod parent_port;
 #[cfg(test)]
 mod parent_port_tests;
@@ -1282,9 +1285,9 @@ pub extern "C" fn js_worker_threads_receive_message_on_port(port: f64) -> f64 {
     }
 }
 
-/// Recover a port id from a MessagePort JS object (the hidden `__perryPortId`).
+/// Recover the intrinsic private ID without observable property access.
 fn port_id_from_object(port: f64) -> Option<u64> {
-    object_u64_field(port, "__perryPortId")
+    perry_runtime::messaging::message_port_id(port).filter(|id| *id != 0)
 }
 
 fn broadcast_channel_id_from_object(channel: f64) -> Option<u64> {
@@ -1351,15 +1354,33 @@ pub extern "C" fn js_worker_threads_message_channel_new() -> f64 {
 
 #[no_mangle]
 pub extern "C" fn js_worker_threads_worker_new(entry_ptr: i64, options: f64) -> f64 {
+    let options_state = WorkerOptions::from_value(options);
+    worker_new_prepared(entry_ptr, options, options_state, None)
+}
+
+fn worker_new_prepared(
+    entry_ptr: i64,
+    options: f64,
+    mut options_state: WorkerOptions,
+    source: Option<String>,
+) -> f64 {
     ensure_worker_gc_scanner();
     ensure_worker_thread_exit_hook_registered();
     worker_pump::ensure_parent_event_retire_hook();
     crate::worker_threads::async_shim::ensure_pump_registered();
 
-    let options_state = WorkerOptions::from_value(options);
     let process_state =
-        perry_runtime::process::WorkerProcessState::capture(options_state.env.as_deref());
-    let payload = environment_data::prepare(options);
+        perry_runtime::process::WorkerProcessState::capture(options_state.env.as_deref())
+            .with_worker_argv(source, options_state.argv.take());
+    let payload =
+        match perry_runtime::exception::catch_js_throw(|| environment_data::prepare(options)) {
+            Ok(payload) => payload,
+            Err(error) => {
+                drop(process_state);
+                drop(options_state);
+                perry_runtime::exception::js_throw(error)
+            }
+        };
     let worker_id = NEXT_WORKER_ID.fetch_add(1, Ordering::Relaxed);
     let (tx, rx) = mpsc::channel::<WorkerCommand>();
     let sender = WorkerSender::new(tx);
@@ -1410,7 +1431,7 @@ pub extern "C" fn js_worker_threads_worker_new(entry_ptr: i64, options: f64) -> 
     // only latches for an agent holding a route slot.
     perry_runtime::event_pump::claim_agent_loop_route();
 
-    let thread_options = options_state.clone();
+    let thread_options = options_state;
     // Captured on the creating thread: this Worker's events go to THIS agent.
     let parent_agent = perry_runtime::agent::current_agent();
     // #8546: the Worker re-runs its module bodies on its own thread, but it is

@@ -34,6 +34,7 @@ mod pointer_lifetime;
 
 fn empty_opts() -> CompileOptions {
     CompileOptions {
+        namespace_self_import: false,
         static_shape_ids: Vec::new(),
         program_layout_ordinals: Default::default(),
         program_class_shape_ids: Default::default(),
@@ -541,6 +542,8 @@ fn array_set(array_id: u32, index: Expr, value: Expr) -> Stmt {
         object: Box::new(local(array_id)),
         index: Box::new(index),
         value: Box::new(value),
+        byte_offset: 0,
+        byte_end: 0,
     })
 }
 

@@ -229,8 +229,8 @@ pub(crate) use old_free::{
 mod tenuring;
 use tenuring::*;
 mod oldgen;
-use oldgen::*;
 pub(crate) use oldgen::finalize_dead_arena_payload;
+use oldgen::*;
 pub(crate) mod heap_generation;
 /// #10698: `gc_check_trigger`'s "nothing is due" watermark and the
 /// `TriggerInput` cell type whose writes retire it.
@@ -311,8 +311,10 @@ pub(crate) mod poll_arm;
 pub(crate) mod schedule;
 pub(crate) use instruments::note_loop_poll_reached;
 pub use instruments::{copying_minor_cycles, loop_polls_reached, moved_objects_total};
+#[cfg(not(all(target_arch = "x86_64", target_os = "linux", target_env = "gnu")))]
+pub(crate) use poll_arm::poll_armed;
 pub use poll_arm::PERRY_GC_POLL_ARMED;
-pub(crate) use poll_arm::{arm_poll, disarm_poll, poll_armed, resolve_poll_seed};
+pub(crate) use poll_arm::{arm_poll, disarm_poll, resolve_poll_seed};
 pub use schedule::{
     gc_schedule_forced_collections, gc_schedule_safepoints, schedule_liveness_report,
     schedule_polls_paced,

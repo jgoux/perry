@@ -60,6 +60,7 @@ use perry_hir::{Expr, Module, ModuleInitKind, Stmt};
 
 fn entry_opts() -> CompileOptions {
     CompileOptions {
+        namespace_self_import: false,
         static_shape_ids: Vec::new(),
         program_layout_ordinals: Default::default(),
         program_class_shape_ids: Default::default(),
@@ -493,6 +494,8 @@ fn later_store_into_a_scalar_replaced_field_is_bound() {
                 object: Box::new(Expr::LocalGet(1)),
                 property: "a".to_string(),
                 value: Box::new(heap_value()),
+                byte_offset: 0,
+                byte_end: 0,
             }),
             console_log(vec![field_get(1, "a")]),
         ],
@@ -541,11 +544,15 @@ fn repeated_stores_into_one_scalar_slot_bind_once() {
                 object: Box::new(Expr::LocalGet(1)),
                 property: "a".to_string(),
                 value: Box::new(heap_value()),
+                byte_offset: 0,
+                byte_end: 0,
             }),
             Stmt::Expr(Expr::PropertySet {
                 object: Box::new(Expr::LocalGet(1)),
                 property: "a".to_string(),
                 value: Box::new(heap_value()),
+                byte_offset: 0,
+                byte_end: 0,
             }),
             console_log(vec![field_get(1, "a")]),
         ],
@@ -581,11 +588,15 @@ fn every_store_into_a_hoisted_scalar_slot_uses_final_remark() {
                 object: Box::new(Expr::LocalGet(1)),
                 property: "a".to_string(),
                 value: Box::new(heap_value()),
+                byte_offset: 0,
+                byte_end: 0,
             }),
             Stmt::Expr(Expr::PropertySet {
                 object: Box::new(Expr::LocalGet(1)),
                 property: "a".to_string(),
                 value: Box::new(heap_value()),
+                byte_offset: 0,
+                byte_end: 0,
             }),
             console_log(vec![field_get(1, "a")]),
         ],

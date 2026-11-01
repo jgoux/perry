@@ -62,6 +62,7 @@ pub(super) fn assert_default_barrier_env_not_disabled() {
 
 pub(super) fn ir_opts() -> CompileOptions {
     CompileOptions {
+        namespace_self_import: false,
         static_shape_ids: Vec::new(),
         program_layout_ordinals: Default::default(),
         program_class_shape_ids: Default::default(),
@@ -175,6 +176,8 @@ fn param_prologue_ctor() -> Function {
             object: Box::new(Expr::This),
             property: "v".to_string(),
             value: Box::new(Expr::LocalGet(PARAM_ID)),
+            byte_offset: 0,
+            byte_end: 0,
         })],
         is_async: false,
         is_generator: false,
@@ -256,6 +259,8 @@ fn probe_module() -> Module {
                 object: Box::new(Expr::LocalGet(BOXED_ID)),
                 property: "v".to_string(),
                 value: Box::new(Expr::LocalGet(STORED_ID)),
+                byte_offset: 0,
+                byte_end: 0,
             }),
             Stmt::Return(Some(Expr::LocalGet(BOXED_ID))),
         ],
@@ -308,6 +313,8 @@ pub(super) fn wide_prologue_ir() -> String {
                 object: Box::new(Expr::This),
                 property: name,
                 value: Box::new(Expr::LocalGet(PARAM_ID)),
+                byte_offset: 0,
+                byte_end: 0,
             }));
     }
     let mut opts = ir_opts();

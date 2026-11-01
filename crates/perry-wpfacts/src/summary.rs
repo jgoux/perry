@@ -293,6 +293,12 @@ pub fn map_cons(
             this,
         },
         OverrideThis { tmpl, key, reason } => OverrideThis { tmpl, key, reason },
+        Guard { test, from, dst } => Guard {
+            test,
+            from: n(from),
+            dst: n(dst),
+        },
+        Defined { dst } => Defined { dst: n(dst) },
         TopIfAny { dst, from, reason } => TopIfAny {
             dst: n(dst),
             from: n(from),
@@ -328,12 +334,19 @@ pub fn map_cons(
         },
         Implicit { reason, proto } => Implicit { reason, proto },
         CreateProto { reason } => CreateProto { reason },
-        ChainUnion { key, dst, of } => ChainUnion {
+        ChainUnion {
+            key,
+            dst,
+            of,
+            builtin,
+        } => ChainUnion {
             key,
             dst: n(dst),
             of,
+            builtin,
         },
         ProtoGiven { protos } => ProtoGiven { protos: n(protos) },
+        ParentGiven { of } => ParentGiven { of },
         ProtoClosure { dst } => ProtoClosure { dst: n(dst) },
         ProtoMethods { origin, key, call } => ProtoMethods {
             origin,
@@ -522,6 +535,7 @@ fn gen_kind(c: &Cons) -> bool {
             | ContractThis { .. }
             | OverrideThis { .. }
             | TopIfAny { .. }
+            | Guard { .. }
             | Hard { .. }
             | DeleteKey { .. }
             | DefineKey { .. }
@@ -578,7 +592,9 @@ impl Model {
         }
         if self.nodes[n as usize].obs {
             let dst = match *c {
-                Cons::TopIfAny { dst, .. } => Some(dst),
+                Cons::TopIfAny { dst, .. } | Cons::Guard { dst, .. } | Cons::Defined { dst } => {
+                    Some(dst)
+                }
                 _ => read_dst(c),
             };
             return !dst.is_some_and(|d| self.nodes[d as usize].obs);
@@ -839,6 +855,9 @@ impl Model {
                     let n = self.node_named("inst", || format!("inst{inst}.{i}"));
                     // A fresh slot holds one run's values.
                     self.nodes[n as usize].frame = inst + 1;
+                    if let Some(d) = &mut self.diagnostic {
+                        d.inst_orig.insert(n, s.orig[i as usize]);
+                    }
                     n
                 }
                 _ if ctx == NO_CTX => s.orig[i as usize],
@@ -1084,7 +1103,20 @@ impl Model {
         }
         let f = self.tok_fn(ft);
         let why = |m: &Self| format!("this of escaped function: {}", m.reasons[reason as usize]);
-        let dsts = self.this_nodes(ft);
+        let mut dsts = self.this_nodes(ft);
+        // A constructor's field initializers run on every object it runs on
+        // (before its body, as `run_ctor_chain` runs them for a `new`):
+        // another unit's `super()` reaches them through the constructor's
+        // contract, so their stores into the receiver are the contract's
+        // (`this_stores`, DECISIONS 179), not only the body's.
+        if let Some(fi) = self.funcs[f as usize]
+            .ctor_of
+            .filter(|&tm| self.tmpls[tm as usize].ctor == Some(f))
+            .and_then(|tm| self.tmpls[tm as usize].field_init)
+        {
+            let fit = self.funcs[fi as usize].token;
+            dsts.extend(self.this_nodes(fit));
+        }
         let insts = self.published_this.get(&f).cloned().unwrap_or_default();
         // DECISIONS 116: a method of sealed classes only, published through
         // its contract, runs on the instances this unit gave out (and the
@@ -1150,6 +1182,12 @@ impl Model {
                         self.add_tok(d, t);
                     }
                 }
+                // DECISIONS 231(a): a constructor runs on its receiver
+                // marker (another unit's `super()`) and on the instances
+                // `new` makes (the contract's construction, DECISIONS 125),
+                // never on the receiver token: no unit calls a constructor
+                // as a method of an instance it holds.
+                _ if self.funcs[f as usize].ctor_of.is_some() => {}
                 _ => {
                     for &i in &insts {
                         self.add_tok(d, i);
@@ -1368,7 +1406,13 @@ impl Model {
             self.activate(g, "composed");
         }
         for &(slot, ref toks, prim) in &s.seeds {
+            // The summary's own slot is where the instance's seed came from
+            // (the dump follows it to the ⊤'s origin).
+            let saved = (self.cur_src, self.cur_why);
+            self.cur_src = s.orig.get(slot as usize).copied().unwrap_or(NO_NODE);
+            self.cur_why = u32::MAX;
             self.add(base[slot as usize], toks, prim);
+            (self.cur_src, self.cur_why) = saved;
         }
         // Closures born here carry this instance's nodes for their outer
         // terms, in the context those cells differ by (design §14.2): its

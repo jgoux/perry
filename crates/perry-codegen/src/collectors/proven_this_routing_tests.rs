@@ -38,6 +38,7 @@ use perry_hir::{BinaryOp, Class, ClassField, Expr, Function, Module, ModuleInitK
 
 fn ir_opts(is_entry: bool) -> CompileOptions {
     CompileOptions {
+        namespace_self_import: false,
         static_shape_ids: Vec::new(),
         program_layout_ordinals: Default::default(),
         program_class_shape_ids: Default::default(),
@@ -289,6 +290,8 @@ fn bump_method() -> Function {
                 left: Box::new(this_get("value")),
                 right: Box::new(Expr::Number(1.0)),
             }),
+            byte_offset: 0,
+            byte_end: 0,
         })],
     )
 }
@@ -337,11 +340,15 @@ fn point_class() -> Class {
                 object: Box::new(Expr::This),
                 property: "x".to_string(),
                 value: Box::new(Expr::LocalGet(80)),
+                byte_offset: 0,
+                byte_end: 0,
             }),
             Stmt::Expr(Expr::PropertySet {
                 object: Box::new(Expr::This),
                 property: "y".to_string(),
                 value: Box::new(Expr::LocalGet(81)),
+                byte_offset: 0,
+                byte_end: 0,
             }),
         ],
     );
@@ -425,6 +432,8 @@ fn ptr_shape_local_module() -> Module {
                     }),
                     right: Box::new(Expr::Number(1.0)),
                 }),
+                byte_offset: 0,
+                byte_end: 0,
             }),
             // The method result is accumulated into a separate local, exactly as
             // `fixture_ptr_shape.ts` does. Returning `p.norm2()` directly puts a
@@ -1276,6 +1285,8 @@ fn array_field_cache_declines_direct_and_super_slot_rebinding() {
         object: Box::new(Expr::This),
         property: "keys".to_string(),
         value: Box::new(Expr::Array(Vec::new(), None)),
+        byte_offset: 0,
+        byte_end: 0,
     }));
     assert!(
         crate::collectors::ptr_array_cache_fields(&class, &direct).is_empty(),
@@ -1372,6 +1383,8 @@ fn row_class() -> Class {
                     }),
                     right: Box::new(this_get("id")),
                 }),
+                byte_offset: 0,
+                byte_end: 0,
             }),
             Stmt::Return(Some(this_get("score"))),
         ],

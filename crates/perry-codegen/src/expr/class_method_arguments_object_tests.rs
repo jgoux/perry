@@ -54,6 +54,7 @@ const RECV_ID: u32 = 4;
 
 fn ir_opts() -> CompileOptions {
     CompileOptions {
+        namespace_self_import: false,
         static_shape_ids: Vec::new(),
         program_layout_ordinals: Default::default(),
         program_class_shape_ids: Default::default(),
@@ -436,6 +437,8 @@ fn a_length_only_family_call_keeps_the_scalar_arguments_abi() {
             object: Box::new(Expr::This),
             property: "late".into(),
             value: Box::new(Expr::Number(1.0)),
+            byte_offset: 0,
+            byte_end: 0,
         }),
     );
     let mut opts = ir_opts();

@@ -42,12 +42,13 @@ pub(crate) const LLVM_CC_PRESERVE_NONE: u32 = 21;
 pub(crate) const LLVM_CC_PRESERVE_MOST: u32 = 14;
 
 use text::{
-    add_enum_attr, apply_flags, be, float_pred, int_pred, rauw, rmatch_paren, set_alignment_if_any,
-    set_invariant_load, split_top_level, take_quoted, unquote,
+    add_enum_attr, apply_flags, attach_trailing_metadata, be, float_pred, inline_metadata,
+    int_pred, rauw, rmatch_paren, set_alignment_if_any, set_invariant_load, split_top_level,
+    take_quoted, unquote,
 };
 use types::{basic_type, constant, fn_type_of, indirect_fn_type, strip_label, ty_and_val};
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// Create (only) the function declaration for `fn_text`'s define header, so
 /// later-defined functions are callable while earlier bodies are read. The
@@ -181,6 +182,8 @@ struct ParsedHeader {
     /// (type token, `%name`) per parameter.
     params: Vec<(String, String)>,
     attr_str: String,
+    /// `section "NAME"`: the JS text section on x86_64 Linux.
+    section: Option<String>,
     /// `personality ptr @NAME` clause, if the define carries one (#7302:
     /// every function containing try/catch does).
     personality: Option<String>,
@@ -194,6 +197,14 @@ struct ParsedHeader {
     /// the function's calling convention; every call site carries it too.
     preserve_none: bool,
     preserve_most: bool,
+}
+
+/// The section clause and the remaining attribute text of a define line
+/// (unit tests of the header renderer).
+#[cfg(test)]
+pub(crate) fn parse_header_for_tests(header: &str) -> Result<(Option<String>, String)> {
+    let h = parse_header(header)?;
+    Ok((h.section, h.attr_str))
 }
 
 fn parse_header(header: &str) -> Result<ParsedHeader> {
@@ -294,6 +305,20 @@ fn parse_header(header: &str) -> Result<ParsedHeader> {
         gc_strategy = Some(name);
     }
 
+    // `section "NAME"` precedes `gc` on the define line (x86_64 Linux puts
+    // every generated function in the JS text section): lifted out as the
+    // clauses above are, since the attribute loop would read it as junk.
+    let mut section = None;
+    if let Some(pos) = attr_str.find("section \"") {
+        let tail = attr_str[pos..].to_string();
+        attr_str = attr_str[..pos].trim_end().to_string();
+        let name = tail.trim_start_matches("section ").trim().trim_matches('"').to_string();
+        if name.is_empty() {
+            bail!("malformed section clause: {tail}");
+        }
+        section = Some(name);
+    }
+
     let mut params = Vec::new();
     for p in split_top_level(params_str) {
         let p = p.trim();
@@ -311,6 +336,7 @@ fn parse_header(header: &str) -> Result<ParsedHeader> {
         name,
         params,
         attr_str,
+        section,
         personality,
         gc_strategy,
         preserve_none,
@@ -369,6 +395,9 @@ impl<'ctx, 'm> FnReader<'ctx, 'm> {
         // would verify, run, and quietly have no precise roots (#7982).
         if let Some(strategy) = &h.gc_strategy {
             func.set_gc(strategy);
+        }
+        if let Some(section) = &h.section {
+            func.set_section(Some(section));
         }
         let attr_str = h.attr_str;
         for a in attr_str.split_whitespace() {
@@ -636,6 +665,7 @@ impl<'ctx, 'm> FnReader<'ctx, 'm> {
                     let _ = inst.set_volatile(true);
                 }
                 set_alignment_if_any(Some(inst), rest);
+                attach_trailing_metadata(self.ctx, Some(inst), &parts[2..])?;
                 Ok(())
             }
             "br" => {
@@ -707,11 +737,7 @@ impl<'ctx, 'm> FnReader<'ctx, 'm> {
         if volatile {
             let _ = v.as_instruction_value().map(|i| i.set_volatile(true));
         }
-        if rest.contains("!invariant.load") {
-            if let Some(i) = v.as_instruction_value() {
-                set_invariant_load(self.ctx, i);
-            }
-        }
+        attach_trailing_metadata(self.ctx, v.as_instruction_value(), &parts[2..])?;
         if atomic {
             let ord = match ordering {
                 Some("seq_cst") => {
@@ -829,6 +855,22 @@ impl<'ctx, 'm> FnReader<'ctx, 'm> {
 
     /// Calls: direct `@f(...)`, indirect `%fp(...)` (with or without a
     /// pre-opaque `(sig)*` type), and Perry-emitted inline asm.
+    /// One call argument. A `metadata` operand is an inline metadata tree
+    /// (`llvm.read_register`'s register name, a noalias scope declaration);
+    /// every other operand is a basic value of its type.
+    fn call_arg(
+        &mut self,
+        ty: &str,
+        tok: &str,
+    ) -> Result<(BasicMetadataValueEnum<'ctx>, inkwell::types::BasicMetadataTypeEnum<'ctx>)> {
+        if ty == "metadata" {
+            let node = inline_metadata(self.ctx, tok)?;
+            return Ok((node.into(), self.ctx.metadata_type().into()));
+        }
+        let bt = basic_type(self.ctx, ty)?;
+        Ok((self.val(bt, tok)?.into(), bt.into()))
+    }
+
     fn call(&mut self, dst: Option<&str>, rest: &str) -> Result<Option<BasicValueEnum<'ctx>>> {
         // Optional fast-math prefix tokens on float-returning calls.
         let rest = rest
@@ -878,24 +920,9 @@ impl<'ctx, 'm> FnReader<'ctx, 'm> {
         let mut arg_types: Vec<inkwell::types::BasicMetadataTypeEnum> = Vec::new();
         for a in split_top_level(args_str) {
             let (aty, atok) = ty_and_val(&a)?;
-            if aty == "metadata" {
-                // `metadata !{!"NAME"}`: the one metadata operand Perry
-                // emits, `llvm.read_register`'s register name
-                // (`expr/stack_guard.rs`).
-                let name = atok
-                    .strip_prefix("!{!\"")
-                    .and_then(|t| t.strip_suffix("\"}"))
-                    .ok_or_else(|| anyhow!("unsupported metadata operand `{atok}`"))?;
-                let node = self
-                    .ctx
-                    .metadata_node(&[self.ctx.metadata_string(name).into()]);
-                args.push(node.into());
-                arg_types.push(self.ctx.metadata_type().into());
-                continue;
-            }
-            let ty = basic_type(self.ctx, aty)?;
-            args.push(self.val(ty, atok)?.into());
-            arg_types.push(ty.into());
+            let (value, ty) = self.call_arg(aty, atok)?;
+            args.push(value);
+            arg_types.push(ty);
         }
 
         let name = dst.map(|d| d.trim_start_matches('%')).unwrap_or("");
@@ -1742,9 +1769,9 @@ impl<'ctx, 'm> FnReader<'ctx, 'm> {
                 let mut argtys: Vec<inkwell::types::BasicMetadataTypeEnum> =
                     Vec::with_capacity(args.len());
                 for (t, v) in args {
-                    let bt = basic_type(self.ctx, t)?;
-                    argv.push(self.val(bt, v)?.into());
-                    argtys.push(bt.into());
+                    let (value, ty) = self.call_arg(t, v)?;
+                    argv.push(value);
+                    argtys.push(ty);
                 }
                 let fn_ty = fn_type_of(self.ctx, ret, &argtys)?;
                 let f = match self.module.get_function(callee) {
@@ -1807,9 +1834,9 @@ impl<'ctx, 'm> FnReader<'ctx, 'm> {
                 let mut argtys: Vec<inkwell::types::BasicMetadataTypeEnum> =
                     Vec::with_capacity(args.len());
                 for (t, v) in args {
-                    let bt = basic_type(self.ctx, t)?;
-                    argv.push(self.val(bt, v)?.into());
-                    argtys.push(bt.into());
+                    let (value, ty) = self.call_arg(t, v)?;
+                    argv.push(value);
+                    argtys.push(ty);
                 }
                 let fn_ty = fn_type_of(self.ctx, ret, &argtys)?;
                 let fp = self

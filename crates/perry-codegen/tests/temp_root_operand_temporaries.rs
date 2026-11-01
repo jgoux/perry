@@ -61,6 +61,7 @@ use perry_hir::{Class, Expr, Module, ModuleInitKind, Stmt};
 
 fn entry_opts() -> CompileOptions {
     CompileOptions {
+        namespace_self_import: false,
         static_shape_ids: Vec::new(),
         program_layout_ordinals: Default::default(),
         program_class_shape_ids: Default::default(),
@@ -1636,6 +1637,8 @@ fn a_put_value_set_key_is_re_derived_below_the_value() {
                 value: Box::new(Expr::Object(Vec::new())),
                 receiver: Box::new(Expr::LocalGet(0)),
                 strict: true,
+                byte_offset: 0,
+                byte_end: 0,
             }),
         ],
     );

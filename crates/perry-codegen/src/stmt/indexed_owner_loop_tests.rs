@@ -121,6 +121,8 @@ fn rmw() -> Vec<Stmt> {
             object: Box::new(get(4)),
             index: Box::new(get(5)),
             value: Box::new(bin(BinaryOp::Add, index(4, get(5)), get(2))),
+            byte_offset: 0,
+            byte_end: 0,
         }),
     ]
 }
@@ -222,6 +224,8 @@ fn fractional_and_unbounded_indices_do_not_receive_an_interval_proof() {
         object: Box::new(get(1)),
         index: Box::new(bin(BinaryOp::Div, get(3), Expr::Integer(2))),
         value: Box::new(Expr::Integer(7)),
+        byte_offset: 0,
+        byte_end: 0,
     })];
     assert!(!ir("Float64Array", body).contains("indexed.owner.fast"));
 }
@@ -244,6 +248,23 @@ fn disjoint_owner_scopes_have_dynamic_single_scope_declarations_and_verify() {
         .create_module_from_ir(buffer)
         .expect("owner-region LLVM parses");
     module.verify().expect("dynamic owner-region scopes verify");
+    // Split modules build bodies through the native reader: the same
+    // emission must construct there with every scope declaration and
+    // attachment LLVM's parse keeps.
+    let llvm = module.print_to_string().to_string();
+    let reader = crate::dialect::tests::reader_module_print(&ir);
+    for form in [
+        "call void @llvm.experimental.noalias.scope.decl(metadata",
+        "!alias.scope !",
+        "!noalias !",
+    ] {
+        assert!(llvm.contains(form), "LLVM parse lost `{form}`");
+        assert_eq!(
+            llvm.matches(form).count(),
+            reader.matches(form).count(),
+            "reader and LLVM disagree on `{form}`"
+        );
+    }
 }
 
 #[test]
@@ -298,6 +319,8 @@ fn nested_numeric_loops_keep_scalar_recurrences_in_native_slots() {
                 object: Box::new(get(7)),
                 index: Box::new(get(3)),
                 value: Box::new(get(9)),
+                byte_offset: 0,
+                byte_end: 0,
             }),
         ],
     );
@@ -341,6 +364,8 @@ fn certified_numeric_leaf_calls_are_emitted_without_a_call_in_the_region() {
                 type_args: vec![],
                 byte_offset: 0,
             }),
+            byte_offset: 0,
+            byte_end: 0,
         })],
         facts,
     );
@@ -556,6 +581,8 @@ fn string_array_length_region_rejects_stores_and_calls_before_any_body_effect() 
             object: Box::new(get(1)),
             index: Box::new(get(3)),
             value: Box::new(Expr::String("x".into())),
+            byte_offset: 0,
+            byte_end: 0,
         })],
     ] {
         let ir = ir_with_param_type(string_array(), body, Default::default());

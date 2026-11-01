@@ -23,6 +23,7 @@ use perry_hir::{
 
 fn ir_opts() -> CompileOptions {
     CompileOptions {
+        namespace_self_import: false,
         static_shape_ids: Vec::new(),
         program_layout_ordinals: Default::default(),
         program_class_shape_ids: Default::default(),
@@ -179,6 +180,8 @@ fn assigning_ctor(fields: &[ClassField]) -> perry_hir::Function {
                 object: Box::new(Expr::This),
                 property: p.name.clone(),
                 value: Box::new(Expr::LocalGet(p.id)),
+                byte_offset: 0,
+                byte_end: 0,
             })
         })
         .collect();
@@ -664,6 +667,8 @@ fn element_shape_versioned_loop_declines_a_body_that_stores() {
                 object: Box::new(Expr::LocalGet(ARRAY_ID)),
                 index: Box::new(Expr::LocalGet(COUNTER_ID)),
                 value: Box::new(Expr::Number(1.0)),
+                byte_offset: 0,
+                byte_end: 0,
             }),
         ],
         None,

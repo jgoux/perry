@@ -13,6 +13,7 @@ use perry_hir::{Expr, Stmt};
 
 #[path = "gen/accessor_descriptor.rs"]
 mod accessor_descriptor;
+mod nodes;
 
 fn kids(e: &Expr) -> Vec<&Expr> {
     let mut v = Vec::new();
@@ -53,6 +54,7 @@ impl<'a> Gen<'a> {
                     object,
                     property,
                     value,
+                    ..
                 }) if matches!(object.as_ref(), Expr::This) && property == key => {
                     match value.as_ref() {
                         Expr::LocalGet(p) => ctor.params.iter().position(|q| q.id == *p),
@@ -63,73 +65,6 @@ impl<'a> Gen<'a> {
             })
         };
         Some((class_name, args, arg("get"), arg("set")))
-    }
-
-    fn prim_kids(&mut self, fx: &Fx, e: &Expr, result: u16, why: &str, proto: Protocol) -> NodeId {
-        let ks = kids(e);
-        self.prim_op(fx, &ks, result, why, proto)
-    }
-
-    fn primbox_kids(&mut self, fx: &Fx, e: &Expr, why: &str, proto: Protocol) -> NodeId {
-        let ks = kids(e);
-        self.prim_box_op(fx, &ks, why, proto)
-    }
-
-    pub(crate) fn bobj(&mut self, mi: u32, what: &'static str) -> (Tok, NodeId) {
-        let tm = self.new_bobj_template(mi, what);
-        let t = self.m.tok(TokKind::Obj(tm, NO_CTX));
-        let n = self.tok_node(t);
-        (t, n)
-    }
-
-    pub(crate) fn new_arr_from(&mut self, mi: u32, what: &str, elems: &[NodeId]) -> NodeId {
-        let tm = self.new_arr_template(mi, what);
-        let t = self.m.tok(TokKind::Obj(tm, NO_CTX));
-        let fa = self.m.field_any(t);
-        for &e in elems {
-            self.m.edge(e, fa);
-        }
-        self.tok_node(t)
-    }
-
-    /// A builtin iterator object (`arr.values()`, `entries()`, `keys()`)
-    /// yielding `vals` through `next().value` (`builtins::iterator_method`).
-    pub(crate) fn new_iter_from(&mut self, mi: u32, vals: &[NodeId]) -> NodeId {
-        let (t, n) = self.bobj(mi, "Iterator");
-        let a = self.m.atom("#elems");
-        let e = self.m.field(t, a);
-        for &v in vals {
-            self.m.edge(v, e);
-        }
-        n
-    }
-
-    /// Store `v` into every element/entry of what `recv` holds.
-    fn elem_store(&mut self, fx: &Fx, recv: NodeId, v: NodeId, what: &str) {
-        let ek = self.m.elem_key();
-        self.store(fx, recv, ek, v, what.to_string(), None, false);
-    }
-
-    /// Call `cb` with `args` (this = undefined); returns the result node.
-    fn callback(&mut self, cb: NodeId, args: Vec<NodeId>) -> NodeId {
-        self.call_value(cb, ThisArg::Undef, args, vec![])
-    }
-
-    /// These operations read numeric elements. The solved receiver decides
-    /// whether this is an array-like; other receivers retain full lookup.
-    fn elem_load(&mut self, recv: NodeId) -> NodeId {
-        let key = self.m.elem_key();
-        self.load(recv, key)
-    }
-
-    fn array_cb(&mut self, fx: &Fx, array: &Expr, callback: &Expr) -> (NodeId, NodeId, NodeId) {
-        let a = self.expr(fx, array);
-        let cb = self.expr(fx, callback);
-        let ek = self.m.elem_key();
-        let elems = self.load(a, ek);
-        let num = self.prim_node(prim::NUM);
-        let ret = self.callback(cb, vec![elems, num, a]);
-        (a, elems, ret)
     }
 
     /// The class whose method home `home` reads, when it is that home.
@@ -819,6 +754,7 @@ impl<'a> Gen<'a> {
                     birth_keys: vec![],
                     definite: vec![],
                     declared: Vec::new(),
+                    reserved: Vec::new(),
                     parent: None,
                     ctor: None,
                     native_parent: None,
@@ -949,7 +885,15 @@ impl<'a> Gen<'a> {
             | Expr::WebAssemblyInstantiate { .. }
             | Expr::WebAssemblyCallExport { .. } => self.fail_closed(fx, e, "WebAssembly"),
             Expr::TextEncoderNew | Expr::TextDecoderNew { .. } => {
-                let _ = kids(e).into_iter().map(|k| self.expr(fx, k)).count();
+                let mut ks = kids(e).into_iter();
+                if let Expr::TextDecoderNew { .. } = e {
+                    // The label is ToString'd (WHATWG Encoding: DOMString).
+                    if let Some(k) = ks.next() {
+                        let l = self.expr(fx, k);
+                        crate::builtins::to_prim(&mut self.m, l, "TextDecoder label DOMString");
+                    }
+                }
+                let _ = ks.map(|k| self.expr(fx, k)).count();
                 self.bobj(mi, "TextCodec").1
             }
             Expr::TextEncoderEncode(..)
@@ -965,6 +909,7 @@ impl<'a> Gen<'a> {
                 let ks = kids(e);
                 let (t, n) = self.bobj(mi, "TypedArray");
                 let owner = self.begin_indexed_owner(mi, t, e);
+                let mut first = true;
                 for k in ks {
                     let v = self.expr(fx, k);
                     if owner {
@@ -981,6 +926,15 @@ impl<'a> Gen<'a> {
                         },
                     );
                     self.m.cons(v, Cons::ShareBuffer { ta: t });
+                    if first && matches!(e, Expr::Uint8ArrayNew(_) | Expr::TypedArrayNew { .. }) {
+                        // 23.2.5.1: an object source is iterated, else read
+                        // as an array-like; each element is ToNumber'd.
+                        let it = self.iterate(v);
+                        crate::builtins::to_prim(&mut self.m, it, "typed array element ToNumber");
+                        let el = self.load(v, Key::Any);
+                        crate::builtins::to_prim(&mut self.m, el, "typed array element ToNumber");
+                    }
+                    first = false;
                 }
                 let fa = self.m.field_any(t);
                 self.m.add_prim(fa, prim::NUM);
@@ -1028,6 +982,7 @@ impl<'a> Gen<'a> {
             }
             Expr::LinkGeneratorPrototype {
                 obj,
+                is_async,
                 i32_controls,
                 i1_controls,
                 ..
@@ -1037,6 +992,7 @@ impl<'a> Gen<'a> {
                 for t in self.m.nodes[o as usize].pts.to_sorted() {
                     if let TokKind::Func(f, _) = self.m.toks[t as usize] {
                         self.m.funcs[f as usize].gen_step = true;
+                        self.m.funcs[f as usize].gen_async = *is_async;
                     }
                 }
                 for id in i32_controls.iter().chain(i1_controls.iter()) {
@@ -1868,6 +1824,9 @@ impl<'a> Gen<'a> {
                 let nt = self.expr(fx, new_target);
                 let r = self.m.reason("E11 Reflect.construct newTarget");
                 self.m.cons(nt, Cons::NewTargetHard { reason: r });
+                // A new target picks the prototype of whatever the target
+                // constructs, an Array exotic object included (#13645).
+                self.m.array_member_write.get_or_insert(r);
                 let (call, ret) = self.new_call(ThisArg::Undef, vec![], vec![a]);
                 self.m.cons(t, Cons::New { call });
                 ret
@@ -1895,14 +1854,22 @@ impl<'a> Gen<'a> {
                 // codegen's dispatch resolves it. A target outside this view
                 // (native, another unit) is the fallback's ⊤.
                 let out = self.tmp("dynimport");
+                for p in paths {
+                    self.dynimport_seen.insert((mi, p.clone()));
+                }
                 let imports = self.imports_of(mi as usize);
                 for p in paths {
-                    let target = imports
+                    let loads = imports
                         .iter()
-                        .filter(|_| !self.dynimport_sabotage)
                         .find(|i| &i.source == p && (i.is_dynamic || i.is_dynamic_target))
                         .and_then(|i| i.resolved_path.as_ref())
                         .and_then(|r| self.path_index.get(r).copied());
+                    // The site loads its target: its body runs.
+                    if let Some(t) = loads.filter(|t| self.dynamic_only.contains(t)) {
+                        let f = self.init_fn_of[&t];
+                        self.m.activate(f, "import");
+                    }
+                    let target = loads.filter(|_| !self.dynimport_sabotage);
                     if let Some(t) = target {
                         let ns = self.mods[t as usize].ns_tok;
                         self.m.add_tok(out, ns);
