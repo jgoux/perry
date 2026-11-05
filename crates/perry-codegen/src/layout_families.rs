@@ -220,6 +220,9 @@ pub struct ProgramLayouts {
     pub families: BTreeMap<u32, FamilyLayout>,
     /// Literal prototype identity and source-ordered base slots; compile facts only.
     pub literal_families: BTreeSet<u32>,
+    /// Inlined anonymous classes share global descriptor symbols; only their
+    /// first module (`HirModule::name`) defines them.
+    pub family_owner: BTreeMap<u32, String>,
     /// Classes not admitted, counted once each by the first failed proof.
     pub refused: BTreeMap<String, u32>,
     pub digest: u64,
@@ -244,6 +247,13 @@ pub struct ProgramLayouts {
 }
 
 impl ProgramLayouts {
+    /// Without a program-wide owner, preserve module-local descriptor emission.
+    pub fn owns_family(&self, class_id: u32, module: &str) -> bool {
+        self.family_owner
+            .get(&class_id)
+            .is_none_or(|owner| owner == module)
+    }
+
     /// Does class `class_id`'s family layout put a key at a slot other than
     /// its constructor-order position (so codegen's class slot is not the
     /// instance's)?
@@ -530,6 +540,7 @@ fn prologue_store<'a>(s: &'a Stmt, params: &BTreeSet<u32>) -> Option<(&'a str, b
             object,
             property,
             value,
+            ..
         }) if matches!(object.as_ref(), Expr::This) => {
             Some((property.as_str(), inert(value, params)))
         }
@@ -980,6 +991,7 @@ fn param_keys(class: &Class) -> Vec<(u32, String)> {
                 object,
                 property,
                 value,
+                ..
             }) => (object.as_ref(), property.as_str(), value.as_ref()),
             Stmt::Expr(Expr::PutValueSet {
                 target, key, value, ..
@@ -1696,10 +1708,21 @@ pub fn compute<'a>(
             }
         }
     }
+    for (_, module) in &program {
+        for class in &module.classes {
+            if layouts.families.contains_key(&class.id) {
+                layouts
+                    .family_owner
+                    .entry(class.id)
+                    .or_insert_with(|| module.name.clone());
+            }
+        }
+    }
     use std::hash::{Hash, Hasher};
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     layouts.digest.hash(&mut hash);
     layouts.run_once_evaluated.hash(&mut hash);
+    layouts.family_owner.hash(&mut hash);
     layouts.digest = hash.finish();
     if std::env::var_os("PERRY_LAYOUT_REPORT").is_some() {
         eprintln!("perry: canonical run-once evaluated classes: {} (closed module capabilities: {closed})", layouts.run_once_evaluated.len());
