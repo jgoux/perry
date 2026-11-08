@@ -805,6 +805,7 @@ pub extern "C" fn js_closure_alloc_fixed(
 }
 
 #[cold]
+#[optimize(size)]
 #[inline(never)]
 fn closure_alloc_init_collecting(
     info: *const crate::closure::JsFunctionInfo,
@@ -1041,6 +1042,9 @@ pub extern "C" fn js_closure_alloc_singleton(
     if let Some(cached) = SINGLETON_CLOSURES.with(|s| s.borrow().get(&(info as usize)).copied()) {
         return cached;
     }
+    // The body's one no-capture closure, minted on its first use whichever
+    // init asks first: the SNAP census counts it as the runtime's.
+    let _census = crate::snap_census::first_use();
     let allocated = js_closure_alloc(info, 0);
     SINGLETON_CLOSURES.with(|s| {
         s.borrow_mut().insert(info as usize, allocated);
@@ -1149,7 +1153,6 @@ pub(crate) fn test_captured_singleton_closure_cache_entries(
             .unwrap_or_default()
     })
 }
-
 /// Maximum number of (captures-tuple, ClosureHeader) entries cached
 /// per-`func_ptr` in `SINGLETON_CAPTURED_CLOSURES`. Sized to absorb the
 /// parallel-instance async-await pattern (e.g. `Promise.all` of N
@@ -1171,7 +1174,6 @@ const _: () = assert!(
     MAX_CAPTURED_CLOSURE_SLOTS <= u8::MAX as usize,
     "hint_indices_plus_one stores an entry index plus one in a u8"
 );
-
 /// Per-body cache miss-streak counter for the adaptive bypass.
 /// Closures whose captures change every call (per-call boxes for
 /// `__step` / `__gen_state`, etc.) miss 100% of the time on the
@@ -1183,7 +1185,6 @@ const _: () = assert!(
 /// threshold reset the counter.
 const CAPTURED_MISS_STREAK_DISABLE: u32 = 256;
 const CAPTURED_DISABLED_SENTINEL: u32 = u32::MAX;
-
 crate::perry_thread_local! {
     static CAPTURED_MISS_STREAK: RefCell<crate::fast_hash::PtrHashMap<usize, u32>> =
         RefCell::new(crate::fast_hash::new_ptr_hash_map());
@@ -1344,6 +1345,55 @@ pub extern "C" fn js_closure_get_capture_bits(closure: *const ClosureHeader, ind
         }
         *closure_capture_slots(closure).add(index as usize)
     }
+}
+
+/// What a call of the function value `bits` returns, when its body is
+/// exactly `return <captured binding>` (`FN_RETURNS_CAPTURE` on its info):
+/// the same loads the body executes (the capture word, then the value in the
+/// cell it names when the binding lives in one), at the same moment. `None`
+/// for every other value or body, and for a binding in its dead zone
+/// (`TAG_TDZ`, which the call reports by throwing) or a hole: the caller then
+/// makes the call.
+///
+/// No allocation, no user code, no collection: a GC leaf. Every word read is
+/// the closure's own data, its cell's, or its immutable info. The flag is the
+/// license: codegen sets it only for a body that is exactly these loads, and
+/// the closure's capture slot holds the binding's cell from birth (the cell
+/// rule, `box::is_live_capture_cell`), so the cell is read as the body reads
+/// it, unchecked. The mutator never sees a forwarded object.
+///
+/// # Safety
+/// `bits` is any value of the running agent.
+#[inline]
+pub(crate) unsafe fn returned_capture_bits(bits: u64) -> Option<u64> {
+    let header = crate::value::addr_class::pointer_value_header(bits)?;
+    if header.obj_type != crate::gc::GC_TYPE_CLOSURE {
+        return None;
+    }
+    let closure = (bits & crate::value::POINTER_MASK) as *const ClosureHeader;
+    let info = (*closure).info;
+    if info.is_null() || (*info).flags & crate::codegen_abi::FN_RETURNS_CAPTURE == 0 {
+        return None;
+    }
+    debug_assert!((*info).trusted_code.is_null());
+    let index = (*info).trusted_captures;
+    if index >= real_capture_count((*closure).capture_count) {
+        return None;
+    }
+    let word = *closure_capture_slots(closure).add(index as usize);
+    let value = match (*info).trusted_boxed_mask {
+        0 => word,
+        // The binding's cell: a JSValue box (its value at offset 0) or a
+        // scope object (the binding's slot), as the body reads it.
+        cell_offset => {
+            debug_assert!(crate::r#box::is_live_capture_cell(word));
+            *(((word & crate::value::POINTER_MASK) + (cell_offset - 1)) as *const u64)
+        }
+    };
+    if value == crate::value::TAG_TDZ || value == crate::value::TAG_HOLE {
+        return None;
+    }
+    Some(value)
 }
 
 /// Set a captured value's raw JSValueBits by index.

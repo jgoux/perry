@@ -52,8 +52,9 @@ pub enum ClassFreshStaticInit {
     Block(u32),
 }
 
-/// Expression
-#[derive(Debug, Clone)]
+/// Expression. Its `Clone` (`walker/expr_clone.rs`) copies without
+/// recursion per nesting level.
+#[derive(Debug)]
 pub enum Expr {
     // Literals
     Undefined,
@@ -233,6 +234,10 @@ pub enum Expr {
         object: Box<Expr>,
         property: String,
         value: Box<Expr>,
+        /// Diagnostic source coordinates (SWC 1-based, end exclusive); set only with
+        /// `PERRY_FACTS_DUMP`, otherwise 0; ignored by stable hashing.
+        byte_offset: u32,
+        byte_end: u32,
     },
     // Property update (++/--)
     PropertyUpdate {
@@ -241,6 +246,10 @@ pub enum Expr {
         op: BinaryOp, // Add for ++, Sub for --
         prefix: bool, // true for ++x, false for x++
         strict: bool,
+        /// Diagnostic source coordinates (SWC 1-based, end exclusive); set only with
+        /// `PERRY_FACTS_DUMP`, otherwise 0; ignored by stable hashing.
+        byte_offset: u32,
+        byte_end: u32,
     },
 
     // Array/index access
@@ -250,11 +259,21 @@ pub enum Expr {
         /// Diagnostic source coordinates (SWC 1-based, end exclusive); ignored by stable hashing.
         byte_offset: u32,
         byte_end: u32,
+        /// Element-fact source identity (SWC span.lo), independent of verdict sites.
+        /// Ignored by stable hashing and structural equality.
+        element_offset: u32,
     },
     IndexSet {
         object: Box<Expr>,
         index: Box<Expr>,
         value: Box<Expr>,
+        /// Diagnostic source coordinates (SWC 1-based, end exclusive); set only with
+        /// `PERRY_FACTS_DUMP`, otherwise 0; ignored by stable hashing.
+        byte_offset: u32,
+        byte_end: u32,
+        /// Element-fact source identity (SWC span.lo), independent of verdict sites.
+        /// Ignored by stable hashing and structural equality.
+        element_offset: u32,
     },
     // Index update (arr[i]++ or obj[key]++)
     IndexUpdate {
@@ -263,6 +282,13 @@ pub enum Expr {
         op: BinaryOp, // Add for ++, Sub for --
         prefix: bool, // true for ++x, false for x++
         strict: bool,
+        /// Diagnostic source coordinates (SWC 1-based, end exclusive); set only with
+        /// `PERRY_FACTS_DUMP`, otherwise 0; ignored by stable hashing.
+        byte_offset: u32,
+        byte_end: u32,
+        /// Element-fact source identity (SWC span.lo), independent of verdict sites.
+        /// Ignored by stable hashing and structural equality.
+        element_offset: u32,
     },
 
     // Object literal
@@ -352,6 +378,12 @@ pub enum Expr {
     /// Restore a captured private-name environment around a continuation.
     PrivateLexicalBrandPush(Box<Expr>),
     PrivateLexicalBrandPop,
+    /// Compiler-generated, no source syntax: true exactly in a body codegen
+    /// lowers with a proven `this` of class `.0` (a `$pshape` clone, whose
+    /// receiver, layout and method table the module facts prove), false in
+    /// every other body. Versions the `this.F` loop hoist
+    /// (`lower::property_array_hoist`). Evaluating it has no effect.
+    ThisProvenClass(String),
 
     /// Private-name brand check: `#field in obj`.
     ///
@@ -927,10 +959,15 @@ pub enum Expr {
     /// of a guarded namespace call (`patched_builtin_call`):
     /// `NamespacePatched(ns) ? <the generic call> : <the intrinsic>`.
     NamespacePatched(String),
-    /// `this` in module top-level code. Node runs the assembled test files
-    /// as CJS, where top-level `this` is `module.exports` — a fresh plain
-    /// object distinct from `globalThis`. Lowered separately from
-    /// `Expr::This` so function-body `this` semantics are untouched.
+    /// `this` in CommonJS module top-level code. Node runs a CommonJS file
+    /// (the assembled test files, `node --experimental-strip-types` on a
+    /// `.ts`/`.js` in a CommonJS scope) with `this === module.exports`; Perry
+    /// materializes a stand-in plain object instead (the real `module.exports`
+    /// is a separate object, so the identity does not hold) — distinct from
+    /// `globalThis` in both. Lowered separately from
+    /// `Expr::This` so function-body `this` semantics are untouched. An ES
+    /// module's top-level `this` is `undefined` instead (#13558), so it lowers
+    /// to `Expr::Undefined` and never reaches this variant.
     ModuleTopThis,
     // Process uptime: process.uptime() -> number (seconds)
     ProcessUptime,
@@ -2803,6 +2840,13 @@ pub enum Expr {
         value: Box<Expr>,
         receiver: Box<Expr>,
         strict: bool,
+        /// Diagnostic source coordinates (SWC 1-based, end exclusive); set only with
+        /// `PERRY_FACTS_DUMP`, otherwise 0; ignored by stable hashing.
+        byte_offset: u32,
+        byte_end: u32,
+        /// Element-fact source identity (SWC span.lo), independent of verdict sites.
+        /// Ignored by stable hashing and structural equality.
+        element_offset: u32,
     },
     ReflectHas {
         target: Box<Expr>,
@@ -2986,5 +3030,30 @@ impl Expr {
     pub fn is_global_fetch_callee(&self) -> bool {
         matches!(self, Expr::PropertyGet { object, property, .. }
             if matches!(object.as_ref(), Expr::GlobalGet(0)) && property == "fetch")
+    }
+}
+
+impl Expr {
+    /// A compiler-owned indexed read with no source or verdict identity.
+    pub fn synthetic_index_get(object: Box<Expr>, index: Box<Expr>) -> Self {
+        Self::IndexGet {
+            object,
+            index,
+            element_offset: 0,
+            byte_offset: 0,
+            byte_end: 0,
+        }
+    }
+
+    /// A compiler-owned indexed write with no source or verdict identity.
+    pub fn synthetic_index_set(object: Box<Expr>, index: Box<Expr>, value: Box<Expr>) -> Self {
+        Self::IndexSet {
+            object,
+            index,
+            value,
+            element_offset: 0,
+            byte_offset: 0,
+            byte_end: 0,
+        }
     }
 }

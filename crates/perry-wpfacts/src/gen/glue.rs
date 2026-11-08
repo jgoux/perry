@@ -16,6 +16,24 @@ impl<'a> Gen<'a> {
         n
     }
 
+    /// ToPropertyDescriptor of `desc` (`DESCRIPTOR_KEYS`): each key read with
+    /// [[Get]], getters run. The values of `value`, `get` and `set`, the keys
+    /// a definition uses.
+    pub(crate) fn descriptor_reads(&mut self, desc: NodeId) -> [NodeId; 3] {
+        let mut used = [desc; 3];
+        for name in DESCRIPTOR_KEYS {
+            let a = self.m.atom(name);
+            let v = self.load(desc, Key::Named(a));
+            match name {
+                "value" => used[0] = v,
+                "get" => used[1] = v,
+                "set" => used[2] = v,
+                _ => {}
+            }
+        }
+        used
+    }
+
     /// `Object.defineProperty(o, key, desc)`: E5 on the target, the
     /// descriptor's value is a post-construction write, and its accessors
     /// become accessors of the target (called with `this` = the target).
@@ -23,6 +41,7 @@ impl<'a> Gen<'a> {
     /// a constant key the definition is an accessor key on every layout that
     /// does not hold the key as data, and either descriptor a key of a
     /// prototype (`Cons::DefineKey`), not E5 HARD.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn define_property(
         &mut self,
         fx: &Fx,
@@ -31,7 +50,12 @@ impl<'a> Gen<'a> {
         desc: NodeId,
         r: u32,
         accessor: bool,
+        own: [Option<NodeId>; 2],
     ) {
+        // The key `o` gains (`STAR_KEY`: a computed one), for the chain keys
+        // a given prototype holds (`settle_native_given`).
+        let dk = self.m.atom(key.as_deref().unwrap_or(crate::STAR_KEY));
+        self.m.define_on.insert((o, dk, !accessor));
         match &key {
             Some(k) => {
                 let ka = self.m.atom(k);
@@ -52,13 +76,12 @@ impl<'a> Gen<'a> {
                 },
             ),
         }
+        let [v, dget, dset] = self.descriptor_reads(desc);
         // An accessor descriptor has no value: the getter is the read.
         if !accessor {
-            let va = self.m.atom("value");
-            let v = self.load(desc, Key::Named(va));
             let k = match &key {
                 Some(s) => Key::Named(self.m.atom(s)),
-                None => Key::Any,
+                None => Key::any(),
             };
             self.store(fx, o, k, v, "defineProperty".into(), None, false);
         }
@@ -67,11 +90,11 @@ impl<'a> Gen<'a> {
             None => self.m.atom(crate::STAR_KEY),
         };
         if key.is_some() {
-            self.m.accessor_atoms.insert(ka);
+            self.m.add_accessor_atom(ka);
         }
-        for (name, setter) in [("get", false), ("set", true)] {
-            let a = self.m.atom(name);
-            let f = self.load(desc, Key::Named(a));
+        for ((read, setter), own) in [(dget, false), (dset, true)].into_iter().zip(own) {
+            // A literal descriptor's own get/set (`accessor_literal`).
+            let f = own.unwrap_or(read);
             self.m.cons(
                 f,
                 Cons::Accessor {
@@ -109,20 +132,13 @@ impl<'a> Gen<'a> {
                 accessor,
             },
         );
+        let [v, dget, dset] = self.descriptor_reads(desc);
         if !accessor {
-            let va = self.m.atom("value");
-            let v = self.load(desc, Key::Named(va));
             let site = self.store_site(fx.module, fx.f, "defineProperty".into(), None, false);
             self.m.cons(kn, Cons::StoreKeyed { o, src: v, site });
         }
-        for ((name, setter), own) in [("get", false), ("set", true)].into_iter().zip(own) {
-            let f = match own {
-                Some(f) => f,
-                None => {
-                    let a = self.m.atom(name);
-                    self.load(desc, Key::Named(a))
-                }
-            };
+        for ((read, setter), own) in [(dget, false), (dset, true)].into_iter().zip(own) {
+            let f = own.unwrap_or(read);
             self.m.cons(
                 kn,
                 Cons::AccessorKeyed {
@@ -145,7 +161,7 @@ impl<'a> Gen<'a> {
                 proto: Protocol::Any,
             },
         );
-        let vals = self.load(o, Key::Any);
+        let vals = self.load(o, Key::any());
         let (t, n) = self.bobj(mi, "descriptor");
         let fa = self.m.field_any(t);
         self.m.edge(vals, fa);
@@ -231,6 +247,35 @@ impl<'a> Gen<'a> {
                 }
                 out
             }
+            // A for-of element: `mode ? value : element` (codegen), where
+            // `value` was written by this loop's step after a result that is
+            // not done (`step_yield_node`) and `element` is read below the
+            // payload's length: what the iteration yields.
+            "arrayRecordForValue" if source_args.len() == 3 => {
+                let out = self.tmp("for-value");
+                match &source_args[1] {
+                    Expr::LocalGet(v) => {
+                        let y = self.step_yield_node(fx, *v);
+                        self.m.edge(y, out);
+                    }
+                    _ => self.m.edge(args[1], out),
+                }
+                match &source_args[2] {
+                    Expr::IndexGet { object, index, .. }
+                        if matches!(object.as_ref(), Expr::LocalGet(_))
+                            && matches!(index.as_ref(), Expr::NativeMethodCall { method, .. } if method == "arrayRecordIndex") =>
+                    {
+                        let Expr::LocalGet(p) = object.as_ref() else {
+                            unreachable!()
+                        };
+                        let payload = self.local(fx.module, *p);
+                        let it = self.iterate(payload);
+                        self.m.edge(it, out);
+                    }
+                    _ => self.m.edge(args[2], out),
+                }
+                out
+            }
             "arrayRecordPayload" | "arrayRecordForValue" => {
                 let out = self.tmp("glue-pass");
                 for a in &args {
@@ -246,6 +291,11 @@ impl<'a> Gen<'a> {
                 }
                 out
             }
+            // A fresh plain Array of exactly its arguments, in order: what
+            // codegen lowers the glue to (`js_array_record_literal` allocates
+            // an Array and pushes each value), so it is `Expr::Array` of the
+            // arguments (gen_expr.rs), its elements the array's field_any.
+            "arrayRecordLiteral" => self.new_dense_arr_from(fx.module, "record", &args),
             "iteratorNextMethod" => {
                 let Some(it) = arg(0) else {
                     return self.m.top_val("iteratorNextMethod without argument");
@@ -260,12 +310,28 @@ impl<'a> Gen<'a> {
                 };
                 let res =
                     self.call_value(next, ThisArg::Node(it), vec![self.m.top_tok_node], vec![]);
+                // The step output: the value of a result that is not done,
+                // or `undefined` the runtime publishes at done
+                // (`js_iterator_step`), which destructuring reads.
                 let va = self.m.atom("value");
                 let v = self.load(res, Key::Named(va));
                 let io = self.iter_out_node(fx);
                 self.m.edge(v, io);
                 let all = self.iterate(it);
                 self.m.edge(all, io);
+                self.m.add_prim(io, prim::UNDEF);
+                // A for-of loop reads its value only after a step that is
+                // not done: the yielded values (`Model::yield_key`).
+                if let Some(Expr::LocalSet(value, out)) = source_args.get(2) {
+                    if matches!(out.as_ref(), Expr::NativeMethodCall { method, .. } if method == "iteratorStepOutput")
+                    {
+                        let yk = self.m.yield_key();
+                        let yv = self.load(res, yk);
+                        let y = self.step_yield_node(fx, *value);
+                        self.m.edge(yv, y);
+                        self.m.edge(all, y);
+                    }
+                }
                 self.prim_node(prim::BOOL)
             }
             "iteratorStepOutput" => self.iter_out_node(fx),
@@ -279,7 +345,7 @@ impl<'a> Gen<'a> {
                 self.store(
                     fx,
                     rest,
-                    Key::Any,
+                    Key::any(),
                     value,
                     "rest element append".into(),
                     None,
@@ -290,10 +356,36 @@ impl<'a> Gen<'a> {
                 out
             }
             "iteratorCloseOnThrow" | "iteratorCloseIfNotDone" | "arrayRecordClose" => {
-                if let Some(it) = arg(0) {
-                    // `iterator.return()` runs.
+                if let Some(a) = arg(0) {
+                    // `iterator.return()` runs. An array record's is a
+                    // fresh array iterator over its array, at its index
+                    // (`js_array_record_close`), not the array.
+                    let it = if method == "arrayRecordClose" {
+                        let ek = self.m.elem_key();
+                        let el = self.load(a, ek);
+                        self.new_iter_from(fx.module, crate::builtins::ARRAY_ITERATOR_KIND, &[el])
+                    } else {
+                        // The record's iterator is what GetIterator's
+                        // `v[Symbol.iterator]()` returned; the payload holds
+                        // `v` in its place (`Cons::IterNext` steps it), so a
+                        // returned iterator distinct from `v` is closed too.
+                        let returned = self.iterator_of(a);
+                        let it = self.tmp("close-iterator");
+                        self.m.edge(a, it);
+                        self.m.edge(returned, it);
+                        it
+                    };
+                    // The runtime's IteratorClose: a protocol call.
                     let ra = self.m.atom("return");
-                    let _ = self.mcall(it, Key::Named(ra), vec![], vec![]);
+                    let (rc, _) = self.new_call(ThisArg::Node(it), vec![], vec![]);
+                    self.m.protocol_calls.insert(rc);
+                    self.m.cons(
+                        it,
+                        Cons::MCall {
+                            key: Key::Named(ra),
+                            call: rc,
+                        },
+                    );
                 }
                 let out = self.tmp("close");
                 self.m.edge(self.thrown, out);
@@ -305,10 +397,29 @@ impl<'a> Gen<'a> {
             // A literal CommonJS require (design CJS_LINK §3): the target's
             // init runs (every module body is in the program), and the value
             // is a read of its record binding; the caller reads `.exports`.
-            "cjsRequireEdge" => match arg(0) {
-                Some(record) => record,
-                None => self.m.top_val("cjsRequireEdge without its record binding"),
-            },
+            "cjsRequireEdge" => {
+                // The target's init guard runs its body here when it has not
+                // run yet: what that body throws, this call throws.
+                if let Some(Expr::ExternFuncRef { name, .. }) = source_args.first() {
+                    let t = self.imports_of(fx.module as usize).into_iter().find_map(|i| {
+                        let binds = i.specifiers.iter().any(|sp| match sp {
+                            perry_hir::ImportSpecifier::Named { local, .. }
+                            | perry_hir::ImportSpecifier::Default { local }
+                            | perry_hir::ImportSpecifier::Namespace { local } => local == name,
+                        });
+                        binds.then_some(i.resolved_path.as_ref()).flatten()
+                    });
+                    if let Some(t) = t.and_then(|p| self.path_index.get(p).copied()) {
+                        let rt = self.module_raise(t);
+                        let r = self.region();
+                        self.m.edge(rt, r);
+                    }
+                }
+                match arg(0) {
+                    Some(record) => record,
+                    None => self.m.top_val("cjsRequireEdge without its record binding"),
+                }
+            }
             "registerPathModule" | "registerPathModulePartial" => {
                 if let Some(value) = arg(1) {
                     let registry = match source_args.first() {
@@ -329,7 +440,11 @@ impl<'a> Gen<'a> {
                 // again after its cache entry was deleted.
                 if method == "registerPathModulePartial" {
                     if let Some(factory) = arg(2) {
+                        // It runs inside a later require: a lazy module body.
+                        let lazy = Some(self.m.lazy_raise);
+                        let region = std::mem::replace(&mut self.m.gen_region, lazy);
                         let _ = self.call_value(factory, ThisArg::Undef, vec![], vec![]);
+                        self.m.gen_region = region;
                     }
                 }
                 self.prim_node(prim::UNDEF)
@@ -401,6 +516,9 @@ impl<'a> Gen<'a> {
                 self.prim_node(prim::UNDEF)
             }
             "requirePathModule" => {
+                // The registry may run a lazy module body here.
+                let r = self.region();
+                self.m.edge(self.m.lazy_raise, r);
                 // A path an instance knows is as good as a literal.
                 let known = match source_args.first().map(|x| self.const_eval(fx.module, x)) {
                     Some(Some(crate::gen_const::Const::Str(s))) => Some(Expr::String(s)),
@@ -452,6 +570,17 @@ impl<'a> Gen<'a> {
                 self.m.top_val(&format!("result of runtime glue {method}"))
             }
         }
+    }
+
+    /// What the step of the for-of loop whose value local is `value` yields.
+    pub(crate) fn step_yield_node(&mut self, fx: &Fx, value: u32) -> NodeId {
+        let key = (fx.f, value);
+        if let Some(&n) = self.mods[fx.module as usize].stepyield.get(&key) {
+            return n;
+        }
+        let n = self.tmp("stepyield");
+        self.mods[fx.module as usize].stepyield.insert(key, n);
+        n
     }
 
     pub(crate) fn iter_out_node(&mut self, fx: &Fx) -> NodeId {

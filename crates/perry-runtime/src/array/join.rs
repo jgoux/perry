@@ -24,13 +24,13 @@ unsafe fn array_elements_ptr(arr: *const ArrayHeader) -> *const f64 {
 fn throw_invalid_string_length() -> ! {
     let message = b"Invalid string length";
     let string = crate::string::js_string_from_bytes(message.as_ptr(), message.len() as u32);
-    let error = crate::error::js_rangeerror_new(string);
-    crate::exception::js_throw(crate::value::js_nanbox_pointer(error as i64))
+    crate::exception::throw_core(crate::error::CoreError::range_error(string))
 }
 
 /// Read one exotic element while keeping the receiver current across a getter
 /// or prototype lookup that can allocate and move it.
 #[cold]
+#[optimize(size)]
 #[inline(never)]
 fn exotic_element(arr: *const ArrayHeader, index: u32) -> Option<u64> {
     let scope = crate::gc::RuntimeHandleScope::new();
@@ -48,6 +48,7 @@ fn exotic_element(arr: *const ArrayHeader, index: u32) -> Option<u64> {
 
 /// Run an allocating element conversion with the receiver and value rooted.
 #[cold]
+#[optimize(size)]
 #[inline(never)]
 fn element_to_string(arr: *const ArrayHeader, element_bits: u64) -> *const StringHeader {
     let scope = crate::gc::RuntimeHandleScope::new();
@@ -235,7 +236,11 @@ fn try_join_well_formed(
                 let string = (bits & POINTER_MASK) as *const StringHeader;
                 let len = (*string).byte_len as usize;
                 // A piece is usually a handful of bytes: keep it out of libc.
-                crate::string::concat::copy_bytes_small(crate::string::string_data(string), cursor, len);
+                crate::string::concat::copy_bytes_small(
+                    crate::string::string_data(string),
+                    cursor,
+                    len,
+                );
                 cursor = cursor.add(len);
                 continue;
             }
@@ -757,11 +762,7 @@ fn join_values(
             result.append_static(if value.as_bool() { b"true" } else { b"false" });
         } else if value.is_number() {
             result.append_number(value.as_number());
-        } else if value.is_int32()
-            && !crate::object::is_class_id_registered((element_bits & 0xFFFF_FFFF) as u32)
-        {
-            // A registered class id shares the INT32 encoding (ClassRef);
-            // those need the spec ToString below for function-source text.
+        } else if value.is_int32() {
             result.append_number(value.as_int32() as f64);
         } else {
             crate::builtins::reject_symbol_to_string(f64::from_bits(element_bits));

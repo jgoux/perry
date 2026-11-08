@@ -160,58 +160,63 @@ pub extern "C" fn js_math_fround(x: f64) -> f64 {
     x as f32 as f64
 }
 
-fn round_ties_to_even(value: f64) -> u64 {
-    let floor = value.floor();
-    let floor_int = floor as u64;
-    let frac = value - floor;
-    if frac < 0.5 {
-        floor_int
-    } else if frac > 0.5 {
-        floor_int + 1
-    } else if floor_int & 1 == 0 {
-        floor_int
-    } else {
-        floor_int + 1
+/// IEEE-754 binary16 bits of `x`: round to nearest, ties to even, on the bits
+/// (exact, no float arithmetic). NaN packs as the quiet NaN 0x7E00, like V8.
+pub(crate) fn f64_to_binary16(x: f64) -> u16 {
+    let bits = x.to_bits();
+    let sign = ((bits >> 48) & 0x8000) as u16;
+    let exp = ((bits >> 52) & 0x7ff) as i32;
+    let mant = bits & 0x000f_ffff_ffff_ffff;
+    if exp == 0x7ff {
+        return sign | if mant != 0 { 0x7e00 } else { 0x7c00 };
     }
+    // The binary16 biased exponent of `x`, before rounding.
+    let e = exp - 1023 + 15;
+    if e >= 31 {
+        return sign | 0x7c00;
+    }
+    // Keep the top bits of the significand that binary16 holds (10 for a
+    // normal, fewer for a subnormal) and round the dropped ones; a carry out
+    // of the significand moves into the exponent, up to infinity.
+    let (kept, shift) = if e > 0 {
+        (((e as u64) << 52) | mant, 42u32)
+    } else if e >= -10 {
+        (mant | (1u64 << 52), (43 - e) as u32)
+    } else {
+        return sign; // below half the smallest subnormal: +-0
+    };
+    let mut half = kept >> shift;
+    let rest = kept & ((1u64 << shift) - 1);
+    let tie = 1u64 << (shift - 1);
+    if rest > tie || (rest == tie && half & 1 == 1) {
+        half += 1;
+    }
+    sign | half as u16
+}
+
+/// The number an IEEE-754 binary16 bit pattern denotes.
+pub(crate) fn binary16_to_f64(bits: u16) -> f64 {
+    let sign = ((bits & 0x8000) as u64) << 48;
+    let exp = ((bits >> 10) & 0x1f) as u64;
+    let mant = (bits & 0x3ff) as u64;
+    let magnitude = match exp {
+        // m * 2^-24, exact
+        0 => mant as f64 * (1.0 / 16_777_216.0),
+        31 if mant == 0 => f64::INFINITY,
+        31 => return f64::NAN,
+        e => f64::from_bits(((e + 1023 - 15) << 52) | (mant << 42)),
+    };
+    f64::from_bits(magnitude.to_bits() | sign)
 }
 
 /// Math.f16round(x) -> number — nearest IEEE-754 binary16 value
 #[no_mangle]
 pub extern "C" fn js_math_f16round(value: f64) -> f64 {
     let x = js_math_to_number(value);
-    if x == 0.0 || !x.is_finite() {
+    if x.is_nan() {
         return x;
     }
-
-    const MIN_HALF_SUBNORMAL: f64 = 5.960464477539063e-8; // 2^-24
-    const MIN_HALF_NORMAL: f64 = 0.00006103515625; // 2^-14
-    const MAX_HALF_FINITE: f64 = 65504.0;
-    const OVERFLOW_THRESHOLD: f64 = 65520.0;
-
-    let negative = x.is_sign_negative();
-    let abs = x.abs();
-    let rounded = if abs >= OVERFLOW_THRESHOLD {
-        f64::INFINITY
-    } else if abs < MIN_HALF_NORMAL {
-        let mantissa = round_ties_to_even(abs / MIN_HALF_SUBNORMAL);
-        mantissa as f64 * MIN_HALF_SUBNORMAL
-    } else {
-        let exponent = (((abs.to_bits() >> 52) & 0x7ff) as i32) - 1023;
-        let step = 2.0f64.powi(exponent - 10);
-        let significand = round_ties_to_even(abs / step);
-        let rounded = significand as f64 * step;
-        if rounded > MAX_HALF_FINITE {
-            f64::INFINITY
-        } else {
-            rounded
-        }
-    };
-
-    if negative {
-        -rounded
-    } else {
-        rounded
-    }
+    binary16_to_f64(f64_to_binary16(x))
 }
 
 /// Math.clz32(x) -> number — count leading zeros of 32-bit integer
@@ -285,6 +290,7 @@ pub extern "C" fn js_math_hypot(a: f64, b: f64) -> f64 {
 /// Math.random() -> number (0 <= x < 1)
 #[no_mangle]
 pub extern "C" fn js_math_random() -> f64 {
+    crate::effect!(host_read, random);
     let mut rng = rand::rng();
     rng.random::<f64>()
 }
@@ -322,21 +328,6 @@ pub extern "C" fn js_math_min_array(arr_ptr: i64) -> f64 {
     }
 }
 
-/// Math.min(a, b) -> number — fast path for the common two-arg form.
-#[no_mangle]
-pub extern "C" fn js_math_min2(a: f64, b: f64) -> f64 {
-    let a = js_math_to_number(a);
-    let b = js_math_to_number(b);
-    if a.is_nan() || b.is_nan() {
-        return f64::NAN;
-    }
-    if a < b || (a == 0.0 && b == 0.0 && a.is_sign_negative()) {
-        a
-    } else {
-        b
-    }
-}
-
 /// Math.max(...array) -> number — find maximum value in an array
 #[no_mangle]
 pub extern "C" fn js_math_max_array(arr_ptr: i64) -> f64 {
@@ -370,63 +361,148 @@ pub extern "C" fn js_math_max_array(arr_ptr: i64) -> f64 {
     }
 }
 
-/// Math.max(a, b) -> number — fast path for the common two-arg form.
-#[no_mangle]
-pub extern "C" fn js_math_max2(a: f64, b: f64) -> f64 {
-    let a = js_math_to_number(a);
-    let b = js_math_to_number(b);
-    if a.is_nan() || b.is_nan() {
-        return f64::NAN;
-    }
-    if a > b || (a == 0.0 && b == 0.0 && a.is_sign_positive()) {
-        a
+/// ToNumber over `n` already-evaluated arguments, in order, then the spec
+/// reduction (`min`: NaN wins, -0 < +0). The arguments are copied into temp
+/// roots first and re-read one at a time, so a `valueOf` that collects cannot
+/// leave a later argument stale. Called by generated code for a `Math.min` /
+/// `Math.max` with at least one argument not proven to be a plain number.
+#[inline(never)]
+unsafe fn math_minmax_n(args: *const f64, n: u32, is_min: bool) -> f64 {
+    use crate::gc::{js_gc_temp_root_get, js_gc_temp_root_push, js_gc_temp_root_truncate};
+    let mut result = if is_min {
+        f64::INFINITY
     } else {
-        b
+        f64::NEG_INFINITY
+    };
+    if n == 0 {
+        return result;
+    }
+    let mut base = 0;
+    for i in 0..n as usize {
+        let idx = js_gc_temp_root_push((*args.add(i)).to_bits());
+        if i == 0 {
+            base = idx;
+        }
+    }
+    let mut saw_nan = false;
+    for i in 0..n {
+        let num = js_math_to_number(f64::from_bits(js_gc_temp_root_get(base + i)));
+        if num.is_nan() {
+            saw_nan = true;
+        } else if is_min {
+            if num < result || (num == 0.0 && result == 0.0 && num.is_sign_negative()) {
+                result = num;
+            }
+        } else if num > result || (num == 0.0 && result == 0.0 && num.is_sign_positive()) {
+            result = num;
+        }
+    }
+    js_gc_temp_root_truncate(base);
+    if saw_nan {
+        f64::NAN
+    } else {
+        result
     }
 }
+
+/// `Math.min(a1..an)` over `n` NaN-boxed values at `args` (see [`math_minmax_n`]).
+///
+/// # Safety
+/// `args` must point at `n` readable `f64`s.
+#[no_mangle]
+pub unsafe extern "C" fn js_math_min_n(args: *const f64, n: u32) -> f64 {
+    math_minmax_n(args, n, true)
+}
+
+/// `Math.max(a1..an)` over `n` NaN-boxed values at `args` (see [`math_minmax_n`]).
+///
+/// # Safety
+/// `args` must point at `n` readable `f64`s.
+#[no_mangle]
+pub unsafe extern "C" fn js_math_max_n(args: *const f64, n: u32) -> f64 {
+    math_minmax_n(args, n, false)
+}
+
+/// Fixed-arity entry points for `Math.min/max` with 2, 3 or 4 operands: the
+/// operands arrive in registers (no stack buffer at the call site), are spilled
+/// into a callee-local array and handed to the one implementation,
+/// [`math_minmax_n`], so the semantics cannot drift from the N-ary helper.
+macro_rules! math_minmax_fixed {
+    ($name:ident, $is_min:expr, $n:expr, $($arg:ident),+) => {
+        #[no_mangle]
+        pub extern "C" fn $name($($arg: f64),+) -> f64 {
+            let args = [$($arg),+];
+            // SAFETY: `args` holds exactly `$n` readable f64s.
+            unsafe { math_minmax_n(args.as_ptr(), $n, $is_min) }
+        }
+    };
+}
+math_minmax_fixed!(js_math_min_2, true, 2, a, b);
+math_minmax_fixed!(js_math_min_3, true, 3, a, b, c);
+math_minmax_fixed!(js_math_min_4, true, 4, a, b, c, d);
+math_minmax_fixed!(js_math_max_2, false, 2, a, b);
+math_minmax_fixed!(js_math_max_3, false, 3, a, b, c);
+math_minmax_fixed!(js_math_max_4, false, 4, a, b, c, d);
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn js_math_minmax_fixed_arity_matches_n() {
+        let cases: [[f64; 4]; 4] = [
+            [3.0, -0.0, 0.0, 1.0],
+            [0.0, -0.0, -0.0, 5.0],
+            [1.0, f64::NAN, 2.0, 0.5],
+            [-7.0, 2.0, 9.0, -0.0],
+        ];
+        for c in cases {
+            let same = |x: f64, y: f64| x.to_bits() == y.to_bits() || (x.is_nan() && y.is_nan());
+            unsafe {
+                assert!(same(
+                    js_math_min_2(c[0], c[1]),
+                    js_math_min_n(c.as_ptr(), 2)
+                ));
+                assert!(same(
+                    js_math_max_2(c[0], c[1]),
+                    js_math_max_n(c.as_ptr(), 2)
+                ));
+                assert!(same(
+                    js_math_min_3(c[0], c[1], c[2]),
+                    js_math_min_n(c.as_ptr(), 3)
+                ));
+                assert!(same(
+                    js_math_max_3(c[0], c[1], c[2]),
+                    js_math_max_n(c.as_ptr(), 3)
+                ));
+                assert!(same(
+                    js_math_min_4(c[0], c[1], c[2], c[3]),
+                    js_math_min_n(c.as_ptr(), 4)
+                ));
+                assert!(same(
+                    js_math_max_4(c[0], c[1], c[2], c[3]),
+                    js_math_max_n(c.as_ptr(), 4)
+                ));
+            }
+        }
+    }
 
     fn is_neg_zero(value: f64) -> bool {
         value == 0.0 && value.is_sign_negative()
     }
 
     #[test]
-    fn js_math_min2_basic_and_signed_zero() {
-        assert_eq!(js_math_min2(4.0, -2.0), -2.0);
-        assert_eq!(js_math_min2(-2.0, 4.0), -2.0);
-
-        let neg_zero = js_math_min2(-0.0, 0.0);
-        assert_eq!(neg_zero, 0.0);
-        assert!(neg_zero.is_sign_negative());
-
-        let neg_zero_reversed = js_math_min2(0.0, -0.0);
-        assert_eq!(neg_zero_reversed, 0.0);
-        assert!(neg_zero_reversed.is_sign_negative());
-    }
-
-    #[test]
-    fn js_math_max2_basic_and_signed_zero() {
-        assert_eq!(js_math_max2(4.0, -2.0), 4.0);
-        assert_eq!(js_math_max2(-2.0, 4.0), 4.0);
-
-        let pos_zero = js_math_max2(-0.0, 0.0);
-        assert_eq!(pos_zero, 0.0);
-        assert!(pos_zero.is_sign_positive());
-
-        let pos_zero_reversed = js_math_max2(0.0, -0.0);
-        assert_eq!(pos_zero_reversed, 0.0);
-        assert!(pos_zero_reversed.is_sign_positive());
-    }
-
-    #[test]
-    fn js_math_minmax2_nan() {
-        assert!(js_math_min2(f64::NAN, 1.0).is_nan());
-        assert!(js_math_min2(1.0, f64::NAN).is_nan());
-        assert!(js_math_max2(f64::NAN, 1.0).is_nan());
-        assert!(js_math_max2(1.0, f64::NAN).is_nan());
+    fn js_math_minmax_n_orders_and_signed_zero() {
+        let a = [3.0f64, -0.0, 0.0];
+        unsafe {
+            assert!(js_math_min_n(a.as_ptr(), 3).is_sign_negative());
+            assert_eq!(js_math_max_n(a.as_ptr(), 3), 3.0);
+            let z = [-0.0f64, 0.0];
+            assert!(js_math_max_n(z.as_ptr(), 2).is_sign_positive());
+            let nan = [1.0f64, f64::NAN, 2.0];
+            assert!(js_math_min_n(nan.as_ptr(), 3).is_nan());
+            assert!(js_math_max_n(nan.as_ptr(), 3).is_nan());
+        }
     }
 
     #[test]

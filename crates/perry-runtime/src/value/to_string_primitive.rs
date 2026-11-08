@@ -118,9 +118,9 @@ unsafe fn ordinary_to_primitive_string_inner(value: f64) -> Option<f64> {
     }
 }
 
-/// True iff `value` is a heap object stamped `OBJ_FLAG_NULL_PROTO`
-/// (`Object.create(null)` and friends) — i.e. it has no `[[Prototype]]`, so it
-/// does not inherit the default `Object.prototype.toString`/`valueOf`.
+/// True iff `value` is an ordinary object whose `[[Prototype]]` is null
+/// (`Object.create(null)` and friends, or one linked to null), so it does not
+/// inherit the default `Object.prototype.toString`/`valueOf`.
 unsafe fn value_is_null_proto_object(value: f64) -> bool {
     let jsval = JSValue::from_bits(value.to_bits());
     if !jsval.is_pointer() {
@@ -136,16 +136,14 @@ unsafe fn value_is_null_proto_object(value: f64) -> bool {
     if (obj as usize) < crate::gc::GC_HEADER_SIZE + 0x1000 {
         return false;
     }
-    let gc = (obj as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
-    (*gc)._reserved & crate::gc::OBJ_FLAG_NULL_PROTO != 0
+    crate::object::shapes::cell_prototype_is_null(obj as usize)
 }
 
 #[cold]
 pub(crate) fn throw_cannot_convert_to_primitive() -> ! {
     let msg = b"Cannot convert object to primitive value";
     let s = crate::string::js_string_from_bytes(msg.as_ptr(), msg.len() as u32);
-    let err = crate::error::js_typeerror_new(s);
-    crate::exception::js_throw(crate::value::js_nanbox_pointer(err as i64))
+    crate::exception::throw_core(crate::error::CoreError::type_error(s))
 }
 
 /// Spec-faithful `OrdinaryToPrimitive(O, hint)` (ES2024 §7.1.1.1) for the

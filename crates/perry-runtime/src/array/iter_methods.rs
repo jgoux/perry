@@ -238,6 +238,7 @@ pub extern "C" fn js_array_forEach(arr: *const ArrayHeader, callback: *const Clo
         crate::typedarray_hook_slots::js_typed_array_for_each(
             arr as *const crate::typedarray_hook_slots::TypedArrayHeader,
             callback,
+            f64::from_bits(crate::value::TAG_UNDEFINED),
         );
         return;
     }
@@ -330,6 +331,7 @@ pub extern "C" fn js_array_map(
         return crate::typedarray_hook_slots::js_typed_array_map(
             arr as *const crate::typedarray_hook_slots::TypedArrayHeader,
             callback,
+            f64::from_bits(crate::value::TAG_UNDEFINED),
         ) as *mut ArrayHeader;
     }
     unsafe {
@@ -550,6 +552,7 @@ pub extern "C" fn js_array_filter(
         return crate::typedarray_hook_slots::js_typed_array_filter(
             arr as *const crate::typedarray_hook_slots::TypedArrayHeader,
             callback,
+            f64::from_bits(crate::value::TAG_UNDEFINED),
         ) as *mut ArrayHeader;
     }
     unsafe {
@@ -652,6 +655,7 @@ pub extern "C" fn js_array_find(arr: *const ArrayHeader, callback: *const Closur
         return crate::typedarray_hook_slots::js_typed_array_find(
             arr as *const crate::typedarray_hook_slots::TypedArrayHeader,
             callback,
+            f64::from_bits(crate::value::TAG_UNDEFINED),
         );
     }
     unsafe {
@@ -731,6 +735,7 @@ pub extern "C" fn js_array_findIndex(
         return crate::typedarray_hook_slots::js_typed_array_find_index(
             arr as *const crate::typedarray_hook_slots::TypedArrayHeader,
             callback,
+            f64::from_bits(crate::value::TAG_UNDEFINED),
         ) as i32;
     }
     unsafe {
@@ -791,6 +796,7 @@ pub extern "C" fn js_array_find_last(
         return crate::typedarray_hook_slots::js_typed_array_find_last(
             arr as *const crate::typedarray_hook_slots::TypedArrayHeader,
             callback,
+            f64::from_bits(crate::value::TAG_UNDEFINED),
         );
     }
     unsafe {
@@ -850,6 +856,7 @@ pub extern "C" fn js_array_find_last_index(
         let r = crate::typedarray_hook_slots::js_typed_array_find_last_index(
             arr as *const crate::typedarray_hook_slots::TypedArrayHeader,
             callback,
+            f64::from_bits(crate::value::TAG_UNDEFINED),
         );
         return r as i32;
     }
@@ -967,6 +974,7 @@ pub extern "C" fn js_array_some(arr: *const ArrayHeader, callback: *const Closur
         return crate::typedarray_hook_slots::js_typed_array_some(
             arr as *const crate::typedarray_hook_slots::TypedArrayHeader,
             callback,
+            f64::from_bits(crate::value::TAG_UNDEFINED),
         );
     }
     unsafe {
@@ -1138,6 +1146,7 @@ pub extern "C" fn js_array_every(arr: *const ArrayHeader, callback: *const Closu
         return crate::typedarray_hook_slots::js_typed_array_every(
             arr as *const crate::typedarray_hook_slots::TypedArrayHeader,
             callback,
+            f64::from_bits(crate::value::TAG_UNDEFINED),
         );
     }
     unsafe {
@@ -1403,9 +1412,7 @@ pub extern "C" fn js_array_reduce(
 pub(crate) fn throw_reduce_of_empty() -> ! {
     let msg = "Reduce of empty array with no initial value";
     let msg_str = crate::string::js_string_from_bytes(msg.as_ptr(), msg.len() as u32);
-    let err_ptr = crate::error::js_typeerror_new(msg_str);
-    let err_value = crate::value::JSValue::pointer(err_ptr as *const u8).bits();
-    crate::exception::js_throw(f64::from_bits(err_value))
+    crate::exception::throw_core(crate::error::CoreError::type_error(msg_str))
 }
 
 /// `arr.toLocaleString(locales?, options?)` (#2808).
@@ -1582,8 +1589,7 @@ fn render_callback_plain(cb_boxed: f64) -> String {
 fn throw_not_a_function(rendered: String) -> ! {
     let message = format!("{} is not a function", rendered);
     let msg = crate::string::js_string_from_bytes(message.as_ptr(), message.len() as u32);
-    let err = crate::error::js_typeerror_new(msg);
-    crate::exception::js_throw(crate::value::js_nanbox_pointer(err as i64));
+    crate::exception::throw_core(crate::error::CoreError::type_error(msg));
 }
 
 /// Validate a higher-order array/TypedArray callback (#4091). Returns the

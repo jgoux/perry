@@ -337,6 +337,7 @@ fn representation_payloads_use_the_common_scope_boundary() {
         values_i32: false,
         elem: crate::expr::MaskedWindowElem::PlainF64,
         allows_stores: false,
+        elements_slot: None,
     });
     assert_eq!(
         table
@@ -463,6 +464,7 @@ fn ordinary_loop_descriptor_is_not_installed_across_a_call() {
 #[test]
 fn trusting_an_operation_does_not_trust_its_effectful_children() {
     let read = Expr::IndexGet {
+        element_offset: 0,
         byte_offset: 0,
         byte_end: 0,
         object: Box::new(num(OBJ)),
@@ -649,6 +651,7 @@ fn generic_property_and_index_reads_are_enders() {
     assert!(has(&get, RegionEnder::CollectingCall));
 
     let idx = vec![Stmt::Expr(Expr::IndexGet {
+        element_offset: 0,
         byte_offset: 0,
         byte_end: 0,
         object: Box::new(num(OBJ)),
@@ -817,20 +820,18 @@ fn battery() -> Vec<(&'static str, Vec<Stmt>)> {
         ),
         (
             "generic index read",
-            vec![Stmt::Expr(Expr::IndexGet {
-                byte_offset: 0,
-                byte_end: 0,
-                object: Box::new(num(OBJ)),
-                index: Box::new(num(NUM)),
-            })],
+            vec![Stmt::Expr(Expr::synthetic_index_get(
+                Box::new(num(OBJ)),
+                Box::new(num(NUM)),
+            ))],
         ),
         (
             "generic index write",
-            vec![Stmt::Expr(Expr::IndexSet {
-                object: Box::new(num(OBJ)),
-                index: Box::new(num(NUM)),
-                value: Box::new(Expr::Number(1.0)),
-            })],
+            vec![Stmt::Expr(Expr::synthetic_index_set(
+                Box::new(num(OBJ)),
+                Box::new(num(NUM)),
+                Box::new(Expr::Number(1.0)),
+            ))],
         ),
         (
             "conditional over clean operands",

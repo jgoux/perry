@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 #[path = "realm_layout_facts.rs"]
 mod realm_layout_facts;
 pub use realm_layout_facts::*;
+#[path = "realm_effect.rs"]
+mod realm_effect;
+pub use realm_effect::*;
 
 pub use perry_runtime_manifest::realm_source::REALM_MANIFEST_VERSION;
 
@@ -108,7 +111,15 @@ pub struct ConstructorFacts {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RealmStorageFacts {
-    Set { entries: Vec<RealmValue> },
+    Set {
+        entries: Vec<RealmValue>,
+    },
+    /// The dense elements of a static array birth, in index order. Reflection
+    /// reads them as index properties; the array holder carries only
+    /// and its named properties, so the elements have one home.
+    Array {
+        elements: Vec<RealmValue>,
+    },
     RuntimeLayout(RuntimeLayoutFacts),
 }
 
@@ -116,6 +127,7 @@ impl RealmStorageFacts {
     pub fn values(&self) -> &[RealmValue] {
         match self {
             Self::Set { entries } => entries,
+            Self::Array { elements } => elements,
             Self::RuntimeLayout(_) => &[],
         }
     }
@@ -175,12 +187,43 @@ pub struct RealmDeclaration {
     pub captures: Vec<RealmValue>,
     #[serde(default)]
     pub header: Option<RealmHeaderFacts>,
+    /// What a dynamic host array declares its elements to be
+    /// (`value = dynamic, elements = string`): the runtime puts only such
+    /// values in the array it makes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elements: Option<String>,
     #[serde(default)]
     pub native_namespace: Option<String>,
     #[serde(default)]
     pub constructor: Option<ConstructorFacts>,
     #[serde(default)]
     pub storage: Option<RealmStorageFacts>,
+    /// What the body does to its inputs; empty = undeclared (unknown code).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effects: Vec<RealmEffect>,
+    /// The body `effects` describe when it is not `body`: the function a
+    /// `provider = bound_method` member's native_module_dispatch arm calls
+    /// (source symbol, from the effects-only `realm_decl!` above it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effects_body: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub throws: Vec<RealmThrowOperand>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RealmThrowOperand {
+    pub source: Option<String>,
+    pub argument: u16,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RealmThrowDeclaration {
+    pub symbol: String,
+    pub source: String,
+    pub line: usize,
+    pub operands: Vec<RealmThrowOperand>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -188,6 +231,8 @@ pub struct RealmDeclaration {
 pub struct RealmManifest {
     pub version: u32,
     pub declarations: Vec<RealmDeclaration>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub throw_declarations: Vec<RealmThrowDeclaration>,
 }
 
 /// Borrowed projection in the generated compiler table. `facts` preserves
@@ -199,6 +244,8 @@ pub struct RealmEntry {
     pub births: &'static [&'static str],
     pub module: Option<&'static str>,
     pub facts: &'static str,
+    /// The declared effects of the body (empty: undeclared, unknown code).
+    pub effects: &'static [RealmEffect],
 }
 
 impl RealmManifest {
@@ -260,6 +307,15 @@ impl RealmManifest {
             }
         }
         for d in &self.declarations {
+            if !d.effects.is_empty() {
+                if d.body.is_none() {
+                    return Err(format!(
+                        "{}: effects on a declaration without a body",
+                        d.name
+                    ));
+                }
+                validate_effects(&d.name, &d.effects, &|name| names.contains(name))?;
+            }
             if let Some(RealmStorageFacts::RuntimeLayout(layout)) = &d.storage {
                 for owner in &layout.owners {
                     let birth = self

@@ -50,6 +50,7 @@ pub fn gc_header_size_word(total: usize) -> u32 {
 }
 
 #[cold]
+#[optimize(size)]
 #[inline(never)]
 fn gc_header_size_overflow(total: usize) -> ! {
     panic!(
@@ -60,6 +61,7 @@ fn gc_header_size_overflow(total: usize) -> ! {
 
 // Object type constants
 pub const GC_TYPE_ARRAY: u8 = 1;
+const _: () = assert!(GC_TYPE_ARRAY == perry_abi::GC_TYPE_ARRAY);
 pub const GC_TYPE_OBJECT: u8 = perry_abi::GC_TYPE_OBJECT;
 // The object-type predicates (`gc_type_is_object!`, `object_has_meta_word!`,
 // `gc_type_is_not_object!`, `object_lacks_meta_word!`, `gc_object_type_pat!`)
@@ -1506,97 +1508,10 @@ pub(super) fn gc_type_name(obj_type: u8) -> &'static str {
     gc_type_info(obj_type).map_or("unknown", |info| info.name)
 }
 
-// #854: part of GC type-metadata verification contract (exercised by gc/tests)
-#[allow(dead_code)]
-pub(crate) fn validate_gc_type_info(info: &GcTypeInfo) -> Result<(), &'static str> {
-    let descriptor_is_leaf = info.rewrite_descriptor_kind == GcRewriteDescriptorKind::Leaf;
-    if info.pointer_free {
-        if !descriptor_is_leaf {
-            return Err("pointer-free GC type exposes a rewrite descriptor");
-        }
-        if info.layout_slot_kind != GcLayoutSlotKind::None {
-            return Err("pointer-free GC type exposes pointer slots");
-        }
-        return Ok(());
-    }
+mod validation;
 
-    if descriptor_is_leaf {
-        return Err("pointerful GC type lacks rewrite descriptor metadata");
-    }
-
-    match info.rewrite_descriptor_kind {
-        GcRewriteDescriptorKind::Array => {
-            if info.layout_slot_kind != GcLayoutSlotKind::ArrayElements {
-                return Err("array rewrite descriptor must expose array element slots");
-            }
-        }
-        GcRewriteDescriptorKind::Object => {
-            if info.layout_slot_kind != GcLayoutSlotKind::ObjectFields {
-                return Err("object rewrite descriptor must expose object field slots");
-            }
-        }
-        GcRewriteDescriptorKind::RegExp => {
-            if info.layout_slot_kind != GcLayoutSlotKind::RegExpFields {
-                return Err("regexp rewrite descriptor must expose regexp fields");
-            }
-        }
-        GcRewriteDescriptorKind::Closure => {
-            if info.layout_slot_kind != GcLayoutSlotKind::ClosureCaptures {
-                return Err("closure rewrite descriptor must expose closure capture slots");
-            }
-        }
-        GcRewriteDescriptorKind::WeakStorage
-        | GcRewriteDescriptorKind::Overflow
-        | GcRewriteDescriptorKind::Box
-        | GcRewriteDescriptorKind::Scope
-        | GcRewriteDescriptorKind::Buffer
-        | GcRewriteDescriptorKind::MetaOnly
-        | GcRewriteDescriptorKind::RegexProgram
-        | GcRewriteDescriptorKind::NativeHandle
-        | GcRewriteDescriptorKind::Promise
-        | GcRewriteDescriptorKind::AsyncSnapshot
-        | GcRewriteDescriptorKind::AsyncResourceState
-        | GcRewriteDescriptorKind::Symbol
-        | GcRewriteDescriptorKind::Error
-        | GcRewriteDescriptorKind::Map
-        | GcRewriteDescriptorKind::MapStore
-        | GcRewriteDescriptorKind::LazyArray
-        | GcRewriteDescriptorKind::Set
-        | GcRewriteDescriptorKind::SetStore
-        | GcRewriteDescriptorKind::Proxy => {
-            if info.layout_slot_kind != GcLayoutSlotKind::None {
-                return Err(
-                    "external-backed rewrite descriptor must not expose payload layout slots",
-                );
-            }
-        }
-        GcRewriteDescriptorKind::ObjectMeta => {
-            // Meta records expose every child edge (prototype, spill buffer,
-            // and private-evaluation brand) to marking and rewriting.
-            if info.layout_slot_kind != GcLayoutSlotKind::ObjectMeta {
-                return Err("object-meta descriptor must expose its child edges to marking");
-            }
-        }
-        GcRewriteDescriptorKind::NativePodView => {
-            if info.layout_slot_kind != GcLayoutSlotKind::None {
-                return Err("native view rewrite descriptor must use fixed slots only");
-            }
-        }
-        GcRewriteDescriptorKind::Leaf => unreachable!("leaf handled above"),
-    }
-
-    Ok(())
-}
-
-// #854: part of GC type-metadata verification contract (exercised by gc/tests)
-#[allow(dead_code)]
-pub(crate) fn validate_gc_type_metadata() -> Result<(), String> {
-    for info in gc_type_infos() {
-        validate_gc_type_info(info)
-            .map_err(|reason| format!("invalid GC metadata for {}: {}", info.name, reason))?;
-    }
-    Ok(())
-}
+#[cfg(test)]
+pub(crate) use validation::{validate_gc_type_info, validate_gc_type_metadata};
 
 // Flag constants
 pub const GC_FLAG_MARKED: u8 = 0x01;
@@ -1726,7 +1641,6 @@ pub use perry_abi::{OBJ_FLAG_FROZEN, OBJ_FLAG_NO_EXTEND, OBJ_FLAG_SEALED};
 /// objects (`OBJ_FLAG_RESERVED_BIT_MAP_SEE_DOC`); arrays and byte owners give
 /// it other meanings, so every reader checks `obj_type` first. Set-only.
 pub(crate) use perry_abi::OBJ_FLAG_NEVER_MOVE;
-pub use perry_abi::OBJ_FLAG_NULL_PROTO;
 /// I1 companion (`gc::never_move::note_memo_named`): a site memo stores
 /// this object's address. If a class relink displaces it from a class
 /// identity, the retirement pins it, so the memo keeps reading this object.
@@ -1768,6 +1682,7 @@ pub use perry_abi::OBJ_FLAG_TYPED_ARRAY_PROTO;
 /// `JSValue` slots. This is only meaningful for `GC_TYPE_ARRAY`; object
 /// flags share the same `_reserved` word but never inspect this bit.
 pub(crate) const GC_ARRAY_RAW_F64_LAYOUT: u16 = 0x80;
+const _: () = assert!(GC_ARRAY_RAW_F64_LAYOUT == perry_abi::GC_ARRAY_RAW_F64_LAYOUT);
 /// #10593: a per-array flag, read as "THIS array's
 /// `[[Prototype]]` was retargeted". Arrays are never meta-capable, so every
 /// `Object.setPrototypeOf(arr, p)` records in its property bag and sets
@@ -1785,6 +1700,16 @@ pub(crate) const GC_ARRAY_RAW_F64_LAYOUT: u16 = 0x80;
 /// JSON array (whose materialized storage is a separate allocation that does
 /// not carry this bit).
 pub(crate) const GC_ARRAY_CUSTOM_PROTO: u16 = 0x40;
+const _: () = assert!(GC_ARRAY_CUSTOM_PROTO == perry_abi::GC_ARRAY_CUSTOM_PROTO);
+/// The `_reserved` bits a lazy JSON array keeps when it becomes the ordinary
+/// array in place (`json_tape::flip_to_array`): the copy age every kind
+/// carries, the integrity level, and `GC_ARRAY_CUSTOM_PROTO`. Everything else
+/// is array layout state, which the flip rebuilds from the slots.
+pub(crate) const ARRAY_FLIP_KEPT_RESERVED: u16 = super::layout::GC_COPY_SURVIVAL_AGE_MASK
+    | OBJ_FLAG_FROZEN
+    | OBJ_FLAG_SEALED
+    | OBJ_FLAG_NO_EXTEND
+    | GC_ARRAY_CUSTOM_PROTO;
 /// Array was synthesized for a function's `arguments` binding. This is only
 /// meaningful for `GC_TYPE_ARRAY`; it lets `util.types.isArgumentsObject`
 /// distinguish Perry's internal `arguments` arrays from user rest arrays.
@@ -1847,7 +1772,7 @@ pub(crate) const OBJ_FLAG_ARGUMENTS: u16 = 0x1000;
 /// | 0..2 | FROZEN / SEALED / NO_EXTEND | no proxy-specific writer | integrity flags |
 /// | 3..4 | survival age | survival age | GC_COPY_SURVIVAL_AGE_MASK, all kinds |
 /// | 5 | GC_OBJECT_CALLABLE | GC_OBJECT_CALLABLE | unused |
-/// | 6 | NULL_PROTO | unused | array: CUSTOM_PROTO |
+/// | 6 | free (was NULL_PROTO; a null [[Prototype]] is the shape identity `PROTO_ID_NULL`) | unused | array: CUSTOM_PROTO |
 /// | 7 | NEVER_MOVE | unused | array: RAW_F64_LAYOUT; closure: NON_CONSTRUCTABLE; byte owner: FOREIGN_DATA; byte view: LENGTH_TRACKING |
 /// | 8 | TYPED_ARRAY_PROTO | unused | array: KEY_ATTRS; byte owner: RESIZABLE |
 /// | 9 | PLAIN_ORDINARY | unused | array: ARGUMENTS_OBJECT |
@@ -1876,7 +1801,6 @@ pub(crate) const GC_OBJECT_CALLABLE_IS_DISJOINT: bool = GC_OBJECT_CALLABLE
         | OBJ_FLAG_FROZEN
         | OBJ_FLAG_SEALED
         | OBJ_FLAG_NO_EXTEND
-        | OBJ_FLAG_NULL_PROTO
         | OBJ_FLAG_NEVER_MOVE
         | OBJ_FLAG_TYPED_ARRAY_PROTO
         | OBJ_FLAG_PLAIN_ORDINARY

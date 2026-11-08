@@ -48,6 +48,15 @@ pub extern "C" fn js_object_set_field_by_name(
     key: *const crate::StringHeader,
     value: f64,
 ) {
+    // Census builds: a store on the realm global names its key (§2.10.13).
+    #[cfg(perry_gc_instruments)]
+    let _gkey =
+        crate::snap_census::global_key((obj as u64 & crate::value::POINTER_MASK) as usize, || {
+            (!key.is_null()).then(|| crate::regex::string_as_bytes(key))
+        });
+
+    #[cfg(debug_assertions)]
+    crate::object::field_get_set::field_ops::debug_assert_one_number_encoding(value.to_bits());
     #[cfg(perry_contract_checks)]
     crate::contracts::generic_store(obj, key, value);
     // Case 2c: a family object's late key and a key outside its layout
@@ -212,11 +221,10 @@ pub extern "C" fn js_object_set_field_by_name(
                     | crate::gc::OBJ_FLAG_NO_EXTEND
                     | crate::gc::OBJ_FLAG_HAS_DESCRIPTORS
                     | crate::gc::OBJ_FLAG_TYPED_ARRAY_PROTO;
-                // A born-null receiver takes the lane when its shape proves
-                // it ordinary with no chain (the plan is keyed on that shape).
+                // The plan is keyed on the shape, which names the receiver's
+                // [[Prototype]] (a null one too).
                 if crate::gc_type_is_object!((*gc_hdr).obj_type)
                     && (*gc_hdr)._reserved & LANE_BLOCKING == 0
-                    && super::shapes::store_kind::born_null_admits_lane(o, (*gc_hdr)._reserved)
                 {
                     let class_id = (*o).class_id;
                     // Class objects must reach the static-write mirror.
@@ -457,7 +465,7 @@ pub extern "C" fn js_object_set_field_by_name(
         {
             let bits = obj as u64;
             if let (Some(class_id), false) = (
-                crate::object::class_value::legacy_class_ptr_word(bits),
+                crate::object::class_value::class_ref_ptr_word(bits),
                 key.is_null(),
             ) {
                 unsafe {

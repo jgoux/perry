@@ -277,11 +277,52 @@ pub(crate) fn is_worker_messaging_constructor_name(name: &str) -> bool {
     matches!(name, "MessageChannel" | "BroadcastChannel")
 }
 
+/// WorkerNew is also the signal that makes module collection retain the child entry.
+pub(crate) fn lower_imported_worker_threads_new(
+    ctx: &mut LoweringContext,
+    local_name: &str,
+    new_expr: &ast::NewExpr,
+) -> Result<Option<Expr>> {
+    let export = ctx
+        .lookup_native_module(local_name)
+        .filter(|(module, _)| is_worker_threads_module_name(module))
+        .and_then(|(_, export)| export.map(str::to_owned));
+    match export.as_deref() {
+        Some("Worker") => lower_worker_new(ctx, new_expr).map(Some),
+        Some(name) if is_worker_messaging_constructor_name(name) => {
+            lower_worker_messaging_new(ctx, name, new_expr.args.as_deref()).map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
 pub(crate) fn lower_worker_messaging_new(
     ctx: &mut LoweringContext,
     class_name: &str,
     args: Option<&[ast::ExprOrSpread]>,
 ) -> Result<Expr> {
+    if class_name == "BroadcastChannel" {
+        let callee = Box::new(Expr::PropertyGet {
+            byte_end: 0,
+            byte_offset: 0,
+            object: Box::new(Expr::NativeModuleRef("worker_threads".to_string())),
+            property: class_name.to_string(),
+        });
+        if let Some(args) = args.filter(|args| args.iter().any(|arg| arg.spread.is_some())) {
+            return Ok(Expr::NewDynamicSpread {
+                byte_end: 0,
+                callee,
+                args: lower_new_spread_args(ctx, args)?,
+                byte_offset: 0,
+            });
+        }
+        return Ok(Expr::NewDynamic {
+            byte_end: 0,
+            callee,
+            args: lower_optional_args(ctx, args)?,
+            byte_offset: 0,
+        });
+    }
     Ok(Expr::NativeMethodCall {
         module: "worker_threads".to_string(),
         class_name: None,

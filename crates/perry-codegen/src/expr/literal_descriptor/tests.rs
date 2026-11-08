@@ -25,6 +25,8 @@ fn fixture(records: usize, fields: usize) -> Module {
                     object: Box::new(Expr::This),
                     property: p.name.clone(),
                     value: Box::new(Expr::LocalGet(p.id)),
+                    byte_offset: 0,
+                    byte_end: 0,
                 })
             })
             .collect(),
@@ -202,6 +204,8 @@ fn added_store(receiver: Expr, key: &str) -> Stmt {
         object: Box::new(receiver),
         property: key.into(),
         value: Box::new(Expr::Number(3.0)),
+        byte_offset: 0,
+        byte_end: 0,
     })
 }
 
@@ -476,6 +480,9 @@ fn born_wide_global_binding_and_static_putvalue_key() {
         key: Box::new(Expr::String("z".into())),
         value: Box::new(Expr::Number(3.0)),
         strict: false,
+        element_offset: 0,
+        byte_offset: 0,
+        byte_end: 0,
     })];
     // HIR globals may be materialized by an earlier pass; assert the capacity
     // evidence directly as well as emitting an ordinary birth of the class.
@@ -588,6 +595,7 @@ fn born_wide_array_element_evidence() {
             field_writeback: None,
         }),
         literal_binding(Expr::IndexGet {
+            element_offset: 0,
             byte_offset: 0,
             byte_end: 0,
             object: Box::new(Expr::LocalGet(1002)),
@@ -608,6 +616,7 @@ fn born_wide_array_element_evidence() {
         },
         added_store(
             Expr::IndexGet {
+                element_offset: 0,
                 byte_offset: 0,
                 byte_end: 0,
                 object: Box::new(Expr::LocalGet(1002)),

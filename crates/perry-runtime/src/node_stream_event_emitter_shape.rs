@@ -117,7 +117,8 @@ pub(super) fn shape_prototype(obj: *const crate::object::ObjectHeader) -> Option
 pub(super) fn null_prototype(obj: *const crate::object::ObjectHeader, flags: u16) -> bool {
     // SAFETY: a live ordinary object the caller validated.
     let word = unsafe { crate::object::shapes::object_prototype_word(obj) };
-    word == crate::value::TAG_NULL || (word == 0 && flags & crate::gc::OBJ_FLAG_NULL_PROTO != 0)
+    let _ = flags;
+    word == crate::value::TAG_NULL
 }
 
 /// What `target`'s shape says about its own key `key` ([`own_slot_of`]); a
@@ -486,7 +487,7 @@ pub(super) fn remove_only_listener_fast(target: f64, event: f64, listener: f64) 
     let deleted =
         unsafe { crate::object::delete_last_key::try_delete_last_added_key_at(events_obj, slot) };
     if deleted.is_none() {
-        let _ = crate::object::js_object_delete_dynamic_value(view.events, event);
+        let _ = crate::object::delete_dynamic_value(view.events, event);
     }
     true
 }

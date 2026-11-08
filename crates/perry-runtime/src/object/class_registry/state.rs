@@ -668,20 +668,6 @@ pub static CLASS_STATIC_METHOD_BIND_LENGTHS: ImageTable<
     RwLock<Option<HashMap<(u32, Vec<u8>), u32>>>,
 > = ImageTable::new(|image| &image.static_method_bind_lengths);
 
-crate::perry_thread_local! {
-    pub static CLASS_SYMBOL_METHODS: RwLock<Option<HashMap<(u32, usize, bool), (usize, u32, bool, usize)>>> =
-        RwLock::new(None);
-
-    pub static CLASS_SYMBOL_ACCESSORS: RwLock<Option<HashMap<(u32, usize, bool), (usize, usize)>>> =
-        RwLock::new(None);
-
-    /// Source order for Symbol-keyed class methods/accessors. Symbol member
-    /// registries are thread-local because their keys are heap addresses, so
-    /// their ordering metadata follows the same ownership model.
-    pub static CLASS_SYMBOL_MEMBER_ORDERS: RwLock<Option<HashMap<(u32, u64, bool), u32>>> =
-        RwLock::new(None);
-}
-
 /// Set of all registered class ids. Populated at module init by codegen
 /// emitting `js_register_class_id(cid)` for every user class — even
 /// classes without any methods. Refs #618 / #420 followup.
@@ -1127,9 +1113,32 @@ fn decl_prototype_class_id(ptr: usize) -> Option<u32> {
     // SAFETY: the header names an ordinary object at `ptr`; its first word
     // is the class id.
     let class_id = unsafe { (*(ptr as *const ObjectHeader)).class_id };
-    (class_id != 0
-        && crate::object::class_value::class_decl_prototype_link(class_id) as usize == ptr)
-        .then_some(class_id)
+    (class_id != 0 && decl_prototype_link_observed(class_id, ptr) == ptr).then_some(class_id)
+}
+
+/// `class_id`'s declared-prototype link, as `decl_prototype_class_id`
+/// compares it with `ptr`. The link of a class that is not `ptr`'s observes
+/// nothing: the compare fails whatever the link holds. In instrumented
+/// builds the SNAP census counts the read as the init's only on a match (it
+/// reads the link again outside the bookkeeping scope); a production build
+/// reads it once.
+#[cfg(all(perry_gc_instruments, target_os = "linux", target_arch = "x86_64"))]
+#[inline(always)]
+fn decl_prototype_link_observed(class_id: u32, ptr: usize) -> usize {
+    let link = {
+        let _census = crate::snap_census::bookkeeping();
+        crate::object::class_value::class_decl_prototype_link(class_id) as usize
+    };
+    if link == ptr {
+        return crate::object::class_value::class_decl_prototype_link(class_id) as usize;
+    }
+    link
+}
+
+#[cfg(not(all(perry_gc_instruments, target_os = "linux", target_arch = "x86_64")))]
+#[inline(always)]
+fn decl_prototype_link_observed(class_id: u32, _ptr: usize) -> usize {
+    crate::object::class_value::class_decl_prototype_link(class_id) as usize
 }
 
 /// #7757: a monomorphized specialization (`Gen$num`) must present the GENERIC's
@@ -1334,120 +1343,6 @@ pub(super) fn install_class_decl_prototype_method_field_at(
             PropertyAttrs::new(true, false, true),
         )
     });
-}
-
-/// Install one computed Symbol ClassBody member on the materialized declared
-/// prototype. The class registries retain compiled dispatch metadata, while
-/// the prototype shape is the authoritative record that the property exists:
-/// deleting the shape entry therefore cannot be resurrected by a registry
-/// fallback.
-pub(super) fn install_class_decl_prototype_symbol_member(
-    proto: *mut ObjectHeader,
-    class_id: u32,
-    sym_key: usize,
-) {
-    if proto.is_null() || sym_key == 0 {
-        return;
-    }
-    let scope = crate::gc::RuntimeHandleScope::new();
-    let proto_h = scope.root_raw_mut_ptr(proto);
-    let sym = f64::from_bits(crate::JSValue::pointer(sym_key as *const u8).bits());
-    let sym_h = scope.root_nanbox_f64(sym);
-    // SAFETY: `sym_key` came from the registered ClassBody symbol table and
-    // remains rooted by that registry for the class lifetime.
-    let display_name = unsafe { crate::symbol::symbol_function_name(sym_key) };
-
-    if let Some((raw_get, raw_set)) =
-        super::class_own_symbol_accessor_ptrs(class_id, sym_key, false)
-    {
-        let get = scope.root_nanbox_f64(super::class_accessor_function_value(
-            raw_get,
-            false,
-            false,
-            &display_name,
-            None,
-        ));
-        let set = scope.root_nanbox_f64(super::class_accessor_function_value(
-            raw_set,
-            true,
-            false,
-            &display_name,
-            None,
-        ));
-        let proto_value =
-            proto_h.with_mut_ptr::<ObjectHeader, _>(|p| crate::value::js_nanbox_pointer(p as i64));
-        unsafe {
-            crate::symbol::set_symbol_accessor_property(
-                proto_value,
-                sym_h.get_nanbox_f64(),
-                if raw_get == 0 {
-                    0
-                } else {
-                    get.get_nanbox_u64()
-                },
-                if raw_set == 0 {
-                    0
-                } else {
-                    set.get_nanbox_u64()
-                },
-            );
-        }
-    } else if let Some((func_ptr, param_count, has_rest, entry)) =
-        super::lookup_class_symbol_method_in_chain(class_id, sym_key, false)
-    {
-        let generator = entry != 0
-            && unsafe {
-                crate::closure::info_has(
-                    &*(entry as *const crate::closure::JsFunctionInfo),
-                    crate::closure::FN_GENERATOR,
-                )
-            };
-        let value = scope.root_nanbox_f64(if generator {
-            crate::object::native_module::class_method_declaration_value(
-                crate::object::class_prototype_ref_value(class_id),
-                &display_name,
-                func_ptr,
-                param_count,
-                false,
-                has_rest,
-                entry,
-                true,
-            )
-        } else {
-            crate::object::build_symbol_bound_method_closure(
-                crate::object::class_prototype_ref_value(class_id),
-                func_ptr,
-                param_count,
-                has_rest,
-                false,
-                &display_name,
-            )
-        });
-        let proto_value =
-            proto_h.with_mut_ptr::<ObjectHeader, _>(|p| crate::value::js_nanbox_pointer(p as i64));
-        unsafe {
-            crate::symbol::define_symbol_data_property(
-                proto_value,
-                sym_h.get_nanbox_f64(),
-                value.get_nanbox_f64(),
-            );
-        }
-    } else {
-        return;
-    }
-
-    let owner = proto_h.with_mut_ptr::<ObjectHeader, _>(|p| p as usize);
-    crate::symbol::set_symbol_property_attrs(owner, sym_key, PropertyAttrs::new(true, false, true));
-}
-
-fn install_class_decl_prototype_symbol_members(proto: *mut ObjectHeader, class_id: u32) {
-    let scope = crate::gc::RuntimeHandleScope::new();
-    let proto_h = scope.root_raw_mut_ptr(proto);
-    for sym_key in super::class_own_symbol_member_keys(class_id, false) {
-        proto_h.with_mut_ptr(|p: *mut ObjectHeader| {
-            install_class_decl_prototype_symbol_member(p, class_id, sym_key)
-        });
-    }
 }
 
 /// One own string-keyed prototype member of a class: its name, whether it is
@@ -1696,6 +1591,18 @@ pub(crate) fn class_decl_prototype_value_selected(class_id: u32) -> f64 {
             .then(|| crate::value::js_nanbox_pointer(proto as i64))
             .unwrap_or_else(|| f64::from_bits(crate::value::TAG_UNDEFINED));
     }
+    // A runtime-native class has no compiler declaration; its prototype is
+    // the object the runtime registered for it (`tty.WriteStream.prototype`;
+    // a registered parent CLASS OBJECT is a heritage edge, not a prototype).
+    // Materializing a declared holder here would publish the CLASS identity
+    // word over that prototype, and every instance would lose its inherited
+    // surface and `Object.getPrototypeOf` answer (#13686).
+    if super::declarations::class_declaration(class_id).is_none() {
+        let proto = class_prototype_object(class_id);
+        if !proto.is_null() && !super::is_class_object_ptr(proto as *const u8) {
+            return crate::value::js_nanbox_pointer(proto as i64);
+        }
+    }
     if !class_identity_has_surface(class_id) {
         return f64::from_bits(crate::value::TAG_UNDEFINED);
     }
@@ -1710,6 +1617,9 @@ pub(crate) fn class_decl_prototype_value_selected(class_id: u32) -> f64 {
         return crate::value::js_nanbox_pointer(existing as i64);
     }
 
+    // Materializing the declared prototype is a first-use build of static
+    // declaration data: the SNAP census counts it as the runtime's.
+    let _census = crate::snap_census::runtime_scope();
     // The [[Prototype]] it links to, resolved before the object exists (a
     // parent that cannot be one throws before anything is linked).
     let scope = crate::gc::RuntimeHandleScope::new();
@@ -1768,7 +1678,13 @@ pub(crate) fn class_decl_prototype_value_selected(class_id: u32) -> f64 {
     // A computed member the definition has not named yet stops the
     // installation above; naming it resumes there.
     super::declarations::note_decl_prototype_born(class_id);
-    proto.with_mut_ptr(|p| install_class_decl_prototype_symbol_members(p, class_id));
+    proto.with_mut_ptr(|p| {
+        super::parent_static::install_prototype_symbol_members(
+            p,
+            class_id,
+            f64::from_bits(crate::value::TAG_UNDEFINED),
+        )
+    });
 
     if parent_proto_bits.is_some() {
         proto.with_mut_ptr::<ObjectHeader, _>(|p| {
@@ -1907,198 +1823,13 @@ pub(crate) fn global_object_prototype_bits() -> Option<u64> {
 }
 
 #[cfg(test)]
-mod class_realm_isolation_tests {
-    use super::*;
-    use std::sync::{Arc, Barrier, Mutex};
-
-    /// #8001 — a declared class's lazily materialized `.prototype` belongs to
-    /// the agent that materialized it, not to whichever thread first used the
-    /// process-wide class id.
-    ///
-    /// The class id and name are codegen facts shared by both agents. The heap
-    /// object stored under that id is not: each thread owns a separate realm and
-    /// arena. Bootstraps are serialized because the test harness's globalThis
-    /// root slot is process-global, while the barrier keeps both arenas live
-    /// until both addresses have been observed. Before #8001, agent B returned
-    /// agent A's cached pointer at the first-thread-wins gate.
-    #[test]
-    fn a_second_agents_declared_prototype_address_is_its_own() {
-        const CLASS_ID: u32 = 0x7d01_8001;
-        const CLASS_NAME: &[u8] = b"Issue8001Class";
-
-        unsafe {
-            js_register_class_name(CLASS_ID, CLASS_NAME.as_ptr(), CLASS_NAME.len() as u32);
-        }
-
-        let bootstrap_gate = Arc::new(Mutex::new(()));
-        let both_alive = Arc::new(Barrier::new(2));
-        let agent = |gate: Arc<Mutex<()>>, barrier: Arc<Barrier>| {
-            move || -> usize {
-                let addr = {
-                    let _serialized = gate.lock().expect("bootstrap gate");
-                    let bits = class_decl_prototype_value(CLASS_ID).to_bits();
-                    assert_eq!(
-                        bits & crate::value::TAG_MASK,
-                        crate::value::POINTER_TAG,
-                        "the class prototype must materialize before isolation is tested"
-                    );
-                    (bits & crate::value::POINTER_MASK) as usize
-                };
-                barrier.wait();
-                addr
-            }
-        };
-        let spawn_agent = |gate: Arc<Mutex<()>>, barrier: Arc<Barrier>| {
-            std::thread::Builder::new()
-                .stack_size(16 << 20)
-                .spawn(agent(gate, barrier))
-                .expect("spawn realm agent")
-        };
-
-        let a = spawn_agent(Arc::clone(&bootstrap_gate), Arc::clone(&both_alive));
-        let b = spawn_agent(bootstrap_gate, both_alive);
-        let a_addr = a.join().expect("agent A panicked");
-        let b_addr = b.join().expect("agent B panicked");
-
-        for (label, addr) in [("agent A", a_addr), ("agent B", b_addr)] {
-            assert_ne!(
-                addr, 0,
-                "{label} did not materialize a real class prototype; distinctness would be vacuous"
-            );
-        }
-        assert_ne!(
-            a_addr, b_addr,
-            "two live agents must materialize their own Class.prototype objects (#8001)"
-        );
-    }
-}
+mod class_realm_isolation_tests;
 
 #[cfg(test)]
-mod class_dynamic_prop_store_tests {
-    use super::*;
-
-    fn stored(class_id: u32, name: &str) -> Option<f64> {
-        class_own_static_field_value(class_id, name)
-    }
-
-    /// The in-place update arm must be observationally identical to the
-    /// insert arm — same table, same value, same key set. This is the shape
-    /// `Shape.made = Shape.made + 1` produces once per construction.
-    #[test]
-    fn repeated_store_updates_in_place_and_stays_readable() {
-        let cid = 0x7c01_0001;
-        for i in 0..5u32 {
-            class_dynamic_prop_root_store(cid, "made", f64::from(i));
-            assert_eq!(stored(cid, "made"), Some(f64::from(i)));
-        }
-        // A second key on the same class still inserts.
-        class_dynamic_prop_root_store(cid, "other", 9.0);
-        assert_eq!(stored(cid, "other"), Some(9.0));
-        assert_eq!(stored(cid, "made"), Some(4.0));
-        let mut keys = class_own_enumerable_field_names(cid);
-        keys.sort();
-        assert_eq!(keys, vec!["made".to_string(), "other".to_string()]);
-    }
-
-    /// `delete C.k` removes the key from the class function object; a later
-    /// store defines it again.
-    #[test]
-    fn store_after_delete_defines_the_key_again() {
-        let cid = 0x7c01_0002;
-        class_dynamic_prop_root_store(cid, "k", 1.0);
-        class_delete_own_dynamic_prop(cid, "k");
-        assert_eq!(stored(cid, "k"), None);
-
-        class_dynamic_prop_root_store(cid, "k", 2.0);
-        assert_eq!(stored(cid, "k"), Some(2.0));
-
-        class_dynamic_prop_root_store(cid, "k", 3.0);
-        assert_eq!(stored(cid, "k"), Some(3.0));
-    }
-}
+mod class_dynamic_prop_store_tests;
 
 #[cfg(test)]
-mod class_parent_prototype_tests {
-    use super::*;
-
-    #[test]
-    fn only_object_and_null_parent_prototypes_are_valid() {
-        let object_ptr = crate::object::js_object_alloc(0, 0);
-        assert!(!object_ptr.is_null());
-        let object = crate::value::js_nanbox_pointer(object_ptr as i64);
-        assert_eq!(class_parent_prototype_bits(object), Some(object.to_bits()));
-        assert_eq!(
-            class_parent_prototype_bits(f64::from_bits(crate::value::POINTER_TAG | 0x1234)),
-            None
-        );
-        assert_eq!(
-            class_parent_prototype_bits(f64::from_bits(crate::value::TAG_NULL)),
-            Some(crate::value::TAG_NULL)
-        );
-        assert_eq!(
-            class_parent_prototype_bits(f64::from_bits(crate::value::TAG_UNDEFINED)),
-            None
-        );
-        assert_eq!(class_parent_prototype_bits(1.0), None);
-    }
-
-    /// #8760: a `class X extends <bound native EventEmitter export>` registered
-    /// through the dynamic-parent path (`import { EventEmitter as EE } from
-    /// "events"; class X extends EE {}` — cli.js 2.1.112's exact shape) must
-    /// link its declared prototype to EventEmitter's real, lazily-materialized
-    /// prototype instead of throwing "Class extends value does not have valid
-    /// prototype property". The raw `prototype` dynamic slot on the bound export
-    /// closure may be `undefined` (it is not any more: the slot already reads as
-    /// a pointer), so the resolution must work off the same value an
-    /// ordinary `EE.prototype` read uses.
-    #[test]
-    fn native_constructor_export_parent_links_declared_prototype() {
-        const ISSUE_8760_CLASS_ID: u32 = 0x7d01_8760;
-        const CLASS_NAME: &[u8] = b"Issue8760Subclass";
-
-        // The bound `events.EventEmitter` export — a BOUND_METHOD closure whose
-        // `.prototype` object is materialized on demand, not at mint time.
-        let ee_ctor = crate::object::bound_native_callable_export_value("events", "EventEmitter");
-
-        // The raw dynamic `prototype` slot used to be undefined here, which is
-        // what made the dynamic-parent registration throw before the fix. The
-        // slot now already reads as a pointer, so that precondition no
-        // longer exists; the registration and the link below are what remain
-        // to guard, whichever way the prototype is produced.
-        unsafe {
-            js_register_class_name(
-                ISSUE_8760_CLASS_ID,
-                CLASS_NAME.as_ptr(),
-                CLASS_NAME.len() as u32,
-            );
-        }
-        js_register_class_parent_dynamic(ISSUE_8760_CLASS_ID, ee_ctor);
-
-        // Must not throw, and must materialize a real prototype object.
-        let decl_proto = class_decl_prototype_value(ISSUE_8760_CLASS_ID);
-        assert_eq!(
-            decl_proto.to_bits() & crate::value::TAG_MASK,
-            crate::value::POINTER_TAG,
-            "the subclass prototype must materialize (no TypeError) for a native constructor parent"
-        );
-
-        // Its [[Prototype]] must be EventEmitter's canonical prototype — the same
-        // object an ordinary `EE.prototype` read resolves to — so `instanceof`
-        // and inherited `emit`/`on` work through the chain.
-        let ee_proto = super::function_prototype::ordinary_function_prototype_value_for_read(
-            crate::object::bound_native_callable_export_value("events", "EventEmitter"),
-        )
-        .expect("EventEmitter export must expose a prototype object");
-        let decl_proto_addr = (decl_proto.to_bits() & crate::value::POINTER_MASK) as usize;
-        let linked = super::super::prototype_chain::object_static_prototype(decl_proto_addr)
-            .expect("the subclass prototype must have a linked [[Prototype]]");
-        assert_eq!(
-            linked & crate::value::POINTER_MASK,
-            ee_proto.to_bits() & crate::value::POINTER_MASK,
-            "the subclass prototype must inherit from EventEmitter.prototype"
-        );
-    }
-}
+mod class_parent_prototype_tests;
 
 #[cfg(test)]
 #[path = "member_order_tests.rs"]

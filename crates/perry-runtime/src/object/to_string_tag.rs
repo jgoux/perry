@@ -3,6 +3,9 @@
 
 use super::*;
 
+#[cfg(test)]
+mod fetch_handle_tests;
+
 pub(crate) fn web_stream_to_string_tag(value: f64) -> Option<&'static str> {
     let id = stream_handle_id(value)?;
     let kind_probe = stream_handle_kind_probe()?;
@@ -12,6 +15,49 @@ pub(crate) fn web_stream_to_string_tag(value: f64) -> Option<&'static str> {
         5 => Some("TransformStream"),
         _ => None,
     }
+}
+
+/// The Web Fetch interface a registry handle id is an instance of, if any.
+pub(crate) fn fetch_handle_interface_name(addr: usize) -> Option<&'static str> {
+    let probe = crate::object::fetch_handle_kind_probe()?;
+    match unsafe { probe(addr) } {
+        1 => Some("Response"),
+        2 => Some("Request"),
+        3 => Some("Headers"),
+        4 => Some("Blob"),
+        5 => Some("File"),
+        6 => Some("FormData"),
+        _ => None,
+    }
+}
+
+/// Own properties shadow the actual prototype, even when their value is undefined.
+pub(crate) fn fetch_handle_constructor_value(addr: usize) -> Option<crate::value::JSValue> {
+    let name = fetch_handle_interface_name(addr)?;
+    let key = b"constructor";
+    if let Some(value) = unsafe {
+        super::handle_expando::handle_own_property_get(addr as i64, key.as_ptr(), key.len())
+    } {
+        return Some(crate::value::JSValue::from_bits(value.to_bits()));
+    }
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let prototype = super::prototype_chain::object_static_prototype(addr)
+        .map(f64::from_bits)
+        .unwrap_or_else(|| super::builtin_prototype_value(name));
+    let prototype = scope.root_nanbox_f64(prototype);
+    let prototype_value = crate::value::JSValue::from_bits(prototype.get_nanbox_u64());
+    if prototype_value.is_null() || prototype_value.is_undefined() {
+        return Some(crate::value::JSValue::undefined());
+    }
+    let key = crate::string::js_string_from_bytes(key.as_ptr(), key.len() as u32);
+    let key = crate::value::js_nanbox_string(key as i64);
+    let receiver = f64::from_bits(crate::value::HANDLE_TAG | addr as u64);
+    let value = crate::proxy::js_reflect_get_with_explicit_receiver(
+        prototype.get_nanbox_f64(),
+        key,
+        receiver,
+    );
+    Some(crate::value::JSValue::from_bits(value.to_bits()))
 }
 
 /// Remaining Web built-ins without a recorded prototype chain. Migrated
@@ -26,16 +72,8 @@ pub(crate) fn web_builtin_to_string_tag(value: f64) -> Option<&'static str> {
     if top16 == (crate::value::HANDLE_TAG >> 48) {
         // Web Fetch handle family — one shared id counter, disjoint registries
         // (see `js_fetch_handle_kind`'s own doc comment).
-        if let Some(probe) = crate::object::fetch_handle_kind_probe() {
-            match unsafe { probe(addr) } {
-                1 => return Some("Response"),
-                2 => return Some("Request"),
-                3 => return Some("Headers"),
-                4 => return Some("Blob"),
-                5 => return Some("File"),
-                6 => return Some("FormData"),
-                _ => {}
-            }
+        if let Some(name) = fetch_handle_interface_name(addr) {
+            return Some(name);
         }
         // #340/#341: TextEncoder/TextDecoder used to be sentinel ids handled
         // here. They are ordinary objects linked to their prototypes now, so
@@ -80,6 +118,8 @@ unsafe fn string_value_to_owned(value: f64) -> Option<String> {
 }
 
 unsafe fn object_to_string_tag_property(value: f64) -> Option<String> {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let receiver = scope.root_nanbox_f64(value);
     let bits = value.to_bits();
     if (bits & 0xFFFF_0000_0000_0000) != 0x7FFD_0000_0000_0000 {
         return None;
@@ -96,8 +136,8 @@ unsafe fn object_to_string_tag_property(value: f64) -> Option<String> {
     // Spec §20.1.3.6 step 6: Get(O, @@toStringTag) — own property first, then
     // the explicit prototype chain (set via Object.setPrototypeOf or the
     // runtime's object_set_static_prototype).
-    let tag_value = crate::symbol::own_symbol_property(value, sym_f64)
-        .or_else(|| crate::symbol::inherited_symbol_property(value, sym_f64))?;
+    let tag_value = crate::symbol::own_symbol_property(receiver.get_nanbox_f64(), sym_f64)
+        .or_else(|| crate::symbol::inherited_symbol_property(receiver.get_nanbox_f64(), sym_f64))?;
     string_value_to_owned(tag_value)
 }
 
@@ -146,6 +186,14 @@ pub(crate) fn typed_array_to_string_tag_name(value: f64) -> Option<&'static str>
 /// if registered, otherwise `Object` (matching Node for plain objects).
 #[no_mangle]
 pub unsafe extern "C" fn js_object_to_string(value: f64) -> f64 {
+    object_prototype_to_string(value)
+}
+
+/// Intrinsic entry for Rust callers whose exception boundary admits throwing
+/// tag getters, without crossing the non-unwinding C export wrapper.
+pub unsafe fn object_prototype_to_string(value: f64) -> f64 {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let receiver = scope.root_nanbox_f64(value);
     use crate::value::JSValue;
     const POINTER_TAG: u64 = 0x7FFD_0000_0000_0000;
     const POINTER_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
@@ -327,6 +375,9 @@ pub unsafe extern "C" fn js_object_to_string(value: f64) -> f64 {
         let str_ptr = crate::string::js_string_from_bytes(bytes.as_ptr(), bytes.len() as u32);
         return f64::from_bits(STRING_TAG | (str_ptr as u64 & POINTER_MASK));
     }
+    let value = receiver.get_nanbox_f64();
+    let bits = value.to_bits();
+    let jsv = JSValue::from_bits(bits);
     // Intrinsic primitive-wrapper prototypes carry the corresponding internal
     // slot: `%Number.prototype%` has `[[NumberData]]` (+0), `%Boolean.prototype%`
     // has `[[BooleanData]]` (false), `%String.prototype%` has `[[StringData]]`
@@ -358,14 +409,6 @@ pub unsafe extern "C" fn js_object_to_string(value: f64) -> f64 {
         let bytes = b"[object Function]";
         let str_ptr = crate::string::js_string_from_bytes(bytes.as_ptr(), bytes.len() as u32);
         return f64::from_bits(STRING_TAG | (str_ptr as u64 & POINTER_MASK));
-    }
-    if jsv.is_int32() {
-        let class_id = (bits & 0xFFFF_FFFF) as u32;
-        if crate::object::is_class_id_registered(class_id) {
-            let bytes = b"[object Function]";
-            let str_ptr = crate::string::js_string_from_bytes(bytes.as_ptr(), bytes.len() as u32);
-            return f64::from_bits(STRING_TAG | (str_ptr as u64 & POINTER_MASK));
-        }
     }
     if jsv.is_int32() || jsv.is_number() {
         let bytes = b"[object Number]";

@@ -186,10 +186,17 @@ fn lower_guarded_numeric_add(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String>
         let fast_label = ctx.block_label(fast_idx);
         let slow_label = ctx.block_label(slow_idx);
         let merge_label = ctx.block_label(merge_idx);
+        // A receiver run in flight goes on past the add: the numeric arm
+        // emits no call, and the dynamic arm re-proves the run's receiver
+        // after its conversions (`layout_read::ColdSpan`).
+        let mut span = crate::expr::layout_read::cold_span(ctx);
         ctx.block().cond_br(&all_num, &fast_label, &slow_label);
 
         ctx.current_block = fast_idx;
         let fast_val = rebuild_numeric_add_tree(ctx, expr, values, &mut 0);
+        if let Some(span) = span.as_mut() {
+            crate::expr::layout_read::cold_hot_end(ctx, span);
+        }
         let fast_end = ctx.block().label.clone();
         ctx.block().br(&merge_label);
 
@@ -210,13 +217,21 @@ fn lower_guarded_numeric_add(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String>
             let result = rebuild_rooted_dynamic_add_tree(ctx, expr, group, &leaves, &mut 0, false);
             Ok(group.reread_emitted(ctx, result))
         })?;
+        let reproof = match span.as_ref() {
+            Some(span) => crate::expr::layout_read::cold_reprove(ctx, span)?,
+            None => None,
+        };
         let slow_end = ctx.block().label.clone();
         ctx.block().br(&merge_label);
 
         ctx.current_block = merge_idx;
-        Ok(ctx
+        let value = ctx
             .block()
-            .phi(DOUBLE, &[(&fast_val, &fast_end), (&slow_val, &slow_end)]))
+            .phi(DOUBLE, &[(&fast_val, &fast_end), (&slow_val, &slow_end)]);
+        if let Some(span) = span {
+            crate::expr::layout_read::cold_merge(ctx, span, &fast_end, reproof);
+        }
+        Ok(value)
     })
 }
 
@@ -965,6 +980,17 @@ fn lower_numeric_logical_for_number_context(
     right: &Expr,
 ) -> Result<String> {
     if matches!(op, LogicalOp::Coalesce) {
+        // A canonical raw f64 is a Number, never `null`/`undefined`: `l ?? r`
+        // is `l` and `r` is never evaluated. (An in-window read under a
+        // packed-loop index fact, a proven raw-f64 field, a numeric local.)
+        if crate::type_analysis::expr_produces_canonical_raw_f64(ctx, left)
+            && !matches!(
+                std::env::var("PERRY_UNBOXED_CLASS_FIELDS").as_deref(),
+                Ok("0") | Ok("off") | Ok("false")
+            )
+        {
+            return lower_expr(ctx, left);
+        }
         let l_boxed = lower_expr(ctx, left)?;
         let is_nullish = {
             let blk = ctx.block();

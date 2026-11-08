@@ -394,6 +394,7 @@ fn lower_object_assignment_from_expr(
                     });
                     for key_id in &computed_key_temps {
                         result.push(Stmt::Expr(Expr::Delete(Box::new(Expr::IndexGet {
+                            element_offset: 0,
                             byte_offset: 0,
                             byte_end: 0,
                             object: Box::new(Expr::LocalGet(rest_id)),
@@ -465,6 +466,7 @@ fn object_property_get_expr(
                     init: Some(key_expr),
                 }],
                 Expr::IndexGet {
+                    element_offset: 0,
                     byte_offset: 0,
                     byte_end: 0,
                     object: Box::new(source),
@@ -614,6 +616,9 @@ fn assign_prepared_target(
             value: Box::new(value),
             receiver: Box::new(object),
             strict: ctx.current_strict,
+            element_offset: 0,
+            byte_offset: 0,
+            byte_end: 0,
         })]),
         PreparedTarget::Index { object, index } => Ok(vec![Stmt::Expr(Expr::PutValueSet {
             target: Box::new(object.clone()),
@@ -621,6 +626,9 @@ fn assign_prepared_target(
             value: Box::new(value),
             receiver: Box::new(object),
             strict: ctx.current_strict,
+            element_offset: 0,
+            byte_offset: 0,
+            byte_end: 0,
         })]),
         PreparedTarget::Array(arr) => {
             let mut setup = Vec::new();

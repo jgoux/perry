@@ -315,6 +315,9 @@ mod allocation_tests {
             op: BinaryOp::Add,
             prefix: false,
             strict: true,
+            element_offset: 0,
+            byte_offset: 0,
+            byte_end: 0,
         };
         assert!(may_allocate(&[Stmt::Expr(update)], &[]));
     }
@@ -322,6 +325,7 @@ mod allocation_tests {
     #[test]
     fn allocating_loop_control_keeps_the_loop_safepoint() {
         let condition = Expr::IndexGet {
+            element_offset: 0,
             byte_offset: 0,
             byte_end: 0,
             object: Box::new(Expr::LocalGet(1)),

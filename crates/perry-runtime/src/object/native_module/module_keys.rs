@@ -1280,8 +1280,10 @@ pub(crate) fn native_module_enumerable_keys(module_name: &str) -> Option<&'stati
         // The table lives beside crypto's value-resolution in `constants.rs`.
         "crypto" => Some(super::constants::CRYPTO_NAMESPACE_KEYS),
         "sqlite" => Some(&[
+            b"Database",
             b"DatabaseSync",
             b"Session",
+            b"Statement",
             b"StatementSync",
             b"backup",
             b"constants",
@@ -1641,7 +1643,7 @@ pub(crate) fn zlib_readonly_property_enumerability(module_name: &str, key: &str)
 }
 
 pub(crate) fn native_module_has_enumerable_key(module_name: &str, key: &str) -> bool {
-    if crate::process::worker_restrictions::worker_process_member_hidden(module_name, key) {
+    if super::native_namespace_member_absent(module_name, key) {
         return false;
     }
     if matches!(

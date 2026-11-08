@@ -13,6 +13,7 @@ const PC_CHARS: usize = 8;
 /// Frame budget `materialize_error_stack` passes to `render_frames`.
 const RENDER_LIMIT: usize = 10;
 
+#[cfg(target_pointer_width = "64")]
 /// A module body is registered as `Object.<anonymous> (<path>)`: the frame
 /// must print that location verbatim. Appending `(<anonymous>)` gave
 /// fastify-plugin's stack parser a line without a file name, and it threw
@@ -21,9 +22,7 @@ const RENDER_LIMIT: usize = 10;
 fn a_module_body_frame_renders_its_own_location() {
     const MODULE_START: usize = 0x0000_7d00_0000_0000;
     const MODULE_LABEL: &[u8] = b"Object.<anonymous> (/app/node_modules/plugin/index.js)";
-    unsafe {
-        crate::builtins::test_publish_bundle_name(MODULE_START as *const u8 as usize, MODULE_LABEL);
-    }
+    crate::builtins::test_publish_bundle_name(MODULE_START as *const u8 as usize, MODULE_LABEL);
 
     let mut blob = [0u8; MAX_CAPTURED_FRAMES * PC_CHARS];
     let len = encode_pcs(&[MODULE_START + 32], &mut blob);
