@@ -283,6 +283,7 @@ pub(crate) fn forbid_throw_in_collection() {
 }
 
 #[cold]
+#[optimize(size)]
 #[inline(never)]
 fn throw_in_collection_abort() -> ! {
     eprintln!(
@@ -385,18 +386,12 @@ mod tests {
     #[test]
     fn js_throw_inside_a_collection_aborts() {
         if std::env::var_os(ABORT_CHILD_ENV).is_some() {
-            TEST_STEP_HOOK.with(|h| h.set(Some(|| crate::exception::js_throw(1.0))));
+            TEST_STEP_HOOK.with(|h| h.set(Some(|| crate::exception::test_throw(1.0))));
             let _ = super::super::gc_collect_minor();
             // Reaching here means the throw returned or unwound: fail loudly.
             std::process::exit(77);
         }
-        let out = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "gc::allocation_pacing::tests::js_throw_inside_a_collection_aborts",
-                "--nocapture",
-                "--test-threads=1",
-            ])
+        let out = crate::test_support::this_test_process()
             .env(ABORT_CHILD_ENV, "1")
             .output()
             .unwrap();
@@ -460,7 +455,8 @@ mod tests {
 /// effect. Finish an older non-moving cycle before publishing its new owner;
 /// a suppressed/unsafe construction leaves the guarded stepper deferred.
 pub(crate) fn finish_cycle_before_large_birth() {
-    if super::policy::gc_budgeted_cycle_active() && !super::schedule::budgeted_old_reclaim_forced() {
+    if super::policy::gc_budgeted_cycle_active() && !super::schedule::budgeted_old_reclaim_forced()
+    {
         super::policy::gc_drain_active_budgeted_cycle();
     }
 }

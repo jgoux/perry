@@ -106,12 +106,13 @@ pub unsafe extern "C" fn perry_probe_get_value(
             // any code since the birth could run (`order_known`, the
             // constructors' inert prologue) knows it.
             if order_known == 0 {
-                let fields =
-                    (obj as *const u8).add(std::mem::size_of::<ObjectHeader>()) as *const u64;
                 let keys = std::slice::from_raw_parts(d.keys, d.key_count as usize);
                 let mut hole = false;
                 if keys[pos as usize..].iter().any(|k| {
-                    let present = *fields.add(k.slot as usize) != TAG_HOLE;
+                    let present = *crate::object::header::object_slot_at(
+                        obj as *mut ObjectHeader,
+                        u32::from(k.off),
+                    ) != TAG_HOLE;
                     let after_hole = present && hole;
                     hole |= !present;
                     after_hole
@@ -381,4 +382,26 @@ pub unsafe extern "C" fn perry_probe_get_keyed(
         hash,
     );
     v
+}
+
+/// The store twin of [`perry_probe_get_keyed`]: `obj[key] = value` for a
+/// computed `key` (a string or symbol value), by the store probe
+/// ([`perry_probe_set`]) with the key's atom. `true` when it stored; `false`
+/// for everything the complete `[[Set]]` must do (an index-like or
+/// uninterned key, and every decline of the store probe).
+///
+/// GC leaf: no allocation on the heap, no collection, no user code.
+///
+/// # Safety
+/// `dir` as for [`perry_probe_get`]; any value bits.
+pub(crate) unsafe fn probe_set_keyed(
+    dir: *const u8,
+    obj_bits: u64,
+    key_bits: u64,
+    value: f64,
+) -> bool {
+    let Some((key, hash)) = computed_key(key_bits) else {
+        return false;
+    };
+    perry_probe_set(dir, obj_bits, key, hash, value) != 0
 }

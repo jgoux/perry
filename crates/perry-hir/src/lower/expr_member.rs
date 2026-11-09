@@ -37,6 +37,7 @@ pub(crate) use native_dispatch::{
     is_http_server_response_method_name, is_http_server_response_runtime_property_name,
     is_native_dispatch_member, is_net_server_method_name, is_net_socket_method_name,
     is_stream_api_member, is_url_pattern_data_property, is_worker_instance_value_property,
+    is_worker_messaging_heap_object,
 };
 pub(crate) use private_guard::{
     is_class_expr_self_binding, private_storage_property, wrap_private_guard, PRIV_OP_READ,
@@ -539,6 +540,7 @@ fn lower_member_inner(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Re
                     // (#1401); the shape-only read is what closes #1346.
                     "argv0" | "execPath" => {
                         return Ok(Expr::IndexGet {
+                            element_offset: 0,
                             byte_offset: 0,
                             byte_end: 0,
                             object: Box::new(Expr::ProcessArgv),
@@ -680,6 +682,7 @@ fn lower_member_inner(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Re
                     "report" => return Ok(process_native_property("report")),
                     "argv0" | "execPath" => {
                         return Ok(Expr::IndexGet {
+                            element_offset: 0,
                             byte_offset: 0,
                             byte_end: 0,
                             object: Box::new(Expr::ProcessArgv),
@@ -956,6 +959,7 @@ fn lower_member_inner(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Re
                     if matches!(value, crate::ir::EnumValue::Computed) {
                         if let Some(id) = ctx.lookup_local(&obj_name) {
                             return Ok(Expr::IndexGet {
+                                element_offset: 0,
                                 byte_offset: 0,
                                 byte_end: 0,
                                 object: Box::new(Expr::LocalGet(id)),
@@ -1016,6 +1020,7 @@ fn lower_member_inner(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Re
                         crate::lower_decl::enum_runtime_object(&members)
                     };
                 return Ok(Expr::IndexGet {
+                    element_offset: member.span.lo.0,
                     byte_offset: 0,
                     byte_end: 0,
                     object: Box::new(object),
@@ -1273,19 +1278,7 @@ fn lower_member_inner(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Re
                         object: Box::new(object_expr),
                         property: property_name,
                     });
-                } else if module_name == "worker_threads"
-                    && matches!(class_name.as_str(), "MessagePort" | "BroadcastChannel")
-                    && matches!(
-                        property_name.as_str(),
-                        "postMessage"
-                            | "close"
-                            | "ref"
-                            | "unref"
-                            | "hasRef"
-                            | "addEventListener"
-                            | "removeEventListener"
-                    )
-                {
+                } else if is_worker_messaging_heap_object(&module_name, &class_name) {
                     let object_expr = lower_expr(ctx, &member.obj)?;
                     return Ok(Expr::PropertyGet {
                         byte_end: 0,

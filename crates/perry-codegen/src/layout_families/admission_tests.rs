@@ -18,6 +18,8 @@ fn set(object: Expr, property: &str, value: Expr) -> Stmt {
         object: Box::new(object),
         property: property.into(),
         value: Box::new(value),
+        byte_offset: 0,
+        byte_end: 0,
     })
 }
 
@@ -29,6 +31,7 @@ fn an_instance_stored_into_another_object_is_a_filled_record() {
         Stmt::Expr(Expr::Logical {
             op: perry_hir::LogicalOp::Coalesce,
             left: Box::new(Expr::IndexGet {
+                element_offset: 0,
                 byte_offset: 0,
                 byte_end: 0,
                 object: Box::new(Expr::LocalGet(1)),
@@ -38,6 +41,9 @@ fn an_instance_stored_into_another_object_is_a_filled_record() {
                 object: Box::new(Expr::LocalGet(1)),
                 index: Box::new(Expr::LocalGet(2)),
                 value: Box::new(new("Links")),
+                element_offset: 0,
+                byte_offset: 0,
+                byte_end: 0,
             }),
         }),
         set(Expr::LocalGet(3), "links", new("Linked")),

@@ -9,7 +9,7 @@ use crate::object::{
     ObjectHeader,
 };
 use crate::string::{js_string_from_bytes, js_string_materialize_to_heap, StringHeader};
-use crate::value::{js_nanbox_pointer, JSValue, TAG_FALSE, TAG_TRUE, TAG_UNDEFINED};
+use crate::value::{JSValue, TAG_FALSE, TAG_TRUE, TAG_UNDEFINED};
 
 const TAG_UNDEFINED_F64: f64 = f64::from_bits(TAG_UNDEFINED);
 
@@ -768,10 +768,7 @@ fn heap_ptr_with_gc_type(value: f64, expected_type: u8) -> Option<*const u8> {
         return None;
     }
     let ptr = jsvalue.as_pointer::<u8>();
-    if ptr.is_null() || (ptr as usize) < crate::gc::GC_HEADER_SIZE + 0x1000 {
-        return None;
-    }
-    let gc_header = unsafe { &*(ptr.sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader) };
+    let gc_header = unsafe { crate::value::addr_class::try_read_gc_header(ptr as usize) }?;
     if gc_header.obj_type == expected_type {
         Some(ptr)
     } else {
@@ -785,10 +782,7 @@ fn heap_ptr_object(value: f64) -> Option<*const u8> {
         return None;
     }
     let ptr = jsvalue.as_pointer::<u8>();
-    if ptr.is_null() || (ptr as usize) < crate::gc::GC_HEADER_SIZE + 0x1000 {
-        return None;
-    }
-    let gc_header = unsafe { &*(ptr.sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader) };
+    let gc_header = unsafe { crate::value::addr_class::try_read_gc_header(ptr as usize) }?;
     if crate::gc_type_is_object!(gc_header.obj_type) {
         Some(ptr)
     } else {
@@ -871,8 +865,7 @@ fn throw_invalid_option_value(raw_name: &str) -> ! {
 fn throw_parse_args_error(code: &'static str, message: &str) -> ! {
     let msg = js_string_from_bytes(message.as_ptr(), message.len() as u32);
     crate::node_submodules::register_error_code_pub(msg, code);
-    let err = crate::error::js_typeerror_new(msg);
-    crate::exception::js_throw(js_nanbox_pointer(err as i64))
+    crate::exception::throw_core(crate::error::CoreError::type_error(msg))
 }
 
 trait JSValueBits {

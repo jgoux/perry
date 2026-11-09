@@ -27,9 +27,7 @@ fn throw_not_iterable(receiver: &str) -> ! {
         receiver
     );
     let msg_str = crate::string::js_string_from_bytes(msg.as_ptr(), msg.len() as u32);
-    let err_ptr = crate::error::js_typeerror_new(msg_str);
-    let err_value = JSValue::pointer(err_ptr as *const u8).bits();
-    crate::exception::js_throw(f64::from_bits(err_value));
+    crate::exception::throw_core(crate::error::CoreError::type_error(msg_str));
 }
 
 /// Throw `TypeError: <value> is not a function` for a non-callable mapFn,
@@ -53,16 +51,18 @@ fn throw_map_fn_not_callable(map_fn: f64) -> ! {
     let jv = JSValue::from_bits(map_fn.to_bits());
     let type_name = if jv.is_null() || jv.is_pointer() {
         "object"
-    } else if map_fn.to_bits() >> 48 == 0x7FFF {
+    } else if jv.is_any_string() {
+        // Both string representations, not just the heap one: a short (SSO)
+        // mapper used to report `number x is not a function`. `is_any_string`
+        // covers STRING_TAG and SHORT_STRING_TAG, so the message matches Node
+        // for every length.
         "string"
     } else {
         "number"
     };
     let msg = format!("{} {} is not a function", type_name, value_str);
     let msg_str = crate::string::js_string_from_bytes(msg.as_ptr(), msg.len() as u32);
-    let err_ptr = crate::error::js_typeerror_new(msg_str);
-    let err_value = JSValue::pointer(err_ptr as *const u8).bits();
-    crate::exception::js_throw(f64::from_bits(err_value));
+    crate::exception::throw_core(crate::error::CoreError::type_error(msg_str));
 }
 
 /// `Array.from(source)` — the non-mapped form. Per ECMA-262 §23.1.2.1,
@@ -173,20 +173,17 @@ pub extern "C" fn js_array_from_value(boxed: f64) -> *mut ArrayHeader {
             return arr;
         }
     }
-    // A raw ArrayBuffer / SharedArrayBuffer is NOT array-like: it has no
-    // `length` property and no [[Symbol.iterator]], so `Array.from(arrayBuffer)`
-    // takes the array-like branch with length 0 and yields an empty array,
-    // rather than materializing its bytes (test262
+    // A raw ArrayBuffer / SharedArrayBuffer / DataView is NOT array-like: it
+    // has no `length` property and no [[Symbol.iterator]], so
+    // `Array.from(arrayBuffer)` takes the array-like branch with length 0 and
+    // yields an empty array, rather than materializing its bytes (test262
     // Array/from/items-is-arraybuffer). Node Buffers and typed arrays ARE
     // array-like / iterable and still materialize their elements via
     // js_array_clone below — only the backing ArrayBuffer is registered here,
     // and Array.from receives the typed-array/Buffer pointer, not the backing
     // buffer. (Spread `[...arrayBuffer]` goes through js_array_clone_for_spread,
     // not this path, so its separate semantics are unaffected.)
-    if ptr_bits != 0
-        && (crate::buffer::is_array_buffer(ptr_bits)
-            || crate::buffer::is_shared_array_buffer(ptr_bits))
-    {
+    if ptr_bits != 0 && crate::buffer::is_non_indexed_buffer_view(ptr_bits) {
         return js_array_alloc(0);
     }
     js_array_clone(ptr_bits as *const ArrayHeader)
@@ -547,9 +544,7 @@ pub(super) fn finish_length(result: &RuntimeHandle<'_>, len: usize, array_result
 fn throw_cannot_define_property(index: usize) -> ! {
     let msg = format!("Cannot define property {}, object is not extensible", index);
     let msg_str = crate::string::js_string_from_bytes(msg.as_ptr(), msg.len() as u32);
-    let err_ptr = crate::error::js_typeerror_new(msg_str);
-    let err_value = JSValue::pointer(err_ptr as *const u8).bits();
-    crate::exception::js_throw(f64::from_bits(err_value));
+    crate::exception::throw_core(crate::error::CoreError::type_error(msg_str));
 }
 
 /// Call `mapfn(value, index)` with `this_arg` bound. Restores the implicit
@@ -562,7 +557,7 @@ fn call_map_fn(mapfn: f64, this_arg: f64, value: f64, index: usize) -> f64 {
         &[value, index as f64],
     ) {
         Ok(v) => v,
-        Err(e) => crate::exception::js_throw(e),
+        Err(e) => crate::exception::rethrow_caught(e),
     }
 }
 
@@ -755,9 +750,15 @@ unsafe fn populate_from_iterable(
                 ),
                 None => crate::symbol::js_get_iterator(items.get_nanbox_f64()),
             });
+            let next = scope.root_nanbox_f64(crate::collection_iter::iterator_next_method(
+                iter.get_nanbox_f64(),
+            ));
             let mut k = 0usize;
             loop {
-                match crate::collection_iter::iterator_next_value(iter.get_nanbox_f64()) {
+                match crate::collection_iter::iterator_next_value(
+                    iter.get_nanbox_f64(),
+                    next.get_nanbox_f64(),
+                ) {
                     None => return finish_length(result, k, array_result),
                     Some(value) => {
                         let mapped = if mapping {
@@ -768,9 +769,9 @@ unsafe fn populate_from_iterable(
                             ) {
                                 Ok(v) => v,
                                 Err(e) => {
-                                    let e = scope.root_nanbox_f64(e);
+                                    let e = e.root(&scope);
                                     crate::collection_iter::iterator_close(iter.get_nanbox_f64());
-                                    crate::exception::js_throw(e.get_nanbox_f64());
+                                    crate::exception::rethrow_caught(e.caught());
                                 }
                             }
                         } else {
@@ -1397,5 +1398,54 @@ fn append_spread_array(result: *mut ArrayHeader, src: *const ArrayHeader) -> *mu
             out = js_array_push_f64(out, v);
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod mapper_error_tests {
+    use super::*;
+
+    /// Drive the real `Array.from(array, mapFn)` rejection path and return the
+    /// TypeError message it produced.
+    fn rejection(map_fn: f64) -> String {
+        let roots = RuntimeHandleScope::new();
+        let map_fn = roots.root_nanbox_f64(map_fn);
+        let source =
+            roots.root_nanbox_f64(crate::value::js_nanbox_pointer(js_array_alloc(0) as i64));
+        let thrown = crate::exception::catch_js_throw(|| {
+            js_array_from_mapped(
+                source.get_nanbox_f64(),
+                map_fn.get_nanbox_f64(),
+                f64::from_bits(TAG_UNDEFINED),
+            ) as usize
+        })
+        .expect_err("a string mapper must throw");
+        let thrown = roots.root_nanbox_f64(thrown);
+        let err = JSValue::from_bits(thrown.get_nanbox_f64().to_bits())
+            .as_pointer::<crate::error::ErrorHeader>()
+            as *mut crate::error::ErrorHeader;
+        let message = crate::error::js_error_get_message(err);
+        unsafe { crate::object::has_own_helpers::str_from_string_header(message) }
+            .expect("error message is UTF-8")
+            .to_string()
+    }
+
+    /// `Array.from([], "x")` is `TypeError: string x is not a function` in Node.
+    /// An inline (SSO) string and its heap counterpart must report the same
+    /// type, and that type must be `string` — the tag check this asserts used to
+    /// only recognise heap strings, so every short mapper said `number`.
+    #[test]
+    fn short_string_mappers_keep_the_heap_string_error_type() {
+        for bytes in [b"".as_slice(), b"x".as_slice(), b"abcde".as_slice()] {
+            let inline = JSValue::short_string_unchecked(bytes);
+            assert!(inline.is_short_string());
+            let inline_message = rejection(f64::from_bits(inline.bits()));
+            let header = crate::string::js_string_from_bytes(bytes.as_ptr(), bytes.len() as u32);
+            let heap = JSValue::string_ptr(header);
+            assert!(heap.is_string() && !heap.is_short_string());
+            let heap_message = rejection(f64::from_bits(heap.bits()));
+            assert!(heap_message.starts_with("string "));
+            assert_eq!(inline_message, heap_message);
+        }
     }
 }

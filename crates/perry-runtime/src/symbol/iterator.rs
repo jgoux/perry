@@ -49,12 +49,7 @@ pub unsafe extern "C" fn js_object_get_own_property_symbols(obj_f64: f64) -> i64
             let proto = crate::object::class_decl_prototype_value(class_id);
             return js_object_get_own_property_symbols(proto);
         }
-        let mut entries = crate::object::class_own_symbol_member_keys(class_id, true);
-        for sym_key in class_static_symbol_keys_for_class(class_id) {
-            if !entries.contains(&sym_key) {
-                entries.push(sym_key);
-            }
-        }
+        let mut entries = class_static_symbol_keys_for_class(class_id);
         let mut arr = crate::array::js_array_alloc(entries.len() as u32);
         for sym_ptr_usize in entries.drain(..) {
             let boxed = f64::from_bits(POINTER_TAG | (sym_ptr_usize as u64 & POINTER_MASK));
@@ -121,8 +116,7 @@ fn is_object_value(value: f64) -> bool {
 fn throw_iterator_result_not_object() -> ! {
     let msg = b"Result of the Symbol.iterator method is not an object";
     let msg_str = crate::string::js_string_from_bytes(msg.as_ptr(), msg.len() as u32);
-    let err = crate::error::js_typeerror_new(msg_str);
-    crate::exception::js_throw(crate::value::js_nanbox_pointer(err as i64));
+    crate::exception::throw_core(crate::error::CoreError::type_error(msg_str));
 }
 
 /// The word Node puts in front of `is not iterable`.
@@ -148,8 +142,7 @@ fn not_iterable_label(value: f64) -> &'static str {
 fn throw_value_not_iterable(value: f64) -> ! {
     let msg = format!("{} is not iterable", not_iterable_label(value));
     let msg_str = crate::string::js_string_from_bytes(msg.as_ptr(), msg.len() as u32);
-    let err = crate::error::js_typeerror_new(msg_str);
-    crate::exception::js_throw(crate::value::js_nanbox_pointer(err as i64));
+    crate::exception::throw_core(crate::error::CoreError::type_error(msg_str));
 }
 
 /// #6454: does this value — already known to be a *registered class ref*
@@ -185,8 +178,7 @@ pub extern "C" fn js_iterator_result_validate(result: f64) -> f64 {
         crate::array::iter_bt_dump("js_iterator_result_validate", result);
         let msg = b"Iterator result is not an object";
         let msg_str = crate::string::js_string_from_bytes(msg.as_ptr(), msg.len() as u32);
-        let err = crate::error::js_typeerror_new(msg_str);
-        crate::exception::js_throw(crate::value::js_nanbox_pointer(err as i64));
+        crate::exception::throw_core(crate::error::CoreError::type_error(msg_str));
     }
     result
 }

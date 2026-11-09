@@ -317,6 +317,7 @@ fn lower_scalar_method_inline_body(
     fact_detail: &'static str,
     extra_notes: Vec<String>,
 ) -> Result<String> {
+    crate::verify_facts::body_entry(ctx, method.id, "");
     let saved_locals = ctx.locals.clone();
     let saved_local_types = ctx.local_types.clone();
     let saved_proven_local_types = ctx.proven_local_types.clone();
@@ -329,7 +330,9 @@ fn lower_scalar_method_inline_body(
         ctx.block().store(DOUBLE, value, &slot);
         ctx.locals.insert(param.id, slot);
         ctx.local_types.insert(param.id, param.ty.clone());
-        ctx.proven_local_types.insert(param.id, param.ty.clone());
+        if ctx.admits_contents_proof(param.id, &param.ty) {
+            ctx.proven_local_types.insert(param.id, param.ty.clone());
+        }
     }
 
     ctx.scalar_ctor_target.push(receiver_id);
@@ -420,6 +423,7 @@ fn lower_scalar_method_int32_inline_body(
     fact_detail: &'static str,
     extra_notes: Vec<String>,
 ) -> Result<String> {
+    crate::verify_facts::body_entry(ctx, method.id, "");
     let saved_locals = ctx.locals.clone();
     let saved_local_types = ctx.local_types.clone();
     let saved_proven_local_types = ctx.proven_local_types.clone();
@@ -433,7 +437,9 @@ fn lower_scalar_method_int32_inline_body(
         ctx.block().store(I32, value, &slot);
         ctx.i32_counter_slots.insert(param.id, slot);
         ctx.local_types.insert(param.id, param.ty.clone());
-        ctx.proven_local_types.insert(param.id, param.ty.clone());
+        if ctx.admits_contents_proof(param.id, &param.ty) {
+            ctx.proven_local_types.insert(param.id, param.ty.clone());
+        }
     }
 
     ctx.scalar_ctor_target.push(receiver_id);

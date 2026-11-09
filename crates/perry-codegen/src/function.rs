@@ -27,6 +27,19 @@ use precise_roots::{lower_precise_roots_to_native_stack, retype_landing_pads_for
 /// global in address space 0.
 pub const TLS_ADDRESS_INTRINSIC: &str = "llvm.threadlocal.address.p0";
 
+/// A size-based decision made after worker-local operands acquire their
+/// serial spellings. Symbol digit counts are part of the existing IR budget.
+pub(crate) enum PreinlineAfterNaming {
+    SelfBody {
+        statements: usize,
+        name_bytes: usize,
+    },
+    OtherBody {
+        statements: usize,
+        symbol: String,
+    },
+}
+
 pub struct LlFunction {
     pub name: String,
     pub return_type: LlvmType,
@@ -45,6 +58,11 @@ pub struct LlFunction {
     /// general small-function policy gives the early pass an explicit code-size
     /// budget instead of activating every historical hint at once.
     pub pre_statepoint_inline: bool,
+    preinline_after_naming: Option<PreinlineAfterNaming>,
+    /// This admission belongs to the receiver/closed-target/ConstFn cost
+    /// policy. Numeric/index ABI adapters have their own admission contracts;
+    /// the final guarded-growth gate may revoke only this policy's decisions.
+    pub guarded_preinline: bool,
     /// This lowered method body fits the guarded-specialization inline budget.
     /// It joins the early inliner only when the facts prove a call site closed
     /// over it (`codegen/closed_targets.rs`).
@@ -101,6 +119,11 @@ pub struct LlFunction {
     /// since #7354 — windows-msvc used to name `__C_specific_handler` here,
     /// which forced funclet EH and locked Windows out of statepoints.
     pub personality: Option<&'static str>,
+    /// The module publishes a named `JsFunctionInfo` for this body (its
+    /// function-metadata owner lists it): on x86_64 Linux it is placed in the
+    /// JS text section, the range the `Error` capture keeps frames of
+    /// (`helpers::js_text_section`). Set by `emit_fn_infos`.
+    pub js_text: bool,
     blocks: Vec<LlBlock>,
     block_counter: u32,
     reg_counter: Rc<RegCounter>,
@@ -310,6 +333,8 @@ impl LlFunction {
             linkage: String::new(),
             force_inline: false,
             pre_statepoint_inline: false,
+            preinline_after_naming: None,
+            guarded_preinline: false,
             closed_target_preinline: false,
             no_inline: false,
             disable_tail_calls: false,
@@ -320,6 +345,7 @@ impl LlFunction {
             private_resume_entry: false,
             alloc_hot: false,
             personality: None,
+            js_text: false,
             blocks: Vec::new(),
             block_counter: 0,
             reg_counter: Rc::new(RegCounter::new()),
@@ -1165,8 +1191,16 @@ impl LlFunction {
         } else {
             ""
         };
+        // On x86_64 Linux every named JS body lives in the JS text section
+        // (`helpers::js_text_section`): the `Error` capture tells a JS frame
+        // from a runtime one by that range. LLVM's grammar puts the
+        // section after the fn attributes and before the GC strategy.
+        let section = match crate::codegen::helpers::js_text_section() {
+            Some(s) if self.js_text => format!(" section \"{s}\""),
+            _ => String::new(),
+        };
         format!(
-            "define {}{}{} @{}({}){}{}{}{}{}{}{} {{",
+            "define {}{}{} @{}({}){}{}{}{}{}{}{}{} {{",
             linkage,
             cconv,
             self.return_type,
@@ -1177,6 +1211,7 @@ impl LlFunction {
             frame_pointer,
             tail_calls,
             nanbox_operands,
+            section,
             gc_strategy,
             personality
         )
@@ -1246,6 +1281,13 @@ impl LlFunction {
     /// Every decision that reads compile state (the root backend, which is
     /// per-thread) is made here, on the thread that owns the function; the
     /// returned plan applies on any thread.
+    /// Whether this body's roots lower to native stack maps at text finish
+    /// (`lower_precise_roots_to_native_stack`), which removes its shadow-slot
+    /// bookkeeping calls.
+    pub(crate) fn precise_roots_lowered(&self) -> bool {
+        self.stack_map_requested
+    }
+
     pub(crate) fn text_finish(&self, gc_leaf_callees: &HashSet<String>) -> TextFinish {
         TextFinish {
             name: self.name.clone(),
@@ -1508,6 +1550,41 @@ mod define_header_tests {
     /// A natively-constructed module without that strategy gets no RS4GC pass
     /// and therefore no precise roots, and it looks entirely correct until a
     /// collection frees something live.
+    /// x86_64 Linux places a named JS body in the JS text section, the
+    /// range the runtime's `Error` capture keeps frames of; a body without a
+    /// published name, and every body on other targets, names no section.
+    /// The native reader takes the clause off the define line and keeps the
+    /// attributes it follows.
+    #[test]
+    fn a_named_js_body_lives_in_the_js_text_section_on_x86_64_linux() {
+        let cases = [
+            ("x86_64-unknown-linux-gnu", true, true),
+            ("x86_64-unknown-linux-gnu", false, false),
+            ("aarch64-unknown-linux-gnu", true, false),
+            ("arm64-apple-macosx15.0.0", true, false),
+            ("x86_64-pc-windows-msvc", true, false),
+        ];
+        for (triple, named, placed) in cases {
+            crate::codegen::helpers::set_js_text_section_for_target(triple);
+            let mut f = probe();
+            f.js_text = named;
+            let header = f.define_header(false);
+            assert_eq!(
+                header.contains("section \"perry_js_text\""),
+                placed,
+                "{triple} named={named}: {header}"
+            );
+            let parsed = crate::dialect::parse_header_for_tests(&header).expect("parses");
+            assert_eq!(
+                parsed.0.as_deref(),
+                placed.then_some("perry_js_text"),
+                "{header}"
+            );
+            assert!(!parsed.1.contains("section"), "{}", parsed.1);
+        }
+        crate::codegen::helpers::set_js_text_section_for_target("arm64-apple-macosx15.0.0");
+    }
+
     #[test]
     fn to_ir_opens_with_exactly_the_shared_define_header() {
         for force_inline in [false, true] {
@@ -1841,6 +1918,15 @@ impl TextFinish {
         } else {
             ir
         };
+        // A root re-read with no safepoint since the previous one reuses its
+        // launder output (`precise_roots/reload_reuse.rs`). After the leaf
+        // stamping above, so a direct call the whole-module analysis proved
+        // cannot collect does not end the stretch.
+        let ir = if self.precise_roots.is_some() {
+            precise_roots::reload_reuse::reuse_root_reloads(&ir)
+        } else {
+            ir
+        };
 
         // RS4GC uses the unwind destination's landing pad **as the token** for
         // the relocates it inserts on the exceptional edge, so
@@ -1872,5 +1958,45 @@ impl TextFinish {
         }
 
         ir
+    }
+}
+
+mod owned;
+pub(crate) use owned::OwnedFunction;
+
+impl LlFunction {
+    pub(crate) fn defer_self_preinline(&mut self, statements: usize) {
+        self.preinline_after_naming = Some(PreinlineAfterNaming::SelfBody {
+            statements,
+            name_bytes: self.name.len(),
+        });
+    }
+    pub(crate) fn defer_body_preinline(&mut self, statements: usize, symbol: String) {
+        self.preinline_after_naming = Some(PreinlineAfterNaming::OtherBody { statements, symbol });
+    }
+    pub(crate) fn cancel_deferred_preinline(&mut self) {
+        self.preinline_after_naming = None;
+    }
+    pub(crate) fn resolve_callable_preinline(&mut self, body_size: impl Fn(&str) -> Option<usize>) {
+        use PreinlineAfterNaming::*;
+        let Some(decision) = self.preinline_after_naming.take() else {
+            return;
+        };
+        let (size, statements) = match decision {
+            SelfBody {
+                statements,
+                name_bytes,
+            } => (
+                Some(self.estimated_ir_bytes() - self.name.len() + name_bytes),
+                statements,
+            ),
+            OtherBody { statements, symbol } => (body_size(&symbol), statements),
+        };
+        if size.is_some_and(|size| {
+            crate::codegen::helpers::guarded_specialization_admits_preinline(size, statements)
+        }) {
+            self.pre_statepoint_inline = true;
+            self.guarded_preinline = true;
+        }
     }
 }

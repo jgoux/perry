@@ -153,6 +153,11 @@ impl<'a, 'b> ThisFlowAnalysis<'a, 'b> {
         }
         for class in self.chain {
             if let Some(ctor) = &class.constructor {
+                // A value-bearing `return` makes the construction result some
+                // other object, whose layout the chain's fields do not describe.
+                if crate::lower_call::ctor_body_has_value_return(&ctor.body) {
+                    return false;
+                }
                 if !self.function_this_safe(&class.name, "constructor", ctor, false) {
                     return false;
                 }
@@ -341,6 +346,8 @@ impl<'a, 'b> ThisFlowAnalysis<'a, 'b> {
                 args.iter().all(|a| self.expr_this_safe(a, ctx))
             }
             Expr::PrivateBrandCheck { object, .. } if matches!(object.as_ref(), Expr::This) => true,
+            // The `this.F` hoist's compile-time version test: reads nothing.
+            Expr::ThisProvenClass(_) => true,
             Expr::PropertyGet {
                 object, property, ..
             } if matches!(object.as_ref(), Expr::This) => self.fields.contains(property),
@@ -348,6 +355,7 @@ impl<'a, 'b> ThisFlowAnalysis<'a, 'b> {
                 object,
                 property,
                 value,
+                ..
             } if matches!(object.as_ref(), Expr::This) => {
                 if !self.fields.contains(property)
                     || (!self.allow_this_in_store_values && expr_mentions_this(value))

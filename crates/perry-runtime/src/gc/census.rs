@@ -234,7 +234,7 @@ fn census_pass1_if_armed_impl() {
             }
         }
     });
-    marked.sort_unstable();
+    crate::cold_sort::sort_by(&mut marked, |a, b| a.cmp(b));
     PASS1_MARKED.with(|p| *p.borrow_mut() = Some(marked));
 }
 
@@ -449,6 +449,7 @@ impl Census {
             }
         }
         self.space_live[space].add(size);
+        crate::snap_census::census_live(header.cast(), obj_type, size);
         if t > GC_TYPE_MAX as usize {
             return;
         }
@@ -485,8 +486,11 @@ impl Census {
         entry.count += 1;
         entry.bytes += size as u64;
         entry.slot_capacity += slot_capacity as u64;
-        if !crate::meta_read!(crate::meta_obj_from_type!(obj as *mut crate::object::ObjectHeader, t))
-            .is_null()
+        if !crate::meta_read!(crate::meta_obj_from_type!(
+            obj as *mut crate::object::ObjectHeader,
+            t
+        ))
+        .is_null()
         {
             entry.meta_objects += 1;
             self.obj_meta += 1;
@@ -856,7 +860,7 @@ fn take_census(label: &str, pass1: Option<Vec<usize>>) {
         })
         .collect();
 
-    c.live_shape_ids.sort_unstable();
+    crate::cold_sort::sort_by(&mut c.live_shape_ids, |a, b| a.cmp(b));
     c.live_shape_ids.dedup();
     let mut side_rows = side_tables();
     side_rows.extend(crate::object::shapes::shape_table_liveness_census(

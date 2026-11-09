@@ -80,11 +80,13 @@ pub(crate) fn scan_tty_resize_callback_root_mut(visitor: &mut crate::gc::Runtime
 
 #[cfg(unix)]
 fn isatty_impl(fd: i32) -> bool {
+    crate::effect!(host_read, tty);
     unsafe { libc::isatty(fd) != 0 }
 }
 
 #[cfg(unix)]
 fn winsize_impl(fd: i32) -> Option<(i32, i32)> {
+    crate::effect!(host_read, tty);
     unsafe {
         let mut ws: libc::winsize = std::mem::zeroed();
         if libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
@@ -97,6 +99,7 @@ fn winsize_impl(fd: i32) -> Option<(i32, i32)> {
 
 #[cfg(windows)]
 fn isatty_impl(fd: i32) -> bool {
+    crate::effect!(host_read, tty);
     // A std handle counts as a TTY when `GetConsoleMode` succeeds on it —
     // the same probe `std::io::IsTerminal` uses (see `builtins/console.rs`)
     // and the same criterion libuv uses to classify a handle as `UV_TTY`.
@@ -106,6 +109,7 @@ fn isatty_impl(fd: i32) -> bool {
 
 #[cfg(windows)]
 fn winsize_impl(fd: i32) -> Option<(i32, i32)> {
+    crate::effect!(host_read, tty);
     // GetConsoleScreenBufferInfo srWindow extents (right-left+1,
     // bottom-top+1) for the stdout/stderr console handle.
     crate::win_console::window_size(fd)
@@ -113,11 +117,13 @@ fn winsize_impl(fd: i32) -> Option<(i32, i32)> {
 
 #[cfg(not(any(unix, windows)))]
 fn isatty_impl(_fd: i32) -> bool {
+    crate::effect!(host_read, tty);
     false
 }
 
 #[cfg(not(any(unix, windows)))]
 fn winsize_impl(_fd: i32) -> Option<(i32, i32)> {
+    crate::effect!(host_read, tty);
     None
 }
 
@@ -327,7 +333,8 @@ fn set_fd_raw_mode(fd: i32, enabled: bool) -> bool {
                 | libc::IGNCR
                 | libc::ICRNL
                 | libc::IXON);
-            raw.c_oflag &= !libc::OPOST;
+            // Preserve output processing (including OPOST/ONLCR): raw input
+            // must not break newline rendering on a shared terminal (#13644).
             raw.c_lflag &= !(libc::ECHO | libc::ECHONL | libc::ICANON | libc::ISIG | libc::IEXTEN);
             raw.c_cflag &= !(libc::CSIZE | libc::PARENB);
             raw.c_cflag |= libc::CS8;
@@ -1175,33 +1182,18 @@ pub extern "C" fn js_tty_write_stream_remove_all_listeners(
 }
 
 pub fn throw_invalid_fd(fd: f64) -> ! {
-    let obj = crate::object::js_object_alloc(crate::error::CLASS_ID_RANGE_ERROR, 4);
-    {
-        crate::object::js_register_class_extends_error(crate::error::CLASS_ID_RANGE_ERROR);
-        let str_val = |s: &str| -> f64 {
-            let ptr = crate::string::js_string_from_bytes(s.as_ptr(), s.len() as u32);
-            f64::from_bits(JSValue::string_ptr(ptr).bits())
-        };
-        let set = |key: &str, value: f64| {
-            let key_ptr = crate::string::js_string_from_bytes(key.as_ptr(), key.len() as u32);
-            crate::object::js_object_set_field_by_name(obj, key_ptr, value);
-        };
-        set("name", str_val("RangeError"));
-        set("code", str_val("ERR_INVALID_FD"));
-        set(
-            "message",
-            str_val(&format!("\"fd\" must be a positive integer: {}", fd as i64)),
-        );
-    }
-    crate::exception::js_throw(crate::value::js_nanbox_pointer(obj as i64))
+    let message = format!("\"fd\" must be a positive integer: {}", fd as i64);
+    crate::exception::throw_core(crate::error::CoreError::range_error_with_own_code(
+        message.as_bytes(),
+        b"ERR_INVALID_FD",
+    ))
 }
 
 pub fn throw_tty_init_failed() -> ! {
     let message = "TTY initialization failed: uv_tty_init returned EINVAL (invalid argument)";
     let msg = crate::string::js_string_from_bytes(message.as_ptr(), message.len() as u32);
     crate::node_submodules::register_error_code_pub(msg, "ERR_TTY_INIT_FAILED");
-    let err = crate::error::js_error_new_with_name_message(b"SystemError", msg);
-    crate::exception::js_throw(crate::value::js_nanbox_pointer(err as i64))
+    crate::exception::throw_core(crate::error::CoreError::named(b"SystemError", msg))
 }
 
 /// `process.stdin.isTTY` / `process.stdout.isTTY` / `process.stderr.isTTY`.
@@ -1310,6 +1302,10 @@ pub extern "C" fn js_tty_resize_drain() -> i32 {
 // Tests
 // ---------------------------------------------------------------------------
 
+#[cfg(all(test, unix))]
+#[path = "tty/raw_mode_tests.rs"]
+mod raw_mode_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1344,6 +1340,32 @@ mod tests {
         // Both should be TAG_UNDEFINED bits (0x7FFC_0000_0000_0001).
         assert_eq!(cols.to_bits(), 0x7FFC_0000_0000_0001);
         assert_eq!(rows.to_bits(), 0x7FFC_0000_0000_0001);
+    }
+
+    /// #13686: a TTY write stream sized by its own `columns`/`rows` keys keeps
+    /// `tty.WriteStream.prototype` as its [[Prototype]]: `Object.getPrototypeOf`
+    /// and inherited reads of `isTTY` and the stream methods all see it.
+    #[test]
+    fn sized_write_stream_keeps_write_stream_prototype() {
+        ensure_tty_prototypes();
+        let _no_move = crate::gc::GcSuppressScope::new();
+        let proto = crate::object::class_prototype_object(CLASS_ID_TTY_WRITE_STREAM);
+        assert!(!proto.is_null());
+        let obj = crate::object::js_object_alloc_class_with_keys(
+            CLASS_ID_TTY_WRITE_STREAM,
+            0,
+            0,
+            std::ptr::null(),
+            0,
+        );
+        crate::object::js_object_set_field_by_name(obj, named_key(b"columns"), 80.0);
+        crate::object::js_object_set_field_by_name(obj, named_key(b"rows"), 25.0);
+        let got = crate::object::js_object_get_prototype_of(ptr_value(obj));
+        assert_eq!(got.to_bits(), ptr_value(proto).to_bits());
+        let is_tty = crate::object::js_object_get_field_by_name(obj, named_key(b"isTTY"));
+        assert_eq!(is_tty.bits(), TAG_TRUE);
+        let cursor_to = crate::object::js_object_get_field_by_name(obj, named_key(b"cursorTo"));
+        assert!(cursor_to.is_pointer());
     }
 
     #[test]

@@ -22,9 +22,7 @@ pub(super) fn throw_invalid_index(index: f64) -> ! {
     };
     let message = format!("Invalid index : {}", body);
     let msg = crate::string::js_string_from_bytes(message.as_ptr(), message.len() as u32);
-    let error = crate::error::js_rangeerror_new(msg);
-    let bits = crate::value::JSValue::pointer(error as *const u8).bits();
-    crate::exception::js_throw(f64::from_bits(bits))
+    crate::exception::throw_core(crate::error::CoreError::range_error(msg))
 }
 
 /// `arr.toReversed()` — return a new reversed copy (immutable)
@@ -102,8 +100,11 @@ pub extern "C" fn js_array_to_sorted_default(arr: *const ArrayHeader) -> *mut Ar
     }
     unsafe {
         let len = (*arr).length as usize;
-        // Clone the array
-        let new_arr = js_array_alloc(len as u32);
+        // The clone allocation can move the source before its slots are
+        // read, so root it across the allocation.
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let source = scope.root_raw_const_ptr(arr);
+        let (new_arr, arr) = source.across_const::<ArrayHeader, _>(|| js_array_alloc(len as u32));
         (*new_arr).length = len as u32;
         let src = crate::array::array_elements_ptr(arr as *const ArrayHeader) as *const f64;
         let dst = crate::array::array_elements_ptr(new_arr as *const ArrayHeader) as *mut f64;
@@ -119,9 +120,9 @@ pub extern "C" fn js_array_to_sorted_default(arr: *const ArrayHeader) -> *mut Ar
             };
         }
         rebuild_array_layout(new_arr);
-        // Sort the copy in-place using default sort
-        js_array_sort_default(new_arr);
-        new_arr
+        // The sort itself can collect, so hand back the helper's live pointer
+        // rather than the one captured before it.
+        js_array_sort_default(new_arr)
     }
 }
 
@@ -164,8 +165,11 @@ pub extern "C" fn js_array_to_sorted_with_comparator(
     }
     unsafe {
         let len = (*arr).length as usize;
-        // Clone the array
-        let new_arr = js_array_alloc(len as u32);
+        // Root both inputs before the clone allocation can move them.
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let source = scope.root_raw_const_ptr(arr);
+        let comparator = scope.root_raw_const_ptr(comparator);
+        let (new_arr, arr) = source.across_const::<ArrayHeader, _>(|| js_array_alloc(len as u32));
         (*new_arr).length = len as u32;
         let src = crate::array::array_elements_ptr(arr as *const ArrayHeader) as *const f64;
         let dst = crate::array::array_elements_ptr(new_arr as *const ArrayHeader) as *mut f64;
@@ -181,9 +185,9 @@ pub extern "C" fn js_array_to_sorted_with_comparator(
             };
         }
         rebuild_array_layout(new_arr);
-        // Sort the copy in-place
-        js_array_sort_with_comparator(new_arr, comparator);
-        new_arr
+        // The sort calls back into JS, which can move both the copy and the
+        // comparator: re-read the comparator and return the live result.
+        comparator.with_const_ptr(|comparator| js_array_sort_with_comparator(new_arr, comparator))
     }
 }
 
@@ -491,8 +495,7 @@ unsafe fn copy_within_spec_dense(arr: *mut ArrayHeader, len: i64, t: i64, s: i64
 #[cold]
 fn throw_copy_within_type_error(message: &[u8]) -> ! {
     let msg = crate::string::js_string_from_bytes(message.as_ptr(), message.len() as u32);
-    let err = crate::error::js_typeerror_new(msg);
-    crate::exception::js_throw(crate::value::js_nanbox_pointer(err as i64))
+    crate::exception::throw_core(crate::error::CoreError::type_error(msg))
 }
 
 fn copy_within_to_integer_or_infinity(value: f64) -> f64 {

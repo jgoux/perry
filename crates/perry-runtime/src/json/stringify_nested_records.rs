@@ -35,7 +35,7 @@ unsafe fn ordinary_object(bits: u64) -> Option<(*const crate::ObjectHeader, usiz
         || (header.size as usize)
             < crate::gc::GC_HEADER_SIZE + crate::object::header::meta_form_alloc_bytes(0)
         || !super::stringify_tojson_probe::object_is_plain_record(obj)
-        || crate::object::prototype_chain::object_static_prototype(obj as usize).is_some()
+        || crate::object::prototype_chain::object_static_prototype_is_linked(obj as usize)
     {
         return None;
     }
@@ -55,8 +55,7 @@ unsafe fn record(bits: u64) -> Option<Record> {
     }
     Some(Record {
         // A1_UNPROVEN: record-first: no proof of the object form at this slot read (kind-A/B question for S0f).
-        values: crate::meta_slots_of!(crate::meta_obj_runtime_born!(obj as *mut _))
-            .cast(),
+        values: crate::meta_slots_of!(crate::meta_obj_runtime_born!(obj as *mut _)).cast(),
         len,
     })
 }
@@ -202,8 +201,8 @@ impl Emitter {
             return Some(());
         }
         // A1_UNPROVEN: record-first: no proof of the object form at this slot read (kind-A/B question for S0f).
-        let values = crate::meta_slots_of!(crate::meta_obj_runtime_born!(object as *mut _))
-            .cast::<u64>();
+        let values =
+            crate::meta_slots_of!(crate::meta_obj_runtime_born!(object as *mut _)).cast::<u64>();
         for i in 0..len {
             let value = *values.add(i);
             // Omitted fields require different comma placement; decline before

@@ -153,6 +153,7 @@
 
 # Testing
 
+- [Test Structure](testing/test-structure.md)
 - [Test Registration (dark tests)](testing/test-registration.md)
 - [Geisterhand (UI Fuzzer)](testing/geisterhand.md)
 - [Node Compatibility Matrix](testing/node-compat-matrix.md)
@@ -198,10 +199,13 @@
 - [Garbage Collector](internals/garbage-collector.md)
 - [Explicit Memory Control](internals/explicit-memory.md)
 - [The GC rooting invariant (codegen)](internals/gc-rooting-invariant.md)
+  - [Runtime claim diagnostics](internals/runtime-claim-checks.md)
+- [Program facts](internals/program-facts.md)
 - [Local binding type evidence](internals/local-binding-type-evidence.md)
 - [Codegen mechanisms and workload evidence](internals/codegen-mechanisms.md)
 - [Incremental GC step bounds](internals/gc-step-bounds.md)
 - [RFC: rooting by construction](internals/rfc-rooting-by-construction.md)
+- [Runtime throw provenance](internals/typed-throws.md)
 - [Node-API host design](internals/node-api-host.md)
 - [Generic fallback diagnostics](internals/fallback-diagnostics.md)
 

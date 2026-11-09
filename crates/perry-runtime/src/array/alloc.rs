@@ -7,8 +7,7 @@ use std::ptr;
 fn throw_invalid_array_length() -> ! {
     let bytes = b"Invalid array length";
     let msg = crate::string::js_string_from_bytes(bytes.as_ptr(), bytes.len() as u32);
-    let err = crate::error::js_rangeerror_new(msg);
-    crate::exception::js_throw(crate::value::js_nanbox_pointer(err as i64))
+    crate::exception::throw_core(crate::error::CoreError::range_error(msg))
 }
 
 /// Throw the `RangeError: Invalid array length` raised by `ArraySetLength`
@@ -175,13 +174,13 @@ pub(crate) fn js_array_alloc_named_props_reserved(
         let (named, array) = array.across_mut::<ArrayHeader, _>(|| {
             crate::object::layout_desc::perry_alloc_layout(match set {
                 crate::array::NamedPropertyKeys::ExecResult => {
-                    std::ptr::addr_of!(crate::object::runtime_layouts::REGEX_EXEC_NAMED)
+                    crate::object::runtime_layouts::REGEX_EXEC_NAMED::desc()
                 }
                 crate::array::NamedPropertyKeys::ExecResultIndices => {
-                    std::ptr::addr_of!(crate::object::runtime_layouts::REGEX_EXEC_INDICES_NAMED)
+                    crate::object::runtime_layouts::REGEX_EXEC_INDICES_NAMED::desc()
                 }
                 crate::array::NamedPropertyKeys::IndicesGroups => {
-                    std::ptr::addr_of!(crate::object::runtime_layouts::REGEX_INDICES_GROUPS_NAMED)
+                    crate::object::runtime_layouts::REGEX_INDICES_GROUPS_NAMED::desc()
                 }
             })
         });

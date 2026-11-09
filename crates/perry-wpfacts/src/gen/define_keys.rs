@@ -112,9 +112,28 @@ impl<'a> Gen<'a> {
         (n >= 0.0 && n <= i32::MAX as f64 && n.fract() == 0.0).then_some(n as u32)
     }
 
-    /// The constant string `e` evaluates to: a constant expression
-    /// (`const_eval`), or a constant binding whose initializer is one.
+    /// A constant string expression or immutable binding. Numeric index
+    /// paths keep their element representation in callers of this helper.
     pub(crate) fn const_key(&mut self, mi: u32, e: &Expr) -> Option<String> {
+        match self.const_key_value(mi, e)? {
+            crate::gen_const::Const::Str(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// A call's constant primitive argument as its ToPropertyKey spelling.
+    pub(crate) fn const_property_key(&mut self, mi: u32, e: &Expr) -> Option<String> {
+        use crate::gen_const::Const;
+        Some(match self.const_key_value(mi, e)? {
+            Const::Str(s) => s,
+            Const::Num(n) => perry_hir::js_number_to_string(n),
+            Const::Bool(b) => b.to_string(),
+            Const::Undef => "undefined".into(),
+            Const::Null => "null".into(),
+        })
+    }
+
+    fn const_key_value(&mut self, mi: u32, e: &Expr) -> Option<crate::gen_const::Const> {
         let mut seen: Vec<Binding> = Vec::new();
         let mut e = e.clone();
         loop {
@@ -141,10 +160,51 @@ impl<'a> Gen<'a> {
                 ConstInit::Lit(_) => return None,
             }
         }
-        match self.const_eval(mi, &e)? {
-            crate::gen_const::Const::Str(s) => Some(s),
-            _ => None,
+        self.const_eval(mi, &e)
+    }
+
+    /// The keys a store under computed key `e` may name, when they are a
+    /// finite set of constant strings: a constant (`const_key`), a
+    /// conditional whose branches are such sets, or a constant binding
+    /// initialized by one (`const k = w ? "a" : "b"`). Each is a named store.
+    pub(crate) fn const_key_set(&mut self, mi: u32, e: &Expr) -> Option<Vec<String>> {
+        fn go(
+            g: &mut crate::gen::Gen,
+            mi: u32,
+            e: &Expr,
+            depth: u32,
+            out: &mut Vec<String>,
+        ) -> bool {
+            if depth > 8 {
+                return false;
+            }
+            if let Some(s) = g.const_key(mi, e) {
+                if !out.contains(&s) {
+                    out.push(s);
+                }
+                return true;
+            }
+            match e {
+                Expr::Conditional {
+                    then_expr,
+                    else_expr,
+                    ..
+                } => go(g, mi, then_expr, depth + 1, out) && go(g, mi, else_expr, depth + 1, out),
+                Expr::LocalGet(id) | Expr::GlobalGet(id) => {
+                    let b = (mi, matches!(e, Expr::GlobalGet(_)), *id);
+                    match g.const_inits.get(&b) {
+                        Some(ConstInit::Value(x)) => {
+                            let x = x.clone();
+                            go(g, mi, &x, depth + 1, out)
+                        }
+                        _ => false,
+                    }
+                }
+                _ => false,
+            }
         }
+        let mut out = Vec::new();
+        go(self, mi, e, 0, &mut out).then_some(out)
     }
 
     /// The literal class a constant binding is born with.
@@ -211,26 +271,31 @@ impl<'a> Gen<'a> {
                         Expr::GlobalGet(id) => self.bound_literal((mi as u32, true, *id)),
                         _ => None,
                     };
+                    if name.is_none() {
+                        keys.push(Expr::Undefined);
+                    }
                     lits.extend(name.cloned());
                 }
                 Expr::ObjectDefineProperty(_, k, _)
-                | Expr::ReflectDefineProperty { key: k, .. }
-                    if matches!(k.as_ref(), Expr::LocalGet(_) | Expr::GlobalGet(_)) =>
-                {
-                    keys.push(k.as_ref().clone())
+                | Expr::ReflectDefineProperty { key: k, .. } => keys.push(k.as_ref().clone()),
+                Expr::RegisterClassComputedAccessor { key_expr, .. } => {
+                    keys.push(key_expr.as_ref().clone());
                 }
                 _ => {}
             });
             for k in &keys {
                 if let Some(s) = self.const_key(mi as u32, k) {
                     let a = self.m.atom(&s);
-                    self.m.accessor_atoms.insert(a);
+                    self.m.add_accessor_atom(a);
+                } else {
+                    let star = self.m.atom(crate::STAR_KEY);
+                    self.m.add_accessor_atom(star);
                 }
             }
             for name in lits {
                 for n in self.literal_keys(mi, &name) {
                     let a = self.m.atom(&n);
-                    self.m.accessor_atoms.insert(a);
+                    self.m.add_accessor_atom(a);
                 }
             }
         }

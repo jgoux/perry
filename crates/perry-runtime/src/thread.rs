@@ -226,6 +226,7 @@ fn is_truthy_bits(bits: u64) -> bool {
 /// Message-owned layout and value storage. No source shape or heap address crosses.
 #[derive(Debug, Default)]
 pub struct CloneMessage {
+    pub ports: Vec<std::sync::Arc<crate::messaging::port_transport::Ticket>>,
     pub shapes: Vec<CloneShape>,
     pub strings: Vec<Vec<u8>>,
     pub slots: Vec<CloneSlot>,
@@ -277,6 +278,7 @@ impl CloneSlot {
 
 #[derive(Debug, Clone)]
 pub enum SerializedValue {
+    MessagePort(u32),
     RawArray(Vec<u64>),
     Message {
         root: Box<SerializedValue>,
@@ -455,9 +457,14 @@ mod clone_read;
 #[cfg(perry_gc_instruments)]
 mod clone_timing;
 mod clone_write;
-pub use clone_read::deserialize_nanbox_on_current_thread;
+mod transfer_list;
+pub use clone_read::{deserialize_message, deserialize_nanbox_on_current_thread};
 use clone_write::serialize_capture_for_thread;
-pub use clone_write::{serialize_message, serialize_nanbox_for_thread};
+pub use clone_write::{
+    serialize_message, serialize_message_with_ports, serialize_nanbox_for_thread,
+    validate_message_buffer,
+};
+pub use transfer_list::js_worker_transfer_sequence;
 
 pub(crate) use crate::thread_hook_slots::fs_thread_codec;
 
@@ -535,11 +542,15 @@ pub(crate) fn first_unsupported_transfer_type(sv: &SerializedValue) -> Option<&'
 /// Must run on the thread whose arena should own the error object (the main
 /// thread, at the drain boundary).
 unsafe fn make_unsupported_transfer_error(type_name: &str) -> f64 {
+    unsupported_transfer_error(type_name).value()
+}
+
+unsafe fn unsupported_transfer_error(type_name: &str) -> crate::error::CoreError {
     let msg =
         format!("Cannot transfer a {type_name} across a perry/thread boundary (unsupported type)");
     let s = crate::string::js_string_from_bytes(msg.as_ptr(), msg.len() as u32);
-    let err = crate::error::js_typeerror_new(s);
-    crate::value::js_nanbox_pointer(err as i64)
+    let err = crate::error::CoreError::type_error(s);
+    err
 }
 
 /// Throw a catchable `TypeError` naming an unsupported cross-thread transfer.
@@ -551,7 +562,7 @@ unsafe fn make_unsupported_transfer_error(type_name: &str) -> f64 {
 /// there would be undefined behavior — worker-side failures are surfaced by
 /// rejecting the returned promise on the main thread instead.
 unsafe fn throw_unsupported_transfer(type_name: &str) -> ! {
-    crate::exception::js_throw(make_unsupported_transfer_error(type_name));
+    crate::exception::throw_core(unsupported_transfer_error(type_name));
 }
 
 /// Main-thread guard: if any value in `values` is non-transferable, throw a
@@ -1390,30 +1401,18 @@ unsafe fn spawn_impl(closure_val: f64, literal_prepare: i64) -> *mut crate::prom
             ))
         };
 
-        // Call the function — catch panics to avoid aborting across FFI boundary
-        let call_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // Call the function. Every perry build is `panic = "abort"`: a panic in
+        // the body ends the process, so there is no unwind to catch here.
+        let result = {
             let code = unsafe { (*(info_usize as *const crate::closure::JsFunctionInfo)).code };
             let call_fn: ClosureCall0Fn = unsafe { crate::closure::body_call::js_body_fn!(code;) };
             let local_closure =
                 closure_handle.get_raw_mut_ptr::<ClosureHeader>() as *const ClosureHeader;
             call_fn(local_closure, crate::closure::plain_call_receiver())
-        }));
-
-        match call_result {
-            Ok(result) => {
-                // Serialize result for transfer back to the spawning agent.
-                let serialized_result = unsafe { serialize_nanbox_for_thread(result.to_bits()) };
-                queue_thread_result(owner_agent, promise_usize, serialized_result);
-            }
-            Err(_) => {
-                // Thread panicked — resolve with undefined to avoid hanging promise
-                queue_thread_result(
-                    owner_agent,
-                    promise_usize,
-                    SerializedValue::Inline(TAG_UNDEFINED),
-                );
-            }
-        }
+        };
+        // Serialize result for transfer back to the spawning agent.
+        let serialized_result = unsafe { serialize_nanbox_for_thread(result.to_bits()) };
+        queue_thread_result(owner_agent, promise_usize, serialized_result);
 
         // #6185: this worker's arena is about to be unmapped. Drop the shadow
         // scope first (the result is already serialized into owner-independent
@@ -1463,3 +1462,11 @@ mod literal_launch_tests;
 #[cfg(test)]
 #[path = "thread/shape_clone_tests.rs"]
 mod shape_clone_tests;
+
+#[cfg(test)]
+#[path = "thread/error_stack_clone_tests.rs"]
+mod error_stack_clone_tests;
+
+#[cfg(test)]
+#[path = "thread/error_cause_clone_tests.rs"]
+mod error_cause_clone_tests;

@@ -556,9 +556,18 @@ pub fn arena_alloc_gc(size: usize, align: usize, obj_type: u8) -> *mut u8 {
 /// fills by; the image is read through the pointer on the fast arm only, so the
 /// large and slow arms pay nothing for it.
 ///
+/// `origin` is the JS caller's frame when the entry passed one: only the slow
+/// arm, the one that can collect, offers it (`gc::roots::walk_origin`), so the
+/// bump path stays as it was.
+///
 /// # Safety
 /// `word` points at the descriptor's header image.
-pub(crate) unsafe fn arena_alloc_gc_object_word(word: *const u64, slots: u32) -> *mut u8 {
+#[inline(always)]
+pub(crate) unsafe fn arena_alloc_gc_object_word_offering(
+    word: *const u64,
+    slots: u32,
+    origin: Option<crate::gc::WalkOrigin>,
+) -> *mut u8 {
     use crate::gc::GC_TYPE_OBJECT;
     let size = crate::object::header::meta_form_alloc_bytes(slots as usize);
     let total = gc_padded_total_size(size, 8);
@@ -573,7 +582,21 @@ pub(crate) unsafe fn arena_alloc_gc_object_word(word: *const u64, slots: u32) ->
             return init_young_header_word(raw, *word, GC_TYPE_OBJECT);
         }
     }
-    arena_alloc_gc_slow(size, 8, GC_TYPE_OBJECT, total)
+    match origin {
+        Some(origin) => arena_alloc_gc_slow_offering(size, total, origin),
+        None => arena_alloc_gc_slow(size, 8, GC_TYPE_OBJECT, total),
+    }
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn arena_alloc_gc_slow_offering(
+    size: usize,
+    total: usize,
+    origin: crate::gc::WalkOrigin,
+) -> *mut u8 {
+    let _offer = crate::gc::EntryWalkOrigin::enter(&origin);
+    arena_alloc_gc_slow(size, 8, crate::gc::GC_TYPE_OBJECT, total)
 }
 
 /// The current live birth color is read at the allocation, never cached
@@ -678,6 +701,7 @@ fn arena_alloc_gc_slow(size: usize, align: usize, obj_type: u8, total: usize) ->
     };
 
     if let Some(user_ptr) = reused {
+        crate::snap_census::birth_user(user_ptr as usize, total);
         ARENA.with(|a| unsafe { (&mut *a.get()).note_allocation(total, total >= 16 * 1024) });
         // Reusing a free-list slot: the GcHeader is already in place (before user_ptr)
         // Just update it

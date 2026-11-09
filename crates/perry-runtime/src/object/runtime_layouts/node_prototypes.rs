@@ -424,14 +424,14 @@ const _: () = assert!(
 /// The hash of runtime symbol atom `n` (a fixed constant per number, like a
 /// well-known symbol's; the symbol itself is created when it is bound).
 const fn runtime_symbol_atom_hash(n: u32) -> u64 {
-    0x9e37_79b9_7f4a_7c15u64.wrapping_mul(n as u64 + 0x100)
+    perry_abi::runtime_symbol_atom_hash(n)
 }
 
 /// A symbol of node's own library as a layout key: a kind-2 atom (`string` its
 /// description, `index` its number among [`RUNTIME_SYMBOL_ATOMS`]), bound to
 /// its process-lifetime symbol by [`runtime_symbol_of_atom`].
 macro_rules! runtime_symbol_atom {
-    ($name:ident, $desc:literal, $n:expr) => {
+    ($name:ident, $desc:literal, $n:literal) => {
         #[allow(non_snake_case)]
         pub(crate) mod $name {
             use super::*;
@@ -439,6 +439,9 @@ macro_rules! runtime_symbol_atom {
             pub(super) static IMAGE: ImageString<{ $desc.len() + 1 }> =
                 image_bytes(concat!($desc, "\0").as_bytes());
         }
+        // Compiler-emitted descriptors name this atom by its number: the
+        // runtime binds a kind-2 atom by address (`runtime_symbol_of_atom`).
+        #[export_name = concat!("perry_runtime_symbol_atom_", $n)]
         pub(crate) static $name: StaticAtom = StaticAtom {
             hash: $name::HASH,
             string: std::ptr::addr_of!($name::IMAGE.string),
@@ -470,10 +473,14 @@ runtime_symbol_atom!(
     "kAbortSignalDetached",
     12
 );
+// The private key of an object's native payload slot (`native_payload`):
+// a layout that lists it is born with the payload slot in place, so the
+// attach fills that slot and the object stays on its layout.
+runtime_symbol_atom!(NP_SYMBOL_NATIVE_PAYLOAD, "[[NativePayload]]", 13);
 
 /// The runtime symbol atoms by number, and whether each is a registry symbol
 /// (`Symbol.for(description)`) rather than a symbol of its own.
-static RUNTIME_SYMBOL_ATOMS: [(&StaticAtom, bool); 13] = [
+static RUNTIME_SYMBOL_ATOMS: [(&StaticAtom, bool); 14] = [
     (&NP_SYMBOL_K_CAPTURE, false),
     (&NP_SYMBOL_NODEJS_REJECTION, true),
     (&NP_SYMBOL_TO_ASYNC_STREAMABLE, true),
@@ -487,9 +494,10 @@ static RUNTIME_SYMBOL_ATOMS: [(&StaticAtom, bool); 13] = [
     (&NP_SYMBOL_K_ABORT_SIGNAL_SOCKET, false),
     (&NP_SYMBOL_K_ABORT_SIGNAL_LISTENER, false),
     (&NP_SYMBOL_K_ABORT_SIGNAL_DETACHED, false),
+    (&NP_SYMBOL_NATIVE_PAYLOAD, false),
 ];
-static RUNTIME_SYMBOLS: [std::sync::atomic::AtomicUsize; 13] =
-    [const { std::sync::atomic::AtomicUsize::new(0) }; 13];
+static RUNTIME_SYMBOLS: [std::sync::atomic::AtomicUsize; 14] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 14];
 
 /// The symbol runtime symbol atom `atom` names: created once per process, the
 /// same symbol in every agent (registration binds every layout key to it),
@@ -537,14 +545,12 @@ pub(crate) unsafe fn runtime_symbol_of_atom(
     }
 }
 
-/// Is `ptr` one of the runtime symbols bound so far? Their immortal owner,
-/// the way the registry and the well-known cache own theirs
-/// (`symbol::is_persistent_symbol`).
-pub(crate) fn is_runtime_symbol(ptr: usize) -> bool {
-    ptr != 0
-        && RUNTIME_SYMBOLS
-            .iter()
-            .any(|bound| bound.load(std::sync::atomic::Ordering::Acquire) == ptr)
+/// The symbol runtime symbol atom `atom` names if it is already created
+/// (`None` before its first use: no object can list it yet).
+pub(crate) fn bound_runtime_symbol(atom: &'static StaticAtom) -> Option<usize> {
+    let n = atom.index as usize;
+    let bound = RUNTIME_SYMBOLS.get(n)?.load(std::sync::atomic::Ordering::Acquire);
+    (bound != 0).then_some(bound)
 }
 
 /// The NaN-boxed symbol runtime symbol atom `atom` names.
@@ -753,7 +759,7 @@ runtime_layout!(OUTGOING_MESSAGE_PROTOTYPE, kind = LAYOUT_KIND_UNMARKED, 0x53500
     NP_ATOM_FLUSH_HEADERS,
     NP_ATOM_PIPE,
     NP_SYMBOL_NODEJS_REJECTION,
-], realm = ["node:http.OutgoingMessage.prototype"]);
+], realm = ["node:http.OutgoingMessage.prototype", "node:http2.Http2ServerResponse.prototype"]);
 
 // `ServerResponse.prototype`: node's own keys, in node's order.
 runtime_layout!(SERVER_RESPONSE_PROTOTYPE, kind = LAYOUT_KIND_UNMARKED, 0x53500017, 0,
@@ -770,7 +776,7 @@ runtime_layout!(SERVER_RESPONSE_PROTOTYPE, kind = LAYOUT_KIND_UNMARKED, 0x535000
     NP_ATOM_WRITE_EARLY_HINTS,
     NP_ATOM_U_IMPLICIT_HEADER,
     NP_ATOM_WRITE_HEAD,
-], realm = ["node:http.ServerResponse.prototype"]);
+], realm = ["node:http.ServerResponse.prototype", "node:http2.Http2ServerResponse.prototype"]);
 
 // `IncomingMessage.prototype`: node's own keys, in node's order.
 runtime_layout!(INCOMING_MESSAGE_PROTOTYPE, kind = LAYOUT_KIND_UNMARKED, 0x53500018, 0,

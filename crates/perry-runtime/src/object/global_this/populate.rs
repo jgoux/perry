@@ -69,11 +69,16 @@ pub(crate) fn populate_global_this_builtins(singleton_at_entry: *mut ObjectHeade
         populate_global_this_builtins_inner(singleton_at_entry)
     })
 }
-crate::realm_decl! { Infinity, value = Infinity; NaN, value = NaN; crypto, attrs = 6, get = "crypto.<get>", births = [ArrayBuffer, Crypto, CryptoKey, Promise, SubtleCrypto]; global, attrs = 7, alias = "%Global%"; globalThis, alias = "%Global%"; localStorage, attrs = 6, get = "localStorage.<get>", set = "localStorage.<set>"; sessionStorage, attrs = 6, get = "sessionStorage.<get>", set = "sessionStorage.<set>"; undefined, value = undefined; }
+crate::realm_decl! { Infinity, value = Infinity; NaN, value = NaN; crypto, attrs = 6, get = "crypto.<get>", births = [ArrayBuffer, Crypto, CryptoKey, Promise, SubtleCrypto]; global, attrs = 7, alias = "%Global%"; globalThis, alias = "%Global%"; localStorage, attrs = 4, get = "localStorage.<get>", set = "localStorage.<set>"; sessionStorage, attrs = 6, get = "sessionStorage.<get>", set = "sessionStorage.<set>"; undefined, value = undefined; }
+// Compact the once-per-realm installer, not the methods it installs. Blanket
+// Oz also shrinks/outlines hot array and iterator helpers (#13662).
+#[optimize(size)]
 fn populate_global_this_builtins_inner(singleton_at_entry: *mut ObjectHeader) {
     if singleton_at_entry.is_null() {
         return;
     }
+    // The realm is the runtime's, whichever init first asks for it.
+    let _realm = crate::snap_census::runtime_scope();
     // #6982: this function installs several hundred builtins, and nearly every
     // step allocates (name strings, constructor closures, prototype objects).
     // Any of those allocations can trigger a collection, and an *evacuating*
@@ -142,7 +147,7 @@ fn populate_global_this_builtins_inner(singleton_at_entry: *mut ObjectHeader) {
     let singleton = || singleton_handle.get_raw_mut_ptr::<ObjectHeader>();
     {
         let name = b"globalThis";
-        let key = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
+        let key = super::global_name_key(name);
         let value = crate::value::js_nanbox_pointer(singleton() as i64);
         super::super::define_builtin_data_property(
             singleton(),
@@ -158,7 +163,7 @@ fn populate_global_this_builtins_inner(singleton_at_entry: *mut ObjectHeader) {
         // `global` / `(global as any).x` reads resolve to the real singleton
         // instead of the unknown-identifier sentinel.
         let name = b"global";
-        let key = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
+        let key = super::global_name_key(name);
         let value = crate::value::js_nanbox_pointer(singleton() as i64);
         super::super::define_builtin_data_property(
             singleton(),
@@ -187,8 +192,7 @@ fn populate_global_this_builtins_inner(singleton_at_entry: *mut ObjectHeader) {
         let name = declaration.name;
         if name == "Buffer" {
             let name_bytes = name.as_bytes();
-            let name_key =
-                crate::string::js_string_from_bytes(name_bytes.as_ptr(), name_bytes.len() as u32);
+            let name_key = super::global_name_key(name_bytes);
             let ctor_value = super::super::native_module::buffer_constructor_value();
 
             // #9173: Buffer instances resolve to Buffer.prototype, whose own
@@ -239,7 +243,7 @@ fn populate_global_this_builtins_inner(singleton_at_entry: *mut ObjectHeader) {
             // realm global adopts them, a `vm`/eval realm gets its own pair.
             let (object_ctor, _) = object_intrinsics_for_realm(singleton());
             if !object_ctor.is_null() {
-                let name_key = crate::string::js_string_from_bytes(b"Object".as_ptr(), 6);
+                let name_key = super::global_name_key(b"Object");
                 super::super::define_builtin_data_property(
                     singleton(),
                     name_key,
@@ -282,14 +286,22 @@ fn populate_global_this_builtins_inner(singleton_at_entry: *mut ObjectHeader) {
             // SAFETY: a registered runtime descriptor with the default prototype.
             unsafe {
                 crate::realm_decl! { birth crate::object::layout_desc::alloc_layout_prototype(
-                    std::ptr::addr_of!(crate::object::runtime_layouts::FUNCTION_PROTOTYPE),
+                    crate::object::runtime_layouts::FUNCTION_PROTOTYPE::desc(),
                     0,
-                ); realm { Function.prototype, members = { length = 0.0, attrs = configurable; name = "", attrs = configurable; arguments = accessor(get = "Function.prototype.arguments.<get>", set = "Function.prototype.arguments.<get>"); caller = accessor(get = "Function.prototype.arguments.<get>", set = "Function.prototype.arguments.<get>"); constructor; apply; bind; call; toString; [Symbol.hasInstance], attrs = writable | enumerable | configurable; }; } }
+                ); realm { Function.prototype, members = { length = 0.0, attrs = configurable; name = "", attrs = configurable; constructor; apply; bind; call; toString; arguments = accessor(get = "Function.prototype.arguments.<get>", set = "Function.prototype.arguments.<get>"); caller = accessor(get = "Function.prototype.arguments.<get>", set = "Function.prototype.arguments.<get>"); [Symbol.hasInstance], attrs = writable | enumerable | configurable; }; } }
             }
         } else if name == "Iterator" {
             crate::object::iterator_ctor::iterator_prototype_object()
         } else {
-            crate::realm_decl! { birth super::proto_room::alloc_builtin_prototype(); realm { AbortController.prototype, members = { constructor; signal = accessor(get = "AbortController.prototype.signal.<get>"), attrs = enumerable | configurable; abort, attrs = writable | enumerable | configurable; [Symbol.toStringTag] = "AbortController"; }; AbortSignal.prototype, extends = EventTarget.prototype, members = { constructor; aborted = accessor(get = "AbortSignal.prototype.aborted.<get>"), attrs = enumerable | configurable; reason = accessor(get = "AbortSignal.prototype.reason.<get>"); throwIfAborted; onabort = accessor(get = "AbortSignal.prototype.onabort.<get>", set = "AbortSignal.prototype.onabort.<set>"), attrs = enumerable | configurable; [Symbol.toStringTag] = "AbortSignal"; }; AggregateError.prototype, extends = Error.prototype, members = { constructor; toLocaleString; valueOf; toString; isPrototypeOf; hasOwnProperty; name = "AggregateError", attrs = writable | configurable; message = "", attrs = writable | configurable; }; ArrayBuffer.prototype, members = { constructor; slice; resize; transfer; transferToFixedLength; byteLength = accessor(get = "ArrayBuffer.prototype.byteLength.<get>"); resizable = accessor(get = "ArrayBuffer.prototype.resizable.<get>"); maxByteLength = accessor(get = "ArrayBuffer.prototype.maxByteLength.<get>"); detached = accessor(get = "ArrayBuffer.prototype.detached.<get>"); toLocaleString; valueOf; [Symbol.toStringTag] = "ArrayBuffer"; }; AsyncDisposableStack.prototype, members = { constructor; disposed = accessor(get = "AsyncDisposableStack.prototype.disposed.<get>"); use; adopt; defer; disposeAsync; move; toLocaleString; valueOf; [Symbol.asyncDispose] = ref(AsyncDisposableStack.prototype.disposeAsync); [Symbol.toStringTag] = "AsyncDisposableStack"; }; BigInt.prototype, members = { constructor; toString; valueOf; toLocaleString; }; Blob.prototype, members = { constructor; arrayBuffer; bytes; slice; stream; text; toLocaleString; valueOf; [Symbol.toStringTag] = "Blob"; }; Boolean.prototype, members = { constructor; toString; valueOf; toLocaleString; }; BroadcastChannel.prototype, members = { constructor; name = undefined, attrs = writable | enumerable | configurable; close, attrs = writable | enumerable | configurable; postMessage, attrs = writable | enumerable | configurable; ref, attrs = writable | enumerable | configurable; unref, attrs = writable | enumerable | configurable; onmessage = null, attrs = writable | enumerable | configurable; onmessageerror = null, attrs = writable | enumerable | configurable; }; CompressionStream.prototype, members = { constructor; }; Crypto.prototype, members = { constructor; subtle = accessor(get = "Crypto.prototype.subtle.<get>"), attrs = enumerable | configurable; getRandomValues, attrs = writable | enumerable | configurable; randomUUID, attrs = writable | enumerable | configurable; toLocaleString; valueOf; }; CryptoKey.prototype, members = { constructor; algorithm = accessor(get = "CryptoKey.prototype.algorithm.<get>"), attrs = enumerable | configurable; extractable = accessor(get = "CryptoKey.prototype.extractable.<get>"), attrs = enumerable | configurable; type = accessor(get = "CryptoKey.prototype.type.<get>"), attrs = enumerable | configurable; usages = accessor(get = "CryptoKey.prototype.usages.<get>"), attrs = enumerable | configurable; toLocaleString; valueOf; }; CustomEvent.prototype, extends = Event.prototype, members = { constructor; detail = accessor(get = "CustomEvent.prototype.detail.<get>"), attrs = enumerable | configurable; [Symbol.toStringTag] = "CustomEvent"; }; DOMException.prototype, extends = Error.prototype, members = { constructor; name = accessor(get = "DOMException.prototype.name.<get>"), attrs = enumerable | configurable; message = accessor(get = "DOMException.prototype.message.<get>"), attrs = enumerable | configurable; code = accessor(get = "DOMException.prototype.code.<get>"), attrs = enumerable | configurable; INDEX_SIZE_ERR = 1.0, attrs = enumerable; DOMSTRING_SIZE_ERR = 2.0, attrs = enumerable; HIERARCHY_REQUEST_ERR = 3.0, attrs = enumerable; WRONG_DOCUMENT_ERR = 4.0, attrs = enumerable; INVALID_CHARACTER_ERR = 5.0, attrs = enumerable; NO_DATA_ALLOWED_ERR = 6.0, attrs = enumerable; NO_MODIFICATION_ALLOWED_ERR = 7.0, attrs = enumerable; NOT_FOUND_ERR = 8.0, attrs = enumerable; NOT_SUPPORTED_ERR = 9.0, attrs = enumerable; INUSE_ATTRIBUTE_ERR = 10.0, attrs = enumerable; INVALID_STATE_ERR = 11.0, attrs = enumerable; SYNTAX_ERR = 12.0, attrs = enumerable; INVALID_MODIFICATION_ERR = 13.0, attrs = enumerable; NAMESPACE_ERR = 14.0, attrs = enumerable; INVALID_ACCESS_ERR = 15.0, attrs = enumerable; VALIDATION_ERR = 16.0, attrs = enumerable; TYPE_MISMATCH_ERR = 17.0, attrs = enumerable; SECURITY_ERR = 18.0, attrs = enumerable; NETWORK_ERR = 19.0, attrs = enumerable; ABORT_ERR = 20.0, attrs = enumerable; URL_MISMATCH_ERR = 21.0, attrs = enumerable; QUOTA_EXCEEDED_ERR = 22.0, attrs = enumerable; TIMEOUT_ERR = 23.0, attrs = enumerable; INVALID_NODE_TYPE_ERR = 24.0, attrs = enumerable; DATA_CLONE_ERR = 25.0, attrs = enumerable; [Symbol.toStringTag] = "DOMException"; }; DataView.prototype, members = { constructor; byteLength = accessor(get = "DataView.prototype.byteLength.<get>"); byteOffset = accessor(get = "DataView.prototype.byteOffset.<get>"); buffer = accessor(get = "DataView.prototype.buffer.<get>"); getInt8; getUint8; getInt16; getUint16; getInt32; getUint32; getFloat32; getFloat64; getBigInt64; getBigUint64; setInt8; setUint8; setInt16; setUint16; setInt32; setUint32; setFloat32; setFloat64; setBigInt64; setBigUint64; toLocaleString; valueOf; [Symbol.toStringTag] = "DataView"; }; Date.prototype, members = { constructor; getDate; getDay; getFullYear; getHours; getMilliseconds; getMinutes; getMonth; getSeconds; getTime; getTimezoneOffset; getUTCDate; getUTCDay; getUTCFullYear; getUTCHours; getUTCMilliseconds; getUTCMinutes; getUTCMonth; getUTCSeconds; getYear; setDate; setFullYear; setHours; setMilliseconds; setMinutes; setMonth; setSeconds; setTime; setUTCDate; setUTCFullYear; setUTCHours; setUTCMilliseconds; setUTCMinutes; setUTCMonth; setUTCSeconds; setYear; toDateString; toISOString; toJSON; toLocaleDateString; toLocaleString; toLocaleTimeString; toTimeString; toUTCString = ref(Date.prototype.toGMTString); valueOf; toTemporalInstant; toGMTString; isPrototypeOf; toString; [Symbol.toPrimitive], attrs = configurable; }; DecompressionStream.prototype, members = { constructor; }; DisposableStack.prototype, members = { constructor; disposed = accessor(get = "DisposableStack.prototype.disposed.<get>"); use; adopt; defer; dispose; move; toLocaleString; valueOf; [Symbol.dispose] = ref(DisposableStack.prototype.dispose); [Symbol.toStringTag] = "DisposableStack"; }; Error.prototype, members = { constructor; toLocaleString; valueOf; toString; isPrototypeOf; hasOwnProperty; name = "Error", attrs = writable | configurable; message = "", attrs = writable | configurable; }; EvalError.prototype, extends = Error.prototype, members = { constructor; toLocaleString; valueOf; toString; isPrototypeOf; hasOwnProperty; name = "EvalError", attrs = writable | configurable; message = "", attrs = writable | configurable; }; Event.prototype, members = { constructor; initEvent, attrs = writable | enumerable | configurable; stopImmediatePropagation, attrs = writable | enumerable | configurable; preventDefault, attrs = writable | enumerable | configurable; target = accessor(get = "Event.prototype.target.<get>"), attrs = enumerable | configurable; currentTarget = accessor(get = "Event.prototype.currentTarget.<get>"), attrs = enumerable | configurable; srcElement = accessor(get = "Event.prototype.srcElement.<get>"), attrs = enumerable | configurable; type = accessor(get = "Event.prototype.type.<get>"), attrs = enumerable | configurable; cancelable = accessor(get = "Event.prototype.cancelable.<get>"), attrs = enumerable | configurable; defaultPrevented = accessor(get = "Event.prototype.defaultPrevented.<get>"), attrs = enumerable | configurable; timeStamp = accessor(get = "Event.prototype.timeStamp.<get>"), attrs = enumerable | configurable; composedPath, attrs = writable | enumerable | configurable; returnValue = accessor(get = "Event.prototype.returnValue.<get>", set = "Event.prototype.returnValue.<set>"), attrs = enumerable | configurable; bubbles = accessor(get = "Event.prototype.bubbles.<get>"), attrs = enumerable | configurable; composed = accessor(get = "Event.prototype.composed.<get>"), attrs = enumerable | configurable; eventPhase = accessor(get = "Event.prototype.eventPhase.<get>"), attrs = enumerable | configurable; cancelBubble = accessor(get = "Event.prototype.cancelBubble.<get>", set = "Event.prototype.cancelBubble.<set>"), attrs = enumerable | configurable; stopPropagation, attrs = writable | enumerable | configurable; isTrusted = accessor(get = "Event.prototype.isTrusted.<get>"), attrs = enumerable | configurable; [Symbol.toStringTag] = "Event"; }; EventTarget.prototype, members = { constructor; addEventListener, attrs = writable | enumerable | configurable; removeEventListener, attrs = writable | enumerable | configurable; dispatchEvent, attrs = writable | enumerable | configurable; [Symbol.toStringTag] = "EventTarget"; }; File.prototype, members = { constructor; arrayBuffer; bytes; slice; stream; text; toLocaleString; valueOf; [Symbol.toStringTag] = "File"; }; FinalizationRegistry.prototype, members = { constructor; register; unregister; toLocaleString; valueOf; }; FormData.prototype, members = { constructor; append; delete; entries; forEach; get; getAll; has; keys; set; values; toLocaleString; valueOf; [Symbol.toStringTag] = "FormData"; }; Headers.prototype, members = { constructor; entries; append; delete; forEach; get; getSetCookie; has; keys; set; values; toLocaleString; valueOf; [Symbol.iterator] = ref(Headers.prototype.entries); [Symbol.toStringTag] = "Headers"; }; Map.prototype, members = { constructor; size = accessor(get = "Map.prototype.size.<get>"); clear; delete; entries; forEach; get; has; keys; set; values; toLocaleString; valueOf; [Symbol.iterator] = ref(Map.prototype.entries); [Symbol.toStringTag] = "Map"; }; MessageChannel.prototype, members = { constructor; }; MessagePort.prototype, members = { constructor; postMessage, attrs = writable | enumerable | configurable; start, attrs = writable | enumerable | configurable; ref, attrs = writable | enumerable | configurable; unref, attrs = writable | enumerable | configurable; hasRef, attrs = writable | enumerable | configurable; onmessage = null, attrs = writable | enumerable | configurable; onmessageerror = null, attrs = writable | enumerable | configurable; close, attrs = writable | enumerable | configurable; }; Navigator.prototype, members = { constructor; }; Number.prototype, members = { constructor; toExponential; toFixed; toLocaleString; toPrecision; toString; valueOf; }; Promise.prototype, members = { constructor; catch; finally; then; toLocaleString; valueOf; [Symbol.toStringTag] = "Promise"; }; Proxy.prototype, members = { constructor; }; RangeError.prototype, extends = Error.prototype, members = { constructor; toLocaleString; valueOf; toString; isPrototypeOf; hasOwnProperty; name = "RangeError", attrs = writable | configurable; message = "", attrs = writable | configurable; }; ReadableStream.prototype, members = { constructor; }; ReferenceError.prototype, extends = Error.prototype, members = { constructor; toLocaleString; valueOf; toString; isPrototypeOf; hasOwnProperty; name = "ReferenceError", attrs = writable | configurable; message = "", attrs = writable | configurable; }; RegExp.prototype, members = { constructor; flags = accessor(get = "RegExp.prototype.flags.<get>"); source = accessor(get = "RegExp.prototype.source.<get>"); global = accessor(get = "RegExp.prototype.global.<get>"); ignoreCase = accessor(get = "RegExp.prototype.ignoreCase.<get>"); multiline = accessor(get = "RegExp.prototype.multiline.<get>"); dotAll = accessor(get = "RegExp.prototype.dotAll.<get>"); sticky = accessor(get = "RegExp.prototype.sticky.<get>"); unicode = accessor(get = "RegExp.prototype.unicode.<get>"); unicodeSets = accessor(get = "RegExp.prototype.unicodeSets.<get>"); hasIndices = accessor(get = "RegExp.prototype.hasIndices.<get>"); exec; test; compile; toString; toLocaleString; valueOf; [Symbol.match]; [Symbol.search]; [Symbol.matchAll]; [Symbol.split]; [Symbol.replace]; }; Request.prototype, members = { constructor; arrayBuffer; blob; bytes; clone; formData; json; text; body = accessor(get = "Request.prototype.body.<get>"); bodyUsed = accessor(get = "Request.prototype.bodyUsed.<get>"); cache = accessor(get = "Request.prototype.cache.<get>"); credentials = accessor(get = "Request.prototype.credentials.<get>"); destination = accessor(get = "Request.prototype.destination.<get>"); duplex = accessor(get = "Request.prototype.duplex.<get>"); headers = accessor(get = "Request.prototype.headers.<get>"); integrity = accessor(get = "Request.prototype.integrity.<get>"); keepalive = accessor(get = "Request.prototype.keepalive.<get>"); method = accessor(get = "Request.prototype.method.<get>"); mode = accessor(get = "Request.prototype.mode.<get>"); redirect = accessor(get = "Request.prototype.redirect.<get>"); referrer = accessor(get = "Request.prototype.referrer.<get>"); referrerPolicy = accessor(get = "Request.prototype.referrerPolicy.<get>"); signal = accessor(get = "Request.prototype.signal.<get>"); url = accessor(get = "Request.prototype.url.<get>"); toLocaleString; valueOf; [Symbol.toStringTag] = "Request"; }; Response.prototype, members = { constructor; arrayBuffer; blob; bytes; clone; formData; json; text; body = accessor(get = "Response.prototype.body.<get>"); bodyUsed = accessor(get = "Response.prototype.bodyUsed.<get>"); headers = accessor(get = "Response.prototype.headers.<get>"); ok = accessor(get = "Response.prototype.ok.<get>"); redirected = accessor(get = "Response.prototype.redirected.<get>"); status = accessor(get = "Response.prototype.status.<get>"); statusText = accessor(get = "Response.prototype.statusText.<get>"); type = accessor(get = "Response.prototype.type.<get>"); url = accessor(get = "Response.prototype.url.<get>"); toLocaleString; valueOf; [Symbol.toStringTag] = "Response"; }; Set.prototype, members = { constructor; size = accessor(get = "Set.prototype.size.<get>"); add; clear; delete; entries; forEach; has; keys; values = ref(Set.prototype.keys); toLocaleString; valueOf; [Symbol.iterator] = ref(Set.prototype.keys); [Symbol.toStringTag] = "Set"; }; SharedArrayBuffer.prototype, members = { constructor; slice; byteLength = accessor(get = "SharedArrayBuffer.prototype.byteLength.<get>"); toLocaleString; valueOf; [Symbol.toStringTag] = "SharedArrayBuffer"; }; Storage.prototype, members = { constructor; clear, attrs = writable | enumerable | configurable; getItem, attrs = writable | enumerable | configurable; key, attrs = writable | enumerable | configurable; removeItem, attrs = writable | enumerable | configurable; setItem, attrs = writable | enumerable | configurable; length = accessor(get = "Storage.prototype.length.<get>"), attrs = enumerable; }; String.prototype, members = { constructor; at; charAt; charCodeAt; codePointAt; anchor; big; blink; bold; fixed; fontcolor; fontsize; italics; link; small; strike; sub; sup; concat; endsWith; includes; indexOf; isWellFormed; lastIndexOf; localeCompare; match; matchAll; normalize; padEnd; padStart; repeat; replace; replaceAll; search; slice; split; startsWith; substr; substring; toLocaleLowerCase; toLocaleUpperCase; toLowerCase; toUpperCase; toWellFormed; trim; trimEnd; trimStart = ref(String.prototype.trimLeft); trimLeft; trimRight = ref(String.prototype.trimEnd); toLocaleString; valueOf; toString; [Symbol.iterator]; }; SubtleCrypto.prototype, members = { constructor; encapsulateBits, attrs = writable | enumerable | configurable; decapsulateBits, attrs = writable | enumerable | configurable; encapsulateKey, attrs = writable | enumerable | configurable; decapsulateKey, attrs = writable | enumerable | configurable; toLocaleString; valueOf; }; SuppressedError.prototype, extends = Error.prototype, members = { constructor; name = "SuppressedError", attrs = writable | configurable; message = "", attrs = writable | configurable; }; Symbol.prototype, members = { constructor; toString; valueOf; toLocaleString; }; SyntaxError.prototype, extends = Error.prototype, members = { constructor; toLocaleString; valueOf; toString; isPrototypeOf; hasOwnProperty; name = "SyntaxError", attrs = writable | configurable; message = "", attrs = writable | configurable; }; TextDecoder.prototype, members = { constructor; decode, attrs = writable | enumerable | configurable; encoding = accessor(get = "TextDecoder.prototype.encoding.<get>"), attrs = enumerable | configurable; fatal = accessor(get = "TextDecoder.prototype.fatal.<get>"), attrs = enumerable | configurable; ignoreBOM = accessor(get = "TextDecoder.prototype.ignoreBOM.<get>"), attrs = enumerable | configurable; toLocaleString; valueOf; [Symbol.toStringTag] = "TextDecoder"; }; TextDecoderStream.prototype, members = { constructor; }; TextEncoder.prototype, members = { constructor; encode, attrs = writable | enumerable | configurable; encodeInto, attrs = writable | enumerable | configurable; encoding = accessor(get = "TextEncoder.prototype.encoding.<get>"), attrs = enumerable | configurable; toLocaleString; valueOf; [Symbol.toStringTag] = "TextEncoder"; }; TextEncoderStream.prototype, members = { constructor; }; TransformStream.prototype, members = { constructor; }; TypeError.prototype, extends = Error.prototype, members = { constructor; toLocaleString; valueOf; toString; isPrototypeOf; hasOwnProperty; name = "TypeError", attrs = writable | configurable; message = "", attrs = writable | configurable; }; URIError.prototype, extends = Error.prototype, members = { constructor; toLocaleString; valueOf; toString; isPrototypeOf; hasOwnProperty; name = "URIError", attrs = writable | configurable; message = "", attrs = writable | configurable; }; URL.prototype, members = { constructor; toString, attrs = writable | enumerable | configurable; href = accessor(get = "URL.prototype.href.<get>", set = "URL.prototype.href.<set>"), attrs = enumerable | configurable; origin = accessor(get = "URL.prototype.origin.<get>"), attrs = enumerable | configurable; protocol = accessor(get = "URL.prototype.protocol.<get>", set = "URL.prototype.protocol.<set>"), attrs = enumerable | configurable; username = accessor(get = "URL.prototype.username.<get>", set = "URL.prototype.username.<set>"), attrs = enumerable | configurable; password = accessor(get = "URL.prototype.password.<get>", set = "URL.prototype.password.<set>"), attrs = enumerable | configurable; host = accessor(get = "URL.prototype.host.<get>", set = "URL.prototype.host.<set>"), attrs = enumerable | configurable; hostname = accessor(get = "URL.prototype.hostname.<get>", set = "URL.prototype.hostname.<set>"), attrs = enumerable | configurable; port = accessor(get = "URL.prototype.port.<get>", set = "URL.prototype.port.<set>"), attrs = enumerable | configurable; pathname = accessor(get = "URL.prototype.pathname.<get>", set = "URL.prototype.pathname.<set>"), attrs = enumerable | configurable; search = accessor(get = "URL.prototype.search.<get>", set = "URL.prototype.search.<set>"), attrs = enumerable | configurable; searchParams = accessor(get = "URL.prototype.searchParams.<get>"), attrs = enumerable | configurable; hash = accessor(get = "URL.prototype.hash.<get>", set = "URL.prototype.hash.<set>"), attrs = enumerable | configurable; toJSON, attrs = writable | enumerable | configurable; [Symbol.toStringTag] = "URL"; }; URLPattern.prototype, members = { constructor; exec; test; hasRegExpGroups = undefined, attrs = configurable; hash = undefined, attrs = configurable; hostname = undefined, attrs = configurable; password = undefined, attrs = configurable; pathname = undefined, attrs = configurable; port = undefined, attrs = configurable; protocol = undefined, attrs = configurable; search = undefined, attrs = configurable; username = undefined, attrs = configurable; }; URLSearchParams.prototype, members = { constructor; append; delete; entries; forEach; get; getAll; has; keys; set; sort; toString; values; size = accessor(get = "URLSearchParams.prototype.size.<get>"), attrs = enumerable | configurable; toLocaleString; valueOf; [Symbol.toStringTag] = "URLSearchParams"; }; WeakMap.prototype, members = { constructor; delete; get; has; set; toLocaleString; valueOf; [Symbol.toStringTag] = "WeakMap"; }; WeakRef.prototype, members = { constructor; deref; toLocaleString; valueOf; }; WeakSet.prototype, members = { constructor; add; delete; has; toLocaleString; valueOf; [Symbol.toStringTag] = "WeakSet"; }; WebSocket.prototype, members = { constructor; close, attrs = writable | enumerable | configurable; send, attrs = writable | enumerable | configurable; toLocaleString; valueOf; CONNECTING = 0.0, attrs = enumerable; OPEN = 1.0, attrs = enumerable; CLOSING = 2.0, attrs = enumerable; CLOSED = 3.0, attrs = enumerable; }; WritableStream.prototype, members = { constructor; }; BigInt64Array.prototype, extends = "%TypedArray%.prototype", members = { constructor; BYTES_PER_ELEMENT = 8.0; }; BigUint64Array.prototype, extends = "%TypedArray%.prototype", members = { constructor; BYTES_PER_ELEMENT = 8.0; }; Float16Array.prototype, extends = "%TypedArray%.prototype", members = { constructor; BYTES_PER_ELEMENT = 2.0; }; Float32Array.prototype, extends = "%TypedArray%.prototype", members = { constructor; BYTES_PER_ELEMENT = 4.0; }; Float64Array.prototype, extends = "%TypedArray%.prototype", members = { constructor; BYTES_PER_ELEMENT = 8.0; }; Int16Array.prototype, extends = "%TypedArray%.prototype", members = { constructor; BYTES_PER_ELEMENT = 2.0; }; Int32Array.prototype, extends = "%TypedArray%.prototype", members = { constructor; BYTES_PER_ELEMENT = 4.0; }; Int8Array.prototype, extends = "%TypedArray%.prototype", members = { constructor; BYTES_PER_ELEMENT = 1.0; }; Uint16Array.prototype, extends = "%TypedArray%.prototype", members = { constructor; BYTES_PER_ELEMENT = 2.0; }; Uint32Array.prototype, extends = "%TypedArray%.prototype", members = { constructor; BYTES_PER_ELEMENT = 4.0; }; Uint8Array.prototype, extends = "%TypedArray%.prototype", members = { constructor; toBase64; toHex; setFromBase64; setFromHex; BYTES_PER_ELEMENT = 1.0; }; Uint8ClampedArray.prototype, extends = "%TypedArray%.prototype", members = { constructor; BYTES_PER_ELEMENT = 1.0; }; } }
+            let proto = crate::realm_decl! { birth super::proto_room::alloc_builtin_prototype(); realm { AbortController.prototype, members = { constructor; signal = accessor(get = "AbortController.prototype.signal.<get>"), attrs = enumerable | configurable; abort, attrs = writable | enumerable | configurable; [Symbol.toStringTag] = "AbortController"; }; AbortSignal.prototype, extends = EventTarget.prototype, members = { constructor; aborted = accessor(get = "AbortSignal.prototype.aborted.<get>"), attrs = enumerable | configurable; reason = accessor(get = "AbortSignal.prototype.reason.<get>"); throwIfAborted; onabort = accessor(get = "AbortSignal.prototype.onabort.<get>", set = "AbortSignal.prototype.onabort.<set>"), attrs = enumerable | configurable; [Symbol.toStringTag] = "AbortSignal"; }; AggregateError.prototype, extends = Error.prototype, members = { constructor; toLocaleString; valueOf; toString; isPrototypeOf; hasOwnProperty; name = "AggregateError", attrs = writable | configurable; message = "", attrs = writable | configurable; }; ArrayBuffer.prototype, members = { constructor; byteLength = accessor(get = "ArrayBuffer.prototype.byteLength.<get>"); slice; maxByteLength = accessor(get = "ArrayBuffer.prototype.maxByteLength.<get>"); resizable = accessor(get = "ArrayBuffer.prototype.resizable.<get>"); resize; transfer; transferToFixedLength; detached = accessor(get = "ArrayBuffer.prototype.detached.<get>"); [Symbol.toStringTag] = "ArrayBuffer"; }; AsyncDisposableStack.prototype, members = { constructor; disposed = accessor(get = "AsyncDisposableStack.prototype.disposed.<get>"); use; adopt; defer; disposeAsync; move; toLocaleString; valueOf; [Symbol.asyncDispose] = ref(AsyncDisposableStack.prototype.disposeAsync); [Symbol.toStringTag] = "AsyncDisposableStack"; }; BigInt.prototype, members = { constructor; toString; valueOf; toLocaleString; }; Blob.prototype, members = { constructor; arrayBuffer; bytes; slice; stream; text; toLocaleString; valueOf; [Symbol.toStringTag] = "Blob"; }; Boolean.prototype, members = { constructor; toString; valueOf; toLocaleString; }; BroadcastChannel.prototype, extends = EventTarget.prototype, members = { constructor; name = undefined, attrs = writable | enumerable | configurable; close, attrs = writable | enumerable | configurable; postMessage, attrs = writable | enumerable | configurable; ref, attrs = writable | enumerable | configurable; unref, attrs = writable | enumerable | configurable; onmessage = accessor(get = "BroadcastChannel.prototype.onmessage.<get>", set = "BroadcastChannel.prototype.onmessage.<set>"), attrs = enumerable | configurable; onmessageerror = accessor(get = "BroadcastChannel.prototype.onmessageerror.<get>", set = "BroadcastChannel.prototype.onmessageerror.<set>"), attrs = enumerable | configurable; }; CompressionStream.prototype, members = { constructor; }; Crypto.prototype, members = { constructor; subtle = accessor(get = "Crypto.prototype.subtle.<get>"), attrs = enumerable | configurable; getRandomValues, attrs = writable | enumerable | configurable; randomUUID, attrs = writable | enumerable | configurable; toLocaleString; valueOf; }; CryptoKey.prototype, members = { constructor; algorithm = accessor(get = "CryptoKey.prototype.algorithm.<get>"), attrs = enumerable | configurable; extractable = accessor(get = "CryptoKey.prototype.extractable.<get>"), attrs = enumerable | configurable; type = accessor(get = "CryptoKey.prototype.type.<get>"), attrs = enumerable | configurable; usages = accessor(get = "CryptoKey.prototype.usages.<get>"), attrs = enumerable | configurable; toLocaleString; valueOf; }; MessageEvent.prototype, extends = Event.prototype, members = { constructor; data = accessor(get = "MessageEvent.prototype.data.<get>"), attrs = enumerable | configurable; origin = accessor(get = "MessageEvent.prototype.origin.<get>"), attrs = enumerable | configurable; lastEventId = accessor(get = "MessageEvent.prototype.lastEventId.<get>"), attrs = enumerable | configurable; source = accessor(get = "MessageEvent.prototype.source.<get>"), attrs = enumerable | configurable; ports = accessor(get = "MessageEvent.prototype.ports.<get>"), attrs = enumerable | configurable; initMessageEvent, attrs = writable | enumerable | configurable; [Symbol.toStringTag] = "MessageEvent"; }; CustomEvent.prototype, extends = Event.prototype, members = { constructor; detail = accessor(get = "CustomEvent.prototype.detail.<get>"), attrs = enumerable | configurable; [Symbol.toStringTag] = "CustomEvent"; }; DOMException.prototype, extends = Error.prototype, members = { constructor; name = accessor(get = "DOMException.prototype.name.<get>"), attrs = enumerable | configurable; message = accessor(get = "DOMException.prototype.message.<get>"), attrs = enumerable | configurable; code = accessor(get = "DOMException.prototype.code.<get>"), attrs = enumerable | configurable; INDEX_SIZE_ERR = 1.0, attrs = enumerable; DOMSTRING_SIZE_ERR = 2.0, attrs = enumerable; HIERARCHY_REQUEST_ERR = 3.0, attrs = enumerable; WRONG_DOCUMENT_ERR = 4.0, attrs = enumerable; INVALID_CHARACTER_ERR = 5.0, attrs = enumerable; NO_DATA_ALLOWED_ERR = 6.0, attrs = enumerable; NO_MODIFICATION_ALLOWED_ERR = 7.0, attrs = enumerable; NOT_FOUND_ERR = 8.0, attrs = enumerable; NOT_SUPPORTED_ERR = 9.0, attrs = enumerable; INUSE_ATTRIBUTE_ERR = 10.0, attrs = enumerable; INVALID_STATE_ERR = 11.0, attrs = enumerable; SYNTAX_ERR = 12.0, attrs = enumerable; INVALID_MODIFICATION_ERR = 13.0, attrs = enumerable; NAMESPACE_ERR = 14.0, attrs = enumerable; INVALID_ACCESS_ERR = 15.0, attrs = enumerable; VALIDATION_ERR = 16.0, attrs = enumerable; TYPE_MISMATCH_ERR = 17.0, attrs = enumerable; SECURITY_ERR = 18.0, attrs = enumerable; NETWORK_ERR = 19.0, attrs = enumerable; ABORT_ERR = 20.0, attrs = enumerable; URL_MISMATCH_ERR = 21.0, attrs = enumerable; QUOTA_EXCEEDED_ERR = 22.0, attrs = enumerable; TIMEOUT_ERR = 23.0, attrs = enumerable; INVALID_NODE_TYPE_ERR = 24.0, attrs = enumerable; DATA_CLONE_ERR = 25.0, attrs = enumerable; [Symbol.toStringTag] = "DOMException"; }; DataView.prototype, members = { constructor; buffer = accessor(get = "DataView.prototype.buffer.<get>"); byteLength = accessor(get = "DataView.prototype.byteLength.<get>"); byteOffset = accessor(get = "DataView.prototype.byteOffset.<get>"); getInt8; setInt8; getUint8; setUint8; getInt16; setInt16; getUint16; setUint16; getInt32; setInt32; getUint32; setUint32; getFloat32; setFloat32; getFloat64; setFloat64; getBigInt64; setBigInt64; getBigUint64; setBigUint64; getFloat16; setFloat16; [Symbol.toStringTag] = "DataView"; }; Date.prototype, members = { constructor; getDate; getDay; getFullYear; getHours; getMilliseconds; getMinutes; getMonth; getSeconds; getTime; getTimezoneOffset; getUTCDate; getUTCDay; getUTCFullYear; getUTCHours; getUTCMilliseconds; getUTCMinutes; getUTCMonth; getUTCSeconds; getYear; setDate; setFullYear; setHours; setMilliseconds; setMinutes; setMonth; setSeconds; setTime; setUTCDate; setUTCFullYear; setUTCHours; setUTCMilliseconds; setUTCMinutes; setUTCMonth; setUTCSeconds; setYear; toDateString; toISOString; toJSON; toLocaleDateString; toLocaleString; toLocaleTimeString; toTimeString; toUTCString = ref(Date.prototype.toGMTString); valueOf; toTemporalInstant; toGMTString; isPrototypeOf; toString; [Symbol.toPrimitive], attrs = configurable; }; DecompressionStream.prototype, members = { constructor; }; DisposableStack.prototype, members = { constructor; disposed = accessor(get = "DisposableStack.prototype.disposed.<get>"); use; adopt; defer; dispose; move; toLocaleString; valueOf; [Symbol.dispose] = ref(DisposableStack.prototype.dispose); [Symbol.toStringTag] = "DisposableStack"; }; Error.prototype, members = { constructor; toLocaleString; valueOf; toString; isPrototypeOf; hasOwnProperty; name = "Error", attrs = writable | configurable; message = "", attrs = writable | configurable; }; EvalError.prototype, extends = Error.prototype, members = { constructor; toLocaleString; valueOf; toString; isPrototypeOf; hasOwnProperty; name = "EvalError", attrs = writable | configurable; message = "", attrs = writable | configurable; }; Event.prototype, members = { constructor; initEvent, attrs = writable | enumerable | configurable; stopImmediatePropagation, attrs = writable | enumerable | configurable; preventDefault, attrs = writable | enumerable | configurable; target = accessor(get = "Event.prototype.target.<get>"), attrs = enumerable | configurable; currentTarget = accessor(get = "Event.prototype.currentTarget.<get>"), attrs = enumerable | configurable; srcElement = accessor(get = "Event.prototype.srcElement.<get>"), attrs = enumerable | configurable; type = accessor(get = "Event.prototype.type.<get>"), attrs = enumerable | configurable; cancelable = accessor(get = "Event.prototype.cancelable.<get>"), attrs = enumerable | configurable; defaultPrevented = accessor(get = "Event.prototype.defaultPrevented.<get>"), attrs = enumerable | configurable; timeStamp = accessor(get = "Event.prototype.timeStamp.<get>"), attrs = enumerable | configurable; composedPath, attrs = writable | enumerable | configurable; returnValue = accessor(get = "Event.prototype.returnValue.<get>", set = "Event.prototype.returnValue.<set>"), attrs = enumerable | configurable; bubbles = accessor(get = "Event.prototype.bubbles.<get>"), attrs = enumerable | configurable; composed = accessor(get = "Event.prototype.composed.<get>"), attrs = enumerable | configurable; eventPhase = accessor(get = "Event.prototype.eventPhase.<get>"), attrs = enumerable | configurable; cancelBubble = accessor(get = "Event.prototype.cancelBubble.<get>", set = "Event.prototype.cancelBubble.<set>"), attrs = enumerable | configurable; stopPropagation, attrs = writable | enumerable | configurable; isTrusted = accessor(get = "Event.prototype.isTrusted.<get>"), attrs = enumerable | configurable; [Symbol.toStringTag] = "Event"; }; EventTarget.prototype, members = { constructor; addEventListener, attrs = writable | enumerable | configurable; removeEventListener, attrs = writable | enumerable | configurable; dispatchEvent, attrs = writable | enumerable | configurable; [Symbol.toStringTag] = "EventTarget"; }; File.prototype, members = { constructor; arrayBuffer; bytes; slice; stream; text; toLocaleString; valueOf; [Symbol.toStringTag] = "File"; }; FinalizationRegistry.prototype, members = { constructor; register; unregister; toLocaleString; valueOf; }; FormData.prototype, members = { constructor; append; delete; entries; forEach; get; getAll; has; keys; set; values; toLocaleString; valueOf; [Symbol.toStringTag] = "FormData"; }; Headers.prototype, members = { constructor; entries; append; delete; forEach; get; getSetCookie; has; keys; set; values; toLocaleString; valueOf; [Symbol.iterator] = ref(Headers.prototype.entries); [Symbol.toStringTag] = "Headers"; }; Map.prototype, members = { constructor; size = accessor(get = "Map.prototype.size.<get>"); clear; delete; entries; forEach; get; has; keys; set; values; toLocaleString; valueOf; [Symbol.iterator] = ref(Map.prototype.entries); [Symbol.toStringTag] = "Map"; }; MessageChannel.prototype, members = { constructor; }; MessagePort.prototype, members = { constructor; postMessage, attrs = writable | enumerable | configurable; start, attrs = writable | enumerable | configurable; ref, attrs = writable | enumerable | configurable; unref, attrs = writable | enumerable | configurable; hasRef, attrs = writable | enumerable | configurable; onmessage = null, attrs = writable | enumerable | configurable; onmessageerror = null, attrs = writable | enumerable | configurable; close, attrs = writable | enumerable | configurable; }; Navigator.prototype, members = { constructor; }; Number.prototype, members = { constructor; toExponential; toFixed; toLocaleString; toPrecision; toString; valueOf; }; Promise.prototype, members = { constructor; catch; finally; then; toLocaleString; valueOf; [Symbol.toStringTag] = "Promise"; }; Proxy.prototype, members = { constructor; }; RangeError.prototype, extends = Error.prototype, members = { constructor; toLocaleString; valueOf; toString; isPrototypeOf; hasOwnProperty; name = "RangeError", attrs = writable | configurable; message = "", attrs = writable | configurable; }; ReadableStream.prototype, members = { constructor; }; ReferenceError.prototype, extends = Error.prototype, members = { constructor; toLocaleString; valueOf; toString; isPrototypeOf; hasOwnProperty; name = "ReferenceError", attrs = writable | configurable; message = "", attrs = writable | configurable; }; RegExp.prototype, members = { constructor; flags = accessor(get = "RegExp.prototype.flags.<get>"); source = accessor(get = "RegExp.prototype.source.<get>"); global = accessor(get = "RegExp.prototype.global.<get>"); ignoreCase = accessor(get = "RegExp.prototype.ignoreCase.<get>"); multiline = accessor(get = "RegExp.prototype.multiline.<get>"); dotAll = accessor(get = "RegExp.prototype.dotAll.<get>"); sticky = accessor(get = "RegExp.prototype.sticky.<get>"); unicode = accessor(get = "RegExp.prototype.unicode.<get>"); unicodeSets = accessor(get = "RegExp.prototype.unicodeSets.<get>"); hasIndices = accessor(get = "RegExp.prototype.hasIndices.<get>"); exec; test; compile; toString; toLocaleString; valueOf; [Symbol.match]; [Symbol.search]; [Symbol.matchAll]; [Symbol.split]; [Symbol.replace]; }; Request.prototype, members = { constructor; arrayBuffer; blob; bytes; clone; formData; json; text; body = accessor(get = "Request.prototype.body.<get>"); bodyUsed = accessor(get = "Request.prototype.bodyUsed.<get>"); cache = accessor(get = "Request.prototype.cache.<get>"); credentials = accessor(get = "Request.prototype.credentials.<get>"); destination = accessor(get = "Request.prototype.destination.<get>"); duplex = accessor(get = "Request.prototype.duplex.<get>"); headers = accessor(get = "Request.prototype.headers.<get>"); integrity = accessor(get = "Request.prototype.integrity.<get>"); keepalive = accessor(get = "Request.prototype.keepalive.<get>"); method = accessor(get = "Request.prototype.method.<get>"); mode = accessor(get = "Request.prototype.mode.<get>"); redirect = accessor(get = "Request.prototype.redirect.<get>"); referrer = accessor(get = "Request.prototype.referrer.<get>"); referrerPolicy = accessor(get = "Request.prototype.referrerPolicy.<get>"); signal = accessor(get = "Request.prototype.signal.<get>"); url = accessor(get = "Request.prototype.url.<get>"); toLocaleString; valueOf; [Symbol.toStringTag] = "Request"; }; Response.prototype, members = { constructor; arrayBuffer; blob; bytes; clone; formData; json; text; body = accessor(get = "Response.prototype.body.<get>"); bodyUsed = accessor(get = "Response.prototype.bodyUsed.<get>"); headers = accessor(get = "Response.prototype.headers.<get>"); ok = accessor(get = "Response.prototype.ok.<get>"); redirected = accessor(get = "Response.prototype.redirected.<get>"); status = accessor(get = "Response.prototype.status.<get>"); statusText = accessor(get = "Response.prototype.statusText.<get>"); type = accessor(get = "Response.prototype.type.<get>"); url = accessor(get = "Response.prototype.url.<get>"); toLocaleString; valueOf; [Symbol.toStringTag] = "Response"; }; Set.prototype, members = { constructor; size = accessor(get = "Set.prototype.size.<get>"); add; clear; delete; entries; forEach; has; keys; values = ref(Set.prototype.keys); toLocaleString; valueOf; [Symbol.iterator] = ref(Set.prototype.keys); [Symbol.toStringTag] = "Set"; }; SharedArrayBuffer.prototype, members = { constructor; byteLength = accessor(get = "SharedArrayBuffer.prototype.byteLength.<get>"); slice; maxByteLength = accessor(get = "SharedArrayBuffer.prototype.maxByteLength.<get>"); growable = accessor(get = "SharedArrayBuffer.prototype.growable.<get>"); grow; [Symbol.toStringTag] = "SharedArrayBuffer"; }; Storage.prototype, members = { constructor; clear, attrs = writable | enumerable | configurable; getItem, attrs = writable | enumerable | configurable; key, attrs = writable | enumerable | configurable; removeItem, attrs = writable | enumerable | configurable; setItem, attrs = writable | enumerable | configurable; length = accessor(get = "Storage.prototype.length.<get>"), attrs = enumerable; }; String.prototype, members = { constructor; at; charAt; charCodeAt; codePointAt; anchor; big; blink; bold; fixed; fontcolor; fontsize; italics; link; small; strike; sub; sup; concat; endsWith; includes; indexOf; isWellFormed; lastIndexOf; localeCompare; match; matchAll; normalize; padEnd; padStart; repeat; replace; replaceAll; search; slice; split; startsWith; substr; substring; toLocaleLowerCase; toLocaleUpperCase; toLowerCase; toUpperCase; toWellFormed; trim; trimEnd; trimStart = ref(String.prototype.trimLeft); trimLeft; trimRight = ref(String.prototype.trimEnd); toLocaleString; valueOf; toString; [Symbol.iterator]; }; SubtleCrypto.prototype, members = { constructor; encapsulateBits, attrs = writable | enumerable | configurable; decapsulateBits, attrs = writable | enumerable | configurable; encapsulateKey, attrs = writable | enumerable | configurable; decapsulateKey, attrs = writable | enumerable | configurable; toLocaleString; valueOf; }; SuppressedError.prototype, extends = Error.prototype, members = { constructor; name = "SuppressedError", attrs = writable | configurable; message = "", attrs = writable | configurable; }; Symbol.prototype, members = { constructor; toString; valueOf; toLocaleString; }; SyntaxError.prototype, extends = Error.prototype, members = { constructor; toLocaleString; valueOf; toString; isPrototypeOf; hasOwnProperty; name = "SyntaxError", attrs = writable | configurable; message = "", attrs = writable | configurable; }; TextDecoder.prototype, members = { constructor; decode, attrs = writable | enumerable | configurable; encoding = accessor(get = "TextDecoder.prototype.encoding.<get>"), attrs = enumerable | configurable; fatal = accessor(get = "TextDecoder.prototype.fatal.<get>"), attrs = enumerable | configurable; ignoreBOM = accessor(get = "TextDecoder.prototype.ignoreBOM.<get>"), attrs = enumerable | configurable; toLocaleString; valueOf; [Symbol.toStringTag] = "TextDecoder"; }; TextDecoderStream.prototype, members = { constructor; }; TextEncoder.prototype, members = { constructor; encode, attrs = writable | enumerable | configurable; encodeInto, attrs = writable | enumerable | configurable; encoding = accessor(get = "TextEncoder.prototype.encoding.<get>"), attrs = enumerable | configurable; toLocaleString; valueOf; [Symbol.toStringTag] = "TextEncoder"; }; TextEncoderStream.prototype, members = { constructor; }; TransformStream.prototype, members = { constructor; }; TypeError.prototype, extends = Error.prototype, members = { constructor; toLocaleString; valueOf; toString; isPrototypeOf; hasOwnProperty; name = "TypeError", attrs = writable | configurable; message = "", attrs = writable | configurable; }; URIError.prototype, extends = Error.prototype, members = { constructor; toLocaleString; valueOf; toString; isPrototypeOf; hasOwnProperty; name = "URIError", attrs = writable | configurable; message = "", attrs = writable | configurable; }; URL.prototype, members = { constructor; toString, attrs = writable | enumerable | configurable; href = accessor(get = "URL.prototype.href.<get>", set = "URL.prototype.href.<set>"), attrs = enumerable | configurable; origin = accessor(get = "URL.prototype.origin.<get>"), attrs = enumerable | configurable; protocol = accessor(get = "URL.prototype.protocol.<get>", set = "URL.prototype.protocol.<set>"), attrs = enumerable | configurable; username = accessor(get = "URL.prototype.username.<get>", set = "URL.prototype.username.<set>"), attrs = enumerable | configurable; password = accessor(get = "URL.prototype.password.<get>", set = "URL.prototype.password.<set>"), attrs = enumerable | configurable; host = accessor(get = "URL.prototype.host.<get>", set = "URL.prototype.host.<set>"), attrs = enumerable | configurable; hostname = accessor(get = "URL.prototype.hostname.<get>", set = "URL.prototype.hostname.<set>"), attrs = enumerable | configurable; port = accessor(get = "URL.prototype.port.<get>", set = "URL.prototype.port.<set>"), attrs = enumerable | configurable; pathname = accessor(get = "URL.prototype.pathname.<get>", set = "URL.prototype.pathname.<set>"), attrs = enumerable | configurable; search = accessor(get = "URL.prototype.search.<get>", set = "URL.prototype.search.<set>"), attrs = enumerable | configurable; searchParams = accessor(get = "URL.prototype.searchParams.<get>"), attrs = enumerable | configurable; hash = accessor(get = "URL.prototype.hash.<get>", set = "URL.prototype.hash.<set>"), attrs = enumerable | configurable; toJSON, attrs = writable | enumerable | configurable; [Symbol.toStringTag] = "URL"; }; URLPattern.prototype, members = { constructor; exec; test; hasRegExpGroups = undefined, attrs = configurable; hash = undefined, attrs = configurable; hostname = undefined, attrs = configurable; password = undefined, attrs = configurable; pathname = undefined, attrs = configurable; port = undefined, attrs = configurable; protocol = undefined, attrs = configurable; search = undefined, attrs = configurable; username = undefined, attrs = configurable; }; URLSearchParams.prototype, members = { constructor; append; delete; entries; forEach; get; getAll; has; keys; set; sort; toString; values; size = accessor(get = "URLSearchParams.prototype.size.<get>"), attrs = enumerable | configurable; toLocaleString; valueOf; [Symbol.toStringTag] = "URLSearchParams"; }; WeakMap.prototype, members = { constructor; delete; get; has; set; toLocaleString; valueOf; [Symbol.toStringTag] = "WeakMap"; }; WeakRef.prototype, members = { constructor; deref; toLocaleString; valueOf; }; WeakSet.prototype, members = { constructor; add; delete; has; toLocaleString; valueOf; [Symbol.toStringTag] = "WeakSet"; }; WebSocket.prototype, members = { constructor; close, attrs = writable | enumerable | configurable; send, attrs = writable | enumerable | configurable; toLocaleString; valueOf; CONNECTING = 0.0, attrs = enumerable; OPEN = 1.0, attrs = enumerable; CLOSING = 2.0, attrs = enumerable; CLOSED = 3.0, attrs = enumerable; }; WritableStream.prototype, members = { constructor; }; BigInt64Array.prototype, extends = "%TypedArray%.prototype", members = { constructor; BYTES_PER_ELEMENT = 8.0; }; BigUint64Array.prototype, extends = "%TypedArray%.prototype", members = { constructor; BYTES_PER_ELEMENT = 8.0; }; Float16Array.prototype, extends = "%TypedArray%.prototype", members = { constructor; BYTES_PER_ELEMENT = 2.0; }; Float32Array.prototype, extends = "%TypedArray%.prototype", members = { constructor; BYTES_PER_ELEMENT = 4.0; }; Float64Array.prototype, extends = "%TypedArray%.prototype", members = { constructor; BYTES_PER_ELEMENT = 8.0; }; Int16Array.prototype, extends = "%TypedArray%.prototype", members = { constructor; BYTES_PER_ELEMENT = 2.0; }; Int32Array.prototype, extends = "%TypedArray%.prototype", members = { constructor; BYTES_PER_ELEMENT = 4.0; }; Int8Array.prototype, extends = "%TypedArray%.prototype", members = { constructor; BYTES_PER_ELEMENT = 1.0; }; Uint16Array.prototype, extends = "%TypedArray%.prototype", members = { constructor; BYTES_PER_ELEMENT = 2.0; }; Uint32Array.prototype, extends = "%TypedArray%.prototype", members = { constructor; BYTES_PER_ELEMENT = 4.0; }; Uint8Array.prototype, extends = "%TypedArray%.prototype", members = { constructor; toBase64; toHex; setFromBase64; setFromHex; BYTES_PER_ELEMENT = 1.0; }; Uint8ClampedArray.prototype, extends = "%TypedArray%.prototype", members = { constructor; BYTES_PER_ELEMENT = 1.0; }; } };
+            // The realm seals this family prototype before any program code
+            // can reach it (`seal_realm`): it is born on the born-prototype
+            // lineage, so that seal's mark mints no shape.
+            if crate::object::builtin_proto::realm_seals_constructor_prototype(declaration) {
+                // SAFETY: the keyless newborn, unexposed, in this no-move window.
+                unsafe { crate::object::shapes::stamp_born_prototype_root(proto) };
+            }
+            proto
         };
         if declaration.prototype_callable {
             // The declaration is immutable birth metadata, independent of the
@@ -313,13 +325,11 @@ fn populate_global_this_builtins_inner(singleton_at_entry: *mut ObjectHeader) {
         ) {
             install_builtin_species_accessor(closure_ptr);
         }
-        if name == "Error" {
-            install_error_static_methods(closure_ptr);
-        }
         let ctor_value = crate::value::js_nanbox_pointer(closure_ptr as i64);
         // #4533: `Object.getPrototypeOf(TypeError) === Error`. The constructor's
         // `[[Prototype]]` is `Error` itself (not `Function.prototype`).
         if name == "Error" {
+            ERROR_CONSTRUCTOR_PTR.with(|cell| cell.set(closure_ptr as usize));
             error_ctor_bits = Some(ctor_value.to_bits());
         } else if is_native_error_subclass_constructor(name) {
             if let Some(proto_bits) = error_ctor_bits {
@@ -442,10 +452,15 @@ fn populate_global_this_builtins_inner(singleton_at_entry: *mut ObjectHeader) {
                     );
                 }
             }
-            if matches!(name, "MessageChannel" | "MessagePort" | "BroadcastChannel") {
+            if super::super::native_module::is_worker_messaging_constructor(name) {
                 crate::messaging_hook_slots::populate_messaging_prototype(
                     name, proto_obj, ctor_value,
                 );
+                if name == "BroadcastChannel" {
+                    crate::event_target_hook_slots::install_web_event_proto_methods(
+                        name, proto_obj,
+                    );
+                }
             }
             if name == "Storage" {
                 crate::web_storage::install_storage_globals(
@@ -523,22 +538,11 @@ fn populate_global_this_builtins_inner(singleton_at_entry: *mut ObjectHeader) {
                     );
                 }
             }
-            // #6674: the TC39 base64/hex conversion methods
-            // (`toBase64`/`toHex`/`setFromBase64`/`setFromHex`) are Uint8Array-ONLY
-            // (they don't exist on other typed arrays), so install them as own
-            // methods on the `Uint8Array` per-kind prototype — not the shared
-            // `%TypedArray%.prototype` intrinsic. This materializes the value read
-            // `typeof Uint8Array.prototype.toBase64 === "function"`; the static
-            // factories `fromBase64`/`fromHex` are installed on the constructor by
-            // `install_builtin_constructor_statics`.
-            if name == "Uint8Array" {
-                super::super::typed_array_proto_thunks::install_uint8array_base64_hex_proto_methods(
-                    proto_obj,
-                );
-            }
             // #4140: per-kind `BYTES_PER_ELEMENT` own data property on BOTH the
             // constructor and its prototype, matching Node's descriptor
             // `{ value, writable:false, enumerable:false, configurable:false }`.
+            // On the prototype it precedes `Uint8Array`'s base64/hex methods,
+            // node's own-key order.
             // The bare `Uint8Array.BYTES_PER_ELEMENT` read folds at compile time
             // (#2902), but the reflective forms — `getOwnPropertyDescriptor`,
             // `hasOwnProperty`, and the chained `Float64Array.prototype
@@ -566,6 +570,19 @@ fn populate_global_this_builtins_inner(singleton_at_entry: *mut ObjectHeader) {
                     );
                 }
             }
+            // #6674: the TC39 base64/hex conversion methods
+            // (`toBase64`/`toHex`/`setFromBase64`/`setFromHex`) are Uint8Array-ONLY
+            // (they don't exist on other typed arrays), so install them as own
+            // methods on the `Uint8Array` per-kind prototype — not the shared
+            // `%TypedArray%.prototype` intrinsic. This materializes the value read
+            // `typeof Uint8Array.prototype.toBase64 === "function"`; the static
+            // factories `fromBase64`/`fromHex` are installed on the constructor by
+            // `install_builtin_constructor_statics`.
+            if name == "Uint8Array" {
+                super::super::typed_array_proto_thunks::install_uint8array_base64_hex_proto_methods(
+                    proto_obj,
+                );
+            }
             if name != "Array" {
                 // Its own keys are in: return the room it did not use.
                 // SAFETY: fresh, unexposed, under this bootstrap's no-move scope.
@@ -573,9 +590,21 @@ fn populate_global_this_builtins_inner(singleton_at_entry: *mut ObjectHeader) {
             }
             finish_builtin_prototype(declaration, proto_obj);
         }
+        // The realm's [[Intrinsics]] entry for this family: the constructor
+        // and what its instances inherit from, whatever `globalThis.<name>`
+        // later holds.
+        let ctor = JSValue::from_bits(ctor_value.to_bits());
+        crate::array::note_realm_intrinsic(
+            declaration.identity,
+            proto_obj as usize,
+            if ctor.is_pointer() {
+                ctor.as_pointer::<u8>() as usize
+            } else {
+                0
+            },
+        );
         let name_bytes = name.as_bytes();
-        let name_key =
-            crate::string::js_string_from_bytes(name_bytes.as_ptr(), name_bytes.len() as u32);
+        let name_key = super::global_name_key(name_bytes);
         super::super::define_builtin_data_property(
             singleton(),
             name_key,
@@ -583,12 +612,19 @@ fn populate_global_this_builtins_inner(singleton_at_entry: *mut ObjectHeader) {
             name.to_string(),
             super::super::PropertyAttrs::new(true, false, true),
         );
+        super::super::native_module::publish_worker_messaging_constructor(
+            singleton(),
+            name,
+            ctor_value,
+        );
     }
     // Interface inheritance carries prototype methods. DOMException has
     // Error.prototype as its instance parent, but no Error constructor parent.
     for (child, parent, constructor_inherits) in [
         ("AbortSignal", "EventTarget", true),
+        ("BroadcastChannel", "EventTarget", true),
         ("CustomEvent", "Event", true),
+        ("MessageEvent", "Event", true),
         ("DOMException", "Error", false),
     ] {
         let child_ctor = js_get_global_this_builtin_value(child.as_ptr(), child.len());
@@ -762,8 +798,7 @@ fn populate_global_this_builtins_inner(singleton_at_entry: *mut ObjectHeader) {
         // */A5.6/A5.7/A2.6/A2.7/A7.6/A7.7).
         super::super::native_module::set_builtin_closure_non_constructable(closure_ptr as usize);
         let name_bytes = name.as_bytes();
-        let name_key =
-            crate::string::js_string_from_bytes(name_bytes.as_ptr(), name_bytes.len() as u32);
+        let name_key = super::global_name_key(name_bytes);
         let fn_value = crate::value::js_nanbox_pointer(closure_ptr as i64);
         super::super::define_builtin_data_property(
             singleton(),
@@ -786,8 +821,7 @@ fn populate_global_this_builtins_inner(singleton_at_entry: *mut ObjectHeader) {
     // Namespaces: plain ObjectHeader so typeof is "object" per spec.
     for name in GLOBAL_THIS_BUILTIN_NAMESPACES.iter().copied() {
         let name_bytes = name.as_bytes();
-        let name_key =
-            crate::string::js_string_from_bytes(name_bytes.as_ptr(), name_bytes.len() as u32);
+        let name_key = super::global_name_key(name_bytes);
         let ns_value = if matches!(name, "console" | "process") {
             // #6230: dynamic method calls on the namespace *value* (`const p =
             // process; p.exit(1)`, `process["exit"](1)`, dynamic `console.log`)
@@ -849,7 +883,7 @@ fn populate_global_this_builtins_inner(singleton_at_entry: *mut ObjectHeader) {
     // require("perf_hooks").performance` (#1327). typeof stays "object".
     {
         let pname = b"performance";
-        let pkey = crate::string::js_string_from_bytes(pname.as_ptr(), pname.len() as u32);
+        let pkey = super::global_name_key(pname);
         let pval = crate::perf_hook_slots::performance_namespace();
         js_object_set_field_by_name(singleton(), pkey, pval);
     }
@@ -863,12 +897,11 @@ fn populate_global_this_builtins_inner(singleton_at_entry: *mut ObjectHeader) {
         "PerformanceObserverEntryList",
         "PerformanceResourceTiming",
     ] {
-        let key = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
+        let key = super::global_name_key(name);
         let value =
             super::super::native_module::bound_native_callable_export_value("perf_hooks", name);
         js_object_set_field_by_name(singleton(), key, value);
     }
-    super::super::native_module::install_global_webcrypto(singleton());
     let getter = crate::closure::js_closure_alloc(
         crate::fn_info!(#[realm("crypto.<get>", provider = closure_alloc)] export crate::object::global_this::ctor_thunks::global_this_crypto_getter_thunk, 0; with_declared(0)),
         0,
@@ -888,21 +921,30 @@ fn populate_global_this_builtins_inner(singleton_at_entry: *mut ObjectHeader) {
         super::super::PropertyAttrs::new(true, true, true),
     );
     // #2923: `globalThis.navigator` — Node's browser-compatible runtime
-    // metadata object. typeof is "object". Built once per process.
+    // metadata object. Node installs it as a lazy accessor (get only,
+    // enumerable, configurable); so does Perry. The getter builds the object
+    // on the first read and keeps it in its one capture, so `navigator.language`
+    // reads LC_ALL / LANG on first use, not while the realm is populated.
     {
-        let nname = b"navigator";
-        let nkey = crate::string::js_string_from_bytes(nname.as_ptr(), nname.len() as u32);
-        // Read the `Navigator` constructor we installed on the singleton above
-        // and hand it to the navigator builder directly. We must NOT call
-        // `js_navigator_object()` here: it re-fetches the constructor via
-        // `js_get_global_this_builtin_value` → `js_get_global_this`, which would
-        // re-enter this very lazy-init (GLOBAL_THIS_READY is still false until we
-        // return) and recurse/spin forever.
-        let nav_ctor_key = crate::string::js_string_from_bytes(b"Navigator".as_ptr(), 9);
-        let nav_ctor = js_object_get_field_by_name(singleton(), nav_ctor_key);
-        let nval =
-            crate::navigator::navigator_object_with_constructor(f64::from_bits(nav_ctor.bits()));
-        js_object_set_field_by_name(singleton(), nkey, nval);
+        let getter = crate::closure::js_closure_alloc(
+            crate::fn_info!(#[realm("navigator.<get>", provider = closure_alloc, capture = [undefined])] export crate::navigator::global_this_navigator_getter_thunk, 0; with_declared(0)),
+            1,
+        );
+        let getter_bits = if getter.is_null() {
+            0
+        } else {
+            crate::closure::js_closure_set_capture_bits(getter, 0, crate::value::TAG_UNDEFINED);
+            crate::value::js_nanbox_pointer(getter as i64).to_bits()
+        };
+        super::super::set_builtin_accessor_descriptor(
+            singleton() as usize,
+            "navigator".to_string(),
+            super::super::AccessorDescriptor {
+                get: getter_bits,
+                set: 0,
+            },
+            super::super::PropertyAttrs::new(true, true, true),
+        );
     }
     // ECMA-262 19.1/19.2/19.3: NaN, Infinity, and undefined are own data
     // properties of the global object with {writable:false, enumerable:false,
@@ -913,7 +955,7 @@ fn populate_global_this_builtins_inner(singleton_at_entry: *mut ObjectHeader) {
     {
         let non_writable = super::super::PropertyAttrs::new(false, false, false);
         for (name, value) in [("NaN", f64::NAN), ("Infinity", f64::INFINITY)] {
-            let key = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
+            let key = super::global_name_key(name);
             super::super::define_builtin_data_property(
                 singleton(),
                 key,
@@ -922,7 +964,7 @@ fn populate_global_this_builtins_inner(singleton_at_entry: *mut ObjectHeader) {
                 non_writable,
             );
         }
-        let undef_key = crate::string::js_string_from_bytes(b"undefined".as_ptr(), 9);
+        let undef_key = super::global_name_key(b"undefined");
         let undef_val = f64::from_bits(crate::value::TAG_UNDEFINED);
         super::super::define_builtin_data_property(
             singleton(),
@@ -1023,7 +1065,7 @@ fn alias_number_static_to_global_function(singleton_at_entry: *mut ObjectHeader,
     let singleton_handle = scope.root_raw_mut_ptr(singleton_at_entry);
     let singleton = || singleton_handle.get_raw_mut_ptr::<ObjectHeader>();
 
-    let global_key = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
+    let global_key = super::global_name_key(name);
     let global_fn = js_object_get_field_by_name(singleton(), global_key);
     if (global_fn.bits() >> 48) != 0x7FFD {
         return;
@@ -1040,8 +1082,7 @@ fn alias_number_static_to_global_function(singleton_at_entry: *mut ObjectHeader,
         return;
     }
     let ctor_handle = scope.root_raw_mut_ptr(ctor_ptr);
-
-    let static_key = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
+    let static_key = super::global_name_key(name);
     let ctor_ptr = ctor_handle.get_raw_mut_ptr::<ObjectHeader>();
     js_object_set_field_by_name(
         ctor_ptr,
@@ -1054,7 +1095,6 @@ fn alias_number_static_to_global_function(singleton_at_entry: *mut ObjectHeader,
         super::super::PropertyAttrs::new(true, false, true),
     );
 }
-
 crate::perry_thread_local! {
     /// Raw address of THIS thread's `Error` constructor closure, captured at
     /// install. Read by `error::error_prepare_stack_trace_override` so
@@ -1090,81 +1130,6 @@ pub(crate) fn scan_error_constructor_root_mut(visitor: &mut crate::gc::RuntimeRo
 /// user override apart from Perry's built-in default.
 pub(crate) fn default_prepare_stack_trace_func_ptr() -> usize {
     global_this_error_prepare_stack_trace_thunk as *const u8 as usize
-}
-
-fn install_error_static_methods(ctor: *mut crate::closure::ClosureHeader) {
-    if ctor.is_null() {
-        return;
-    }
-    ERROR_CONSTRUCTOR_PTR.with(|c| c.set(ctor as usize));
-    let closure = crate::closure::js_closure_alloc(
-        crate::fn_info!(#[realm(Error.captureStackTrace, constructible = true)] export crate::object::global_this::builtin_thunks::global_this_error_capture_stack_trace_thunk, 2; with_declared(2)),
-        0,
-    );
-    if closure.is_null() {
-        return;
-    }
-    super::super::native_module::set_bound_native_closure_name(closure, "captureStackTrace");
-
-    let key = crate::string::js_string_from_bytes(b"captureStackTrace".as_ptr(), 17);
-    let value = crate::value::js_nanbox_pointer(closure as i64);
-    super::super::define_builtin_data_property(
-        ctor as *mut ObjectHeader,
-        key,
-        value,
-        "captureStackTrace".to_string(),
-        super::super::PropertyAttrs::new(true, false, true),
-    );
-
-    // #2904: `Error.isError` — V8/Node Error duck-check.
-    install_error_static_fn(
-        ctor,
-        "isError",
-        crate::fn_info!(#[realm(Error.isError, constructible = true)] export crate::object::global_this::builtin_thunks::global_this_error_is_error_thunk, 1; with_declared(1)),
-    );
-
-    // #2904: `Error.prepareStackTrace` — default stack-formatting hook.
-    install_error_static_fn(
-        ctor,
-        "prepareStackTrace",
-        crate::fn_info!(#[realm(Error.prepareStackTrace, constructible = true)] export crate::object::global_this::builtin_thunks::global_this_error_prepare_stack_trace_thunk, 2; with_declared(2)),
-    );
-
-    // #2904: `Error.stackTraceLimit` — writable number controlling captured
-    // frame count. Node's default is 10; Perry's stacks are coarse but the
-    // property must read as a number and be writable.
-    let limit_key = crate::string::js_string_from_bytes(b"stackTraceLimit".as_ptr(), 15);
-    super::super::define_builtin_data_property(
-        ctor as *mut ObjectHeader,
-        limit_key,
-        10.0,
-        "stackTraceLimit".to_string(),
-        super::super::PropertyAttrs::new(true, true, true),
-    );
-}
-
-/// #2904: install a callable static method on the `Error` constructor closure
-/// as a non-enumerable, writable, configurable data property (matching Node's
-/// property descriptors for the V8 static helpers).
-fn install_error_static_fn(
-    ctor: *mut crate::closure::ClosureHeader,
-    name: &str,
-    info: *const crate::closure::JsFunctionInfo,
-) {
-    let closure = crate::closure::js_closure_alloc(info, 0);
-    if closure.is_null() {
-        return;
-    }
-    super::super::native_module::set_bound_native_closure_name(closure, name);
-    let key = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
-    let value = crate::value::js_nanbox_pointer(closure as i64);
-    super::super::define_builtin_data_property(
-        ctor as *mut ObjectHeader,
-        key,
-        value,
-        name.to_string(),
-        super::super::PropertyAttrs::new(true, false, true),
-    );
 }
 
 // =====================================================================

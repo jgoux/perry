@@ -178,7 +178,7 @@ pub(super) fn construct(
     prepare(component.get_nanbox_f64());
     let batch = callbacks::Batch::new(&scope, component.get_nanbox_f64(), false);
     let mut bytes = Vec::new();
-    let outcome = crate::exception::catch_js_throw(|| {
+    let outcome = crate::exception::catch_thrown(|| {
         let mut buffer = Buffer::default();
         let pointer = unsafe {
             (host::ops().perry_component_driver_new)(
@@ -207,10 +207,10 @@ pub(super) fn construct(
         poll::schedule(component.get_nanbox_f64());
         pointer
     });
-    let failure = outcome.err().map(|error| scope.root_nanbox_f64(error));
+    let failure = outcome.err().map(|error| error.root(&scope));
     drop((batch, bytes));
     if let Some(error) = failure {
-        crate::exception::js_throw(error.get_nanbox_f64());
+        crate::exception::rethrow_caught(error.caught());
     }
     outcome.unwrap()
 }
@@ -228,6 +228,20 @@ pub(super) fn dispose(component: f64) -> f64 {
     let scope = RuntimeHandleScope::new();
     let component = scope.root_nanbox_f64(component);
     if unsafe { (*state(component.get_nanbox_f64())).retired } {
+        // A Store retired by a trap ran its destructors at retirement. As
+        // legacy disposal does, the first of their exceptions is thrown here,
+        // once; later ones were suppressed when it was recorded. A call that
+        // failed with its own JavaScript exception already delivered the first.
+        let failed = unsafe {
+            std::mem::replace(&mut (*state(component.get_nanbox_f64())).root_failed, false)
+        };
+        if failed {
+            // Caught callbacks and program Promise rejections share the persistent ERROR records.
+            crate::exception::throw_open(records::get(
+                origin_row(component.get_nanbox_f64(), 0),
+                records::ERROR,
+            ));
+        }
         return undefined();
     }
     if unsafe { (*state(component.get_nanbox_f64())).polling } {
@@ -236,7 +250,7 @@ pub(super) fn dispose(component: f64) -> f64 {
     let batch = callbacks::Batch::new(&scope, component.get_nanbox_f64(), true);
     let error = scope.root_nanbox_f64(undefined());
     let mut bytes = Vec::new();
-    let outcome = crate::exception::catch_js_throw(|| {
+    let outcome = crate::exception::catch_thrown(|| {
         let mut buffer = Buffer::default();
         unsafe {
             (*state(component.get_nanbox_f64())).polling = true;
@@ -261,7 +275,7 @@ pub(super) fn dispose(component: f64) -> f64 {
                 }
                 (*context::get(component.get_nanbox_f64())).alive = false;
             }
-            let rejected = crate::exception::catch_js_throw(|| {
+            let rejected = crate::exception::catch_thrown(|| {
                 poll::reject_pending(component.get_nanbox_f64(), "Component has been disposed")
             });
             let disposed = batch.cleanup(|| {
@@ -271,7 +285,7 @@ pub(super) fn dispose(component: f64) -> f64 {
             // Native callbacks may use a retained invocation's origin, not
             // only origin zero. Its first exception precedes later local cleanup.
             batch.callback_error().map_or(Ok(()), Err)?;
-            rejected?;
+            rejected.map_err(|error| error.value())?;
             disposed?;
         }
         batch.callback_error().map_or(Ok(()), Err)?;
@@ -282,14 +296,15 @@ pub(super) fn dispose(component: f64) -> f64 {
     });
     let outcome = match outcome {
         Ok(inner) => inner,
-        Err(error) => Err(error),
+        Err(error) => Err(error).map_err(|error| error.value()),
     };
     if let Err(thrown) = outcome {
         error.set_nanbox_f64(thrown);
     }
     drop((batch, bytes));
     if outcome.is_err() {
-        crate::exception::js_throw(error.get_nanbox_f64());
+        // Caught callbacks and program Promise rejections share the persistent ERROR records.
+        crate::exception::throw_open(error.get_nanbox_f64());
     }
     undefined()
 }

@@ -76,6 +76,30 @@ use super::{
     TypedFeedbackKind,
 };
 
+/// Runtime entry the inline push tier calls when only room failed: grows the
+/// admitted array without collecting, or declines with null.
+pub(crate) const GROW_FOR_PUSH: &str = "js_array_grow_for_push";
+
+/// `PERRY_PUSH_GROW_INLINE=0` keeps every full-capacity push on the complete
+/// runtime push and the guarded length loads (A/B control: the previous IR).
+fn grow_for_push_enabled() -> bool {
+    std::env::var("PERRY_PUSH_GROW_INLINE").as_deref() != Ok("0")
+}
+
+/// `length` of a receiver the `apush.nofwd` admission has already read the
+/// header of (`payload - 6`). That read proved a live array user pointer, so
+/// `safe_load_i32_from_ptr`'s small-address guard (a compare, a select and a
+/// register for the guard global, once per push) has nothing left to catch.
+/// `PERRY_PUSH_GROW_INLINE=0` keeps the guarded load, i.e. the previous IR.
+fn admitted_length_load(blk: &mut LlBlock, handle: &str) -> String {
+    if grow_for_push_enabled() {
+        let ptr = blk.inttoptr(I64, handle);
+        blk.load(I32, &ptr)
+    } else {
+        blk.safe_load_i32_from_ptr(handle)
+    }
+}
+
 /// Metadata may admit the #7839 append tier because that tier tests the live
 /// result bits before doing GC bookkeeping. A lying numeric operand makes JS
 /// `+` produce a heap value; the pointer test then takes the note/addref/
@@ -184,7 +208,7 @@ fn emit_dynamic_pointer_push_store(
 ) -> (String, String, String) {
     let (length, element_addr, value_bits) = {
         let blk = ctx.block();
-        let length = blk.safe_load_i32_from_ptr(arr_handle);
+        let length = admitted_length_load(blk, arr_handle);
         let length_i64 = blk.zext(I32, &length, I64);
         let byte_offset = blk.shl(I64, &length_i64, "3");
         let elements_addr = blk.array_elements_addr(arr_handle);
@@ -340,7 +364,7 @@ fn emit_numeric_push_store_pointer_tested(
 ) -> (String, String, Option<String>) {
     let (length, element_addr, value_bits) = {
         let blk = ctx.block();
-        let length = blk.safe_load_i32_from_ptr(arr_handle);
+        let length = admitted_length_load(blk, arr_handle);
         let length_i64 = blk.zext(I32, &length, I64);
         let byte_offset = blk.shl(I64, &length_i64, "3");
         let elements_addr = blk.array_elements_addr(arr_handle);
@@ -851,6 +875,8 @@ fn emit_field_push_writeback(
             object: Box::new(Expr::This),
             property: field.to_string(),
             value: Box::new(Expr::LocalGet(array_id)),
+            byte_offset: 0,
+            byte_end: 0,
         },
     )?;
     ctx.block().br(&done_label);
@@ -1117,6 +1143,17 @@ fn lower_inner(ctx: &mut FnCtx<'_>, expr: &Expr, value_discarded: bool) -> Resul
             // branches both update the slot via the existing
             // boxed/captured/local fall-through below.
             if let Some(home) = PushReceiverHome::resolve(ctx, *array_id) {
+                // An owned local (`collectors::loop_pushed_arrays`) is the
+                // live head of an ordinary array born from a literal in this
+                // function, and nothing else holds it: it cannot be a
+                // forwarded stub (every growth stores the new head back into
+                // its slot, and a collection reloads the slot), an Array
+                // subclass, or carry a named layout (an own property, a
+                // descriptor, an own `push`). Those probes are constants for
+                // it, and LLVM drops their loads. The integrity/layout mask,
+                // the prototype admission and the room test still run.
+                let owned = matches!(home, PushReceiverHome::Slot(_))
+                    && ctx.loop_pushed_arrays.owned.contains(array_id);
                 let apush_meta_offset = crate::target_layout::object_meta_slot_offset_bytes(
                     ctx.target_triple,
                     crate::target_layout::HeaderForm::Meta,
@@ -1177,6 +1214,8 @@ fn lower_inner(ctx: &mut FnCtx<'_>, expr: &Expr, value_discarded: bool) -> Resul
                 // it, so `sub.push(v)` stops paying a runtime entry whose only
                 // job is to follow one pointer.
                 let elem_idx = ctx.new_block("apush.elements");
+                let elem_meta_idx = ctx.new_block("apush.elements.meta");
+                let elem_store_idx = ctx.new_block("apush.elements.store");
                 let elem_check_idx = ctx.new_block("apush.elements.check");
                 let nofwd_idx = ctx.new_block("apush.nofwd");
                 let inbounds_idx = ctx.new_block("apush.inbounds");
@@ -1185,6 +1224,8 @@ fn lower_inner(ctx: &mut FnCtx<'_>, expr: &Expr, value_discarded: bool) -> Resul
 
                 let fwd_label = ctx.block_label(fwd_idx);
                 let elem_label = ctx.block_label(elem_idx);
+                let elem_meta_label = ctx.block_label(elem_meta_idx);
+                let elem_store_label = ctx.block_label(elem_store_idx);
                 let elem_check_label = ctx.block_label(elem_check_idx);
                 let nofwd_label = ctx.block_label(nofwd_idx);
                 let inbounds_label = ctx.block_label(inbounds_idx);
@@ -1195,35 +1236,66 @@ fn lower_inner(ctx: &mut FnCtx<'_>, expr: &Expr, value_discarded: bool) -> Resul
                     let blk = ctx.block();
                     // A forwarded receiver keeps the runtime arm; a live
                     // non-Array receiver gets the elements probe.
+                    let fwd_set = if owned {
+                        "false".to_string()
+                    } else {
+                        fwd_set.clone()
+                    };
                     blk.cond_br(&fwd_set, &fwd_label, &elem_label);
                 }
                 let _ = &is_fwd;
 
+                // Every load below sits behind a branch that proved its address
+                // is inside a live allocation: an Array receiver goes straight
+                // to the inline store, only a GC_TYPE_OBJECT receiver reads its
+                // meta slot, and `ObjectMeta.elements` (word 12) is read only
+                // through a non-null meta pointer. A `select` that substituted
+                // the receiver for a null meta pointer still loaded
+                // `receiver + 96`, past the end of a small array allocated at
+                // the end of a page (an access violation on Windows).
                 ctx.current_block = elem_idx;
-                let elem_store = {
+                {
                     let blk = ctx.block();
-                    let array_receiver = blk.icmp_eq(I8, &gc_type, "1");
+                    let array_receiver = if owned {
+                        "true".to_string()
+                    } else {
+                        blk.icmp_eq(I8, &gc_type, "1")
+                    };
+                    blk.cond_br(&array_receiver, &nofwd_label, &elem_meta_label);
+                }
+                let elem_probe_end = ctx.block_label(elem_idx);
+
+                ctx.current_block = elem_meta_idx;
+                let meta = {
+                    let blk = ctx.block();
+                    let is_object = blk.icmp_eq(I8, &gc_type, "2");
                     let meta_addr = blk.add(I64, &arr_handle, &apush_meta_offset);
-                    let meta_slot = blk.inttoptr(I64, &meta_addr);
+                    blk.cond_br(&is_object, &elem_store_label, &fwd_label);
+                    meta_addr
+                };
+
+                ctx.current_block = elem_store_idx;
+                let elem_load_idx = ctx.new_block("apush.elements.load");
+                let elem_load_label = ctx.block_label(elem_load_idx);
+                let meta = {
+                    let blk = ctx.block();
+                    let meta_slot = blk.inttoptr(I64, &meta);
                     let meta = blk.load(I64, &meta_slot);
                     let has_meta = blk.icmp_ne(I64, &meta, "0");
-                    let is_object = blk.icmp_eq(I8, &gc_type, "2");
-                    let can_read_meta = blk.and(I1, &is_object, &has_meta);
-                    // `select` keeps the word-12 load off a null meta pointer.
-                    let safe_meta = blk.select(I1, &can_read_meta, I64, &meta, &arr_handle);
-                    let meta_ptr = blk.inttoptr(I64, &safe_meta);
+                    blk.cond_br(&has_meta, &elem_load_label, &fwd_label);
+                    meta
+                };
+
+                ctx.current_block = elem_load_idx;
+                let elem_store = {
+                    let blk = ctx.block();
+                    let meta_ptr = blk.inttoptr(I64, &meta);
                     let store_slot = blk.gep(I64, &meta_ptr, &[(I64, "12")]);
                     let store = blk.load(I64, &store_slot);
                     let has_store = blk.icmp_ne(I64, &store, "0");
-                    let backed = blk.and(I1, &can_read_meta, &has_store);
-                    // The payload for the check block, materialised BEFORE the
-                    // terminator so it dominates its uses; an ordinary Array
-                    // receiver skips the probe entirely.
-                    let payload = blk.select(I1, &backed, I64, &store, &arr_handle);
-                    blk.cond_br(&array_receiver, &nofwd_label, &elem_check_label);
-                    payload
+                    blk.cond_br(&has_store, &elem_check_label, &fwd_label);
+                    store
                 };
-                let elem_probe_end = ctx.block_label(elem_idx);
 
                 ctx.current_block = elem_check_idx;
                 {
@@ -1272,6 +1344,7 @@ fn lower_inner(ctx: &mut FnCtx<'_>, expr: &Expr, value_discarded: bool) -> Resul
                 // gc_flags u8 at -7, `_reserved` u16 at -6): mask
                 // FROZEN|SEALED|NO_EXTEND = 0x7, plus a null named layout.
                 let live_object_flags: String;
+                let admitted: String;
                 ctx.current_block = nofwd_idx;
                 let payload = ctx.block().phi(
                     I64,
@@ -1356,11 +1429,17 @@ fn lower_inner(ctx: &mut FnCtx<'_>, expr: &Expr, value_discarded: bool) -> Resul
                     let clean = blk.and(I1, &clean, &prototype_clean);
                     // A non-writable `length`, an element descriptor or an own
                     // `push` lives in the array's named layout (§6a).
-                    let has_named =
-                        crate::expr::array_proto_guard::emit_array_has_named_layout(blk, &payload);
-                    let no_named = blk.xor(I1, &has_named, "true");
-                    let clean = blk.and(I1, &clean, &no_named);
-                    let length = blk.safe_load_i32_from_ptr(&payload);
+                    let clean = if owned {
+                        clean
+                    } else {
+                        let has_named = crate::expr::array_proto_guard::emit_array_has_named_layout(
+                            blk, &payload,
+                        );
+                        let no_named = blk.xor(I1, &has_named, "true");
+                        blk.and(I1, &clean, &no_named)
+                    };
+                    admitted = clean.clone();
+                    let length = admitted_length_load(blk, &payload);
                     let cap_addr = blk.add(I64, &payload, "4");
                     let cap_ptr = blk.inttoptr(I64, &cap_addr);
                     let capacity = blk.load(I32, &cap_ptr);
@@ -1372,6 +1451,60 @@ fn lower_inner(ctx: &mut FnCtx<'_>, expr: &Expr, value_discarded: bool) -> Resul
                     let inline_ok = blk.and(I1, &has_room, &clean);
                     blk.cond_br(&inline_ok, &inbounds_label, &realloc_label);
                 }
+
+                // Realloc: no room, or the admission failed. When only room
+                // failed and the receiver is the array itself (not an Array
+                // subclass's elements store, whose replacement would have to
+                // be published into its meta), `js_array_grow_for_push` makes
+                // room without collecting — in place when the array is the
+                // last nursery birth — and the push continues into the same
+                // inline store below with the grown head. A null (declined)
+                // and every other arrival take the complete runtime push.
+                ctx.current_block = realloc_idx;
+                let full_idx = if grow_for_push_enabled() {
+                    let grow_idx = ctx.new_block("apush.grow");
+                    let grown_idx = ctx.new_block("apush.grown");
+                    let full_idx = ctx.new_block("apush.full");
+                    let grow_label = ctx.block_label(grow_idx);
+                    let grown_label = ctx.block_label(grown_idx);
+                    let full_label = ctx.block_label(full_idx);
+                    {
+                        let blk = ctx.block();
+                        let own_store = blk.icmp_eq(I64, &payload, &arr_handle);
+                        let growable = blk.and(I1, &admitted, &own_store);
+                        blk.cond_br(&growable, &grow_label, &full_label);
+                    }
+                    ctx.current_block = grow_idx;
+                    let grown = {
+                        let blk = ctx.block();
+                        let grown = blk.call(I64, GROW_FOR_PUSH, &[(I64, &arr_handle)]);
+                        let declined = blk.icmp_eq(I64, &grown, "0");
+                        blk.cond_br(&declined, &full_label, &grown_label);
+                        grown
+                    };
+                    // The grown head re-enters the admission (`apush.nofwd`)
+                    // as a third incoming payload: it carries the copied
+                    // `_reserved` facts and now has room, so it lands in the
+                    // unchanged inline store below. Looping back keeps the
+                    // in-capacity path's IR exactly what it was.
+                    ctx.current_block = grown_idx;
+                    {
+                        let blk = ctx.block();
+                        let grown_box = nanbox_pointer_inline(blk, &grown);
+                        home.store_head(blk, &grown_box);
+                        blk.br(&nofwd_label);
+                    }
+                    let grown_end = ctx.block_label(ctx.current_block);
+                    let patched = ctx
+                        .func
+                        .block_mut(nofwd_idx)
+                        .expect("apush.nofwd exists")
+                        .add_phi_incoming(&payload, &grown, &grown_end);
+                    assert!(patched, "apush.nofwd opens with the payload phi");
+                    full_idx
+                } else {
+                    realloc_idx
+                };
 
                 // Inline store: arr+8+length*8 = value, length++.
                 ctx.current_block = inbounds_idx;
@@ -1416,7 +1549,7 @@ fn lower_inner(ctx: &mut FnCtx<'_>, expr: &Expr, value_discarded: bool) -> Resul
                     )
                 } else {
                     let blk = ctx.block();
-                    let length = blk.safe_load_i32_from_ptr(&payload);
+                    let length = admitted_length_load(blk, &payload);
                     let length_i64 = blk.zext(I32, &length, I64);
                     let byte_offset = blk.shl(I64, &length_i64, "3");
                     let elements_addr = blk.array_elements_addr(&payload);
@@ -1506,10 +1639,11 @@ fn lower_inner(ctx: &mut FnCtx<'_>, expr: &Expr, value_discarded: bool) -> Resul
                     ctx.block().br(&merge_label);
                 }
 
-                // Realloc: capacity exhausted. Runtime allocates a
-                // bigger backing block and installs the forwarding
-                // pointer; writeback the new head to the local slot.
-                ctx.current_block = realloc_idx;
+                // Complete push: capacity exhausted and not grown above, or
+                // the admission failed. Runtime allocates a bigger backing
+                // block and installs the forwarding pointer; writeback the
+                // new head to the local slot.
+                ctx.current_block = full_idx;
                 let new_handle = own.emit_push(ctx, &arr_handle, &v);
                 {
                     let blk = ctx.block();

@@ -27,7 +27,7 @@ pub(super) mod loop_guard;
 #[path = "subclass_packed_index.rs"]
 pub(super) mod packed_index;
 #[cfg(test)]
-pub(super) use packed_index::js_packed_arraylike_index_get;
+pub(crate) use packed_index::js_packed_arraylike_index_get;
 // The loop-guard entry points are exported C symbols; only the unit tests
 // reach them through Rust paths.
 use crate::codegen_abi::LayoutWord;
@@ -42,7 +42,8 @@ pub(crate) use loop_guard::{js_packed_arraylike_loop_guard, js_packed_ecs_u32_lo
 //     bit 0       native fallback after ordinary undefined
 //     bit 1       payload valid
 //     bit 2       compact nonnegative-int entity proof (mode 2)
-//     bit 3       sealed intrinsic prototype (#11915; family in bits 8..11)
+//     bit 3       sealed intrinsic prototype (#11915; family in bits 8..13,
+//                 image key count + 1 in bits 16..31: DEC 250)
 //     bit 4       free
 //     bit 5       object is a prototype
 //     bit 6       exotic read receiver
@@ -443,7 +444,10 @@ pub(crate) unsafe fn drop_packed_subclass_numeric_proof_record(
     }
     // The caller moves away from the proof sibling before publishing another
     // shape or returning to a mutator; clear the bound and twin-id payload.
-    let meta = crate::meta_read!(crate::meta_obj_from_kind!(obj as *mut _, crate::object::shapes::ShapeObjectKind::OrdinaryNumericProof));
+    let meta = crate::meta_read!(crate::meta_obj_from_kind!(
+        obj as *mut _,
+        crate::object::shapes::ShapeObjectKind::OrdinaryNumericProof
+    ));
     let mut unproven = 0;
     if !meta.is_null() {
         if (*meta).flags & PACKED_NUMERIC_META_VALID != 0 {
@@ -591,9 +595,7 @@ unsafe fn ensure_subclass_numeric_prefix(
             // replace compact int32 Number bits in an already numeric slot.
             let integer = value.as_int32();
             let number = integer as f64;
-            if !require_u32 {
-                ptr::write(value_ptr, number.to_bits());
-            }
+            ptr::write(value_ptr, number.to_bits());
             number
         } else if !value.is_number() {
             return false;
@@ -601,23 +603,17 @@ unsafe fn ensure_subclass_numeric_prefix(
             value.as_number()
         };
         if require_u32 {
-            // ECS entity ids in this tier are normalized to Perry's ordinary
-            // compact INT32 Number representation. Generic reads still
-            // observe the same JS Number, while generated component access
-            // can consume the low native lane without an f64 conversion.
-            // Values outside the nonnegative i31 subset retain the generic
-            // loop; no public behavior is narrowed.
+            // ECS entity ids in this tier stay raw-f64 Numbers (a Number has
+            // one encoding). Admission only validates the nonnegative i31
+            // subset, so generated component access converts the loaded
+            // double to i32 exactly. Other values retain the generic loop;
+            // no public behavior is narrowed.
             if !number.is_finite()
                 || number < 0.0
                 || number > i32::MAX as f64
                 || number.fract() != 0.0
             {
                 return false;
-            }
-            if !value.is_int32() {
-                // GC_STORE_AUDIT(POINTER_FREE): compact Number bits replace
-                // raw-f64 Number bits in an already numeric slot.
-                ptr::write(value_ptr, JSValue::int32(number as i32).bits());
             }
         }
     }
@@ -793,8 +789,8 @@ unsafe fn store_dense_nonpointer_number_slot(
     let value_bits = number.to_bits();
     if slot < live_inline_slots {
         // A1_UNPROVEN: record-first: no proof of the object form at this slot read (kind-A/B question for S0f).
-        let fields = crate::meta_slots_of!(crate::meta_obj_runtime_born!(obj as *mut _))
-            .cast::<u64>();
+        let fields =
+            crate::meta_slots_of!(crate::meta_obj_runtime_born!(obj as *mut _)).cast::<u64>();
         // GC_STORE_AUDIT(POINTER_FREE): the caller proved `number` is a raw nonnegative i32 Number; no edge changes.
         ptr::write(fields.add(slot as usize), value_bits);
         return true;
@@ -822,8 +818,8 @@ unsafe fn clear_retired_dense_slot(
 ) {
     if slot < former_live_inline_slots {
         // A1_UNPROVEN: record-first: no proof of the object form at this slot read (kind-A/B question for S0f).
-        let fields = crate::meta_slots_of!(crate::meta_obj_runtime_born!(obj as *mut _))
-            .cast::<u64>();
+        let fields =
+            crate::meta_slots_of!(crate::meta_obj_runtime_born!(obj as *mut _)).cast::<u64>();
         // The predecessor ShapeId is already installed, so this physical tail
         // is outside the object's traced slot range. Clearing it is storage
         // hygiene, not publication of a new edge.
@@ -858,8 +854,8 @@ unsafe fn clear_retired_dense_numeric_tail_slot(
 ) {
     if slot < former_live_inline_slots {
         // A1_UNPROVEN: record-first: no proof of the object form at this slot read (kind-A/B question for S0f).
-        let fields = crate::meta_slots_of!(crate::meta_obj_runtime_born!(obj as *mut _))
-            .cast::<u64>();
+        let fields =
+            crate::meta_slots_of!(crate::meta_obj_runtime_born!(obj as *mut _)).cast::<u64>();
         // GC_STORE_AUDIT(POINTER_FREE): retiring a physical tail slot to `undefined` publishes no edge.
         ptr::write(fields.add(slot as usize), crate::value::TAG_UNDEFINED);
         return;
@@ -1450,6 +1446,7 @@ pub(crate) fn raw_receiver_is_heap_object(arr: *const ArrayHeader) -> bool {
 }
 
 #[cold]
+#[optimize(size)]
 #[inline(never)]
 pub(crate) fn array_object_receiver(arr: *const ArrayHeader) -> Option<f64> {
     let raw = (arr as u64) & 0x0000_FFFF_FFFF_FFFF;
@@ -1483,6 +1480,7 @@ pub(crate) fn is_array_subclass_value(value: f64) -> bool {
 ///
 /// Returns `None` only for a method name neither engine implements.
 #[cold]
+#[optimize(size)]
 #[inline(never)]
 pub(crate) fn array_object_method(recv: f64, method: &str, args: &[f64]) -> Option<f64> {
     if method == "push" && args.len() == 1 {
@@ -1518,6 +1516,7 @@ pub(crate) fn array_object_method(recv: f64, method: &str, args: &[f64]) -> Opti
 
 /// `Get(recv, ToString(index))` for an array-like object receiver.
 #[cold]
+#[optimize(size)]
 #[inline(never)]
 pub(crate) fn array_object_index_get(recv: f64, index: u32) -> f64 {
     if let Some(value) = array_subclass_fast_index_get(recv, index) {
@@ -1536,6 +1535,7 @@ pub(crate) fn array_object_index_get(recv: f64, index: u32) -> f64 {
 /// `sub[0] = 10; sub.length` read back `0`, on the ANNOTATED and unannotated
 /// paths alike. Emulate the exotic step here so both agree with node.
 #[cold]
+#[optimize(size)]
 #[inline(never)]
 pub(crate) fn array_object_index_set(recv: f64, index: u32, value: f64) {
     if array_subclass_fast_index_set(recv, index, value) {
@@ -1630,6 +1630,7 @@ pub(crate) fn maintain_array_exotic_length(recv: f64, index: u32) {
 /// truncating deletes the indices at or above the new length, exactly as the
 /// Array-exotic `[[DefineOwnProperty]]` would.
 #[cold]
+#[optimize(size)]
 #[inline(never)]
 pub(crate) fn array_object_set_length(recv: f64, new_length: f64) {
     if let Some((obj, elements)) = crate::array::subclass_elements::backed_value(recv) {
