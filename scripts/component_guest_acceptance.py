@@ -20,8 +20,7 @@ import time
 def prepare_rust_host_manifest(path, root):
     """Retain the standalone fixture's source selection after copying it."""
     manifest = path.read_text()
-    for relative in ["crates/perry-wasi", "third_party/turnloop/turnloop",
-                     "third_party/turnloop/turnloop-http"]:
+    for relative in ["crates/perry-wasi"]:
         original = json.dumps("../../../../" + relative)
         assert manifest.count(original) == 1, f"Rust host path changed: {relative}"
         manifest = manifest.replace(original, json.dumps(str(root / relative)))
@@ -47,7 +46,7 @@ def main():
     if args.moving_gc and not args.native_runtime_dir:
         parser.error("--moving-gc requires --native-runtime-dir")
     root = Path(__file__).resolve().parent.parent
-    fixture = root / "test-wasi/components/transform"
+    fixture = root / "tests/integration/wasi/components/transform"
     output = args.output.resolve()
     work = output / "transform"
     work.mkdir(parents=True, exist_ok=True)
@@ -105,14 +104,14 @@ def main():
         if status:
             raise SystemExit(status if status > 0 else 1)
 
-    def build_guest(directory, prefix=""):
+    def build_guest(directory, prefix="", environment=None):
         generated = directory / "generated"
         run(prefix + "guest-bindings", [args.wit.resolve(), "--guest-c", directory / "world.wit",
                                generated, "plugin"])
         library = directory / "libtransform.a"
         run(prefix + "compile-guest", [args.perry.resolve(), "compile", directory / "guest.ts",
                               "--target", "wasi", "--output-type", "staticlib",
-                              "--no-auto-optimize", "--no-cache", "-o", library])
+                              "--no-auto-optimize", "--no-cache", "-o", library], environment=environment)
         component = directory / "transform.component.wasm"
         # wasi-sdk's P2 driver componentizes the linked reactor, combining the
         # application WIT metadata with its libc/WASI imports. Include all TS
@@ -155,7 +154,13 @@ def main():
         expected="PASS canonical values: 14 import/export calls")
     resources = output / "resources"
     shutil.copytree(fixture.parent / "guest-resources", resources, dirs_exist_ok=True)
-    resource_component = build_guest(resources, "resources-")
+    # The moving run's guest knobs (perry-component-host `--resources-moving`)
+    # include PERRY_GC_DIAG, whose `[gc-copy-minor]` witness the GC diagnostics
+    # print; a program installs them only when the knob is set while compiling.
+    guest_env = env.copy()
+    if args.guest_moving_gc:
+        guest_env.update(PERRY_GC_FORCE_EVACUATE="1", PERRY_GC_VERIFY_EVACUATION="1", PERRY_GC_DIAG="1")
+    resource_component = build_guest(resources, "resources-", guest_env)
     run("run-resources", [host, resource_component, "--resources"], timeout=120,
         expected="PASS Perry guest resources: imported ownership, rollback, nested transfers, exported payload GC, expired borrows, 51 explicit destructions, deferred cleanup, trap")
     if args.guest_moving_gc:

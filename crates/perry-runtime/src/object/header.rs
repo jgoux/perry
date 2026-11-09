@@ -140,6 +140,14 @@ pub const fn meta_form_alloc_bytes(slots: usize) -> usize {
     std::mem::size_of::<ObjectHeader>() + slots * std::mem::size_of::<u64>()
 }
 
+/// The byte offset of inline slot `slot` of a meta-form object: what a
+/// per-site memo stores at fill, once, so every reader adds it to the object
+/// ([`object_slot_at`]) and none composes a slot base.
+#[inline(always)]
+pub const fn meta_form_slot_off(slot: u32) -> u32 {
+    meta_form_alloc_bytes(slot as usize) as u32
+}
+
 // The constructors as macros: the struct literal is built in the caller, with
 // the form check under `cfg(debug_assertions)`, so a migrated read is the
 // tokens it replaced and no release code depends on an inlining decision.
@@ -150,10 +158,12 @@ macro_rules! meta_obj_runtime_born {
     ($obj:expr $(,)?) => {{
         let obj: *mut $crate::object::ObjectHeader = $obj;
         #[cfg(debug_assertions)]
-        debug_assert_eq!(
-            unsafe { $crate::object::header::object_type(obj) },
-            $crate::gc::GC_TYPE_OBJECT
-        );
+        {
+            // The macro expands both inside and outside `unsafe` blocks.
+            #[allow(unused_unsafe)]
+            let ty = unsafe { $crate::object::header::object_type(obj) };
+            debug_assert_eq!(ty, $crate::gc::GC_TYPE_OBJECT);
+        }
         $crate::object::header::MetaObj(obj)
     }};
 }
@@ -167,7 +177,10 @@ macro_rules! meta_obj_from_type {
         {
             let t: u8 = $t;
             debug_assert!($crate::object_has_meta_word!(t));
-            debug_assert_eq!(unsafe { $crate::object::header::object_type(obj) }, t);
+            // The macro expands both inside and outside `unsafe` blocks.
+            #[allow(unused_unsafe)]
+            let ty = unsafe { $crate::object::header::object_type(obj) };
+            debug_assert_eq!(ty, t);
         }
         $crate::object::header::MetaObj(obj)
     }};
@@ -180,9 +193,12 @@ macro_rules! meta_obj_from_storage {
         let obj: *mut $crate::object::ObjectHeader = $obj;
         let _ = &$entry;
         #[cfg(debug_assertions)]
-        debug_assert!($crate::object_has_meta_word!(unsafe {
-            $crate::object::header::object_type(obj)
-        }));
+        {
+            // The macro expands both inside and outside `unsafe` blocks.
+            #[allow(unused_unsafe)]
+            let ty = unsafe { $crate::object::header::object_type(obj) };
+            debug_assert!($crate::object_has_meta_word!(ty));
+        }
         $crate::object::header::MetaObj(obj)
     }};
 }
@@ -194,9 +210,12 @@ macro_rules! meta_obj_from_kind {
         let obj: *mut $crate::object::ObjectHeader = $obj;
         let _ = &$word;
         #[cfg(debug_assertions)]
-        debug_assert!($crate::object_has_meta_word!(unsafe {
-            $crate::object::header::object_type(obj)
-        }));
+        {
+            // The macro expands both inside and outside `unsafe` blocks.
+            #[allow(unused_unsafe)]
+            let ty = unsafe { $crate::object::header::object_type(obj) };
+            debug_assert!($crate::object_has_meta_word!(ty));
+        }
         $crate::object::header::MetaObj(obj)
     }};
 }

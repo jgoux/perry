@@ -81,8 +81,9 @@ NON_HANDLE_TABLES = {
     ("crates/perry-runtime/src/gc/fromspace_scan.rs", "SNAPSHOT_PAGES"),
     ("crates/perry-runtime/src/gc/diag_sites.rs", "CHARGES"),
     # Compiled code/literal/site metadata, not heap object identity.
-    ("crates/perry-runtime/src/builtins/fn_metadata.rs", "REGISTRY"),
-    ("crates/perry-runtime/src/builtins/fn_metadata.rs", "OVERRIDES"),
+    # `builtins/fn_metadata.rs` used to hold `REGISTRY` and `OVERRIDES` here; #13442
+    # replaced both modules' tables with stable function-metadata identity, so the
+    # file declares no `static` at all and both classifications went stale.
     # Class ids are compiler metadata ids, not native-resource handles.
     ("crates/perry-runtime/src/object/class_constructors.rs", "CLASS_CAPTURE_VALUES"),
     ("crates/perry-runtime/src/object/class_env.rs", "CLASS_ENVS"),
@@ -117,7 +118,7 @@ EXTRA_TABLES: dict[tuple[str, str], int] = {
     ("crates/perry-runtime/src/tui/hooks.rs", "SLOTS"): 1,
     ("crates/perry-runtime/src/tui/state.rs", "SLOTS"): 1,
     ("crates/perry-runtime/src/tui/tree.rs", "REGISTRY"): 1,
-    ("crates/perry-stdlib/src/common/handle_lifecycle.rs", "ORPHANS"): 1,
+    ("crates/perry-ffi/src/handle_lifecycle.rs", "ORPHANS"): 1,
     ("crates/perry-stdlib/src/readline/mod.rs", "READLINE_INTERFACES"): 1,
 }
 
@@ -252,11 +253,19 @@ def scan(root: Path = ROOT) -> tuple[dict[str, int], dict[str, int], set[tuple[s
 
 
 # a2ca8e952e moved the four byte-cell metadata registries out of header.rs;
-# that file is now only a re-export. The two paths share ONE existing budget.
+# that file is now only a re-export. Each pair of paths shares ONE existing budget.
 # Sum both sides: restoring a registry in the old file cannot mint headroom.
 LEDGER_PATH_MOVES = {
     "crates/perry-runtime/src/buffer/header.rs":
         "crates/perry-runtime/src/buffer/store/layout.rs",
+    # The shared pool lifecycle (its one orphan queue) moved from perry-stdlib into
+    # perry-ffi with the GC-proven id reuse; the file no longer exists in stdlib.
+    "crates/perry-stdlib/src/common/handle_lifecycle.rs":
+        "crates/perry-ffi/src/handle_lifecycle.rs",
+    # The npm `typescript` binding was removed and its crate renamed to
+    # perry-ext-bun; the Bun transpiler/build registries moved with the file.
+    "crates/perry-ext-typescript/src/bun.rs":
+        "crates/perry-ext-bun/src/bun.rs",
 }
 
 

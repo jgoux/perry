@@ -7,7 +7,7 @@ use anyhow::Result;
 use swc_ecma_ast as ast;
 
 use super::url_search_params::build_url_search_params_method_call;
-use super::{is_typed_array_type, typed_array_lacks_array_method};
+use super::{is_qualified_type_name, is_typed_array_type, typed_array_lacks_array_method};
 use crate::ir::*;
 
 use super::super::{lower_expr, LoweringContext};
@@ -122,6 +122,7 @@ fn type_is_class_instance(
                 // instance's ObjectHeader as an ArrayHeader (silently
                 // corrupting it) and never ran the method.
                 || ctx.functions_index.contains_key(name.as_str())
+                || is_qualified_type_name(name)
         }
         // #11128: `InstanceType<typeof C>` is by definition whatever `C`
         // constructs — an instance whose own methods may share Array names
@@ -133,7 +134,8 @@ fn type_is_class_instance(
             !builtin_generic_bases.contains(&base.as_str())
                 && (ctx.lookup_class(base).is_some()
                     || ctx.is_interface_type(base)
-                    || is_imported_class_name(base))
+                    || is_imported_class_name(base)
+                    || is_qualified_type_name(base))
         }
         Type::Union(variants) => variants
             .iter()
@@ -1113,29 +1115,13 @@ pub(super) fn try_local_array_methods(
                             .lookup_local_type(&arr_name)
                             .map(|ty| matches!(ty, Type::Named(name) if name == "TextEncoder"))
                             .unwrap_or(false);
-                        if is_text_encoder {
-                            if method_name == "encode" {
-                                if !args.is_empty() {
-                                    return Ok(Ok(Expr::TextEncoderEncode(Box::new(
-                                        args.into_iter().next().unwrap(),
-                                    ))));
-                                } else {
-                                    // encode() with no args encodes empty string
-                                    return Ok(Ok(Expr::TextEncoderEncode(Box::new(
-                                        Expr::String(String::new()),
-                                    ))));
-                                }
-                            }
-                            if method_name == "encodeInto" {
-                                let mut args = args.into_iter();
-                                let source =
-                                    args.next().unwrap_or_else(|| Expr::String(String::new()));
-                                let dest = args.next().unwrap_or(Expr::Undefined);
-                                return Ok(Ok(Expr::TextEncoderEncodeInto {
-                                    source: Box::new(source),
-                                    dest: Box::new(dest),
-                                }));
-                            }
+                        if is_text_encoder && matches!(method_name, "encode" | "encodeInto") {
+                            return Ok(Ok(super::textencoder::encoder_call(
+                                Expr::LocalGet(array_id),
+                                method_name,
+                                args,
+                                call,
+                            )));
                         }
 
                         // TextDecoder methods

@@ -95,9 +95,7 @@ pub(super) struct Capability {
 
 fn throw_type_error(msg: &str) -> ! {
     let s = crate::string::js_string_from_bytes(msg.as_ptr(), msg.len() as u32);
-    let err = crate::error::js_typeerror_new(s);
-    let v = f64::from_bits(JSValue::pointer(err as *const u8).bits());
-    crate::exception::js_throw(v);
+    crate::exception::throw_core(crate::error::CoreError::type_error(s));
 }
 
 fn type_error_value(msg: &str) -> f64 {
@@ -248,8 +246,7 @@ pub(super) fn new_promise_capability(c: f64) -> Capability {
 }
 
 pub(super) fn is_default_promise_constructor(c: f64) -> bool {
-    let promise_ctor =
-        crate::object::js_get_global_this_builtin_value(b"Promise".as_ptr(), b"Promise".len());
+    let promise_ctor = crate::object::builtin_constructor_value("Promise");
     !is_undef(promise_ctor) && promise_ctor.to_bits() == c.to_bits()
 }
 
@@ -275,14 +272,16 @@ fn get_promise_resolve(c: f64) -> Result<f64, f64> {
 }
 
 /// `Call(func, thisArg, args)` catching exceptions into `Err`.
-fn call_with_this(func: f64, this_arg: f64, args: &[f64]) -> Result<f64, f64> {
+fn call_with_this(func: f64, this_arg: f64, args: &[f64]) -> Result<f64, crate::exception::Caught> {
     let (ptr, len) = if args.is_empty() {
         (std::ptr::null(), 0)
     } else {
         (args.as_ptr(), args.len())
     };
     let this = crate::closure::JsThis::from_f64(this_arg);
-    combinator_catch_js(|| unsafe { crate::closure::native_call_value_this(func, this, ptr, len) })
+    crate::exception::catch_thrown(|| unsafe {
+        crate::closure::native_call_value_this(func, this, ptr, len)
+    })
 }
 
 /// `Invoke(obj, "then", args)` catching exceptions into `Err`.
@@ -758,7 +757,11 @@ fn perform(
         let element_fast = cap_reject_is_closure && !promise_lifecycle_observed();
         // A plain native promise needs neither the catch frame (no getter can
         // run) nor the constructor/`then` probes; see `plain_native_promise`.
-        let plain = if element_fast { plain_native_promise(next) } else { None };
+        let plain = if element_fast {
+            plain_native_promise(next)
+        } else {
+            None
+        };
         let next_promise = if plain.is_some() {
             next
         } else if element_fast {
@@ -772,7 +775,8 @@ fn perform(
                 resolve_fn_h.get_nanbox_f64(),
                 ctor_h.get_nanbox_f64(),
                 &[next],
-            )?
+            )
+            .map_err(|error| error.value())?
         };
         let next_promise_h = iter.root_nanbox_f64(next_promise);
 
@@ -898,7 +902,8 @@ fn perform(
                         cap_resolve_h.get_nanbox_f64(),
                         undef(),
                         &[values_h.get_nanbox_f64()],
-                    )?;
+                    )
+                    .map_err(|error| error.value())?;
                 }
                 CombinatorKind::Any => {
                     // The message allocates; `values` (the errors array) is the
@@ -910,7 +915,8 @@ fn perform(
                     let agg_v = boxed_ptr(crate::error::js_aggregateerror_new(values_ptr(), msg));
                     // Nothing allocates between the line above and the call, so
                     // `agg_v` needs no handle of its own.
-                    call_with_this(cap_reject_h.get_nanbox_f64(), undef(), &[agg_v])?;
+                    call_with_this(cap_reject_h.get_nanbox_f64(), undef(), &[agg_v])
+                        .map_err(|error| error.value())?;
                 }
                 CombinatorKind::Race => unreachable!(),
             }
@@ -988,7 +994,7 @@ pub fn run_combinator(kind: CombinatorKind, c: f64, iterable: f64) -> f64 {
 /// The intrinsic `Promise` constructor value — `this` for the codegen
 /// direct-call path (`Promise.all([...])`).
 pub(super) fn default_promise_ctor() -> f64 {
-    crate::object::js_get_global_this_builtin_value(b"Promise".as_ptr(), b"Promise".len())
+    crate::object::builtin_constructor_value("Promise")
 }
 
 // NOTE: `this_ctor` is passed through verbatim — `undefined`/`null`/primitive
@@ -1052,7 +1058,7 @@ pub extern "C" fn js_promise_reject_spec(this_ctor: f64, reason: f64) -> f64 {
     let cap = new_promise_capability(ctor_h.get_nanbox_f64());
     let cap_promise_h = scope.root_nanbox_f64(cap.promise);
     if let Err(thrown) = call_with_this(cap.reject, undef(), &[reason_h.get_nanbox_f64()]) {
-        crate::exception::js_throw(thrown);
+        crate::exception::rethrow_caught(thrown);
     }
     cap_promise_h.get_nanbox_f64()
 }
@@ -1099,7 +1105,7 @@ pub extern "C" fn js_promise_resolve_spec(this_ctor: f64, value: f64) -> f64 {
     let cap = new_promise_capability(ctor_h.get_nanbox_f64());
     let cap_promise_h = scope.root_nanbox_f64(cap.promise);
     if let Err(thrown) = call_with_this(cap.resolve, undef(), &[value_h.get_nanbox_f64()]) {
-        crate::exception::js_throw(thrown);
+        crate::exception::rethrow_caught(thrown);
     }
     cap_promise_h.get_nanbox_f64()
 }
@@ -1123,7 +1129,7 @@ pub extern "C" fn js_promise_with_resolvers_spec(this_ctor: f64) -> f64 {
     let mut values = [cap.promise, cap.resolve, cap.reject];
     let obj = unsafe {
         crate::object::runtime_layouts::perry_build_runtime_record(
-            std::ptr::addr_of!(crate::object::runtime_layouts::RECORD_F473_0),
+            crate::object::runtime_layouts::RECORD_F473_0::desc(),
             values.as_mut_ptr(),
         )
     };
@@ -1174,7 +1180,7 @@ pub extern "C" fn js_promise_try_spec(this_ctor: f64, callback: f64, rest: f64) 
             let _ = call_with_this(cap_resolve_h.get_nanbox_f64(), undef(), &[value]);
         }
         Err(reason) => {
-            let _ = call_with_this(cap_reject_h.get_nanbox_f64(), undef(), &[reason]);
+            let _ = call_with_this(cap_reject_h.get_nanbox_f64(), undef(), &[reason.value()]);
         }
     }
     cap_promise_h.get_nanbox_f64()

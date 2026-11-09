@@ -320,19 +320,28 @@ fn regenerate_wpfacts_cjs_fixtures() {
     // `t6`'s entry requires by a computed specifier: a program that is not
     // closed, its wrappers keep the open arms.
     // `t7`'s `b.js` requires `module` (Node's `Module._cache`): not closed.
-    let sets: [(&str, &[&str], bool); 6] = [
-        ("t1", &["b.js", "a.js", "m.js"], false),
-        ("t2", &["r.js", "m.js"], false),
+    // `t8`'s entry is ESM (`cjs_t8/m.js`, not wrapped): its `createRequire`
+    // makes the program not closed, and no wrapped module is the entry.
+    let sets: [(&str, &[&str], bool, bool); 7] = [
+        ("t1", &["b.js", "a.js", "m.js"], false, true),
+        ("t2", &["r.js", "m.js"], false, true),
         (
             "t3",
             &["benchmark.js", "richards.js", "sa_Richards.js"],
             false,
+            true,
         ),
-        ("t5", &["b.js", "r.js", "m.js"], false),
-        ("t6", &["benchmark.js", "som.js", "cd.js", "sa_CD.js"], true),
-        ("t7", &["a.js", "b.js", "m.js"], true),
+        ("t5", &["b.js", "r.js", "m.js"], false, true),
+        (
+            "t6",
+            &["benchmark.js", "som.js", "cd.js", "sa_CD.js"],
+            true,
+            true,
+        ),
+        ("t7", &["a.js", "b.js", "m.js"], true, true),
+        ("t8", &["l.js"], true, false),
     ];
-    for (t, files, open) in sets {
+    for (t, files, open, cjs_entry) in sets {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().canonicalize().expect("canonical tempdir");
         let root_text = root.to_string_lossy().into_owned();
@@ -347,13 +356,14 @@ fn regenerate_wpfacts_cjs_fixtures() {
         let out = fixtures.join(format!("cjs_{t}"));
         for (i, f) in files.iter().enumerate() {
             let src = std::fs::read_to_string(root.join(f)).expect("source");
-            let entry = i + 1 == files.len();
+            let entry = cjs_entry && i + 1 == files.len();
             let (wrapped, _) =
                 wrap_commonjs_with_body_offset(&src, &root.join(f), None, entry, None);
             let text = resolve_open(&wrapped, open).replace(&root_text, &short);
             std::fs::write(out.join(f), text).expect("write fixture");
         }
-        let support = resolve_open(&support::source(&keys, true), open).replace(&root_text, &short);
+        let support =
+            resolve_open(&support::source(&keys, cjs_entry), open).replace(&root_text, &short);
         std::fs::write(out.join("perry_cjs.js"), support).expect("write support fixture");
     }
 }
@@ -409,4 +419,98 @@ fn matching_brace(text: &str, open: usize) -> usize {
         }
     }
     panic!("unbalanced braces after offset {open}");
+}
+
+/// The `require.cache` reads of `pf` in the wrapped modules, by the file
+/// name their key ends with, and whether each is proven.
+fn cache_reads(dir: &tempfile::TempDir, pf: &ProgramFacts) -> Vec<(String, bool)> {
+    let root = dir
+        .path()
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let support = support_index(pf);
+    pf.sites
+        .iter()
+        .filter(|s| s.module != support && s.key.starts_with(&root))
+        .map(|s| {
+            let name = s.key.rsplit('/').next().unwrap_or_default().to_string();
+            (name, proven(&s.verdict))
+        })
+        .collect()
+}
+
+/// RPG1b: a cache key keeps its slot because its module's evaluation adds it
+/// before any later key's module evaluates. With the declared order against
+/// the evaluation order (`c.js` first, but `c.js` requires `b.js`, which
+/// evaluates first and adds the later key), `c.js` is added while `b.js` is
+/// present: its slot is the hole, and its reads are not proven.
+#[test]
+fn a_cache_key_added_after_a_later_key_is_not_a_slot() {
+    let (dir, _names, pf) = solve(&[("c.js", C), ("b.js", B), ("a.js", A)]);
+    let dump = pf.dump_text();
+    let reads = cache_reads(&dir, &pf);
+    assert!(reads.iter().any(|(k, _)| k == "c.js"), "{reads:?}\n{dump}");
+    for (k, p) in &reads {
+        match k.as_str() {
+            "c.js" => assert!(!p, "c.js is added after b.js: {reads:?}\n{dump}"),
+            _ => assert!(p, "{k} is added in order: {reads:?}\n{dump}"),
+        }
+    }
+}
+
+/// RPG1b: a deleted cache entry lets the runtime evaluate its module again
+/// (the path registry runs its factory): the factory's stores are no longer
+/// once, so the exports keys it adds keep no order (and the cache, HARD
+/// after the delete, no slot).
+#[test]
+fn a_cache_deletion_ends_the_factory_order() {
+    let a = "const b = require('./b.js');\nconst k = Object.keys(require.cache)[0];\ndelete require.cache[k];\nconsole.log(b.name);\n";
+    let b = "exports.name = 'b';\nexports.twice = function (n) { return n * 2; };\nconsole.log(exports.name);\n";
+    let (dir, _names, pf) = solve(&[("b.js", b), ("c.js", C), ("a.js", a)]);
+    let dump = pf.dump_text();
+    for (k, p) in cache_reads(&dir, &pf) {
+        assert!(!p, "cache read {k} proven after a deletion\n{dump}");
+    }
+    let reads: Vec<_> = pf
+        .sites
+        .iter()
+        .filter(|s| s.key == "name" && !s.is_call)
+        .filter(|s| {
+            s.receivers
+                .iter()
+                .all(|r| r.contains("b.js:__PerryDeclaredKeysObject_"))
+        })
+        .collect();
+    assert!(!reads.is_empty(), "{dump}");
+    for s in reads {
+        assert!(!proven(&s.verdict), "an exports read is proven\n{dump}");
+    }
+}
+
+/// RPG1b: a store in a loop runs again after the stores that follow it: an
+/// exports key first added in a loop keeps no order before a later key.
+#[test]
+fn an_export_added_in_a_loop_keeps_no_order() {
+    let b = "for (let i = 0; i < 2; i++) { if (i === 1) exports.name = 'b'; exports.twice = function (n) { return n * 2; }; }\nconsole.log(exports.name);\n";
+    let (_dir, _names, pf) = solve(&[("b.js", b), ("c.js", C), ("a.js", A)]);
+    let dump = pf.dump_text();
+    let reads: Vec<_> = pf
+        .sites
+        .iter()
+        .filter(|s| s.key == "name" && !s.is_call)
+        .filter(|s| {
+            s.receivers
+                .iter()
+                .all(|r| r.contains("b.js:__PerryDeclaredKeysObject_"))
+        })
+        .collect();
+    assert!(!reads.is_empty(), "{dump}");
+    for s in reads {
+        assert!(
+            !proven(&s.verdict),
+            "a loop-added export read is proven\n{dump}"
+        );
+    }
 }

@@ -1753,6 +1753,7 @@ mod tests {
                 ty: Type::Any,
                 mutable: false,
                 init: Some(Expr::IndexGet {
+                    element_offset: 0,
                     byte_offset: 0,
                     byte_end: 0,
                     object: Box::new(Expr::LocalGet(1)),
@@ -1824,6 +1825,8 @@ mod tests {
                 object: Box::new(Expr::LocalGet(2)),
                 property: "component".to_string(),
                 value: Box::new(Expr::Integer(30)),
+                byte_offset: 0,
+                byte_end: 0,
             },
             Expr::ObjectKeys(Box::new(Expr::LocalGet(2))),
             Expr::Call {

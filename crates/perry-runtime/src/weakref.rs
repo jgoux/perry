@@ -6,8 +6,10 @@
 //! or explicit `gc()` — 2026-07-09 GC audit: delivery used to be gated on the
 //! manual trigger, so ordinary servers never ran any cleanup callback). The
 //! recorded jobs are rooted (`scan_pending_finalization_jobs_roots_mut`) and
-//! delivered as nextTick jobs: immediately after an explicit `gc()`, or at the
-//! next microtask-pump drain for automatic cycles.
+//! delivered as nextTick jobs at the next microtask-pump drain, for automatic
+//! cycles and explicit `gc()` alike. A recorded record stays in its registry
+//! until delivery, so an `unregister` before then removes it and cancels the
+//! callback (delivery skips a record that is no longer registered).
 
 use crate::array::{
     js_array_alloc, js_array_get_f64, js_array_length, js_array_push_f64, ArrayHeader,
@@ -164,9 +166,7 @@ pub(crate) fn weak_collection_entries(obj: *const ObjectHeader) -> Vec<(f64, f64
 
 fn weakref_type_error(message: &str) -> ! {
     let msg = crate::string::js_string_from_bytes(message.as_ptr(), message.len() as u32);
-    let err = crate::error::js_typeerror_new(msg);
-    let err_val = JSValue::pointer(err as *const u8);
-    crate::exception::js_throw(f64::from_bits(err_val.bits()))
+    crate::exception::throw_core(crate::error::CoreError::type_error(msg))
 }
 
 #[inline]
@@ -182,18 +182,15 @@ pub(crate) fn is_valid_weak_target(value: f64) -> bool {
         return true;
     }
 
-    // A class reference (e.g. an imported `class Foo {}` passed as a value, or a
-    // class prototype) is NaN-boxed as an INT32-tagged (`0x7FFE`) class-ref ID,
-    // not a heap pointer. In JS such a value is a function/object and therefore
-    // "CanBeHeldWeakly" (ES2023) — a valid WeakMap/WeakSet/WeakRef key. NestJS
-    // relies on this: `InitializeOnPreviewAllowlist.add(InternalCoreModule)` does
+    // A class constructor (e.g. an imported `class Foo {}` passed as a value) is
+    // a function and therefore "CanBeHeldWeakly" (ES2023) — a valid
+    // WeakMap/WeakSet/WeakRef key. NestJS relies on this:
+    // `InitializeOnPreviewAllowlist.add(InternalCoreModule)` does
     // `weakmap.set(InternalCoreModule, true)`, and module-token factories key a
-    // WeakMap by the module class. Cross-module class imports arrive as class-ref
-    // values (not closure pointers), so without this branch they were rejected
-    // with "Invalid value used as weak map key" only inside a full module graph.
-    if crate::object::class_ref_id(value).is_some()
-        || crate::object::class_prototype_ref_id(value).is_some()
-    {
+    // WeakMap by the module class. Without this branch cross-module class
+    // imports were rejected with "Invalid value used as weak map key" only
+    // inside a full module graph.
+    if crate::object::class_ref_id(value).is_some() {
         return true;
     }
 
@@ -308,6 +305,11 @@ pub(crate) fn weak_target_should_clear(
 ) -> bool {
     if target_bits == TAG_UNDEFINED {
         return false;
+    }
+    // A shared-pool handle id is not a heap address: the pool decides it, and
+    // only a full trace can release one (minors keep it).
+    if let Some(dead) = crate::gc::pool_handle_key_is_dead(target_bits) {
+        return dead && !minor_only;
     }
     let target = f64::from_bits(target_bits);
     if crate::value::is_js_handle(target) {
@@ -691,7 +693,10 @@ pub extern "C" fn js_finreg_unregister(registry: f64, token: f64) -> f64 {
             continue;
         }
         let stored_token = unsafe { object_field_bits(record_ptr, FINREG_RECORD_TOKEN_FIELD) };
-        if stored_token == token_bits {
+        // A token array may have grown since `register` stored it (#13792).
+        if stored_token == token_bits
+            || crate::array::arrays_share_identity(stored_token, token_bits)
+        {
             found = true;
             continue;
         }
@@ -714,7 +719,7 @@ pub extern "C" fn js_finreg_unregister(registry: f64, token: f64) -> f64 {
 
 /// Number of recorded-but-undelivered FinalizationRegistry cleanup jobs on
 /// this thread. Non-zero between a collection's weak pass and the next
-/// delivery point (explicit-`gc()` tail or microtask-pump drain).
+/// delivery point (the next microtask-pump drain).
 pub(crate) fn pending_finalization_jobs_count() -> usize {
     PENDING_FINALIZATION_JOBS.with(|jobs| jobs.borrow().len())
 }
@@ -1264,7 +1269,7 @@ pub(crate) fn queue_pending_finalization_callbacks_after_gc() -> usize {
             })
             .collect()
     });
-    let count = jobs.len();
+    let mut count = 0usize;
     let scope = crate::gc::RuntimeHandleScope::new();
     // The pending-jobs scanner no longer owns this snapshot. Queueing a tick
     // allocates and can invoke an async_hooks init callback, so root EVERY job
@@ -1282,6 +1287,15 @@ pub(crate) fn queue_pending_finalization_callbacks_after_gc() -> usize {
         .collect();
     drop(jobs);
     for (registry, record, callback, held) in rooted {
+        // Spec CleanupFinalizationRegistry: remove the cell, then call the
+        // callback. A cell `unregister` already removed is not delivered.
+        if !remove_finalization_record_from_registry(
+            registry.get_nanbox_f64(),
+            record.get_nanbox_f64(),
+        ) {
+            continue;
+        }
+        count += 1;
         let callback_ptr = js_nanbox_get_pointer(callback.get_nanbox_f64()) as usize;
         if callback_ptr >= 0x1000 && crate::closure::is_closure_ptr(callback_ptr) {
             let held_arg = held.get_nanbox_f64();
@@ -1289,10 +1303,6 @@ pub(crate) fn queue_pending_finalization_callbacks_after_gc() -> usize {
                 crate::builtins::js_queue_next_tick_args(callback_ptr as i64, &held_arg, 1);
             }
         }
-        remove_finalization_record_from_registry(
-            registry.get_nanbox_f64(),
-            record.get_nanbox_f64(),
-        );
     }
     count
 }
@@ -1326,17 +1336,18 @@ pub(crate) fn discard_cancelled_finalization_jobs() {
     }
 }
 
-fn remove_finalization_record_from_registry(registry: f64, record: f64) {
+/// Remove `record` from `registry`'s entries. Returns whether it was there.
+fn remove_finalization_record_from_registry(registry: f64, record: f64) -> bool {
     let reg_ptr = js_nanbox_get_pointer(registry) as *mut ObjectHeader;
     if reg_ptr.is_null() {
-        return;
+        return false;
     }
     let scope = crate::gc::RuntimeHandleScope::new();
     let registry_handle = scope.root_nanbox_f64(registry);
     let record_handle = scope.root_nanbox_f64(record);
     let reg_ptr = js_nanbox_get_pointer(registry_handle.get_nanbox_f64()) as *mut ObjectHeader;
     if reg_ptr.is_null() {
-        return;
+        return false;
     }
     let (entries_key, registry) = registry_handle
         .across_nanbox(|| crate::string::js_string_from_bytes(b"__perry_fr_entries".as_ptr(), 18));
@@ -1344,7 +1355,7 @@ fn remove_finalization_record_from_registry(registry: f64, record: f64) {
     let entries_val = js_object_get_field_by_name(reg_ptr, entries_key);
     let entries_ptr = (entries_val.bits() & 0x0000_FFFF_FFFF_FFFF) as *mut ArrayHeader;
     if entries_ptr.is_null() {
-        return;
+        return false;
     }
     let len = js_array_length(entries_ptr) as usize;
     let new_arr_handle = scope.root_raw_mut_ptr(js_array_alloc(len as u32));
@@ -1356,13 +1367,15 @@ fn remove_finalization_record_from_registry(registry: f64, record: f64) {
     let entries_val = js_object_get_field_by_name(reg_ptr, entries_key);
     let entries_ptr = (entries_val.bits() & 0x0000_FFFF_FFFF_FFFF) as *mut ArrayHeader;
     if entries_ptr.is_null() {
-        return;
+        return false;
     }
     let record_bits = record_handle.get_nanbox_f64().to_bits();
     let len = js_array_length(entries_ptr) as usize;
+    let mut found = false;
     for i in 0..len {
         let current = js_array_get_f64(entries_ptr, i as u32);
         if current.to_bits() == record_bits {
+            found = true;
             continue;
         }
         let pushed = js_array_push_f64(new_arr_handle.get_raw_mut_ptr(), current);
@@ -1374,6 +1387,7 @@ fn remove_finalization_record_from_registry(registry: f64, record: f64) {
         FINREG_ENTRIES_FIELD as u32,
         JSValue::array_ptr(new_arr_handle.get_raw_mut_ptr()),
     );
+    found
 }
 
 // =============================================================================
@@ -1453,13 +1467,13 @@ pub extern "C" fn js_weakmap_init_iterable(map: f64, iterable: f64) -> f64 {
             let adder = adder_handle.get_nanbox_f64();
             let map = map_handle.get_nanbox_f64();
             crate::collection_iter::call_with_this_capturing_throw(adder, map, &[key, val])
-                .unwrap_or_else(|exc| crate::exception::js_throw(exc))
+                .unwrap_or_else(|exc| crate::exception::rethrow_caught(exc))
         });
         if let Err(exc) = result {
             if let Some(iter) = iter_to_close {
                 crate::collection_iter::iterator_close(iter);
             }
-            crate::exception::js_throw(exc);
+            crate::exception::rethrow_caught(exc);
         }
     }
 
@@ -1482,9 +1496,13 @@ pub extern "C" fn js_weakmap_init_iterable(map: f64, iterable: f64) -> f64 {
         }
         ConstructorIter::Iterator(iter) => {
             let iter_handle = scope.root_nanbox_f64(iter);
+            let next_handle =
+                scope.root_nanbox_f64(crate::collection_iter::iterator_next_method(iter));
             loop {
                 let iter = iter_handle.get_nanbox_f64();
-                let Some(entry) = crate::collection_iter::iterator_next_value(iter) else {
+                let Some(entry) =
+                    crate::collection_iter::iterator_next_value(iter, next_handle.get_nanbox_f64())
+                else {
                     break;
                 };
                 add_entry(map_handle, adder_handle, entry, Some(iter));
@@ -1500,8 +1518,7 @@ pub extern "C" fn js_weakmap_init_iterable(map: f64, iterable: f64) -> f64 {
 fn throw_invalid_weakmap_key() -> ! {
     let msg = "Invalid value used as weak map key";
     let msg_str = crate::string::js_string_from_bytes(msg.as_ptr(), msg.len() as u32);
-    let err = crate::error::js_typeerror_new(msg_str);
-    crate::exception::js_throw(f64::from_bits(JSValue::pointer(err as *const u8).bits()))
+    crate::exception::throw_core(crate::error::CoreError::type_error(msg_str))
 }
 
 /// Throw `TypeError: Invalid value used in weak set` (WeakSet value must be an
@@ -1509,8 +1526,7 @@ fn throw_invalid_weakmap_key() -> ! {
 fn throw_invalid_weakset_value() -> ! {
     let msg = "Invalid value used in weak set";
     let msg_str = crate::string::js_string_from_bytes(msg.as_ptr(), msg.len() as u32);
-    let err = crate::error::js_typeerror_new(msg_str);
-    crate::exception::js_throw(f64::from_bits(JSValue::pointer(err as *const u8).bits()))
+    crate::exception::throw_core(crate::error::CoreError::type_error(msg_str))
 }
 
 #[no_mangle]
@@ -1551,7 +1567,7 @@ pub extern "C" fn js_weakset_init_iterable(set: f64, iterable: f64) -> f64 {
             if let Some(iter) = iter_to_close {
                 crate::collection_iter::iterator_close(iter);
             }
-            crate::exception::js_throw(exc);
+            crate::exception::rethrow_caught(exc);
         }
     };
 
@@ -1574,9 +1590,13 @@ pub extern "C" fn js_weakset_init_iterable(set: f64, iterable: f64) -> f64 {
         }
         ConstructorIter::Iterator(iter) => {
             let iter_handle = scope.root_nanbox_f64(iter);
+            let next_handle =
+                scope.root_nanbox_f64(crate::collection_iter::iterator_next_method(iter));
             loop {
                 let iter = iter_handle.get_nanbox_f64();
-                let Some(element) = crate::collection_iter::iterator_next_value(iter) else {
+                let Some(element) =
+                    crate::collection_iter::iterator_next_value(iter, next_handle.get_nanbox_f64())
+                else {
                     break;
                 };
                 add_value(element, Some(iter));
@@ -1617,9 +1637,7 @@ pub extern "C" fn js_weakset_delete(set: f64, value: f64) -> f64 {
 pub extern "C" fn js_weak_throw_primitive() -> f64 {
     let msg = "Invalid value used as weak collection key";
     let msg_str = crate::string::js_string_from_bytes(msg.as_ptr(), msg.len() as u32);
-    let err = crate::error::js_error_new_with_message(msg_str);
-    let err_val = JSValue::pointer(err as *const u8);
-    crate::exception::js_throw(f64::from_bits(err_val.bits()))
+    crate::exception::throw_core(crate::error::CoreError::error(msg_str))
 }
 
 #[cfg(test)]
@@ -1659,7 +1677,7 @@ mod tests {
         // exact value bits it was given.
         let wm = js_weakmap_new();
         let wm_val = f64::from_bits(JSValue::pointer(wm as *const u8).bits());
-        let v = f64::from_bits(JSValue::int32(42).bits());
+        let v = f64::from(42);
         js_weakmap_set(wm_val, fresh_sym, v);
         let got = js_weakmap_get(wm_val, fresh_sym);
         assert_eq!(

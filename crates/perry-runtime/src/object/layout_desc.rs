@@ -38,6 +38,7 @@ pub(crate) mod methods;
 use crate::codegen_abi::{LayoutWord, ShapeId};
 use crate::string::StringHeader;
 pub(crate) use define_field::family_define_field;
+use define_field::family_define_own;
 
 /// Bit 30 of the layout word: THE shadow bit (object model §3.6, §6a). One
 /// bit, one meaning, one stamping rule, shared by step 3 and step 4.
@@ -192,9 +193,9 @@ pub const LAYOUT_PROTO_OBJECT: *const PerryProtoFamily = std::ptr::null();
 pub const LAYOUT_PROTO_NULL: *const PerryProtoFamily = std::ptr::without_provenance(1);
 /// `%Object.prototype%` for a class family whose instances do not inherit
 /// from the class (a compiler declared-keys record, `exports`); `OBJECT` (0)
-/// there means the class's own prototype. A class family tagged `NULL` keeps
-/// the class's shape identity and is born with the null-prototype flag
-/// (`mark_layout_object_facts`).
+/// there means the class's own prototype. A class family tagged `NULL`
+/// (`require.cache`) is registered with the null identity, like any layout
+/// tagged `NULL`: its shape names the link.
 pub const LAYOUT_PROTO_OBJECT_EXPLICIT: *const PerryProtoFamily = std::ptr::without_provenance(3);
 /// `PerryLayoutDesc.proto` addresses at or above this are a
 /// `*const PerryProtoFamily`.
@@ -246,23 +247,6 @@ unsafe fn proto_family_serial(fam: *const PerryProtoFamily) -> u64 {
 unsafe fn proto_family_serial_registered(fam: *const PerryProtoFamily) -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     AtomicU64::from_ptr(std::ptr::addr_of!((*fam).serial).cast_mut()).load(Ordering::Acquire)
-}
-
-/// A program-named key (§6a). `kind` 0 is a string key: its precomputed
-/// FNV-1a hash (the runtime's key hash) and the immutable image string that
-/// is its one address. `kind` 1 is a well-known symbol: `string` null,
-/// `index` its number in `codegen_abi::WELL_KNOWN_SYMBOLS`, `hash` that
-/// number's fixed constant. `kind` 2 is a program symbol: `string` its
-/// description, `hash` the creation sequence number the runtime assigns when
-/// module init creates it. Registration binds a well-known symbol atom to the
-/// agent's symbol before user code runs.
-#[repr(C)]
-pub struct StaticAtom {
-    pub hash: u64,
-    pub string: *const StringHeader,
-    pub kind: u8,
-    pub _pad: [u8; 3],
-    pub index: u32,
 }
 
 /// One key of a layout's key sequence (enumeration order).
@@ -361,8 +345,22 @@ const _: () = assert!(
             crate::codegen_abi::LAYOUT_DESC_GC_HEADER_WORD_OFFSET_ILP32
         }
 );
-const _: () =
-    assert!(std::mem::offset_of!(PerryLayoutKey, off) == crate::codegen_abi::LAYOUT_KEY_OFF_OFFSET);
+const _: () = assert!(
+    std::mem::offset_of!(PerryLayoutKey, off)
+        == if cfg!(target_pointer_width = "64") {
+            crate::codegen_abi::LAYOUT_KEY_OFF_OFFSET_LP64
+        } else {
+            crate::codegen_abi::LAYOUT_KEY_OFF_OFFSET_ILP32
+        }
+);
+const _: () = assert!(
+    std::mem::size_of::<PerryLayoutKey>()
+        == if cfg!(target_pointer_width = "64") {
+            crate::codegen_abi::LAYOUT_KEY_SIZE_LP64
+        } else {
+            crate::codegen_abi::LAYOUT_KEY_SIZE_ILP32
+        }
+);
 
 const _: () = assert!(
     std::mem::offset_of!(PerryLayoutDesc, image_keys)
@@ -528,25 +526,6 @@ section_sentinel!(
     ".perryatm$m"
 );
 
-/// The entry module supplies the strong, immutable program descriptor.
-/// Runtime-only binaries use this empty weak definition. Its address is
-/// resolved by the linker, never registered, memoized or changed at startup.
-#[used(linker)]
-#[linkage = "weak"]
-#[export_name = "perry_shadow_name_descriptor"]
-static SHADOW_NAME_DESCRIPTOR: StaticAtom = StaticAtom {
-    hash: 0,
-    string: std::ptr::null(),
-    kind: 0,
-    _pad: [0; 3],
-    index: 0,
-};
-
-#[inline(always)]
-pub(crate) fn shadow_name_descriptor() -> &'static StaticAtom {
-    &SHADOW_NAME_DESCRIPTOR
-}
-
 #[cfg(target_os = "windows")]
 #[used(linker)]
 #[link_section = ".perrylay$a"]
@@ -603,42 +582,6 @@ fn layout_bounds() -> (usize, usize) {
     }
 }
 
-/// (start, end) of the atom section.
-fn atom_bounds() -> (usize, usize) {
-    std::hint::black_box(std::ptr::addr_of!(ATOM_SECTION_SENTINEL) as usize);
-    #[cfg(target_vendor = "apple")]
-    {
-        unsafe extern "C" {
-            #[link_name = "\u{1}section$start$__DATA$__perry_atoms"]
-            static START: u8;
-            #[link_name = "\u{1}section$end$__DATA$__perry_atoms"]
-            static END: u8;
-        }
-        (
-            std::ptr::addr_of!(START) as usize,
-            std::ptr::addr_of!(END) as usize,
-        )
-    }
-    #[cfg(target_os = "windows")]
-    {
-        (
-            std::ptr::addr_of!(ATOM_START) as usize + 8,
-            std::ptr::addr_of!(ATOM_END) as usize,
-        )
-    }
-    #[cfg(not(any(target_vendor = "apple", target_os = "windows")))]
-    {
-        unsafe extern "C" {
-            static __start_perry_atoms: u8;
-            static __stop_perry_atoms: u8;
-        }
-        (
-            std::ptr::addr_of!(__start_perry_atoms) as usize,
-            std::ptr::addr_of!(__stop_perry_atoms) as usize,
-        )
-    }
-}
-
 /// Every record of a section, in section order (the linker may pad between
 /// input sections; records are 8-aligned and a zero word never starts one).
 fn records<T>(bounds: (usize, usize)) -> impl Iterator<Item = *mut T> {
@@ -646,43 +589,6 @@ fn records<T>(bounds: (usize, usize)) -> impl Iterator<Item = *mut T> {
     let size = std::mem::size_of::<T>();
     let count = if end > start { (end - start) / size } else { 0 };
     (0..count).map(move |i| (start + i * size) as *mut T)
-}
-
-/// The bytes of an atom's image string.
-unsafe fn atom_bytes<'a>(atom: *const StaticAtom) -> Option<&'a [u8]> {
-    let s = (*atom).string;
-    if (*atom).kind != crate::codegen_abi::ATOM_KIND_STRING || s.is_null() {
-        return None;
-    }
-    Some(std::slice::from_raw_parts(
-        crate::string::string_data(s),
-        (*s).byte_len as usize,
-    ))
-}
-
-/// Object model step 5 (case 2c): every coloured key of the program, as
-/// `(bytes, hash, mask bit, slot)`. Codegen marks a coloured string atom with
-/// `_pad[0] = 1` and `index = bit | slot << 8` (`perry-codegen`
-/// `layout_desc::atom`); the entry module emits one for every coloured key.
-pub(crate) fn coloured_atoms() -> Vec<(&'static [u8], u64, u32, u32)> {
-    let mut out = Vec::new();
-    unsafe {
-        for atom in image_atoms() {
-            if (*atom)._pad[0] != 1 {
-                continue;
-            }
-            if let Some(bytes) = atom_bytes(atom) {
-                let index = (*atom).index;
-                out.push((bytes, (*atom).hash, index & 0xFF, index >> 8));
-            }
-        }
-    }
-    // Ordered by the program's own numbers (colour bit, slot, hash). A
-    // coloured key has one (bit, slot), so equal triples are one atom image
-    // repeated; the bytes never need comparing.
-    out.sort_unstable_by_key(|a| (a.2, a.3, a.1));
-    out.dedup_by_key(|a| (a.2, a.3, a.1));
-    out
 }
 
 /// The agent-independent well-known symbol a kind-1 atom is bound to.
@@ -731,29 +637,16 @@ unsafe fn image_atom_symbol(atom: *const StaticAtom) -> Option<*mut crate::symbo
         .then(|| (*atom).string.cast_mut().cast())
 }
 
-/// Pre-seed the agent's atom table, then register every layout. Runs once per
-/// agent from `js_shape_run_static_seed`, after the hash-band literal seeds.
-pub(crate) fn seed_static_atoms() {
-    #[cfg(target_family = "wasm")]
-    assert!(
-        image_atoms().next().is_some(),
-        "Wasm image constructors did not run"
-    );
-    crate::string::reserve_static_atoms(
-        super::runtime_layouts::PERRY_ASCII_CHARS.0.len() + image_atoms().count(),
-    );
-    super::runtime_layouts::seed_ascii_char_atoms();
-    unsafe {
-        for atom in image_atoms() {
-            if let Some(bytes) = atom_bytes(atom) {
-                crate::string::seed_static_atom(bytes, (*atom).hash, (*atom).string);
-            }
-        }
-    }
-    crate::object::layout_probe::seed_colours();
-    #[cfg(all(feature = "wasm-image-selftest", target_family = "wasm"))]
-    wasm_program_image_checks::check_atoms();
-}
+mod atoms;
+#[cfg(any(
+    all(feature = "wasm-image-selftest", target_family = "wasm"),
+    all(test, target_os = "windows")
+))]
+use atoms::atom_bounds;
+#[cfg(test)]
+pub(crate) use atoms::image_atoms;
+pub use atoms::StaticAtom;
+pub(crate) use atoms::{atom_bytes, coloured_atoms, seed_static_atoms, shadow_name_descriptor};
 
 #[path = "layout_desc/lazy_image.rs"]
 mod lazy_image;
@@ -784,8 +677,38 @@ pub(crate) use registration::register_static_layouts_in;
 ///
 /// # Safety
 /// `desc` is a registered descriptor of this program.
+#[cfg(not(all(target_arch = "x86_64", target_os = "linux", target_env = "gnu")))]
 #[no_mangle]
 pub unsafe extern "C" fn perry_alloc_layout(desc: *const PerryLayoutDesc) -> *mut ObjectHeader {
+    unsafe { perry_alloc_layout_body(desc, None) }
+}
+
+/// x86-64 Linux: an allocation JS calls directly, entered through a shim that
+/// passes its caller's frame along. Only the arena slow path, the one branch
+/// that can collect, offers it to the collection (`gc::roots::walk_origin`);
+/// the bump path pays the shim's three moves. Allocation runs no JS, which is
+/// what lets it offer.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", target_env = "gnu"))]
+#[unsafe(naked)]
+#[no_mangle]
+pub unsafe extern "C" fn perry_alloc_layout(desc: *const PerryLayoutDesc) -> *mut ObjectHeader {
+    crate::gc::offering_entry_asm!(1, perry_alloc_layout_from)
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", target_env = "gnu"))]
+extern "C" fn perry_alloc_layout_from(
+    desc: *const PerryLayoutDesc,
+    pc: usize,
+    sp: usize,
+    fp: usize,
+) -> *mut ObjectHeader {
+    unsafe { perry_alloc_layout_body(desc, Some(crate::gc::WalkOrigin { pc, sp, fp })) }
+}
+
+unsafe fn perry_alloc_layout_body(
+    desc: *const PerryLayoutDesc,
+    origin: Option<crate::gc::WalkOrigin>,
+) -> *mut ObjectHeader {
     #[cfg(test)]
     crate::test_support::bootstrap_test_thread();
     let d = &*desc;
@@ -796,7 +719,7 @@ pub unsafe extern "C" fn perry_alloc_layout(desc: *const PerryLayoutDesc) -> *mu
         );
         std::process::abort();
     };
-    alloc_layout_object(d, LayoutWord(id))
+    alloc_layout_object_offering(d, LayoutWord(id), origin)
 }
 
 /// Allocate an instance of class family layout `desc` born on `copy`, a class
@@ -817,9 +740,21 @@ pub(crate) unsafe fn alloc_family_layout_copy(
 /// Allocate an object of the registered layout `id` of `d` (see
 /// [`perry_alloc_layout`]). Can collect.
 unsafe fn alloc_layout_object(d: &PerryLayoutDesc, id: LayoutWord) -> *mut ObjectHeader {
+    alloc_layout_object_offering(d, id, None)
+}
+
+/// [`alloc_layout_object`] for an entry that passed its caller's frame: a
+/// collection the arena slow path runs walks from there.
+#[inline(always)]
+unsafe fn alloc_layout_object_offering(
+    d: &PerryLayoutDesc,
+    id: LayoutWord,
+    origin: Option<crate::gc::WalkOrigin>,
+) -> *mut ObjectHeader {
     // The descriptor carries the header image (with the size) and where the slots start.
-    let obj = crate::arena::arena_alloc_gc_object_word(&d.gc_header_word, d.slot_count)
-        .cast::<ObjectHeader>();
+    let obj =
+        crate::arena::arena_alloc_gc_object_word_offering(&d.gc_header_word, d.slot_count, origin)
+            .cast::<ObjectHeader>();
     finish_layout_object(
         obj,
         d,
@@ -908,8 +843,8 @@ unsafe fn finish_layout_object(
 }
 
 /// The per-object record a layout-born object carries before its shape is
-/// stamped: plain ordinary, null prototype, descriptors and integrity, all
-/// from the descriptor. Every allocator that stamps a layout shape calls it,
+/// stamped: plain ordinary, descriptors and integrity, all from the
+/// descriptor (its [[Prototype]] is the layout's identity). Every allocator that stamps a layout shape calls it,
 /// so the shape kind and the record agree (R6).
 ///
 /// # Safety
@@ -928,14 +863,11 @@ unsafe fn mark_layout_object_facts(obj: *mut ObjectHeader, d: &PerryLayoutDesc) 
             }
         }
     }
-    if d.proto == LAYOUT_PROTO_NULL {
-        (*gc)._reserved |= crate::gc::OBJ_FLAG_NULL_PROTO;
-    }
     if d.integrity != 0
         || (d.key_count != 0
             && std::slice::from_raw_parts(d.keys, d.key_count as usize)
                 .iter()
-                .any(|key| key.attrs & !LAYOUT_KEY_LATE != 0))
+                .any(|key| key.attrs & LAYOUT_KEY_LATE == 0 && key.attrs != 0))
     {
         (*gc)._reserved |= crate::gc::OBJ_FLAG_HAS_DESCRIPTORS;
     }
@@ -1215,6 +1147,9 @@ pub(crate) unsafe fn prototype_image(
     let obj = (built.get_nanbox_u64() & crate::value::POINTER_MASK) as *const ObjectHeader;
     let (keys, live) = super::object_keys_and_live_slot_count(obj);
     let image = image.with_mut_ptr(|p: *mut ObjectHeader| p);
+    // GC_STORE_AUDIT(POINTER_FREE): a storage-only copy preserves nominal
+    // identity; the shared carried layout does not name the source's class.
+    (*image).class_id = (*obj).class_id;
     for (pos, key) in std::slice::from_raw_parts(d.keys, d.key_count as usize)
         .iter()
         .enumerate()
@@ -1523,6 +1458,19 @@ pub(crate) fn family_of_class(class_id: u32) -> Option<(u32, *const PerryLayoutD
     let parent = unsafe { (*desc).parent_class_id };
     let actual = super::class_meta_registry::get_parent_class_id(class_id).unwrap_or(0);
     (actual == parent).then_some((index, desc))
+}
+
+/// Is `word` the layout word of class `class_id`'s own family descriptor
+/// (the layout its births are stamped with)? A literal family names class 0
+/// in its descriptor, so its objects are told by this word, not their class
+/// id. The class declaration owns the descriptor; the word's family record
+/// must be that descriptor.
+pub(crate) fn word_is_class_family_layout(word: u32, class_id: u32) -> bool {
+    let Some(declaration) = super::class_registry::declarations::class_declaration(class_id) else {
+        return false;
+    };
+    let desc = declaration.instance_layout;
+    !desc.is_null() && family_for_word(word) == Some(desc)
 }
 
 /// Is `d` a layout of class family `class_id` or of a family descending
@@ -1893,12 +1841,10 @@ use diagnostics::FAMILY_DIAG;
 #[path = "layout_desc/store.rs"]
 mod store;
 pub(crate) use store::desc_own_key;
-use store::desc_position_by_bytes;
 pub(crate) use store::desc_position_hashed;
 pub(crate) use store::family_create;
 pub(crate) use store::family_own_key;
 pub(crate) use store::family_own_key_hashed;
-use store::family_slot_word;
 pub(crate) use store::family_store;
 pub(crate) use store::family_store_str;
 pub(crate) use store::family_store_value;
@@ -1908,57 +1854,39 @@ pub(crate) use store::later_late_key_present;
 /// definition runs: when the key is a layout's optional key whose slot holds
 /// the hole (absent, `key_view`), the object gets its overflow (§3.4), whose
 /// tombstone the hole then is. The definition meets an absent key and adds
-/// it, in definition order, with exactly the descriptor's attributes. May
+/// it, in definition order, with exactly the descriptor's attributes. A
+/// data definition whose attributes are exactly the ones the layout carries
+/// the key with fills the slot in place instead
+/// (`define_field::family_define_own`): `true`, the definition is done. May
 /// allocate: the caller holds its operands in handles.
 ///
 /// # Safety
 /// `receiver` is a live value.
-pub(crate) unsafe fn prepare_hole_define(receiver: u64, key: u64) {
+pub(crate) unsafe fn prepare_hole_define(
+    receiver: u64,
+    key: u64,
+    descriptor: &super::object_ops::DescView<'_>,
+) -> bool {
     if receiver & !crate::value::POINTER_MASK != crate::value::POINTER_TAG {
-        return;
+        return false;
     }
     let obj = (receiver & crate::value::POINTER_MASK) as *mut ObjectHeader;
     if super::key_view::own_key_is_hole(obj, crate::JSValue::from_bits(key)) {
+        if family_define_own(obj, f64::from_bits(key), descriptor) {
+            return true;
+        }
         note_install_cause(install_cause::DEFINE);
         super::overflow::ensure(obj);
     }
+    false
 }
 
-// Program records use linker section bounds on every target. On wasm the
-// runtime also keeps its own existing inventory: Rust custom sections cannot
-// carry relocations. No program constructor or address registry is needed.
-fn image_atoms() -> impl Iterator<Item = *mut StaticAtom> {
-    #[cfg(target_family = "wasm")]
-    {
-        records::<StaticAtom>(atom_bounds()).chain(
-            inventory::iter::<crate::wasm_image::Atom>
-                .into_iter()
-                .map(|item| item.0.cast_mut()),
-        )
-    }
-    #[cfg(not(target_family = "wasm"))]
-    {
-        records::<StaticAtom>(atom_bounds())
-    }
-}
+// Program records use linker section bounds on every target. Runtime
+// layouts are not among them: each is its own compiler-emitted symbol, named
+// by its births (`runtime_layouts::<NAME>::desc()`), with no position.
 pub(super) fn image_layouts() -> impl Iterator<Item = *mut PerryLayoutDesc> {
-    #[cfg(target_family = "wasm")]
-    {
-        records::<PerryLayoutDesc>(layout_bounds()).chain(
-            inventory::iter::<crate::wasm_image::Layout>
-                .into_iter()
-                .map(|item| item.0),
-        )
-    }
-    #[cfg(not(target_family = "wasm"))]
-    {
-        records::<PerryLayoutDesc>(layout_bounds())
-    }
+    records::<PerryLayoutDesc>(layout_bounds())
 }
-
-#[cfg(any(test, target_family = "wasm"))]
-#[path = "layout_desc/enumeration.rs"]
-mod enumeration;
 
 fn descriptor_index(desc: *const PerryLayoutDesc) -> Option<u32> {
     let (start, end) = layout_bounds();
@@ -1967,15 +1895,7 @@ fn descriptor_index(desc: *const PerryLayoutDesc) -> Option<u32> {
     if at >= start && at < end && (at - start) % size == 0 {
         Some(((at - start) / size) as u32)
     } else {
-        let literal = literal_birth::literal_index(desc);
-        #[cfg(target_family = "wasm")]
-        {
-            literal.or_else(|| literal_birth::runtime_index(desc))
-        }
-        #[cfg(not(target_family = "wasm"))]
-        {
-            literal
-        }
+        literal_birth::literal_index(desc)
     }
 }
 const _: () = assert!(
@@ -1994,7 +1914,7 @@ mod windows_layout_bounds_tests {
     #[test]
     fn image_bounds_include_runtime_layouts() {
         let (start, end) = layout_bounds();
-        let timeout = std::ptr::addr_of!(crate::object::runtime_layouts::TIMEOUT);
+        let timeout = crate::object::runtime_layouts::TIMEOUT::desc();
         let sentinel = std::ptr::addr_of!(LAYOUT_SECTION_SENTINEL);
         assert!(start < end, "COFF layout image must not be empty");
         for record in [timeout, sentinel] {
@@ -2007,6 +1927,7 @@ mod windows_layout_bounds_tests {
 
 #[cfg(all(test, target_os = "windows"))]
 mod windows_atom_bounds_tests {
+    use super::atoms::atom_bounds;
     use super::*;
 
     #[test]

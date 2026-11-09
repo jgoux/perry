@@ -38,6 +38,7 @@ use perry_hir::{BinaryOp, Class, ClassField, Expr, Function, Module, ModuleInitK
 
 fn ir_opts(is_entry: bool) -> CompileOptions {
     CompileOptions {
+        namespace_self_import: false,
         static_shape_ids: Vec::new(),
         program_layout_ordinals: Default::default(),
         program_class_shape_ids: Default::default(),
@@ -68,8 +69,6 @@ fn ir_opts(is_entry: bool) -> CompileOptions {
         cjs_interop_namespaces: Vec::new(),
         constructor_param_counts: Default::default(),
         imported_classes: Vec::new(),
-        short_spread_method_candidates: std::sync::Arc::default(),
-        program_class_accessor_names: Default::default(),
         object_literal_method_candidates: std::sync::Arc::default(),
         imported_enums: Vec::new(),
         imported_async_funcs: std::collections::HashSet::new(),
@@ -289,6 +288,8 @@ fn bump_method() -> Function {
                 left: Box::new(this_get("value")),
                 right: Box::new(Expr::Number(1.0)),
             }),
+            byte_offset: 0,
+            byte_end: 0,
         })],
     )
 }
@@ -337,11 +338,15 @@ fn point_class() -> Class {
                 object: Box::new(Expr::This),
                 property: "x".to_string(),
                 value: Box::new(Expr::LocalGet(80)),
+                byte_offset: 0,
+                byte_end: 0,
             }),
             Stmt::Expr(Expr::PropertySet {
                 object: Box::new(Expr::This),
                 property: "y".to_string(),
                 value: Box::new(Expr::LocalGet(81)),
+                byte_offset: 0,
+                byte_end: 0,
             }),
         ],
     );
@@ -425,6 +430,8 @@ fn ptr_shape_local_module() -> Module {
                     }),
                     right: Box::new(Expr::Number(1.0)),
                 }),
+                byte_offset: 0,
+                byte_end: 0,
             }),
             // The method result is accumulated into a separate local, exactly as
             // `fixture_ptr_shape.ts` does. Returning `p.norm2()` directly puts a
@@ -493,6 +500,7 @@ fn array_registry_class() -> Class {
                         op: BinaryOp::Add,
                         left: Box::new(Expr::LocalGet(111)),
                         right: Box::new(Expr::IndexGet {
+                            element_offset: 0,
                             byte_offset: 0,
                             byte_end: 0,
                             object: Box::new(this_get("vals")),
@@ -655,6 +663,7 @@ fn bitset_truthiness_site_module(proven_index: bool) -> Module {
     let bitset_test = Expr::Binary {
         op: BinaryOp::BitAnd,
         left: Box::new(Expr::IndexGet {
+            element_offset: 0,
             byte_offset: 0,
             byte_end: 0,
             object: Box::new(Expr::LocalGet(MASK_ID)),
@@ -1039,7 +1048,10 @@ fn guarded_pshape_call_site_is_preceded_by_a_shape_id_guard() {
                 bs.iter().any(|(_, body)| {
                     body.iter().any(|line| {
                         line.starts_with("  br i1 ")
-                            && line.contains(&format!("label %{call_block}"))
+                            && line.split("label %").skip(1).any(|part| {
+                                let to = part.split([',', ' ']).next().unwrap();
+                                through_stack_check(&probe, to) == *call_block
+                            })
                     }) && body.iter().any(|line| line.contains("icmp eq i64"))
                 })
             };
@@ -1179,7 +1191,7 @@ fn single_arm_method_shape_guard_is_inlined_with_the_runtime_contract() {
             && probe.contains("getelementptr i8, ptr")
             && probe.contains("i64 -8")
             && probe.contains("and i32")
-            && probe.contains(", 134250751")
+            && probe.contains(", 33023")
             && probe.contains("icmp eq i32")
             && probe.contains(", 2")
             && probe.contains("load i64, ptr")
@@ -1276,6 +1288,8 @@ fn array_field_cache_declines_direct_and_super_slot_rebinding() {
         object: Box::new(Expr::This),
         property: "keys".to_string(),
         value: Box::new(Expr::Array(Vec::new(), None)),
+        byte_offset: 0,
+        byte_end: 0,
     }));
     assert!(
         crate::collectors::ptr_array_cache_fields(&class, &direct).is_empty(),
@@ -1372,6 +1386,8 @@ fn row_class() -> Class {
                     }),
                     right: Box::new(this_get("id")),
                 }),
+                byte_offset: 0,
+                byte_end: 0,
             }),
             Stmt::Return(Some(this_get("score"))),
         ],
@@ -1433,12 +1449,10 @@ fn indexed_tower_site_module() -> Module {
         Type::Any,
         vec![Stmt::Return(Some(Expr::Binary {
             op: BinaryOp::Add,
-            left: Box::new(Expr::IndexGet {
-                byte_offset: 0,
-                byte_end: 0,
-                object: Box::new(this_get("values")),
-                index: Box::new(Expr::LocalGet(INDEX_ID)),
-            }),
+            left: Box::new(Expr::synthetic_index_get(
+                Box::new(this_get("values")),
+                Box::new(Expr::LocalGet(INDEX_ID)),
+            )),
             right: Box::new(this_get("id")),
         }))],
     ));
@@ -1462,6 +1476,41 @@ fn indexed_tower_site_module() -> Module {
 
 /// Split rendered IR into `(label, body_lines)` — block labels render
 /// unindented and colon-terminated, every instruction is indented.
+/// The block an edge into `label` really enters: a body's moved stack check
+/// (`stack_guard::move_check_to_call_sites`) sits in front of a calling block
+/// as `stack_guard.*` blocks, which this follows to the one block they lead to.
+fn through_stack_check(ir: &str, label: &str) -> String {
+    let mut work = vec![label.to_string()];
+    let mut seen = std::collections::HashSet::new();
+    let mut exits = std::collections::BTreeSet::new();
+    while let Some(l) = work.pop() {
+        if !l.starts_with("stack_guard.") {
+            exits.insert(l);
+            continue;
+        }
+        if !seen.insert(l.clone()) {
+            continue;
+        }
+        let start = format!("{l}:");
+        for line in ir
+            .lines()
+            .skip_while(|line| *line != start)
+            .skip(1)
+            .take_while(|line| !line.ends_with(':'))
+        {
+            if line.trim_start().starts_with("br ") {
+                for part in line.split("label %").skip(1) {
+                    work.push(part.split([',', ' ']).next().unwrap().to_string());
+                }
+            }
+        }
+    }
+    match exits.len() {
+        1 => exits.into_iter().next().unwrap(),
+        _ => label.to_string(),
+    }
+}
+
 fn blocks(ir: &str) -> Vec<(String, Vec<&str>)> {
     let mut out: Vec<(String, Vec<&str>)> = Vec::new();
     for line in ir.lines() {
@@ -1769,12 +1818,7 @@ fn polymorphic_array_site_module() -> Module {
     m.classes.extend([derived, inherited]);
     m.functions[0].params[0].ty = Type::Array(Box::new(Type::Named("Counter".into())));
     m.functions[0].body = vec![Stmt::Expr(call(
-        Expr::IndexGet {
-            byte_offset: 0,
-            byte_end: 0,
-            object: Box::new(Expr::LocalGet(2)),
-            index: Box::new(Expr::Integer(0)),
-        },
+        Expr::synthetic_index_get(Box::new(Expr::LocalGet(2)), Box::new(Expr::Integer(0))),
         "bump",
         Vec::new(),
     ))];
@@ -1821,7 +1865,9 @@ fn class_dispatch_compares_the_authoritative_packed_word() {
         .into_iter()
         .filter(|(label, _)| label.starts_with("method_direct.layout."))
         .collect();
-    assert_eq!(tests.len(), 3);
+    // The two declared bodies have layout clones; the inherited arm's case
+    // enters its call directly (both layout edges would call one body).
+    assert_eq!(tests.len(), 2);
     for (_, body) in tests {
         assert!(body.iter().any(|l| l.contains("icmp eq i64")));
         assert!(!body.iter().any(|l| l.contains("icmp eq i32")));

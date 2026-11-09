@@ -45,6 +45,7 @@ const STAGE_FUNC_BASE: u32 = 900;
 
 fn ir_opts() -> CompileOptions {
     CompileOptions {
+        namespace_self_import: false,
         static_shape_ids: Vec::new(),
         program_layout_ordinals: Default::default(),
         program_class_shape_ids: Default::default(),
@@ -75,8 +76,6 @@ fn ir_opts() -> CompileOptions {
         cjs_interop_namespaces: Vec::new(),
         constructor_param_counts: Default::default(),
         imported_classes: Vec::new(),
-        short_spread_method_candidates: std::sync::Arc::default(),
-        program_class_accessor_names: Default::default(),
         object_literal_method_candidates: std::sync::Arc::default(),
         imported_enums: Vec::new(),
         imported_async_funcs: std::collections::HashSet::new(),
@@ -429,7 +428,16 @@ fn the_hot_cache_read_is_marked_gc_leaf_in_bodies_without_root_slots() {
         type_params: Vec::new(),
         params: Vec::new(),
         return_type: Type::Number,
-        body: vec![Stmt::Return(Some(Expr::Number(1.0)))],
+        // A self-call keeps the body's entry stack check (a leaf body that
+        // cannot recurse drops it, `expr::stack_guard::finish_stack_guard`),
+        // and with it the hot-cache read this test inspects.
+        body: vec![Stmt::Return(Some(Expr::Call {
+            byte_end: 0,
+            callee: Box::new(Expr::FuncRef(WALK_ID)),
+            args: Vec::new(),
+            type_args: Vec::new(),
+            byte_offset: 0,
+        }))],
         is_async: false,
         is_generator: false,
         is_strict: true,
@@ -515,8 +523,8 @@ fn a_self_recursive_function_inlines_its_bump_allocator() {
     );
 }
 
-#[test]
-fn every_inline_birth_uses_live_flags_and_seeds_initialized_slots() {
+/// Whole-module IR with every inline-birth flavour the invariant covers.
+fn every_inline_birth_ir() -> String {
     assert_inline_new_not_forced();
     let mut module = walk_module(true);
     // Whole module: both numeric branches, noted pointer elements, different
@@ -539,9 +547,42 @@ fn every_inline_birth_uses_live_flags_and_seeds_initialized_slots() {
         vec![Expr::Array(vec![Expr::Number(2.0)], None)],
         None,
     )));
-    let ir = ir_for(module);
-    inline_birth_invariant::check(&ir);
-    inline_birth_invariant::sabotage_controls(&ir);
+    ir_for(module)
+}
+
+#[test]
+fn every_inline_birth_uses_live_flags_and_seeds_initialized_slots() {
+    inline_birth_invariant::check(&every_inline_birth_ir());
+}
+
+#[test]
+#[should_panic(expected = "header must depend on a LIVE birth flag load")]
+fn a_scalar_birth_header_without_its_live_color_is_refused() {
+    let ir = every_inline_birth_ir();
+    inline_birth_invariant::check(&inline_birth_invariant::sabotaged(
+        &ir,
+        inline_birth_invariant::Sabotage::HeaderColor { vector: false },
+    ));
+}
+
+#[test]
+#[should_panic(expected = "missing %color = shl i64 %wide_flags, 8")]
+fn a_vector_birth_header_without_its_live_color_is_refused() {
+    let ir = every_inline_birth_ir();
+    inline_birth_invariant::check(&inline_birth_invariant::sabotaged(
+        &ir,
+        inline_birth_invariant::Sabotage::HeaderColor { vector: true },
+    ));
+}
+
+#[test]
+#[should_panic(expected = "seed before ALL slots/header metadata initialized")]
+fn a_birth_seed_before_initialization_is_refused() {
+    let ir = every_inline_birth_ir();
+    inline_birth_invariant::check(&inline_birth_invariant::sabotaged(
+        &ir,
+        inline_birth_invariant::Sabotage::SeedBeforeInitialization,
+    ));
 }
 
 #[path = "inline_birth_invariant.rs"]

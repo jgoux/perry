@@ -12,29 +12,8 @@ pub(crate) use own_keys::{OwnNamesSnapshot, OwnProperty};
 unsafe fn class_ref_wtf8_own_property(
     obj_value: f64,
     class_id: u32,
-    key_value: f64,
     name: &[u8],
 ) -> Option<OwnProperty> {
-    let is_prototype = super::class_prototype_ref_id(obj_value).is_some();
-    if is_prototype {
-        if super::class_registry::class_proto_key_deleted_bytes(class_id, name) {
-            return None;
-        }
-        if let Some(proto) =
-            super::class_registry::decl_prototype_own_accessor_bytes(class_id, name)
-        {
-            return own_property(proto, key_value);
-        }
-        if super::native_module::class_has_own_method_bytes(class_id, name) {
-            if let Some(value) =
-                super::class_registry::class_method_slot_value_bytes(class_id, name)
-            {
-                return OwnProperty::data(f64::from_bits(value), true, false, true);
-            }
-        }
-        return None;
-    }
-
     if super::class_registry::class_static_key_deleted_bytes(class_id, name) {
         return None;
     }
@@ -103,7 +82,7 @@ pub(crate) fn sort_property_names_ecma(names: &mut Vec<String>) {
             rest.push(name);
         }
     }
-    indexed.sort_by_key(|(index, _)| *index);
+    crate::cold_sort::sort_by_u64_key(&mut indexed, |(index, _)| u64::from(*index));
     names.extend(indexed.into_iter().map(|(_, name)| name));
     names.extend(rest);
 }
@@ -121,7 +100,7 @@ fn sort_property_name_bytes_ecma(names: &mut Vec<Vec<u8>>) {
             rest.push(name);
         }
     }
-    indexed.sort_by_key(|(index, _)| *index);
+    crate::cold_sort::sort_by_u64_key(&mut indexed, |(index, _)| u64::from(*index));
     names.extend(indexed.into_iter().map(|(_, name)| name));
     names.extend(rest);
 }
@@ -219,11 +198,35 @@ pub extern "C" fn js_object_get_own_property_descriptor(obj_value: f64, key_valu
     }
 }
 
+// A keyed descriptor reads only that native-backed property. Refreshing the
+// entire mirror here would rebuild every environment string once per key when
+// Object.assign inspects the source's descriptors.
+#[optimize(size)]
+unsafe fn process_env_own_property(key_value: f64) -> Option<OwnProperty> {
+    let key = crate::builtins::js_string_coerce(key_value);
+    let value = crate::process::js_getenv(key);
+    if value.is_null() {
+        None
+    } else {
+        OwnProperty::data(
+            crate::value::js_nanbox_string(value as i64),
+            true,
+            true,
+            true,
+        )
+    }
+}
+
 /// The descriptor authority returns property facts before reflection chooses
 /// to materialize a JavaScript descriptor. Snapshot consumers read these same
 /// facts directly; ordinary data/accessor resolution does not allocate.
 #[optimize(size)]
 pub(crate) unsafe fn own_property(obj_value: f64, key_value: f64) -> Option<OwnProperty> {
+    if crate::process::is_process_env_object(obj_value)
+        && crate::symbol::js_is_symbol(key_value) == 0
+    {
+        return process_env_own_property(key_value);
+    }
     unsafe {
         // #2818: ToObject(null/undefined) throws TypeError, matching Node.
         let obj_jv = crate::JSValue::from_bits(obj_value.to_bits());
@@ -525,6 +528,19 @@ pub(crate) unsafe fn own_property(obj_value: f64, key_value: f64) -> Option<OwnP
                     attrs.configurable(),
                 );
             }
+            if kind == ExoticKind::Error && name == "cause" {
+                let err = addr as *const crate::error::ErrorHeader;
+                if (*err).flags & crate::error::ERROR_FLAG_HAS_CAUSE != 0 {
+                    let attrs = super::get_property_attrs(addr, &name)
+                        .unwrap_or(PropertyAttrs::new(true, false, true));
+                    return OwnProperty::data(
+                        (*err).cause,
+                        attrs.writable(),
+                        attrs.enumerable(),
+                        attrs.configurable(),
+                    );
+                }
+            }
             // Builtin own slots: RegExp `lastIndex` (writable, non-enum,
             // non-config) and Error `message`/`stack` (writable, non-enum,
             // configurable).
@@ -554,54 +570,39 @@ pub(crate) unsafe fn own_property(obj_value: f64, key_value: f64) -> Option<OwnP
                 let method_name = match String::from_utf8(method_name_bytes.clone()) {
                     Ok(name) => name,
                     Err(_) => {
-                        return class_ref_wtf8_own_property(
-                            obj_value,
-                            class_id,
-                            key_value,
-                            &method_name_bytes,
-                        )
+                        return class_ref_wtf8_own_property(obj_value, class_id, &method_name_bytes)
                     }
                 };
-                if if class_prototype_ref_id(obj_value).is_some() {
-                    super::class_registry::class_proto_key_deleted(class_id, &method_name)
-                } else {
-                    super::class_registry::class_static_key_deleted(class_id, &method_name)
-                } {
+                if super::class_registry::class_static_key_deleted(class_id, &method_name) {
                     return None;
                 }
                 // Private registry entries retain their source spelling, but
                 // a public computed static field named `"#x"` is a distinct
                 // String property and must remain reflectable.
                 if method_name.starts_with('#') {
-                    if super::class_prototype_ref_id(obj_value).is_none() {
-                        if let Some(v) = super::class_registry::class_own_static_field_value(
-                            class_id,
-                            &method_name,
-                        ) {
-                            return OwnProperty::data(v, true, true, true);
-                        }
+                    if let Some(v) =
+                        super::class_registry::class_own_static_field_value(class_id, &method_name)
+                    {
+                        return OwnProperty::data(v, true, true, true);
                     }
                     return None;
                 }
-                if super::class_prototype_ref_id(obj_value).is_none() {
-                    if let Some((acc, attrs)) =
-                        super::class_registry::class_dynamic_static_accessor_descriptor(
-                            class_id,
-                            &method_name,
-                            obj_value,
-                        )
-                    {
-                        let undef = crate::value::TAG_UNDEFINED;
-                        return OwnProperty::accessor(
-                            f64::from_bits(if acc.get == 0 { undef } else { acc.get }),
-                            f64::from_bits(if acc.set == 0 { undef } else { acc.set }),
-                            attrs.enumerable(),
-                            attrs.configurable(),
-                        );
-                    }
+                if let Some((acc, attrs)) =
+                    super::class_registry::class_dynamic_static_accessor_descriptor(
+                        class_id,
+                        &method_name,
+                        obj_value,
+                    )
+                {
+                    let undef = crate::value::TAG_UNDEFINED;
+                    return OwnProperty::accessor(
+                        f64::from_bits(if acc.get == 0 { undef } else { acc.get }),
+                        f64::from_bits(if acc.set == 0 { undef } else { acc.set }),
+                        attrs.enumerable(),
+                        attrs.configurable(),
+                    );
                 }
                 if method_name == "name"
-                    && super::class_prototype_ref_id(obj_value).is_none()
                     && super::class_registry::lookup_static_method_in_chain(class_id, "name")
                         .is_none()
                     // #7190: an own static `name` — installed by
@@ -627,56 +628,28 @@ pub(crate) unsafe fn own_property(obj_value: f64, key_value: f64) -> Option<OwnP
                         );
                     }
                 }
-                // Class accessors reflect as accessor descriptors. An instance
-                // `get x(){}` is a real accessor property of the declared
-                // prototype object, so a `C.prototype` ref reflects that
-                // object. A static accessor is an own property of `C` itself,
-                // whose raw func_ptrs are wrapped as callable function values.
-                if super::class_prototype_ref_id(obj_value).is_some() {
-                    if let Some(proto) =
-                        super::class_registry::decl_prototype_own_accessor(class_id, &method_name)
-                    {
-                        return own_property(proto, key_value);
-                    }
-                } else if let Some(desc) =
-                    crate::object::class_value::class_static_accessor_descriptor(
-                        class_id,
-                        &method_name,
-                    )
-                {
+                // A static accessor is an own property of `C` itself and
+                // reflects as an accessor descriptor, its raw func_ptrs
+                // wrapped as callable function values.
+                if let Some(desc) = crate::object::class_value::class_static_accessor_descriptor(
+                    class_id,
+                    &method_name,
+                ) {
                     return OwnProperty::public(desc);
-                }
-                if super::class_prototype_ref_id(obj_value).is_some()
-                    && (method_name == "constructor"
-                        || class_has_own_method(class_id, &method_name))
-                {
-                    let value = if method_name == "constructor"
-                        && !class_has_own_method(class_id, &method_name)
-                    {
-                        super::class_constructor_ref_value(class_id)
-                    } else {
-                        class_prototype_method_value_for_name(class_id, &method_name)
-                    };
-                    return OwnProperty::data(value, true, false, true);
                 }
                 // Own data properties, including `prototype`, live in the
                 // class function object's property bag. Read their actual
                 // values and shape attributes, never an encoded class ref.
-                if super::class_prototype_ref_id(obj_value).is_none() {
-                    if let Some(v) =
-                        super::class_registry::class_own_static_field_value(class_id, &method_name)
-                    {
-                        // #7190: a key installed by `Object.defineProperty`
-                        // reports the attributes it was defined with; a
-                        // declared `static x = …` field keeps (true, true, true).
-                        let (writable, enumerable, configurable) =
-                            super::class_registry::class_static_defined_attrs(
-                                class_id,
-                                &method_name,
-                            )
+                if let Some(v) =
+                    super::class_registry::class_own_static_field_value(class_id, &method_name)
+                {
+                    // #7190: a key installed by `Object.defineProperty`
+                    // reports the attributes it was defined with; a
+                    // declared `static x = …` field keeps (true, true, true).
+                    let (writable, enumerable, configurable) =
+                        super::class_registry::class_static_defined_attrs(class_id, &method_name)
                             .unwrap_or((true, true, true));
-                        return OwnProperty::data(v, writable, enumerable, configurable);
-                    }
+                    return OwnProperty::data(v, writable, enumerable, configurable);
                 }
             }
             return None;
@@ -718,6 +691,14 @@ pub(crate) unsafe fn own_property(obj_value: f64, key_value: f64) -> Option<OwnP
                     }
                     // A generator function declares `prototype`: an
                     // unmaterialized slot is born with its bag (allocates).
+                    // So does an unborn lazy builtin family's constructor:
+                    // its family's birth gives it the bag.
+                    if name == "prototype" && crate::closure::props::bag_of(ptr).is_null() {
+                        ptr_handle.across_mut::<u8, _>(|| {
+                            crate::object::birth_unborn_family_of(ptr);
+                        });
+                    }
+                    let ptr = ptr_handle.with_mut_ptr::<u8, _>(|ptr| ptr as usize);
                     let (name, ptr) = if name == "prototype"
                         && crate::closure::props::closure_has_generator_body(
                             ptr as *const crate::closure::ClosureHeader,
@@ -1006,12 +987,11 @@ pub(crate) unsafe fn own_property(obj_value: f64, key_value: f64) -> Option<OwnP
                     );
                 }
                 if name == "constructor" {
-                    let ctor = js_get_global_this_builtin_value(b"Array".as_ptr(), 5);
-                    let ctor_value = crate::value::JSValue::from_bits(ctor.to_bits());
-                    if ctor_value.is_pointer() {
-                        let ctor_ptr = ctor_value.as_pointer::<u8>() as usize;
-                        let proto = crate::closure::closure_get_dynamic_prop(ctor_ptr, "prototype");
-                        if crate::value::js_nanbox_get_pointer(proto) as usize == obj as usize {
+                    // `%Array.prototype%`'s own `constructor` is `%Array%`:
+                    // both from the realm entry, never `globalThis.Array`.
+                    if obj as usize == crate::array::array_prototype_addr() {
+                        let ctor = super::builtin_constructor_value("Array");
+                        if crate::value::JSValue::from_bits(ctor.to_bits()).is_pointer() {
                             return OwnProperty::data(ctor, true, false, true);
                         }
                     }
@@ -1021,6 +1001,13 @@ pub(crate) unsafe fn own_property(obj_value: f64, key_value: f64) -> Option<OwnP
         }
 
         if (*obj).class_id == NATIVE_MODULE_CLASS_ID {
+            if let Some(name) = key_rust.as_deref() {
+                if let Some(property @ OwnProperty::Accessor(..)) =
+                    ordinary_own_property(obj, name.as_bytes())
+                {
+                    return Some(property);
+                }
+            }
             // Namespace-object descriptors route through the armed ops table
             // (see `nm_namespace_hooks`) so binaries without module imports
             // don't statically link the namespace/exports web. Unarmed +
@@ -1102,6 +1089,7 @@ pub(crate) use builders::{
 /// Takes a NaN-boxed f64 object pointer, returns a NaN-boxed f64 array pointer.
 #[no_mangle]
 pub extern "C" fn js_object_get_own_property_names(obj_value: f64) -> f64 {
+    let obj_value = crate::process::refresh_process_env(obj_value);
     // A class object stores everything it owns except `prototype`
     // (`class_object_has_prototype_property`), which was created with it,
     // right after `length` and `name`.
@@ -1267,14 +1255,16 @@ fn js_object_get_own_property_names_shape(obj_value: f64) -> f64 {
             use super::exotic_expando::ExoticKind;
             let mut names = match kind {
                 ExoticKind::Error => {
-                    // V8 creates the lazy own `stack` before Error's optional
-                    // `message`. The header keeps both payload slots, but only
-                    // `message` values supplied to the constructor are own
-                    // properties; `name` is always inherited until assigned.
+                    // Constructor diagnostics precede later expando keys;
+                    // assigned causes must keep their own insertion position.
                     let mut builtin = vec!["stack".to_string()];
                     let error = addr as *mut crate::error::ErrorHeader;
+                    let has_cause = (*error).flags & crate::error::ERROR_FLAG_HAS_CAUSE != 0;
                     if crate::error::js_error_has_own_property(error, "message") {
                         builtin.push("message".to_string());
+                    }
+                    if has_cause {
+                        builtin.push("cause".to_string());
                     }
                     builtin
                 }
@@ -1298,81 +1288,64 @@ fn js_object_get_own_property_names_shape(obj_value: f64) -> f64 {
             return f64::from_bits((out as u64) | 0x7FFD_0000_0000_0000);
         }
         if let Some(class_id) = class_ref_id(obj_value) {
-            let is_prototype_ref = super::class_prototype_ref_id(obj_value).is_some();
             // The class function object's own keys, in its bag's creation
             // order: a key deleted and defined again is a new key and comes
             // last, as for any object.
-            if !is_prototype_ref {
-                if let Some(fo) = crate::object::class_value::class_value_if_minted(class_id) {
-                    let ptr = fo as usize;
-                    // This agent's live class closure (the enclosing `unsafe`).
-                    let names = crate::closure::bag_own_key_names_bytes(ptr);
-                    let mut out: Vec<Vec<u8>> = Vec::new();
-                    for intrinsic in [b"length".as_slice(), b"name", b"prototype"] {
-                        if !names.iter().any(|n| n == intrinsic)
-                            && !crate::closure::closure_is_key_deleted(
-                                ptr,
+            if let Some(fo) = crate::object::class_value::class_value_if_minted(class_id) {
+                let ptr = fo as usize;
+                // This agent's live class closure (the enclosing `unsafe`).
+                let names = crate::closure::bag_own_key_names_bytes(ptr);
+                let mut out: Vec<Vec<u8>> = Vec::new();
+                for intrinsic in [b"length".as_slice(), b"name", b"prototype"] {
+                    if !names.iter().any(|n| n == intrinsic)
+                        && !crate::closure::closure_is_key_deleted(
+                            ptr,
+                            std::str::from_utf8(intrinsic).unwrap(),
+                        )
+                        && (intrinsic == b"prototype"
+                            || !super::class_registry::class_static_key_deleted(
+                                class_id,
                                 std::str::from_utf8(intrinsic).unwrap(),
-                            )
-                            && (intrinsic == b"prototype"
-                                || !super::class_registry::class_static_key_deleted(
-                                    class_id,
-                                    std::str::from_utf8(intrinsic).unwrap(),
-                                ))
-                        {
-                            out.push(intrinsic.to_vec());
-                        }
+                            ))
+                    {
+                        out.push(intrinsic.to_vec());
                     }
-                    for name in names {
-                        if name.starts_with(b"#")
-                            || super::field_get_set::is_internal_runtime_key_bytes(&name)
-                        {
-                            continue;
-                        }
-                        push_unique_name_bytes(&mut out, name);
-                    }
-                    sort_property_name_bytes_ecma(&mut out);
-                    let result = crate::array::js_array_alloc(out.len() as u32);
-                    for name in out {
-                        let str_ptr =
-                            crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
-                        crate::array::js_array_push(result, JSValue::string_ptr(str_ptr));
-                    }
-                    return f64::from_bits((result as u64) | 0x7FFD_0000_0000_0000);
                 }
+                for name in names {
+                    if name.starts_with(b"#")
+                        || super::field_get_set::is_internal_runtime_key_bytes(&name)
+                    {
+                        continue;
+                    }
+                    push_unique_name_bytes(&mut out, name);
+                }
+                sort_property_name_bytes_ecma(&mut out);
+                let result = crate::array::js_array_alloc(out.len() as u32);
+                for name in out {
+                    let str_ptr =
+                        crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
+                    crate::array::js_array_push(result, JSValue::string_ptr(str_ptr));
+                }
+                return f64::from_bits((result as u64) | 0x7FFD_0000_0000_0000);
             }
-            let mut names: Vec<Vec<u8>> = if is_prototype_ref {
-                vec![b"constructor".to_vec()]
-            } else {
-                vec![b"length".to_vec(), b"name".to_vec(), b"prototype".to_vec()]
-            };
-            for name in
-                super::class_registry::class_own_string_member_names(class_id, !is_prototype_ref)
-            {
-                let deleted = if is_prototype_ref {
-                    super::class_registry::class_proto_key_deleted_bytes(class_id, &name)
-                } else {
-                    super::class_registry::class_static_key_deleted_bytes(class_id, &name)
-                };
-                if !deleted {
+            let mut names: Vec<Vec<u8>> =
+                vec![b"length".to_vec(), b"name".to_vec(), b"prototype".to_vec()];
+            for name in super::class_registry::class_own_string_member_names(class_id, true) {
+                if !super::class_registry::class_static_key_deleted_bytes(class_id, &name) {
                     push_unique_name_bytes(&mut names, name);
                 }
             }
-            if !is_prototype_ref {
-                for name in super::class_registry::class_own_dynamic_prop_names(class_id) {
-                    push_unique_name_bytes(&mut names, name.into_bytes());
-                }
-                // Accessor properties a `defineProperty` added.
-                for name in crate::object::class_value::class_static_accessor_names_bytes(class_id)
-                {
-                    push_unique_name_bytes(&mut names, name);
-                }
+            for name in super::class_registry::class_own_dynamic_prop_names(class_id) {
+                push_unique_name_bytes(&mut names, name.into_bytes());
+            }
+            // Accessor properties a `defineProperty` added.
+            for name in crate::object::class_value::class_static_accessor_names_bytes(class_id) {
+                push_unique_name_bytes(&mut names, name);
             }
             names.retain(|n| {
                 !super::field_get_set::is_internal_runtime_key_bytes(n)
                     // A deleted `length` / `name` is no longer own.
-                    && !(!is_prototype_ref
-                        && (n.as_slice() == b"length" || n.as_slice() == b"name")
+                    && !((n.as_slice() == b"length" || n.as_slice() == b"name")
                         && super::class_registry::class_static_key_deleted_bytes(class_id, n))
             });
             sort_property_name_bytes_ecma(&mut names);
@@ -1483,8 +1456,23 @@ fn js_object_get_own_property_names_shape(obj_value: f64) -> f64 {
                 // A constructor's (or a generator's) `prototype` is own from
                 // birth, materialized or not: created right after `length`
                 // and `name` (the bag's birth keys), before every later key.
-                if !in_bag("prototype")
-                    && crate::object::has_own_helpers::closure_own_key_present(ptr, "prototype")
+                // Materialized later (a read, a freeze, a redefinition), it
+                // is still that key: non-configurable, never deleted and
+                // created again, so its place is its birth place, wherever
+                // its bag slot was appended.
+                let intrinsic_in_bag = in_bag("prototype")
+                    && super::class_registry::function_would_have_own_prototype(
+                        crate::value::js_nanbox_pointer(ptr as i64),
+                    );
+                if intrinsic_in_bag {
+                    names.retain(|n| n != "prototype");
+                }
+                if intrinsic_in_bag
+                    || (!in_bag("prototype")
+                        && crate::object::has_own_helpers::closure_own_key_present(
+                            ptr,
+                            "prototype",
+                        ))
                 {
                     let at = names
                         .iter()
@@ -1864,79 +1852,111 @@ pub(crate) unsafe fn nm_get_own_descriptor(
     key_str: *const crate::string::StringHeader,
     key_name: Option<&str>,
 ) -> Option<f64> {
+    use super::NmMember;
     let module_name = read_native_module_name(obj)?;
     let key_name = key_name?;
-    if let Some(enumerable) =
-        super::native_module::zlib_readonly_property_enumerability(&module_name, key_name)
-    {
-        let value = js_object_get_field_by_name(obj, key_str);
-        return Some(build_data_descriptor(
-            f64::from_bits(value.bits()),
-            false,
-            enumerable,
-            false,
-        ));
-    }
-    if !native_module_has_enumerable_key(&module_name, key_name) {
-        return None;
-    }
-    if module_name == "fs" {
-        match key_name {
-            "ReadStream" | "WriteStream" | "FileReadStream" | "FileWriteStream" | "Utf8Stream" => {
-                let get = super::native_module::fs_namespace_descriptor_getter_value(key_name);
-                let set = if key_name == "Utf8Stream" {
-                    f64::from_bits(crate::value::TAG_UNDEFINED)
-                } else {
-                    super::native_module::fs_namespace_descriptor_setter_value(key_name)
-                };
-                return Some(build_accessor_descriptor(get, set, true, true));
-            }
-            "promises" => {
-                let get = super::native_module::fs_namespace_descriptor_getter_value(key_name);
-                return Some(build_accessor_descriptor(
-                    get,
-                    f64::from_bits(crate::value::TAG_UNDEFINED),
-                    true,
-                    true,
-                ));
-            }
-            "constants" => {
-                let value = js_object_get_field_by_name(obj, key_str);
-                return Some(build_data_descriptor(
-                    f64::from_bits(value.bits()),
-                    false,
-                    true,
-                    false,
-                ));
-            }
-            _ => {}
+    let member = nm_member(&module_name, key_name)?;
+    let undefined = f64::from_bits(crate::value::TAG_UNDEFINED);
+    Some(match member {
+        NmMember::FsAccessor => {
+            let get = super::native_module::fs_namespace_descriptor_getter_value(key_name);
+            let set = if matches!(key_name, "Utf8Stream" | "promises") {
+                undefined
+            } else {
+                super::native_module::fs_namespace_descriptor_setter_value(key_name)
+            };
+            build_accessor_descriptor(get, set, true, true)
         }
-    }
-    let value = js_object_get_field_by_name(obj, key_str);
-    if matches!(
-        module_name.as_str(),
-        "process" | "process.namespace" | "process.default"
-    ) && key_name == "permission"
-    {
         // Through the `process` constant registry: a descriptor read needs the
         // `process` value, whose every source installs that registry row.
-        let value = super::native_module_registry::nm_const_lookup("process")
-            .and_then(|f| unsafe { f("process", "permission", 0.0, false) })
-            .unwrap_or_else(|| f64::from_bits(crate::value::TAG_UNDEFINED));
-        return Some(build_data_descriptor(value, false, true, false));
+        NmMember::ReadonlyData if key_name == "permission" => {
+            let value = super::native_module_registry::nm_const_lookup("process")
+                .and_then(|f| unsafe { f("process", "permission", 0.0, false) })
+                .unwrap_or(undefined);
+            build_data_descriptor(value, false, true, false)
+        }
+        _ => {
+            let value = f64::from_bits(js_object_get_field_by_name(obj, key_str).bits());
+            match member {
+                NmMember::ZlibReadonly { enumerable } => {
+                    build_data_descriptor(value, false, enumerable, false)
+                }
+                NmMember::Data { configurable } => {
+                    build_data_descriptor(value, true, true, configurable)
+                }
+                _ => build_data_descriptor(value, false, true, false),
+            }
+        }
+    })
+}
+
+/// What the module's tables say about own member `key` of namespace `module`
+/// (`None`: no such member, or deleted, or hidden). Reached through
+/// `NmNamespaceOps::member` and from the descriptor above.
+#[inline(never)]
+pub(crate) fn nm_member(module: &str, key: &str) -> Option<super::NmMember> {
+    use super::NmMember;
+    if let Some(enumerable) =
+        super::native_module::zlib_readonly_property_enumerability(module, key)
+    {
+        return Some(NmMember::ZlibReadonly { enumerable });
     }
-    if matches!(module_name.as_str(), "module" | "async_hooks") {
-        return Some(build_data_descriptor(
-            f64::from_bits(value.bits()),
-            true,
-            true,
-            false,
-        ));
+    if !native_module_has_enumerable_key(module, key) {
+        return None;
     }
-    Some(build_data_descriptor(
-        f64::from_bits(value.bits()),
-        true,
-        true,
-        module_name != "vm",
-    ))
+    Some(match (module, key) {
+        (
+            "fs",
+            "ReadStream" | "WriteStream" | "FileReadStream" | "FileWriteStream" | "Utf8Stream"
+            | "promises",
+        ) => NmMember::FsAccessor,
+        ("fs", "constants")
+        | ("process" | "process.namespace" | "process.default", "permission") => {
+            NmMember::ReadonlyData
+        }
+        ("module" | "async_hooks" | "vm", _) => NmMember::Data {
+            configurable: false,
+        },
+        _ => NmMember::Data { configurable: true },
+    })
+}
+
+#[cfg(test)]
+mod error_name_tests {
+    use super::*;
+
+    #[test]
+    fn constructor_cause_names_precede_later_error_properties() {
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let message = crate::string::js_string_from_bytes(b"payload".as_ptr(), 7);
+        let error = crate::error::js_error_new_with_cause_from_value(
+            crate::js_nanbox_string(message as i64),
+            23.0,
+        );
+        let error = scope.root_nanbox_f64(crate::value::js_nanbox_pointer(error as i64));
+        let code = crate::string::js_string_from_bytes(b"code".as_ptr(), 4);
+        js_object_set_field_by_name(
+            crate::value::js_nanbox_get_pointer(error.get_nanbox_f64()) as *mut _,
+            code,
+            17.0,
+        );
+        let names = scope.root_nanbox_f64(js_object_get_own_property_names(error.get_nanbox_f64()));
+        let array = crate::value::js_nanbox_get_pointer(names.get_nanbox_f64())
+            as *const crate::ArrayHeader;
+        let keys: Vec<String> = (0..crate::array::js_array_length(array))
+            .map(|index| unsafe {
+                let key = crate::JSValue::from_bits(
+                    crate::array::js_array_get_f64(array, index).to_bits(),
+                );
+                let mut sso = [0; crate::value::SHORT_STRING_MAX_LEN];
+                String::from_utf8(
+                    crate::string::js_string_key_bytes(key, &mut sso)
+                        .unwrap()
+                        .to_vec(),
+                )
+                .unwrap()
+            })
+            .collect();
+        assert_eq!(keys, ["stack", "message", "cause", "code"]);
+    }
 }

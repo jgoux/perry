@@ -121,7 +121,11 @@ fn an_imported_module_is_called_through_its_namespace() {
     for (what, main) in [("literal", LITERAL), ("computed", COMPUTED), ("read", READ)] {
         for units in [false, true] {
             let pf = program(main, &["./m.js"], units, None);
-            assert!(!mk(&pf).is_empty(), "{what}: no .mk site\n{}", pf.dump_text());
+            assert!(
+                !mk(&pf).is_empty(),
+                "{what}: no .mk site\n{}",
+                pf.dump_text()
+            );
             assert!(
                 !one_receiver(&pf),
                 "{what} units={units}: base.mk proven on m.ts's receiver alone\n{}",
@@ -142,8 +146,16 @@ fn a_namespace_read_without_a_call_keeps_the_proof() {
         "{}",
         pf.dump_text()
     );
-    let r: Vec<_> = pf.sites.iter().filter(|s| s.module == 0 && s.key == "r").collect();
-    assert!(!r.is_empty() && r.iter().all(|s| proven(s)), "{}", pf.dump_text());
+    let r: Vec<_> = pf
+        .sites
+        .iter()
+        .filter(|s| s.module == 0 && s.key == "r")
+        .collect();
+    assert!(
+        !r.is_empty() && r.iter().all(|s| proven(s)),
+        "{}",
+        pf.dump_text()
+    );
 }
 
 #[test]
@@ -173,4 +185,25 @@ fn per_unit_is_never_stronger_than_whole() {
         let s = super::body_activation::stronger_sites(&u, &w);
         assert!(s.is_empty(), "{s:?}\n{}", u.dump_text());
     }
+}
+
+/// m.ts's init's own site `p.r`, proven: the init runs.
+fn init_ran(pf: &ProgramFacts) -> bool {
+    pf.sites
+        .iter()
+        .any(|s| s.module == 0 && s.key == "r" && !s.is_call && proven(s))
+}
+
+#[test]
+fn a_module_only_import_loads_runs_only_through_the_import_path() {
+    // DECISIONS 225, activation path `import`: m.ts is reached by `import()`
+    // alone. Its init runs; with the `import` path left out the pass would
+    // claim the init never runs (its site is dropped as dead), which is the
+    // claim codegen must never act on. Leaving out `call` keeps it.
+    let pf = program(CONTROL, &["./m.js"], false, None);
+    assert!(init_ran(&pf), "{}", pf.dump_text());
+    let pf = program(CONTROL, &["./m.js"], false, Some("activation:call"));
+    assert!(init_ran(&pf), "{}", pf.dump_text());
+    let pf = program(CONTROL, &["./m.js"], false, Some("activation:import"));
+    assert!(!init_ran(&pf), "{}", pf.dump_text());
 }

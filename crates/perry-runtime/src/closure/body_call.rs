@@ -82,9 +82,10 @@ macro_rules! js_body_fn_ty {
 /// `fn_info!(native_args body, declared; ...)`.
 #[macro_export]
 macro_rules! fn_info {
+    (#[realm($($facts:tt)*)] declare $item:item) => { $item };
     // Runtime and native provider crates use the same exported record emitter.
-    (#[realm($($facts:tt)*)] export $body:path, $n:tt; $($m:ident($($a:tt)*)),*; bind $binding:ident, $metadata:ident) => {
-        $crate::realm_fn_info_bind!($binding, $metadata, $crate::fn_info!(export $body, $n; $($m($($a)*)),*); $($facts)*);
+    (#[realm($($facts:tt)*)] export $($body:ident)::+, $n:tt; $($m:ident($($a:tt)*)),*; bind $binding:ident, $metadata:ident) => {
+        $crate::realm_fn_info_bind!($binding, $metadata, $crate::fn_info!(export $($body)::+, $n; $($m($($a)*)),*); $($facts)*);
     };
     ($(#[realm($($facts:tt)*)])? export $($rest:tt)*) => {
         $crate::codegen_abi::fn_info! { owned for $crate::closure::ClosureHeader; export $($rest)* }

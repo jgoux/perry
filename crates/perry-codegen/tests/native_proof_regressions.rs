@@ -42,6 +42,7 @@ use native_proof_support::{
 
 fn empty_opts() -> CompileOptions {
     CompileOptions {
+        namespace_self_import: false,
         static_shape_ids: Vec::new(),
         program_layout_ordinals: Default::default(),
         program_class_shape_ids: Default::default(),
@@ -70,8 +71,6 @@ fn empty_opts() -> CompileOptions {
         cjs_interop_namespaces: Vec::new(),
         constructor_param_counts: Default::default(),
         imported_classes: Vec::new(),
-        short_spread_method_candidates: std::sync::Arc::default(),
-        program_class_accessor_names: Default::default(),
         object_literal_method_candidates: std::sync::Arc::default(),
         imported_enums: Vec::new(),
         imported_async_funcs: std::collections::HashSet::new(),
@@ -169,6 +168,7 @@ fn module_with_classes_and_params(
         async_step_closures: std::collections::HashSet::new(),
         closure_display_names: std::collections::HashMap::new(),
         class_display_names: std::collections::HashMap::new(),
+        non_constructor_funcs: Default::default(),
         closure_source_text: std::collections::HashMap::new(),
         class_source_text: std::collections::HashMap::new(),
         async_generator_funcs: std::collections::HashSet::new(),
@@ -176,6 +176,7 @@ fn module_with_classes_and_params(
         gen_param_prologue_len: std::collections::HashMap::new(),
         class_family_syntax: None,
         requested_modules: Vec::new(),
+        locally_redeclared_imports: Vec::new(),
     }
 }
 
@@ -362,6 +363,21 @@ fn class_with_computed_member(id: u32, name: &str, fields: Vec<ClassField>) -> C
         kind: ClassComputedMemberKind::Method,
         source_order: 0,
     });
+    class
+}
+
+/// A class with an instance getter whose key is evaluated at run time
+/// (`get ["dyn" + "amicKey"]()`): the compiler cannot name it, so it may be
+/// the accessor of any key and intercepts a named read or store.
+fn class_with_evaluated_accessor(id: u32, name: &str, fields: Vec<ClassField>) -> Class {
+    let mut class = class_with_computed_member(id, name, fields);
+    let member = &mut class.computed_members[0];
+    member.key_expr = Expr::Binary {
+        op: BinaryOp::Add,
+        left: Box::new(Expr::String("dyn".to_string())),
+        right: Box::new(Expr::String("amicKey".to_string())),
+    };
+    member.kind = ClassComputedMemberKind::Getter;
     class
 }
 
@@ -720,12 +736,7 @@ fn buffer_read(buffer_id: u32, method: &str, index: Expr) -> Expr {
 }
 
 fn index_get(object_id: u32, index: Expr) -> Expr {
-    Expr::IndexGet {
-        byte_offset: 0,
-        byte_end: 0,
-        object: Box::new(local(object_id)),
-        index: Box::new(index),
-    }
+    Expr::synthetic_index_get(Box::new(local(object_id)), Box::new(index))
 }
 
 fn call(callee: Expr, args: Vec<Expr>) -> Expr {
@@ -794,11 +805,11 @@ fn native_library_opts_typed(
 }
 
 fn array_set(array_id: u32, index: Expr, value: Expr) -> Stmt {
-    Stmt::Expr(Expr::IndexSet {
-        object: Box::new(local(array_id)),
-        index: Box::new(index),
-        value: Box::new(value),
-    })
+    Stmt::Expr(Expr::synthetic_index_set(
+        Box::new(local(array_id)),
+        Box::new(index),
+        Box::new(value),
+    ))
 }
 
 fn increment(id: u32) -> Expr {
@@ -1039,6 +1050,8 @@ fn artifact_schema_v6_records_c_layout_pod_manifest() {
             object: Box::new(local(1)),
             property: "tag".to_string(),
             value: Box::new(int(9)),
+            byte_offset: 0,
+            byte_end: 0,
         }),
         Stmt::Return(Some(Expr::PropertyGet {
             byte_end: 0,
@@ -1380,21 +1393,18 @@ fn guards_array_read_inline(ir: &str) -> bool {
         && ir.contains("call double @perry_array_read_cold_shared(")
 }
 
-#[path = "native_proof_support/read_memo_contract.rs"]
-mod read_memo_contract;
-
 /// #12986 selects validated shape/slot memos where getters are reachable.
 /// Both variants retain a complete [[Get]] miss; selected memo entrances must
 /// pass the same site storage to that miss.
+/// The layout probe with the complete `[[Get]]` behind it: the leaf
+/// (`perry_probe_get*`, which answers data and accessor slots from the shape)
+/// and a collecting exit, either the receiver's slow entry or the shared
+/// boxed-receiver refusal. A named read owns no shape/slot storage.
 fn is_layout_probe_read(body: &str) -> bool {
-    if body.contains("call double @perry_probe_get_memo(")
-        || body.contains("call double @perry_probe_get_value_memo(")
-    {
-        read_memo_contract::paired_memo_reads(body).is_some()
-    } else {
-        body.contains("call double @perry_probe_get")
-            && body.contains("call double @js_object_get_field_slow(")
-    }
+    body.contains("call double @perry_probe_get")
+        && (body.contains("call double @js_object_get_field_slow(")
+            || body.contains("call double @js_object_get_field_value("))
+        && !body.contains("_read_shape_slots")
 }
 
 /// Whether `ir` births a HEAP receiver object. A class instance is born by the
@@ -1816,6 +1826,8 @@ fn artifact_schema_v6_records_pod_dynamic_write_fallback() {
             object: Box::new(local(1)),
             property: "tag".to_string(),
             value: Box::new(Expr::String("x".to_string())),
+            byte_offset: 0,
+            byte_end: 0,
         }),
         Stmt::Return(Some(Expr::PropertyGet {
             byte_end: 0,
@@ -1865,6 +1877,8 @@ fn pod_field_read_after_dynamic_materialization_uses_dynamic_numeric_sub() {
             object: Box::new(local(1)),
             property: "tag".to_string(),
             value: Box::new(Expr::String("x".to_string())),
+            byte_offset: 0,
+            byte_end: 0,
         }),
         Stmt::Return(Some(Expr::Binary {
             op: BinaryOp::Sub,
@@ -1935,12 +1949,7 @@ fn number_coerce_of_numeric_array_fallback_keeps_runtime_call() {
         vec![param(1, "values", Type::Array(Box::new(Type::Number)))],
         Type::Number,
         vec![Stmt::Return(Some(Expr::NumberCoerce(Box::new(
-            Expr::IndexGet {
-                byte_offset: 0,
-                byte_end: 0,
-                object: Box::new(local(1)),
-                index: Box::new(int(0)),
-            },
+            Expr::synthetic_index_get(Box::new(local(1)), Box::new(int(0))),
         ))))],
     );
 
@@ -1969,11 +1978,11 @@ fn typed_array_f64_store_coerces_annotation_only_numeric_value() {
                 int(0),
                 int(8),
             ),
-            Stmt::Expr(Expr::IndexSet {
-                object: Box::new(local(2)),
-                index: Box::new(int(0)),
-                value: Box::new(local(3)),
-            }),
+            Stmt::Expr(Expr::synthetic_index_set(
+                Box::new(local(2)),
+                Box::new(int(0)),
+                Box::new(local(3)),
+            )),
             Stmt::Return(Some(int(0))),
         ],
     );
@@ -2018,12 +2027,12 @@ fn scalar_replaced_raw_f64_field_store_keeps_numeric_array_fallback_boxed() {
             Stmt::Expr(Expr::PropertySet {
                 object: Box::new(local(2)),
                 property: "gain".to_string(),
-                value: Box::new(Expr::IndexGet {
-                    byte_offset: 0,
-                    byte_end: 0,
-                    object: Box::new(local(3)),
-                    index: Box::new(int(0)),
-                }),
+                value: Box::new(Expr::synthetic_index_get(
+                    Box::new(local(3)),
+                    Box::new(int(0)),
+                )),
+                byte_offset: 0,
+                byte_end: 0,
             }),
             Stmt::Return(Some(Expr::PropertyGet {
                 byte_end: 0,
@@ -2945,19 +2954,14 @@ fn compound_alias_body(array_id: u32, counter_id: u32, base_temp: u32, key_temp:
     vec![
         alias(base_temp, "__cmpd_base_5", local(array_id)),
         alias(key_temp, "__cmpd_key_6", local(counter_id)),
-        Stmt::Expr(Expr::IndexSet {
-            object: Box::new(local(base_temp)),
-            index: Box::new(local(key_temp)),
-            value: Box::new(add(
-                Expr::IndexGet {
-                    byte_offset: 0,
-                    byte_end: 0,
-                    object: Box::new(local(base_temp)),
-                    index: Box::new(local(key_temp)),
-                },
+        Stmt::Expr(Expr::synthetic_index_set(
+            Box::new(local(base_temp)),
+            Box::new(local(key_temp)),
+            Box::new(add(
+                Expr::synthetic_index_get(Box::new(local(base_temp)), Box::new(local(key_temp))),
                 int(1),
             )),
-        }),
+        )),
     ]
 }
 
@@ -7436,6 +7440,8 @@ fn artifact_records_dynamic_property_set_value_bits_before_helper() {
                 object: Box::new(local(1)),
                 property: "field".to_string(),
                 value: Box::new(local(2)),
+                byte_offset: 0,
+                byte_end: 0,
             }),
             Stmt::Return(Some(int(0))),
         ],
@@ -7477,6 +7483,8 @@ fn artifact_records_sloppy_dynamic_property_set_value_bits_before_helper() {
                 object: Box::new(local(1)),
                 property: "field".to_string(),
                 value: Box::new(local(2)),
+                byte_offset: 0,
+                byte_end: 0,
             }),
             Stmt::Return(Some(int(0))),
         ],
@@ -7510,11 +7518,11 @@ fn artifact_records_dynamic_index_set_value_bits_before_helper() {
         ],
         Type::Number,
         vec![
-            Stmt::Expr(Expr::IndexSet {
-                object: Box::new(local(1)),
-                index: Box::new(local(2)),
-                value: Box::new(local(3)),
-            }),
+            Stmt::Expr(Expr::synthetic_index_set(
+                Box::new(local(1)),
+                Box::new(local(2)),
+                Box::new(local(3)),
+            )),
             Stmt::Return(Some(int(0))),
         ],
     );
@@ -7547,11 +7555,11 @@ fn artifact_records_array_runtime_key_index_set_value_bits_before_helper() {
         Type::Number,
         vec![
             number_let(2, "key", false, number(1.5)),
-            Stmt::Expr(Expr::IndexSet {
-                object: Box::new(local(1)),
-                index: Box::new(local(2)),
-                value: Box::new(local(3)),
-            }),
+            Stmt::Expr(Expr::synthetic_index_set(
+                Box::new(local(1)),
+                Box::new(local(2)),
+                Box::new(local(3)),
+            )),
             Stmt::Return(Some(int(0))),
         ],
     );
@@ -7581,11 +7589,11 @@ fn artifact_records_direct_f64_to_js_value_bits_for_write_barrier() {
         vec![
             string_let(2, "key", "key"),
             number_let(3, "value", false, number(1.5)),
-            Stmt::Expr(Expr::IndexSet {
-                object: Box::new(local(1)),
-                index: Box::new(local(2)),
-                value: Box::new(local(3)),
-            }),
+            Stmt::Expr(Expr::synthetic_index_set(
+                Box::new(local(1)),
+                Box::new(local(2)),
+                Box::new(local(3)),
+            )),
             Stmt::Return(Some(int(0))),
         ],
     );
@@ -7629,11 +7637,11 @@ fn artifact_records_direct_i1_to_js_value_bits_for_write_barrier() {
                 mutable: false,
                 init: Some(Expr::Bool(true)),
             },
-            Stmt::Expr(Expr::IndexSet {
-                object: Box::new(local(1)),
-                index: Box::new(local(2)),
-                value: Box::new(local(3)),
-            }),
+            Stmt::Expr(Expr::synthetic_index_set(
+                Box::new(local(1)),
+                Box::new(local(2)),
+                Box::new(local(3)),
+            )),
             Stmt::Return(Some(int(0))),
         ],
     );
@@ -7670,11 +7678,11 @@ fn artifact_records_static_write_barrier_elision_for_primitive_array_store() {
         Type::Number,
         vec![
             string_let(2, "key", "key"),
-            Stmt::Expr(Expr::IndexSet {
-                object: Box::new(local(1)),
-                index: Box::new(local(2)),
-                value: Box::new(Expr::Bool(true)),
-            }),
+            Stmt::Expr(Expr::synthetic_index_set(
+                Box::new(local(1)),
+                Box::new(local(2)),
+                Box::new(Expr::Bool(true)),
+            )),
             Stmt::Return(Some(int(0))),
         ],
     );
@@ -7936,11 +7944,15 @@ fn abrupt_constructor_argument_stops_anonymous_object_construction() {
                 object: Box::new(Expr::This),
                 property: "worker".to_string(),
                 value: Box::new(local(82)),
+                byte_offset: 0,
+                byte_end: 0,
             }),
             Stmt::Expr(Expr::PropertySet {
                 object: Box::new(Expr::This),
                 property: "stamp".to_string(),
                 value: Box::new(local(83)),
+                byte_offset: 0,
+                byte_end: 0,
             }),
         ],
         is_async: false,
@@ -9003,6 +9015,7 @@ fn typed_f64_clone_test_module(use_any_param: bool) -> Module {
         async_step_closures: std::collections::HashSet::new(),
         closure_display_names: std::collections::HashMap::new(),
         class_display_names: std::collections::HashMap::new(),
+        non_constructor_funcs: Default::default(),
         closure_source_text: std::collections::HashMap::new(),
         class_source_text: std::collections::HashMap::new(),
         async_generator_funcs: std::collections::HashSet::new(),
@@ -9010,6 +9023,7 @@ fn typed_f64_clone_test_module(use_any_param: bool) -> Module {
         gen_param_prologue_len: std::collections::HashMap::new(),
         class_family_syntax: None,
         requested_modules: Vec::new(),
+        locally_redeclared_imports: Vec::new(),
     }
 }
 
@@ -9186,6 +9200,7 @@ fn typed_i1_clone_test_module_named(name: &str) -> Module {
         async_step_closures: std::collections::HashSet::new(),
         closure_display_names: std::collections::HashMap::new(),
         class_display_names: std::collections::HashMap::new(),
+        non_constructor_funcs: Default::default(),
         closure_source_text: std::collections::HashMap::new(),
         class_source_text: std::collections::HashMap::new(),
         async_generator_funcs: std::collections::HashSet::new(),
@@ -9193,6 +9208,7 @@ fn typed_i1_clone_test_module_named(name: &str) -> Module {
         gen_param_prologue_len: std::collections::HashMap::new(),
         class_family_syntax: None,
         requested_modules: Vec::new(),
+        locally_redeclared_imports: Vec::new(),
     }
 }
 
@@ -9285,6 +9301,7 @@ fn typed_string_clone_test_module(case: &str) -> Module {
         async_step_closures: std::collections::HashSet::new(),
         closure_display_names: std::collections::HashMap::new(),
         class_display_names: std::collections::HashMap::new(),
+        non_constructor_funcs: Default::default(),
         closure_source_text: std::collections::HashMap::new(),
         class_source_text: std::collections::HashMap::new(),
         async_generator_funcs: std::collections::HashSet::new(),
@@ -9292,6 +9309,7 @@ fn typed_string_clone_test_module(case: &str) -> Module {
         gen_param_prologue_len: std::collections::HashMap::new(),
         class_family_syntax: None,
         requested_modules: Vec::new(),
+        locally_redeclared_imports: Vec::new(),
     };
     match case {
         "positive" => {}
@@ -9406,6 +9424,7 @@ fn typed_i1_numeric_predicate_module() -> Module {
         async_step_closures: std::collections::HashSet::new(),
         closure_display_names: std::collections::HashMap::new(),
         class_display_names: std::collections::HashMap::new(),
+        non_constructor_funcs: Default::default(),
         closure_source_text: std::collections::HashMap::new(),
         class_source_text: std::collections::HashMap::new(),
         async_generator_funcs: std::collections::HashSet::new(),
@@ -9413,6 +9432,7 @@ fn typed_i1_numeric_predicate_module() -> Module {
         gen_param_prologue_len: std::collections::HashMap::new(),
         class_family_syntax: None,
         requested_modules: Vec::new(),
+        locally_redeclared_imports: Vec::new(),
     }
 }
 
@@ -9490,6 +9510,7 @@ fn typed_i1_i32_predicate_module() -> Module {
         async_step_closures: std::collections::HashSet::new(),
         closure_display_names: std::collections::HashMap::new(),
         class_display_names: std::collections::HashMap::new(),
+        non_constructor_funcs: Default::default(),
         closure_source_text: std::collections::HashMap::new(),
         class_source_text: std::collections::HashMap::new(),
         async_generator_funcs: std::collections::HashSet::new(),
@@ -9497,6 +9518,7 @@ fn typed_i1_i32_predicate_module() -> Module {
         gen_param_prologue_len: std::collections::HashMap::new(),
         class_family_syntax: None,
         requested_modules: Vec::new(),
+        locally_redeclared_imports: Vec::new(),
     }
 }
 
@@ -9623,6 +9645,7 @@ fn typed_i32_return_module(case: &str) -> Module {
         async_step_closures: std::collections::HashSet::new(),
         closure_display_names: std::collections::HashMap::new(),
         class_display_names: std::collections::HashMap::new(),
+        non_constructor_funcs: Default::default(),
         closure_source_text: std::collections::HashMap::new(),
         class_source_text: std::collections::HashMap::new(),
         async_generator_funcs: std::collections::HashSet::new(),
@@ -9630,6 +9653,7 @@ fn typed_i32_return_module(case: &str) -> Module {
         gen_param_prologue_len: std::collections::HashMap::new(),
         class_family_syntax: None,
         requested_modules: Vec::new(),
+        locally_redeclared_imports: Vec::new(),
     }
 }
 
@@ -9985,6 +10009,8 @@ fn typed_f64_receiver_method_negative_module(case: &str) -> Module {
                     object: Box::new(Expr::This),
                     property: "x".to_string(),
                     value: Box::new(number(1.0)),
+                    byte_offset: 0,
+                    byte_end: 0,
                 }),
                 Stmt::Return(Some(this_field("x"))),
             ];
@@ -10911,11 +10937,15 @@ fn scalar_method_summary_module() -> Module {
                 object: Box::new(Expr::This),
                 property: "x".to_string(),
                 value: Box::new(local(10)),
+                byte_offset: 0,
+                byte_end: 0,
             }),
             Stmt::Expr(Expr::PropertySet {
                 object: Box::new(Expr::This),
                 property: "y".to_string(),
                 value: Box::new(local(11)),
+                byte_offset: 0,
+                byte_end: 0,
             }),
         ],
         is_async: false,
@@ -11041,6 +11071,8 @@ fn scalar_method_field_write_module() -> Module {
             object: Box::new(Expr::This),
             property: "value".to_string(),
             value: Box::new(local(10)),
+            byte_offset: 0,
+            byte_end: 0,
         })],
         is_async: false,
         is_generator: false,
@@ -11071,6 +11103,8 @@ fn scalar_method_field_write_module() -> Module {
                     }),
                     right: Box::new(int(1)),
                 }),
+                byte_offset: 0,
+                byte_end: 0,
             }),
             Stmt::Return(Some(Expr::PropertyGet {
                 byte_end: 0,
@@ -11414,11 +11448,15 @@ fn scalar_method_int32_bitwise_module(case: &str, field_ty: Type, arg_ty: Type) 
                 object: Box::new(Expr::This),
                 property: "mask".to_string(),
                 value: Box::new(local(10)),
+                byte_offset: 0,
+                byte_end: 0,
             }),
             Stmt::Expr(Expr::PropertySet {
                 object: Box::new(Expr::This),
                 property: "salt".to_string(),
                 value: Box::new(local(11)),
+                byte_offset: 0,
+                byte_end: 0,
             }),
         ],
         is_async: false,
@@ -11597,6 +11635,8 @@ fn scalar_method_boolean_negative_module(case: &str) -> Module {
                     object: Box::new(Expr::This),
                     property: "x".to_string(),
                     value: Box::new(local(12)),
+                    byte_offset: 0,
+                    byte_end: 0,
                 }),
                 Stmt::Return(Some(scalar_predicate_method_body("x"))),
             ];
@@ -11671,12 +11711,10 @@ fn scalar_method_boolean_negative_module(case: &str) -> Module {
         "dynamic_property" => {
             module.classes[0].methods[method_idx].body = vec![Stmt::Return(Some(Expr::Compare {
                 op: CompareOp::Gt,
-                left: Box::new(Expr::IndexGet {
-                    byte_offset: 0,
-                    byte_end: 0,
-                    object: Box::new(Expr::This),
-                    index: Box::new(Expr::String("x".to_string())),
-                }),
+                left: Box::new(Expr::synthetic_index_get(
+                    Box::new(Expr::This),
+                    Box::new(Expr::String("x".to_string())),
+                )),
                 right: Box::new(local(12)),
             }))];
         }
@@ -15390,7 +15428,7 @@ fn static_property_access_on_computed_class_uses_property_id_wrappers() {
     // rejects a non-writable slot by throwing, which is correct only for a
     // strict `PutValue`; the sloppy tail is asserted by the twin below. The
     // READ side is strictness-independent and is asserted in both.
-    let dynamic = class_with_computed_member(141, "DynamicShape", vec![]);
+    let dynamic = class_with_evaluated_accessor(141, "DynamicShape", vec![]);
     let module = strict_module_with_classes_and_params(
         "property_id_static_access.ts",
         vec![dynamic],
@@ -15404,6 +15442,8 @@ fn static_property_access_on_computed_class_uses_property_id_wrappers() {
                 object: Box::new(local(1)),
                 property: "score".to_string(),
                 value: Box::new(local(2)),
+                byte_offset: 0,
+                byte_end: 0,
             }),
             Stmt::Return(Some(Expr::PropertyGet {
                 byte_end: 0,
@@ -15435,7 +15475,7 @@ fn static_property_access_on_computed_class_uses_property_id_wrappers() {
 /// test from passing on an empty program.
 #[test]
 fn sloppy_static_property_store_on_computed_class_avoids_property_id_setter() {
-    let dynamic = class_with_computed_member(141, "DynamicShape", vec![]);
+    let dynamic = class_with_evaluated_accessor(141, "DynamicShape", vec![]);
     let module = module_with_classes_and_params(
         "property_id_static_access_sloppy.ts",
         vec![dynamic],
@@ -15449,6 +15489,8 @@ fn sloppy_static_property_store_on_computed_class_avoids_property_id_setter() {
                 object: Box::new(local(1)),
                 property: "score".to_string(),
                 value: Box::new(local(2)),
+                byte_offset: 0,
+                byte_end: 0,
             }),
             Stmt::Return(Some(Expr::PropertyGet {
                 byte_end: 0,
@@ -15470,10 +15512,10 @@ fn sloppy_static_property_store_on_computed_class_avoids_property_id_setter() {
     // the assignment's own strictness (sloppy here: Throw = 0), reached only
     // after `perry_probe_set` declines.
     assert!(
-        ir.contains("call i32 @perry_probe_set(")
+        ir.contains("call double @perry_store_or_put(")
             && ir
                 .lines()
-                .any(|l| l.contains("call double @js_put_value_set(") && l.ends_with(", i32 0)")),
+                .any(|l| l.contains("call double @perry_store_or_put(") && l.ends_with(", i32 0)")),
         "a sloppy store should reach the strictness-aware [[Set]]:\n{ir}"
     );
     assert!(
@@ -15714,6 +15756,8 @@ fn raw_numeric_class_field_rejects_unknown_or_dynamic_shape_receiver() {
                 object: Box::new(local(1)),
                 property: "x".to_string(),
                 value: Box::new(number(7.0)),
+                byte_offset: 0,
+                byte_end: 0,
             }),
             Stmt::Return(Some(Expr::PropertyGet {
                 byte_end: 0,
@@ -15737,6 +15781,8 @@ fn raw_numeric_class_field_rejects_unknown_or_dynamic_shape_receiver() {
                 object: Box::new(local(1)),
                 property: "x".to_string(),
                 value: Box::new(number(7.0)),
+                byte_offset: 0,
+                byte_end: 0,
             }),
             Stmt::Return(Some(Expr::PropertyGet {
                 byte_end: 0,
@@ -15782,12 +15828,8 @@ fn put_value_set_index_keeps_the_numeric_array_fast_path() {
     // with `arr: number[]` written through the generic PutValue form.
     let arr = 1u32;
     let i = 2u32;
-    let read_arr_i = Expr::IndexGet {
-        byte_offset: 0,
-        byte_end: 0,
-        object: Box::new(Expr::LocalGet(arr)),
-        index: Box::new(Expr::LocalGet(i)),
-    };
+    let read_arr_i =
+        Expr::synthetic_index_get(Box::new(Expr::LocalGet(arr)), Box::new(Expr::LocalGet(i)));
     let body = vec![
         Stmt::Let {
             id: arr,
@@ -15844,6 +15886,9 @@ fn put_value_set_index_keeps_the_numeric_array_fast_path() {
                 }),
                 receiver: Box::new(Expr::LocalGet(arr)),
                 strict: false,
+                element_offset: 0,
+                byte_offset: 0,
+                byte_end: 0,
             })],
         },
     ];
@@ -15869,23 +15914,20 @@ fn put_value_set_index_keeps_the_numeric_array_fast_path() {
     );
 }
 
-/// A static-key `PutValue` is ONE `perry_probe_set` over the receiver's layout
-/// (an own plain writable slot is stored by the runtime, which owns the
-/// barrier) and, only when the probe declines, the complete receiver-aware
-/// `[[Set]]` (`js_put_value_set`). A key the compiler cannot prove constant
-/// never reaches the probe (`js_put_value_set_dynamic`).
+/// A static-key `PutValue` is ONE `perry_store_or_put` call over the
+/// receiver's layout: the store probe (an own plain writable slot is stored
+/// by the runtime, which owns the barrier) and, only when the probe declines,
+/// the complete receiver-aware `[[Set]]`, both out of line. A key the
+/// compiler cannot prove constant never reaches the probe
+/// (`js_put_value_set_dynamic`).
 fn assert_static_key_store_site(ir: &str, what: &str) {
     assert!(
-        ir.contains("call i32 @perry_probe_set("),
+        ir.contains("call double @perry_store_or_put("),
         "{what} must be the layout store probe:\n{ir}"
     );
     assert!(
-        ir.contains("call double @js_put_value_set("),
-        "{what} must keep the complete [[Set]] as its one miss entry:\n{ir}"
-    );
-    assert!(
-        ir.contains("put.pic.set") && ir.contains("put.pic.merge"),
-        "{what} must branch a declined probe to the semantic miss and merge:\n{ir}"
+        !ir.contains("call i32 @perry_probe_set(") && !ir.contains("put.pic.merge"),
+        "{what}: the probe and its miss are one out-of-line call, not an inline branch:\n{ir}"
     );
     assert!(
         !ir.contains("call double @js_put_value_set_dynamic(")
@@ -15917,6 +15959,9 @@ fn static_put_value_uses_write_pic_for_call_free_rhs() {
                 }),
                 receiver: Box::new(Expr::LocalGet(object)),
                 strict: false,
+                element_offset: 0,
+                byte_offset: 0,
+                byte_end: 0,
             })),
         ],
     );
@@ -15970,6 +16015,9 @@ fn immutable_string_key_reuses_static_write_pic() {
                 value: Box::new(Expr::LocalGet(value)),
                 receiver: Box::new(Expr::LocalGet(object)),
                 strict: false,
+                element_offset: 0,
+                byte_offset: 0,
+                byte_end: 0,
             })),
         ],
     );
@@ -16012,6 +16060,9 @@ fn module_global_immutable_string_key_reuses_static_write_pic() {
             value: Box::new(Expr::Integer(1)),
             receiver: Box::new(Expr::LocalGet(object)),
             strict: false,
+            element_offset: 0,
+            byte_offset: 0,
+            byte_end: 0,
         }),
     ];
 
@@ -16049,13 +16100,16 @@ fn mutable_string_key_rejects_static_write_pic() {
                 value: Box::new(Expr::LocalGet(value)),
                 receiver: Box::new(Expr::LocalGet(object)),
                 strict: false,
+                element_offset: 0,
+                byte_offset: 0,
+                byte_end: 0,
             })),
         ],
     );
 
     let ir = compile_ir_for_module_with_opts(module, empty_opts()).unwrap();
     assert!(
-        !ir.contains("call i32 @perry_probe_set("),
+        !ir.contains("call double @perry_store_or_put("),
         "a mutable key must retain dynamic PropertyKey semantics, not a constant-key probe:\n{ir}"
     );
     assert!(
@@ -16082,6 +16136,9 @@ fn static_put_value_keeps_the_inline_store_when_rhs_can_allocate() {
             value: Box::new(Expr::Object(vec![("value".to_string(), Expr::Integer(1))])),
             receiver: Box::new(Expr::LocalGet(object)),
             strict: false,
+            element_offset: 0,
+            byte_offset: 0,
+            byte_end: 0,
         }))],
     );
 
@@ -16096,7 +16153,7 @@ fn static_put_value_keeps_the_inline_store_when_rhs_can_allocate() {
 // write-barrier IR assertion is the ONLY detector for a deleted barrier — so
 // it has to live where the next PR to move that store will run it.
 
-/// The `js_put_value_set_packed_miss` entries of `module`'s IR, counted per
+/// The static-key store-site entries (`perry_store_or_put`) of `module`'s IR, counted per
 /// literal key `0..keys` (the key operand traced back to the load of
 /// `@<module>_.str.K.handle`). A miss entry whose key is not such a literal
 /// fails the test.
@@ -16121,12 +16178,9 @@ fn put_miss_entries_per_key(ir: &str, module: &str, keys: usize) -> Vec<usize> {
             traced(rest.split(' ').next())
         } else if let Some(rest) = rhs.strip_prefix("and i64 ") {
             traced(rest.split(',').next())
-        } else if let Some(args) = rhs.strip_prefix("call double @js_put_value_set(") {
-            match traced(
-                args.split(", ")
-                    .nth(1)
-                    .and_then(|a| a.strip_prefix("double ")),
-            ) {
+        } else if let Some(args) = rhs.strip_prefix("call double @perry_store_or_put(") {
+            // `(ptr dir, i64 target, i64 key, i64 hash, double value, i32 strict)`
+            match traced(args.split(", ").nth(2).and_then(|a| a.strip_prefix("i64 "))) {
                 Some(k) if k < keys => counts[k] += 1,
                 _ => panic!("a miss entry whose key is not a literal key handle: {line}\n{ir}"),
             }
@@ -16158,6 +16212,9 @@ fn nested_same_shape_object_writes_version_one_through_four_fields() {
             }),
             receiver: Box::new(Expr::LocalGet(object)),
             strict: false,
+            element_offset: 0,
+            byte_offset: 0,
+            byte_end: 0,
         })
     };
 
@@ -16167,12 +16224,10 @@ fn nested_same_shape_object_writes_version_one_through_four_fields() {
             name: "object".to_string(),
             ty: Type::Any,
             mutable: false,
-            init: Some(Expr::IndexGet {
-                byte_offset: 0,
-                byte_end: 0,
-                object: Box::new(Expr::LocalGet(objects)),
-                index: Box::new(Expr::LocalGet(inner)),
-            }),
+            init: Some(Expr::synthetic_index_get(
+                Box::new(Expr::LocalGet(objects)),
+                Box::new(Expr::LocalGet(inner)),
+            )),
         }];
         for (index, property) in ["a", "b", "c", "d", "e"]
             .into_iter()
@@ -16304,7 +16359,7 @@ fn nested_same_shape_object_writes_version_one_through_four_fields() {
             "the fast clone should contain {field_count} direct numeric field stores:\n{fast_body}"
         );
         assert!(
-            ir.matches("call double @js_put_value_set(").count() >= field_count,
+            ir.matches("call double @perry_store_or_put(").count() >= field_count,
             "a failed whole-array proof must retain every original PutValue site:\n{ir}"
         );
         if field_count == 4 {
@@ -16355,7 +16410,7 @@ fn nested_same_shape_object_writes_version_one_through_four_fields() {
     assert!(
         nonzero_start.contains("object_array_write.loop.slow.preheader")
             && nonzero_start
-                .matches("call double @js_put_value_set(")
+                .matches("call double @perry_store_or_put(")
                 .count()
                 >= 2,
         "guard failure must retain both original semantic PutValue sites:\n{nonzero_start}"
@@ -16401,7 +16456,7 @@ fn nested_same_shape_object_writes_version_one_through_four_fields() {
         "a runtime bound below the start has distinct final-counter semantics and must remain on the semantic loop:\n{nonzero_dynamic_bound}"
     );
     assert!(
-        nonzero_dynamic_bound.contains("call double @js_put_value_set("),
+        nonzero_dynamic_bound.contains("call double @perry_store_or_put("),
         "the rejected dynamic-bound form must retain its original PutValue site:\n{nonzero_dynamic_bound}"
     );
 
@@ -16445,7 +16500,7 @@ fn nested_same_shape_object_writes_version_one_through_four_fields() {
     let nonfinite = compile_ir("nested_object_write_nonfinite_loop", nonfinite_body);
     assert!(
         !nonfinite.contains("call i64 @js_object_array_numeric_write_guard")
-            && nonfinite.contains("call double @js_put_value_set("),
+            && nonfinite.contains("call double @perry_store_or_put("),
         "a potentially infinite/NaN result must retain ordinary boxed-number semantics:\n{nonfinite}"
     );
 }
@@ -16585,6 +16640,9 @@ fn sloppy_class_field_number_store_takes_the_inline_raw_store() {
                     value: Box::new(Expr::Number(7.0)),
                     receiver: Box::new(local(1)),
                     strict,
+                    element_offset: 0,
+                    byte_offset: 0,
+                    byte_end: 0,
                 }),
                 Stmt::Return(Some(int(0))),
             ],
@@ -16601,7 +16659,7 @@ fn sloppy_class_field_number_store_takes_the_inline_raw_store() {
         let module = ir_for(strict);
         let body = probe_body(&module);
         assert!(
-            body.contains("call i32 @perry_probe_set("),
+            body.contains("call double @perry_store_or_put("),
             "strict={strict}: a number-field store must reach the store probe;              the #6542 `!strict` bail was wider than the hazard it guarded              (#7288):\n{body}"
         );
         assert!(
@@ -16611,7 +16669,7 @@ fn sloppy_class_field_number_store_takes_the_inline_raw_store() {
         // Matched on the CALL, not the module's extern `declare` line.
         let miss_call = body
             .lines()
-            .find(|line| line.contains("call double @js_put_value_set("))
+            .find(|line| line.contains("call double @perry_store_or_put("))
             .unwrap_or_else(|| panic!("strict={strict}: the store must CALL its miss:\n{body}"));
         let flag = if strict { "i32 1)" } else { "i32 0)" };
         assert!(
@@ -16676,6 +16734,9 @@ fn sloppy_class_field_pointer_store_takes_the_inline_boxed_store() {
                     value: Box::new(local(2)),
                     receiver: Box::new(local(1)),
                     strict,
+                    element_offset: 0,
+                    byte_offset: 0,
+                    byte_end: 0,
                 }),
                 Stmt::Return(Some(int(0))),
             ],
@@ -16687,13 +16748,14 @@ fn sloppy_class_field_pointer_store_takes_the_inline_boxed_store() {
         let module = ir_for(strict);
         let body = probe_body(&module);
         assert!(
-            body.contains("call i32 @perry_probe_set(") && !body.contains("class_field_sloppy_set"),
+            body.contains("call double @perry_store_or_put(")
+                && !body.contains("class_field_sloppy_set"),
             "strict={strict}: a pointer-field store must reach the store probe \
              (#5094 P1, #12483):\n{body}"
         );
         let miss_call = body
             .lines()
-            .find(|line| line.contains("call double @js_put_value_set("))
+            .find(|line| line.contains("call double @perry_store_or_put("))
             .unwrap_or_else(|| panic!("strict={strict}: the store must CALL its miss:\n{body}"));
         let flag = if strict { "i32 1)" } else { "i32 0)" };
         assert!(
@@ -16703,12 +16765,12 @@ fn sloppy_class_field_pointer_store_takes_the_inline_boxed_store() {
         // The GC half. An opaque parameter can carry a heap pointer, so the
         // pointer-tested bookkeeping (write barrier into the remembered set)
         // must happen for it. Under the probe design that bookkeeping is the
-        // runtime's, inside `perry_probe_set` (and the `[[Set]]` miss); the
+        // runtime's, inside `perry_store_or_put` (the probe and the `[[Set]]` miss); the
         // site must therefore pass the VALUE to the probe and must not store
         // it into the slot itself, or a barrier-free store would be possible.
         let probe = body
             .lines()
-            .find(|line| line.contains("call i32 @perry_probe_set("))
+            .find(|line| line.contains("call double @perry_store_or_put("))
             .unwrap();
         assert!(
             probe.ends_with(", double %arg2)") || probe.contains(", double %"),
@@ -16866,4 +16928,77 @@ fn static_method_shape_guard_retains_canonical_layout_clone() {
             && !caller.contains("js_native_call_method_by_id_learn"),
         "a detached validity/learned proof must not replace live shape authority: {caller}"
     );
+}
+
+/// `value <op> 3840`, where `value` is a number local that is reassigned
+/// (statically numeric, but read as a JS value: a loop counter such as `x` in
+/// `x < W`) or an unknown parameter.
+fn literal_compare_materializations(numeric: bool, op: CompareOp) -> Vec<serde_json::Value> {
+    let compare = Stmt::Return(Some(Expr::Compare {
+        op,
+        left: Box::new(local(1)),
+        right: Box::new(int(3840)),
+    }));
+    let (params, body) = if numeric {
+        let step = Stmt::Expr(Expr::LocalSet(
+            1,
+            Box::new(Expr::Binary {
+                op: BinaryOp::Add,
+                left: Box::new(local(1)),
+                right: Box::new(int(1)),
+            }),
+        ));
+        (
+            Vec::new(),
+            vec![number_let(1, "value", true, int(0)), step, compare],
+        )
+    } else {
+        (vec![param(1, "value", Type::Any)], vec![compare])
+    };
+    let module = module_with_classes_and_params(
+        "literal_compare_boundary.ts",
+        Vec::new(),
+        params,
+        Type::Boolean,
+        body,
+    );
+    let artifact = compile_artifact_json_for_module(module);
+    artifact["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|record| {
+            record["consumer"] == "materialize_js_value"
+                && record["native_value_state"] == "materialized"
+                && record["native_abi_transition"]["from_native_rep"] == "f64"
+                && record["native_abi_transition"]["to_native_rep"] == "js_value"
+        })
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn a_literal_compared_with_a_number_by_fcmp_is_not_materialized() {
+    for op in [CompareOp::Lt, CompareOp::Le, CompareOp::Eq, CompareOp::Ne] {
+        let materialized = literal_compare_materializations(true, op);
+        assert!(
+            materialized.is_empty(),
+            "`value {op:?} 3840` on a number is a bare fcmp of the literal's own \
+             constant; no JS-value materialization crosses a boundary:\n{materialized:#?}"
+        );
+    }
+}
+
+#[test]
+fn a_literal_compared_through_a_runtime_helper_is_materialized_at_that_boundary() {
+    for op in [CompareOp::Lt, CompareOp::Eq] {
+        let materialized = literal_compare_materializations(false, op);
+        assert!(
+            materialized
+                .iter()
+                .any(|record| record["materialization_reason"] == "runtime_api"),
+            "`value {op:?} 3840` on an unknown value can reach a runtime compare \
+             helper, so the literal's boxing records its runtime_api boundary:\n{materialized:#?}"
+        );
+    }
 }

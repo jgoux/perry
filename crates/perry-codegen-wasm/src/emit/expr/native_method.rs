@@ -17,6 +17,9 @@ impl<'a> FuncEmitCtx<'a> {
             } => {
                 let normalized = module.strip_prefix("node:").unwrap_or(module);
                 match normalized {
+                    "__perry_borrowed_proof" => {
+                        func.instruction(&Instruction::I64Const(TAG_FALSE as i64));
+                    }
                     "console" => match method.as_str() {
                         "log" => {
                             for arg in args {
@@ -682,7 +685,7 @@ impl<'a> FuncEmitCtx<'a> {
                                         },
                                     ));
                                     self.emit_store_arg(func, 1, &args[0]);
-                                    self.emit_memcall_void(func, "array_for_each", 2);
+                                    self.emit_memcall_void(func, "array_forEach", 2);
                                     func.instruction(&Instruction::I64Const(TAG_UNDEFINED as i64));
                                 }
                                 "find" if !args.is_empty() => {
