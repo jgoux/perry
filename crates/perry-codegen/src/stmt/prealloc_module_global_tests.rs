@@ -19,7 +19,7 @@
 //! that reads the binding through the global sees the `undefined` it was
 //! defined with.
 //!
-//! The user-visible shape (test-files/test_gap_diagchannel_3082_3084_3085_3086.ts,
+//! The user-visible shape (tests/parity/node-suite/diagnostics_channel/test_gap_diagchannel_3082_3084_3085_3086.ts,
 //! and any ES module at all after #7105 started emitting `PreallocateBoxes` for
 //! module-top-level blocks):
 //!
@@ -41,6 +41,7 @@ use perry_hir::{Expr, Module, ModuleInitKind, Param, Stmt};
 
 pub(super) fn ir_opts() -> CompileOptions {
     CompileOptions {
+        namespace_self_import: false,
         static_shape_ids: Vec::new(),
         program_layout_ordinals: Default::default(),
         program_class_shape_ids: Default::default(),
@@ -71,8 +72,6 @@ pub(super) fn ir_opts() -> CompileOptions {
         cjs_interop_namespaces: Vec::new(),
         constructor_param_counts: Default::default(),
         imported_classes: Vec::new(),
-        short_spread_method_candidates: std::sync::Arc::default(),
-        program_class_accessor_names: Default::default(),
         object_literal_method_candidates: std::sync::Arc::default(),
         imported_enums: Vec::new(),
         imported_async_funcs: std::collections::HashSet::new(),

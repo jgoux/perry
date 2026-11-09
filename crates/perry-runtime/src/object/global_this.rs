@@ -13,7 +13,7 @@ pub(crate) use global_this_webassembly::{
 pub(crate) use global_this_webassembly::{
     register_extern_wrapper as register_wasm_extern_wrapper,
     register_module_wrapper as register_wasm_module_wrapper, registered_extern_handle,
-    registered_module_handle,
+    registered_module_handle, wrapper_prototype as wasm_wrapper_prototype,
 };
 
 // Topical sub-modules split out of the original monolithic `global_this.rs`
@@ -104,14 +104,17 @@ pub(crate) use builtin_thunks::{
 };
 pub use ctor_thunks::js_webcrypto_illegal_constructor;
 pub(crate) use ctor_thunks::{
-    builtin_prototype_value, is_array_prototype_method_value, is_function_prototype_object_value,
-    normalize_eval_this_body, regexp_constructor_call_thunk, subtle_crypto_method_value,
-    typed_array_constructor_call_thunk, webcrypto_method_value,
+    builtin_constructor_value, builtin_prototype_value, is_array_prototype_method_value,
+    is_function_prototype_object_value, normalize_eval_this_body, regexp_constructor_call_thunk,
+    subtle_crypto_method_value, typed_array_constructor_call_thunk, webcrypto_method_value,
 };
 #[cfg(test)]
 pub(crate) use fetch_globals::collect_before_global_this_alloc_for_test;
+pub(crate) use fetch_globals::init_fetch_backed_receiver;
 #[cfg(feature = "temporal")]
 pub(crate) use fetch_globals::temporal_subclass_super;
+#[cfg(perry_gc_instruments)]
+pub(crate) use fetch_globals::thread_realm_global_addr;
 pub(crate) use fetch_globals::{
     global_this_blob_thunk, global_this_builtin_noop_thunk, global_this_file_thunk,
     global_this_headers_thunk, global_this_is_materialized, global_this_request_thunk,
@@ -132,8 +135,8 @@ pub(crate) use generator::{
 pub(crate) use generator::{intrinsic_sync_step_kind, resume_intrinsic_sync_step};
 pub use generator::{js_generator_attach_closure_prototype, js_generator_attach_prototype};
 pub(crate) use generator_state::{
-    call_generator_symbol_method, fixed_generator_state, install_class_symbol_method,
-    install_evaluation_generator_symbols, STEP_DONE, STEP_INNER_RESULT,
+    fixed_generator_state, install_class_symbol_method,
+    STEP_DONE, STEP_INNER_RESULT,
 };
 pub(crate) use generator_state::{
     generator_observe_record_prototype, generator_original_prototype_key,
@@ -189,3 +192,16 @@ pub(crate) use array_error::{
 };
 #[cfg(test)]
 pub(crate) use typed_array::array_buffer_is_view_thunk;
+
+/// The key of the global object named `name`: the agent atom of that text
+/// (DEC 243(5)). A builtin global name is an image atom seeded with the
+/// program atoms, so this allocates nothing for it; every key of the global
+/// object is an atom, and a miss on it proves absence.
+pub(crate) fn global_name_key(name: impl AsRef<[u8]>) -> *mut crate::StringHeader {
+    let name = name.as_ref();
+    let hash = crate::object::key_bytes_hash(name.as_ptr(), name.len());
+    if let Some(atom) = crate::object::runtime_layouts::builtin_global_atom(name, hash) {
+        return atom as *mut crate::StringHeader;
+    }
+    crate::string::js_string_pool_atom(name.as_ptr(), name.len() as u32, hash, 0)
+}

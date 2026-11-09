@@ -246,10 +246,14 @@ pub(crate) fn owned_space(addr: usize) -> Option<(HeapSpace, usize, *mut u64)> {
 pub(crate) fn owned_storage(addr: usize) -> Option<(HeapSpace, usize, *mut u64, bool)> {
     let (d, word) = owned_descriptor(addr)?;
     let space = decode_space(word);
-    (space != HeapSpace::Unknown).then(|| (
-        space, d.base.load(SeqCst), d.starts.load(SeqCst) as *mut u64,
-        (word >> 8) & 15 == 3,
-    ))
+    (space != HeapSpace::Unknown).then(|| {
+        (
+            space,
+            d.base.load(SeqCst),
+            d.starts.load(SeqCst) as *mut u64,
+            (word >> 8) & 15 == 3,
+        )
+    })
 }
 
 pub(crate) fn owned_uniform_generation(base: usize, end: usize) -> Option<HeapGeneration> {
@@ -430,10 +434,37 @@ pub(super) unsafe fn map(kind: Kind, mapped: usize) -> *mut u8 {
             d.publication
                 .store(serial() | kind_bits(kind) | MAPPED, SeqCst);
         }
+        crate::snap_census::region_mapped(base, mapped);
         return data.cast();
     }
     std::ptr::null_mut()
 }
+/// `[base, base + len)` of the reservation's payload (empty before it
+/// exists). The SNAP census sizes its page map with it.
+#[cfg(all(perry_gc_instruments, target_os = "linux", target_arch = "x86_64"))]
+pub(crate) fn payload_bounds() -> (usize, usize) {
+    initialized().map_or((0, 0), |r| (r.base, r.base + r.len))
+}
+
+/// Every mapped region, `[base, end)`, once each.
+#[cfg(all(perry_gc_instruments, target_os = "linux", target_arch = "x86_64"))]
+pub(crate) fn for_each_mapped(mut f: impl FnMut(usize, usize)) {
+    let Some(r) = existing() else {
+        return;
+    };
+    let mut slot = 0;
+    while slot < r.len / ALIGN {
+        let d = r.descriptor(slot);
+        if d.publication.load(SeqCst) & MAPPED != 0 {
+            let (base, end) = (d.base.load(SeqCst), d.end.load(SeqCst));
+            f(base, end);
+            slot = (end - r.base).div_ceil(ALIGN).max(slot + 1);
+        } else {
+            slot += 1;
+        }
+    }
+}
+
 pub(super) unsafe fn unmap(data: *mut u8, mapped: usize) {
     let r = existing().expect("region reservation missing");
     let _guard = r.allocation.lock().unwrap_or_else(|e| e.into_inner());
@@ -471,7 +502,11 @@ pub(crate) fn set_space(base: usize, len: usize, space: HeapSpace, starts: Optio
 }
 
 pub(crate) fn set_space_with_kind(
-    base: usize, len: usize, space: HeapSpace, starts: Option<usize>, explicit_kind: Option<Kind>,
+    base: usize,
+    len: usize,
+    space: HeapSpace,
+    starts: Option<usize>,
+    explicit_kind: Option<Kind>,
 ) -> bool {
     let Some(r) = existing() else {
         return false;

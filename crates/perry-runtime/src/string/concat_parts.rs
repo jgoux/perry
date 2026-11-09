@@ -143,11 +143,21 @@ macro_rules! drive_parts {
     ($unroll:expr, $n:expr, $obj:ident . $method:ident ( $parts:ident , ? )) => {{
         if $unroll {
             debug_assert!($n <= MAX_UNROLLED_PARTS);
-            if $n > 0 { $obj.$method($parts, 0)?; }
-            if $n > 1 { $obj.$method($parts, 1)?; }
-            if $n > 2 { $obj.$method($parts, 2)?; }
-            if $n > 3 { $obj.$method($parts, 3)?; }
-            if $n > 4 { $obj.$method($parts, 4)?; }
+            if $n > 0 {
+                $obj.$method($parts, 0)?;
+            }
+            if $n > 1 {
+                $obj.$method($parts, 1)?;
+            }
+            if $n > 2 {
+                $obj.$method($parts, 2)?;
+            }
+            if $n > 3 {
+                $obj.$method($parts, 3)?;
+            }
+            if $n > 4 {
+                $obj.$method($parts, 4)?;
+            }
         } else {
             for i in 0..$n {
                 $obj.$method($parts, i)?;
@@ -162,11 +172,21 @@ macro_rules! emit_parts {
     ($unroll:expr, $n:expr, $obj:ident . $method:ident ( ? , $cursor:ident )) => {{
         let mut cursor = $cursor;
         if $unroll {
-            if $n > 0 { cursor = $obj.$method(0, cursor); }
-            if $n > 1 { cursor = $obj.$method(1, cursor); }
-            if $n > 2 { cursor = $obj.$method(2, cursor); }
-            if $n > 3 { cursor = $obj.$method(3, cursor); }
-            if $n > 4 { cursor = $obj.$method(4, cursor); }
+            if $n > 0 {
+                cursor = $obj.$method(0, cursor);
+            }
+            if $n > 1 {
+                cursor = $obj.$method(1, cursor);
+            }
+            if $n > 2 {
+                cursor = $obj.$method(2, cursor);
+            }
+            if $n > 3 {
+                cursor = $obj.$method(3, cursor);
+            }
+            if $n > 4 {
+                cursor = $obj.$method(4, cursor);
+            }
         } else {
             for i in 0..$n {
                 cursor = $obj.$method(i, cursor);
@@ -396,6 +416,7 @@ fn concat_parts_rooted_copy<const M: usize>(
 /// Every other value kind. The converted text of a value operand is a rooted
 /// heap string; a literal or a number is borrowed from rodata or the stack.
 #[cold]
+#[optimize(size)]
 #[inline(never)]
 fn concat_parts_general<const M: usize>(
     parts: *const ConcatPartSlot,
@@ -446,9 +467,9 @@ fn concat_parts_general<const M: usize>(
             total_u16 = total_u16.saturating_add(len as u32);
             continue;
         }
-        // A registered class id stringifies as its function source, so only an
-        // ordinary INT32 takes the digit arm.
-        if tag == 0x7FFE && !crate::object::is_class_id_registered((bits & 0xFFFF_FFFF) as u32) {
+        // An INT32 number takes the digit arm (a `C.prototype` ref word, bit 32
+        // set, is not one).
+        if (bits & !crate::value::INT32_MASK) == crate::value::INT32_TAG {
             let v = (bits & 0xFFFF_FFFF) as u32 as i32;
             let len = {
                 let buf = num_bufs[i].write([0u8; 32]);

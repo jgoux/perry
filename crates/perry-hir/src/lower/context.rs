@@ -1006,6 +1006,8 @@ impl LoweringContext {
                 object: Box::new(Expr::This),
                 property: name.clone(),
                 value: Box::new(Expr::LocalGet(param_id)),
+                byte_offset: 0,
+                byte_end: 0,
             }));
         }
         let constructor = Function {
@@ -1160,6 +1162,18 @@ impl LoweringContext {
                     *has_synth_args,
                 )
             })
+    }
+
+    /// True when `name` reads the global `WebSocket` (Perry's native client,
+    /// served by perry-ext-ws): not an import binding, not a local and not a
+    /// class in scope. npm `ws` compiles from source, so an imported or
+    /// `require`d `WebSocket` is that package's JS class and must not be
+    /// tagged as the native client.
+    pub(crate) fn names_global_websocket(&self, name: &str) -> bool {
+        name == "WebSocket"
+            && !self.imported_functions_index.contains_key(name)
+            && self.lookup_local(name).is_none()
+            && self.lookup_class(name).is_none()
     }
 
     pub(crate) fn lookup_imported_func(&self, name: &str) -> Option<&str> {

@@ -7,7 +7,7 @@
 //! simulation**: they enumerate `Http2SessionHandle`s with
 //! `iter_handle_ids_of`, pick the ones whose `session_type` is the opposite of
 //! the caller's, and push a synthetic event into their queues. No frame is
-//! encoded, which is why `test-parity/node-suite/http2/` passes today — every
+//! encoded, which is why `tests/parity/node-suite/http2/` passes today — every
 //! case in it is a Perry client talking to a Perry server in one process.
 //!
 //! Which sessions are still off turnloop is narrower than it was. The `h2`
@@ -62,9 +62,7 @@ pub(crate) fn queue_session_ping(handle: i64, args: &[f64]) -> f64 {
     } else {
         (
             second_callback,
-            args.first()
-                .copied()
-                .filter(|v| !is_nullish(*v)),
+            args.first().copied().filter(|v| !is_nullish(*v)),
         )
     };
     let payload = match payload_value {

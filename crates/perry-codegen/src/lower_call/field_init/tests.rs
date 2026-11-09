@@ -94,6 +94,9 @@ fn user_this_assign(property: &str, param_id: u32) -> Stmt {
         value: Box::new(Expr::LocalGet(param_id)),
         receiver: Box::new(Expr::This),
         strict: true,
+        element_offset: 0,
+        byte_offset: 0,
+        byte_end: 0,
     })
 }
 
@@ -104,6 +107,8 @@ fn synthesized_this_assign(property: &str, param_id: u32) -> Stmt {
         object: Box::new(Expr::This),
         property: property.to_string(),
         value: Box::new(Expr::LocalGet(param_id)),
+        byte_offset: 0,
+        byte_end: 0,
     })
 }
 
@@ -290,6 +295,9 @@ fn non_param_rhs_does_not_qualify() {
                 value: Box::new(Expr::LocalGet(77)),
                 receiver: Box::new(Expr::This),
                 strict: true,
+                element_offset: 0,
+                byte_offset: 0,
+                byte_end: 0,
             })],
         )),
     );
@@ -310,6 +318,9 @@ fn computed_key_put_value_set_does_not_qualify() {
                 value: Box::new(Expr::LocalGet(1)),
                 receiver: Box::new(Expr::This),
                 strict: true,
+                element_offset: 0,
+                byte_offset: 0,
+                byte_end: 0,
             })],
         )),
     );
@@ -331,6 +342,9 @@ fn non_this_receiver_does_not_qualify() {
                 value: Box::new(Expr::LocalGet(1)),
                 receiver: Box::new(Expr::LocalGet(4)),
                 strict: true,
+                element_offset: 0,
+                byte_offset: 0,
+                byte_end: 0,
             })],
         )),
     );

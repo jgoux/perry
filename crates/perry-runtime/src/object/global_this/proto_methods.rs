@@ -95,8 +95,7 @@ fn web_method_receiver(this: crate::closure::JsThis, name: &str) -> *mut ObjectH
     }
     let message = format!("Value of this must be of type {name}");
     let text = crate::string::js_string_from_bytes(message.as_ptr(), message.len() as u32);
-    let error = crate::error::js_typeerror_new(text);
-    crate::exception::js_throw(crate::value::js_nanbox_pointer(error as i64))
+    crate::exception::throw_core(crate::error::CoreError::type_error(text))
 }
 
 extern "C" fn url_prototype_href_thunk(
@@ -193,6 +192,22 @@ const ANNEX_B_OBJECT_PROTO_METHODS: &[(&str, u32)] = &[
 /// [`OBJECT_PROTO_METHODS`] for `builtin_name`'s prototype: all of them on
 /// `Object.prototype`, and on any other prototype only the members that are
 /// not `Object.prototype`'s alone.
+/// An accessor on a buffer kind's prototype (`ArrayBuffer.prototype.byteLength`
+/// and friends): a getter closure, no setter.
+fn install_buffer_proto_getter(
+    proto_obj: *mut ObjectHeader,
+    name: &str,
+    thunk: *const crate::closure::JsFunctionInfo,
+) {
+    unsafe {
+        let getter = crate::closure::js_closure_alloc(thunk, 0);
+        if !getter.is_null() {
+            let getter_bits = crate::value::js_nanbox_pointer(getter as i64).to_bits();
+            install_builtin_getter(proto_obj, name, getter_bits);
+        }
+    }
+}
+
 fn install_object_proto_copies(builtin_name: &str, proto_obj: *mut ObjectHeader) {
     if builtin_name == "Object" {
         install_noop_proto_methods(proto_obj, OBJECT_PROTO_METHODS);
@@ -431,6 +446,8 @@ fn make_proto_member_enumerable(proto_obj: *mut ObjectHeader, name: &str) {
     );
 }
 
+// Size optimization stops at installation; prototype method bodies stay hot.
+#[optimize(size)]
 #[rustfmt::skip] pub(crate) fn populate_builtin_prototype_methods(builtin_name: &str, proto_obj: *mut ObjectHeader) {
     if proto_obj.is_null() {
         return;
@@ -574,13 +591,13 @@ fn make_proto_member_enumerable(proto_obj: *mut ObjectHeader, name: &str) {
             install_proto_method(
                 proto_obj,
                 "reverse",
-                crate::fn_info!(#[realm(Array.prototype.reverse)] export crate::object::global_this::array_error::array_prototype_reverse_thunk, 1; with_declared(0), with_flags(crate::closure::FN_BUILTIN | crate::closure::FN_NON_CONSTRUCTOR)),
+                crate::fn_info!(#[realm(Array.prototype.reverse, effects = { reads(this); stores(elems(this) -> elems(this)); returns(this) })] export crate::object::global_this::array_error::array_prototype_reverse_thunk, 1; with_declared(0), with_flags(crate::closure::FN_BUILTIN | crate::closure::FN_NON_CONSTRUCTOR)),
                 0,
             );
             install_proto_method_rest_with_length(
                 proto_obj,
                 "push",
-                crate::fn_info!(#[realm(Array.prototype.push)] export native_args crate::object::global_this::array_error::array_prototype_push_thunk, 1; with_flags(crate::closure::FN_BUILTIN | crate::closure::FN_NON_CONSTRUCTOR | perry_abi::FN_RESOLVES_ARRAY_THIS)),
+                crate::fn_info!(#[realm(Array.prototype.push, effects = { reads(this); stores(rest(0) -> elems(this)); returns(prim(num)) })] export native_args crate::object::global_this::array_error::array_prototype_push_thunk, 1; with_flags(crate::closure::FN_BUILTIN | crate::closure::FN_NON_CONSTRUCTOR | perry_abi::FN_RESOLVES_ARRAY_THIS)),
                 1,
             );
             install_proto_method_rest_with_length(
@@ -602,7 +619,7 @@ fn make_proto_member_enumerable(proto_obj: *mut ObjectHeader, name: &str) {
             install_proto_method_rest_with_length(
                 proto_obj,
                 "fill",
-                crate::fn_info!(#[realm(Array.prototype.fill)] export native_args crate::object::global_this::array_error::array_prototype_fill_thunk, 1; with_flags(crate::closure::FN_BUILTIN | crate::closure::FN_NON_CONSTRUCTOR)),
+                crate::fn_info!(#[realm(Array.prototype.fill, effects = { reads(this); coerce(arg(1), ToPrimitive); coerce(arg(2), ToPrimitive); stores(arg(0) -> elems(this)); returns(this) })] export native_args crate::object::global_this::array_error::array_prototype_fill_thunk, 1; with_flags(crate::closure::FN_BUILTIN | crate::closure::FN_NON_CONSTRUCTOR)),
                 1,
             );
             install_proto_method_rest_with_length(
@@ -619,7 +636,7 @@ fn make_proto_member_enumerable(proto_obj: *mut ObjectHeader, name: &str) {
             install_proto_method(
                 proto_obj,
                 "sort",
-                crate::fn_info!(#[realm(Array.prototype.sort)] export crate::object::global_this::array_error::array_prototype_sort_thunk, 1; with_declared(1), with_flags(crate::closure::FN_BUILTIN | crate::closure::FN_NON_CONSTRUCTOR)),
+                crate::fn_info!(#[realm(Array.prototype.sort, effects = { reads(this); coerce(elems(this), ToPrimitive); calls(arg(0), this = prim(undefined), args = [elems(this), elems(this)]); coerce(returned(0), ToPrimitive); stores(elems(this) -> elems(this)); returns(this) })] export crate::object::global_this::array_error::array_prototype_sort_thunk, 1; with_declared(1), with_flags(crate::closure::FN_BUILTIN | crate::closure::FN_NON_CONSTRUCTOR)),
                 1,
             );
             // Iteration / search methods: real generic-engine thunks (rest
@@ -627,17 +644,17 @@ fn make_proto_member_enumerable(proto_obj: *mut ObjectHeader, name: &str) {
             let arraylike_thunks: [(&str, *const crate::closure::JsFunctionInfo, u32); 15] = [
                 (
                     "forEach",
-                    crate::fn_info!(#[realm(Array.prototype.forEach)] export native_args crate::object::global_this::array_error::array_proto_forEach_thunk, 1; with_flags(crate::closure::FN_BUILTIN | crate::closure::FN_NON_CONSTRUCTOR)),
+                    crate::fn_info!(#[realm(Array.prototype.forEach, effects = { reads(this); calls(arg(0), this = arg(1), args = [elems(this), prim(num) | elems(this), this]); stores(fresh); returns(prim(undefined)) })] export native_args crate::object::global_this::array_error::array_proto_forEach_thunk, 1; with_flags(crate::closure::FN_BUILTIN | crate::closure::FN_NON_CONSTRUCTOR)),
                     1,
                 ),
                 (
                     "map",
-                    crate::fn_info!(#[realm(Array.prototype.map)] export native_args crate::object::global_this::array_error::array_proto_map_thunk, 1; with_flags(crate::closure::FN_BUILTIN | crate::closure::FN_NON_CONSTRUCTOR)),
+                    crate::fn_info!(#[realm(Array.prototype.map, effects = { reads(this); calls(arg(0), this = arg(1), args = [elems(this), prim(num), this]); returns(species(this, args = [prim(num)], elems = [returned(0)])) })] export native_args crate::object::global_this::array_error::array_proto_map_thunk, 1; with_flags(crate::closure::FN_BUILTIN | crate::closure::FN_NON_CONSTRUCTOR)),
                     1,
                 ),
                 (
                     "filter",
-                    crate::fn_info!(#[realm(Array.prototype.filter)] export native_args crate::object::global_this::array_error::array_proto_filter_thunk, 1; with_flags(crate::closure::FN_BUILTIN | crate::closure::FN_NON_CONSTRUCTOR)),
+                    crate::fn_info!(#[realm(Array.prototype.filter, effects = { reads(this); calls(arg(0), this = arg(1), args = [elems(this), prim(num), this]); returns(species(this, args = [prim(num)], elems = [elems(this)])) })] export native_args crate::object::global_this::array_error::array_proto_filter_thunk, 1; with_flags(crate::closure::FN_BUILTIN | crate::closure::FN_NON_CONSTRUCTOR)),
                     1,
                 ),
                 (
@@ -647,17 +664,17 @@ fn make_proto_member_enumerable(proto_obj: *mut ObjectHeader, name: &str) {
                 ),
                 (
                     "some",
-                    crate::fn_info!(#[realm(Array.prototype.some)] export native_args crate::object::global_this::array_error::array_proto_some_thunk, 1; with_flags(crate::closure::FN_BUILTIN | crate::closure::FN_NON_CONSTRUCTOR)),
+                    crate::fn_info!(#[realm(Array.prototype.some, effects = { reads(this); calls(arg(0), this = arg(1), args = [elems(this), prim(num), this]); stores(fresh); returns(prim(bool)) })] export native_args crate::object::global_this::array_error::array_proto_some_thunk, 1; with_flags(crate::closure::FN_BUILTIN | crate::closure::FN_NON_CONSTRUCTOR)),
                     1,
                 ),
                 (
                     "every",
-                    crate::fn_info!(#[realm(Array.prototype.every)] export native_args crate::object::global_this::array_error::array_proto_every_thunk, 1; with_flags(crate::closure::FN_BUILTIN | crate::closure::FN_NON_CONSTRUCTOR)),
+                    crate::fn_info!(#[realm(Array.prototype.every, effects = { reads(this); calls(arg(0), this = arg(1), args = [elems(this), prim(num), this]); stores(fresh); returns(prim(bool)) })] export native_args crate::object::global_this::array_error::array_proto_every_thunk, 1; with_flags(crate::closure::FN_BUILTIN | crate::closure::FN_NON_CONSTRUCTOR)),
                     1,
                 ),
                 (
                     "find",
-                    crate::fn_info!(#[realm(Array.prototype.find)] export native_args crate::object::global_this::array_error::array_proto_find_thunk, 1; with_flags(crate::closure::FN_BUILTIN | crate::closure::FN_NON_CONSTRUCTOR)),
+                    crate::fn_info!(#[realm(Array.prototype.find, effects = { reads(this); calls(arg(0), this = arg(1), args = [elems(this), prim(num), this]); stores(fresh); returns(elems(this)); returns(prim(undefined)) })] export native_args crate::object::global_this::array_error::array_proto_find_thunk, 1; with_flags(crate::closure::FN_BUILTIN | crate::closure::FN_NON_CONSTRUCTOR)),
                     1,
                 ),
                 (
@@ -687,7 +704,7 @@ fn make_proto_member_enumerable(proto_obj: *mut ObjectHeader, name: &str) {
                 ),
                 (
                     "indexOf",
-                    crate::fn_info!(#[realm(Array.prototype.indexOf)] export native_args crate::object::global_this::array_error::array_proto_indexOf_thunk, 1; with_flags(crate::closure::FN_BUILTIN | crate::closure::FN_NON_CONSTRUCTOR)),
+                    crate::fn_info!(#[realm(Array.prototype.indexOf, effects = { reads(this); coerce(arg(1), ToPrimitive); stores(fresh); returns(prim(num)) })] export native_args crate::object::global_this::array_error::array_proto_indexOf_thunk, 1; with_flags(crate::closure::FN_BUILTIN | crate::closure::FN_NON_CONSTRUCTOR)),
                     1,
                 ),
                 (
@@ -697,7 +714,7 @@ fn make_proto_member_enumerable(proto_obj: *mut ObjectHeader, name: &str) {
                 ),
                 (
                     "includes",
-                    crate::fn_info!(#[realm(Array.prototype.includes)] export native_args crate::object::global_this::array_error::array_proto_includes_thunk, 1; with_flags(crate::closure::FN_BUILTIN | crate::closure::FN_NON_CONSTRUCTOR)),
+                    crate::fn_info!(#[realm(Array.prototype.includes, effects = { reads(this); coerce(arg(1), ToPrimitive); stores(fresh); returns(prim(bool)) })] export native_args crate::object::global_this::array_error::array_proto_includes_thunk, 1; with_flags(crate::closure::FN_BUILTIN | crate::closure::FN_NON_CONSTRUCTOR)),
                     1,
                 ),
             ];
@@ -713,7 +730,7 @@ fn make_proto_member_enumerable(proto_obj: *mut ObjectHeader, name: &str) {
             install_proto_method(
                 proto_obj,
                 "join",
-                crate::fn_info!(#[realm(Array.prototype.join)] export crate::object::global_this::array_error::array_proto_join_thunk, 1; with_declared(1), with_flags(crate::closure::FN_BUILTIN | crate::closure::FN_NON_CONSTRUCTOR)),
+                crate::fn_info!(#[realm(Array.prototype.join, effects = { reads(this); coerce(elems(this), ToPrimitive); coerce(arg(0), ToPrimitive); stores(fresh); returns(prim(str)) })] export crate::object::global_this::array_error::array_proto_join_thunk, 1; with_declared(1), with_flags(crate::closure::FN_BUILTIN | crate::closure::FN_NON_CONSTRUCTOR)),
                 1,
             );
             install_proto_method_rest_with_length(
@@ -725,12 +742,19 @@ fn make_proto_member_enumerable(proto_obj: *mut ObjectHeader, name: &str) {
             install_object_proto_copies(builtin_name, proto_obj);
         }
         "ArrayBuffer" => {
+            // node's own-key order: constructor byteLength slice maxByteLength
+            // resizable resize transfer transferToFixedLength detached
+            // @@toStringTag. `valueOf` / `toLocaleString` are Object.prototype's
+            // (the chain), not own copies.
+            install_buffer_proto_getter(proto_obj, "byteLength", crate::fn_info!(#[realm("ArrayBuffer.prototype.byteLength.<get>", provider = intrinsic_closure, constructible = true)] export crate::object::global_this::typed_array::array_buffer_byte_length_getter_thunk, 0; with_declared(0)));
             install_proto_method(
                 proto_obj,
                 "slice",
                 crate::fn_info!(#[realm(ArrayBuffer.prototype.slice)] export crate::object::global_this::typed_array::array_buffer_slice_thunk, 2; with_declared(2), with_flags(crate::closure::FN_BUILTIN | crate::closure::FN_NON_CONSTRUCTOR)),
                 2,
             );
+            install_buffer_proto_getter(proto_obj, "maxByteLength", crate::fn_info!(#[realm("ArrayBuffer.prototype.maxByteLength.<get>", provider = intrinsic_closure, constructible = true)] export crate::object::global_this::typed_array::array_buffer_max_byte_length_getter_thunk, 0; with_declared(0)));
+            install_buffer_proto_getter(proto_obj, "resizable", crate::fn_info!(#[realm("ArrayBuffer.prototype.resizable.<get>", provider = intrinsic_closure, constructible = true)] export crate::object::global_this::typed_array::array_buffer_resizable_getter_thunk, 0; with_declared(0)));
             // ES2024 (#10873): `resize`, `transfer`, `transferToFixedLength`.
             install_proto_method(
                 proto_obj,
@@ -738,8 +762,8 @@ fn make_proto_member_enumerable(proto_obj: *mut ObjectHeader, name: &str) {
                 crate::fn_info!(#[realm(ArrayBuffer.prototype.resize)] export crate::object::global_this::typed_array::array_buffer_resize_thunk, 1; with_declared(1), with_flags(crate::closure::FN_BUILTIN | crate::closure::FN_NON_CONSTRUCTOR)),
                 1,
             );
-            // The thunks take the optional `newLength` (call arity 1); the
-            // spec `.length` of both is 0.
+            // The transfer thunks take the optional `newLength` (call arity 1);
+            // the spec `.length` of both is 0.
             let transfers: [(&str, *const crate::closure::JsFunctionInfo); 2] = [
                 (
                     "transfer",
@@ -757,59 +781,30 @@ fn make_proto_member_enumerable(proto_obj: *mut ObjectHeader, name: &str) {
                     super::super::native_module::set_builtin_closure_length(closure, realm_arraybuffer_transfer_public!(length));
                 }
             }
-            let getters: [(&str, *const crate::closure::JsFunctionInfo); 4] = [
-                (
-                    "byteLength",
-                    crate::fn_info!(#[realm("ArrayBuffer.prototype.byteLength.<get>", provider = intrinsic_closure, constructible = true)] export crate::object::global_this::typed_array::array_buffer_byte_length_getter_thunk, 0; with_declared(0)),
-                ),
-                (
-                    "resizable",
-                    crate::fn_info!(#[realm("ArrayBuffer.prototype.resizable.<get>", provider = intrinsic_closure, constructible = true)] export crate::object::global_this::typed_array::array_buffer_resizable_getter_thunk, 0; with_declared(0)),
-                ),
-                (
-                    "maxByteLength",
-                    crate::fn_info!(#[realm("ArrayBuffer.prototype.maxByteLength.<get>", provider = intrinsic_closure, constructible = true)] export crate::object::global_this::typed_array::array_buffer_max_byte_length_getter_thunk, 0; with_declared(0)),
-                ),
-                (
-                    "detached",
-                    crate::fn_info!(#[realm("ArrayBuffer.prototype.detached.<get>", provider = intrinsic_closure, constructible = true)] export crate::object::global_this::typed_array::array_buffer_detached_getter_thunk, 0; with_declared(0)),
-                ),
-            ];
-            for (name, thunk) in getters {
-                unsafe {
-                    let getter = crate::closure::js_closure_alloc(thunk, 0);
-                    if !getter.is_null() {
-                        let getter_bits = crate::value::js_nanbox_pointer(getter as i64).to_bits();
-                        install_builtin_getter(proto_obj, name, getter_bits);
-                    }
-                }
-            }
+            install_buffer_proto_getter(proto_obj, "detached", crate::fn_info!(#[realm("ArrayBuffer.prototype.detached.<get>", provider = intrinsic_closure, constructible = true)] export crate::object::global_this::typed_array::array_buffer_detached_getter_thunk, 0; with_declared(0)));
             set_intrinsic_to_string_tag(proto_obj, "ArrayBuffer");
-            install_object_proto_copies(builtin_name, proto_obj);
         }
         "SharedArrayBuffer" => {
-            // Mirror the ArrayBuffer.prototype shape: a brand-checking `slice`
-            // (instances dispatch through buffer_dispatch; `.call(notSab)`
-            // throws here), a `byteLength` accessor whose getter brand-checks
-            // the shared registry, and the `Symbol.toStringTag`.
+            // node's own-key order: constructor byteLength slice maxByteLength
+            // growable grow @@toStringTag. The brand-checking `slice` / `grow`
+            // and getters serve `.call(notSab)`; instances dispatch through
+            // buffer_dispatch.
+            install_buffer_proto_getter(proto_obj, "byteLength", crate::fn_info!(#[realm("SharedArrayBuffer.prototype.byteLength.<get>", provider = intrinsic_closure, constructible = true)] export crate::object::global_this::typed_array::shared_array_buffer_byte_length_getter_thunk, 0; with_declared(0)));
             install_proto_method(
                 proto_obj,
                 "slice",
                 crate::fn_info!(#[realm(SharedArrayBuffer.prototype.slice)] export crate::object::global_this::typed_array::shared_array_buffer_slice_thunk, 2; with_declared(2), with_flags(crate::closure::FN_BUILTIN | crate::closure::FN_NON_CONSTRUCTOR)),
                 2,
             );
-            unsafe {
-                let getter = crate::closure::js_closure_alloc(
-                    crate::fn_info!(#[realm("SharedArrayBuffer.prototype.byteLength.<get>", provider = intrinsic_closure, constructible = true)] export crate::object::global_this::typed_array::shared_array_buffer_byte_length_getter_thunk, 0; with_declared(0)),
-                    0,
-                );
-                if !getter.is_null() {
-                    let getter_bits = crate::value::js_nanbox_pointer(getter as i64).to_bits();
-                    install_builtin_getter(proto_obj, "byteLength", getter_bits);
-                }
-            }
+            install_buffer_proto_getter(proto_obj, "maxByteLength", crate::fn_info!(#[realm("SharedArrayBuffer.prototype.maxByteLength.<get>", provider = intrinsic_closure, constructible = true)] export crate::object::global_this::typed_array::shared_array_buffer_max_byte_length_getter_thunk, 0; with_declared(0)));
+            install_buffer_proto_getter(proto_obj, "growable", crate::fn_info!(#[realm("SharedArrayBuffer.prototype.growable.<get>", provider = intrinsic_closure, constructible = true)] export crate::object::global_this::typed_array::shared_array_buffer_growable_getter_thunk, 0; with_declared(0)));
+            install_proto_method(
+                proto_obj,
+                "grow",
+                crate::fn_info!(#[realm(SharedArrayBuffer.prototype.grow)] export crate::object::global_this::typed_array::shared_array_buffer_grow_thunk, 1; with_declared(1), with_flags(crate::closure::FN_BUILTIN | crate::closure::FN_NON_CONSTRUCTOR)),
+                1,
+            );
             set_intrinsic_to_string_tag(proto_obj, "SharedArrayBuffer");
-            install_object_proto_copies(builtin_name, proto_obj);
         }
         "DataView" => {
             // Install the reflectable `byteLength`/`byteOffset`/`buffer`
@@ -819,7 +814,6 @@ fn make_proto_member_enumerable(proto_obj: *mut ObjectHeader, name: &str) {
             // `DataView.prototype.getInt32.call(dv, …)` cascade.
             super::super::dataview_proto_thunks::install_dataview_proto_methods(proto_obj);
             set_intrinsic_to_string_tag(proto_obj, "DataView");
-            install_object_proto_copies(builtin_name, proto_obj);
         }
         "Object" => {
             install_proto_method(
@@ -897,7 +891,7 @@ fn make_proto_member_enumerable(proto_obj: *mut ObjectHeader, name: &str) {
             install_proto_method_rest(
                 proto_obj,
                 "bind",
-                crate::fn_info!(#[realm(Function.prototype.bind)] export native_args crate::object::global_this::array_error::function_prototype_bind_thunk, 1; with_flags(crate::closure::FN_BUILTIN | crate::closure::FN_NON_CONSTRUCTOR)),
+                crate::fn_info!(#[realm(Function.prototype.bind, effects = { reads(field(this, length), field(this, name)); stores(fresh); returns(bound) })] export native_args crate::object::global_this::array_error::function_prototype_bind_thunk, 1; with_flags(crate::closure::FN_BUILTIN | crate::closure::FN_NON_CONSTRUCTOR)),
                 1,
             );
             // #4101: dedicated toString thunk (source reconstruction + brand
@@ -1351,7 +1345,7 @@ fn make_proto_member_enumerable(proto_obj: *mut ObjectHeader, name: &str) {
             web_method_enumerable(proto(), "toJSON");
         }
         "AbortController" | "AbortSignal" | "EventTarget" | "Event" | "CustomEvent"
-        | "DOMException" => {
+        | "DOMException" | "MessageEvent" => {
             let _gc = crate::gc::GcSuppressScope::new();
             crate::event_target_hook_slots::install_web_event_proto_methods(
                 builtin_name,
@@ -1524,7 +1518,14 @@ pub(super) fn web_url_proto_methods(builtin_name: &str, proto_obj: *mut ObjectHe
                     0,
                 ),
             ] {
-                install_proto_method(proto_obj, name, info, arity);
+                let value = install_proto_method(proto_obj, name, info, arity);
+                // WHATWG: URLSearchParams.prototype[Symbol.iterator] is the
+                // same function as `entries` (iterable<USVString, USVString>).
+                // Libraries test `typeof params[Symbol.iterator] === "function"`
+                // before iterating (Effect's UrlParams.fromInput).
+                if name == "entries" {
+                    install_builtin_iterator_symbol(proto_obj, value);
+                }
             }
             install_web_getter_accessor(
                 proto_obj,
@@ -1753,6 +1754,15 @@ pub(super) fn web_webfetch_proto_methods(builtin_name: &str, proto_obj: *mut Obj
                 ],
             );
             install_object_proto_copies(builtin_name, proto_obj);
+            if let Some(entries) = unsafe {
+                crate::object::own_property_get_by_bytes(
+                    proto_obj,
+                    b"entries",
+                    crate::value::js_nanbox_pointer(proto_obj as i64),
+                )
+            } {
+                install_builtin_iterator_symbol(proto_obj, f64::from_bits(entries.bits()));
+            }
             unsafe { install_web_builtin_to_string_tag(proto_obj, "FormData") };
         }
         _ => {}

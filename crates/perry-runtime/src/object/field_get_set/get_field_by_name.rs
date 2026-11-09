@@ -18,6 +18,9 @@ fn handle_proto_inherited_field(
     handle_id: usize,
     key: *const crate::StringHeader,
 ) -> Option<JSValue> {
+    if let Some(v) = crate::object::http_handle_prototype::inherited_field(handle_id, key) {
+        return Some(v);
+    }
     crate::object::prototype_chain::object_static_prototype(handle_id)?;
     let v = crate::object::prototype_chain::resolve_inherited_field(handle_id, key)?;
     if v.bits() == crate::value::TAG_UNDEFINED {
@@ -42,6 +45,7 @@ fn handle_proto_inherited_field(
 /// the call site, so it cannot hoist anything out of it; `is_proxy_cell`
 /// itself stays inline in the caller since it touches no thread-local.
 #[cold]
+#[optimize(size)]
 #[inline(never)]
 fn proxy_receiver_get(raw_addr: u64, key: *const crate::StringHeader) -> Option<JSValue> {
     let boxed = f64::from_bits(crate::value::POINTER_TAG | (raw_addr & 0x0000_FFFF_FFFF_FFFF));
@@ -516,10 +520,7 @@ pub(crate) fn class_value_get_field(
         // fallback after own computed fields, static methods, and
         // static accessors of the same name have had a chance to win.
         if name == "constructor" && class_id != 0 && is_class_id_registered(class_id) {
-            let constructor = super::super::js_get_global_this_builtin_value(
-                b"Function".as_ptr(),
-                b"Function".len(),
-            );
+            let constructor = super::super::builtin_constructor_value("Function");
             return JSValue::from_bits(constructor.to_bits());
         }
     }
@@ -1138,10 +1139,8 @@ fn get_field_by_name_past_data_probe(
                                 {
                                     return JSValue::from_bits(v.to_bits());
                                 }
-                                let name = crate::typedarray_hook_slots::name_for_kind(kind);
-                                let ctor = super::super::js_get_global_this_builtin_value(
-                                    name.as_ptr(),
-                                    name.len(),
+                                let ctor = super::super::builtin_constructor_value(
+                                    crate::typedarray_hook_slots::name_for_kind(kind),
                                 );
                                 return JSValue::from_bits(ctor.to_bits());
                             }
@@ -1213,17 +1212,14 @@ fn get_field_by_name_past_data_probe(
                                 // `Uint8Array` (`ta.buffer.constructor ===
                                 // ArrayBuffer`, test262 ctors/buffer-arg/
                                 // typedarray-backed-by-sharedarraybuffer).
-                                let name: &[u8] = if crate::buffer::is_shared_array_buffer(addr) {
-                                    b"SharedArrayBuffer"
+                                let name = if crate::buffer::is_shared_array_buffer(addr) {
+                                    "SharedArrayBuffer"
                                 } else if crate::buffer::is_any_array_buffer(addr) {
-                                    b"ArrayBuffer"
+                                    "ArrayBuffer"
                                 } else {
-                                    b"Uint8Array"
+                                    "Uint8Array"
                                 };
-                                let ctor = super::super::js_get_global_this_builtin_value(
-                                    name.as_ptr(),
-                                    name.len(),
-                                );
+                                let ctor = super::super::builtin_constructor_value(name);
                                 return JSValue::from_bits(ctor.to_bits());
                             }
                             _ => {}
@@ -1518,11 +1514,19 @@ fn get_field_by_name_past_data_probe(
                         (key as *const u8).add(std::mem::size_of::<crate::StringHeader>());
                     let key_len = (*key).byte_len as usize;
                     let key_bytes = std::slice::from_raw_parts(key_ptr, key_len);
+                    if let Some(value) = crate::object::http_handle_prototype::field(raw, key) {
+                        return value;
+                    }
                     if key_bytes == b"constructor" {
-                        return JSValue::from_bits(crate::object::null_stub_value().to_bits());
+                        if let Some(ctor) = crate::object::fetch_handle_constructor_value(raw) {
+                            return ctor;
+                        }
                     }
                     if let Some(dispatch) = handle_property_dispatch() {
                         let bits = dispatch(raw as i64, key_ptr, key_len);
+                        if key_bytes == b"constructor" {
+                            return crate::object::http_handle_prototype::constructor_or_stub(bits);
+                        }
                         // Wall 10 — fall back to a `setPrototypeOf(handle, proto)`
                         // member (Express's augmented `res`/`req`) when the native
                         // dispatch doesn't know the key. See
@@ -1673,6 +1677,26 @@ fn get_field_by_name_past_data_probe(
                             let bound = js_class_method_bind(boxed, heap_name, key_bytes.len());
                             return JSValue::from_bits(bound.to_bits());
                         }
+                        // Any other key is the ordinary [[Get]] continuing on
+                        // the cell's [[Prototype]], `Temporal.<Kind>.prototype`
+                        // (`constructor`, Object.prototype members, user
+                        // members); accessors run with the cell as receiver.
+                        if let Some(kind) = crate::temporal::temporal_kind(boxed) {
+                            let proto = crate::temporal::hooked::kind_prototype(kind);
+                            if JSValue::from_bits(proto.to_bits()).is_pointer() {
+                                let scope = crate::gc::RuntimeHandleScope::new();
+                                let key_root = scope.root_string_ptr(key);
+                                if let Some(v) =
+                                    crate::object::prototype_chain::resolve_inherited_field_from_prototype(
+                                        addr,
+                                        proto.to_bits(),
+                                        key_root.get_raw_const_ptr::<crate::StringHeader>(),
+                                    )
+                                {
+                                    return v;
+                                }
+                            }
+                        }
                     }
                 }
                 return JSValue::undefined();
@@ -1716,7 +1740,7 @@ fn get_field_by_name_past_data_probe(
     {
         let bits = obj as u64;
         if let (Some(class_id), false) = (
-            crate::object::class_value::legacy_class_ptr_word(bits),
+            crate::object::class_value::class_ref_ptr_word(bits),
             key.is_null(),
         ) {
             return class_value_get_field(obj, key, bits, class_id);
@@ -1785,7 +1809,7 @@ fn get_field_by_name_past_data_probe(
                                 return JSValue::from_bits(v.to_bits());
                             }
                         }
-                        // `promise.constructor` is the global `Promise`
+                        // `promise.constructor` is the realm's `%Promise%`
                         // (inherited from `Promise.prototype.constructor`). Any
                         // own expando (`p.constructor = X`) already returned via
                         // `exotic_get_own_property` above. execa
@@ -1795,10 +1819,7 @@ fn get_field_by_name_past_data_probe(
                         // `.prototype` threw `Cannot read properties of
                         // undefined`.
                         if name_bytes == b"constructor" {
-                            let v = crate::object::js_get_global_this_builtin_value(
-                                b"Promise".as_ptr(),
-                                7,
-                            );
+                            let v = crate::object::builtin_constructor_value("Promise");
                             return JSValue::from_bits(v.to_bits());
                         }
                         // A Promise is a `GC_TYPE_PROMISE` cell, not an

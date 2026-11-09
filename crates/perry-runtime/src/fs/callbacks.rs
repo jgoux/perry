@@ -23,7 +23,7 @@ pub extern "C" fn js_fs_read_file_callback(path_value: f64, encoding: f64, callb
     let args =
         match unsafe { read_file_value_result(path_value, encoding, text_encoding.as_deref()) } {
             Ok(data_val) => [f64::from_bits(TAG_NULL), data_val],
-            Err(err_val) => [err_val, f64::from_bits(TAG_UNDEFINED)],
+            Err(err_val) => [err_val.value(), f64::from_bits(TAG_UNDEFINED)],
         };
     if !cb_ptr.is_null() {
         defer_fs_callback_chain(cb_ptr, &args, 4);
@@ -215,9 +215,13 @@ pub extern "C" fn js_fs_mkdir_callback(path_value: f64, arg1: f64, arg2: f64) ->
     let cb = callback_or_arg2(arg1, arg2);
     unsafe {
         match js_fs_mkdir_result(path_value, options) {
-            Ok(()) => call_cb0(cb),
+            Ok(None) => call_cb0(cb),
+            Ok(first) => defer_fs_callback(
+                cb,
+                &[f64::from_bits(0x7FFC_0000_0000_0002), super::mkdir_result_value(first)],
+            ),
             Err(err_val) => {
-                call_cb_err1(cb, err_val);
+                call_cb_err1(cb, err_val.value());
                 return f64::from_bits(TAG_UNDEFINED);
             }
         }
@@ -240,7 +244,7 @@ pub extern "C" fn js_fs_unlink_callback(path_value: f64, callback: f64) -> f64 {
         match js_fs_unlink_result(path_value) {
             Ok(()) => call_cb0(cb),
             Err(err_val) => {
-                call_cb_err1(cb, err_val);
+                call_cb_err1(cb, err_val.value());
                 return f64::from_bits(TAG_UNDEFINED);
             }
         }
@@ -261,7 +265,7 @@ pub extern "C" fn js_fs_rm_callback(path_value: f64, arg1: f64, arg2: f64) -> f6
     unsafe {
         match crate::fs::js_fs_rm_result(path_value, options) {
             Ok(()) => call_cb0(cb),
-            Err(err_val) => call_cb_err1(cb, err_val),
+            Err(err_val) => call_cb_err1(cb, err_val.value()),
         }
     }
     f64::from_bits(TAG_UNDEFINED)
@@ -282,7 +286,7 @@ pub extern "C" fn js_fs_access_callback(path_value: f64, arg1: f64, arg2: f64) -
     unsafe {
         match crate::fs::js_fs_access_result(path_value, mode) {
             Ok(()) => call_cb0(cb),
-            Err(err_val) => call_cb_err1(cb, err_val),
+            Err(err_val) => call_cb_err1(cb, err_val.value()),
         }
     }
     f64::from_bits(TAG_UNDEFINED)
@@ -432,7 +436,7 @@ pub extern "C" fn js_fs_opendir_callback(path_value: f64, arg1: f64, arg2: f64) 
     let dir = match js_fs_opendir_value_with_path(path_value) {
         Ok(dir) => dir,
         Err(err) => {
-            unsafe { call_cb_err1(cb, err) };
+            unsafe { call_cb_err1(cb, err.value()) };
             return f64::from_bits(TAG_UNDEFINED);
         }
     };
@@ -487,7 +491,7 @@ pub extern "C" fn js_fs_fstat_callback(fd_value: f64, arg1: f64, arg2: f64) -> f
             Ok(stats) => {
                 defer_fs_callback(cb, &[f64::from_bits(TAG_NULL), stats]);
             }
-            Err(err) => unsafe { call_cb_err2(cb, err) },
+            Err(err) => unsafe { call_cb_err2(cb, err.value()) },
         }
     }
     f64::from_bits(TAG_UNDEFINED)
@@ -501,7 +505,7 @@ pub extern "C" fn js_fs_chmod_callback(path_value: f64, mode_value: f64, callbac
     unsafe {
         match crate::fs::js_fs_chmod_result(path_value, mode_value) {
             Ok(()) => call_cb0(cb),
-            Err(err_val) => call_cb_err1(cb, err_val),
+            Err(err_val) => call_cb_err1(cb, err_val.value()),
         }
     }
     f64::from_bits(TAG_UNDEFINED)
@@ -520,7 +524,7 @@ pub extern "C" fn js_fs_chown_callback(
     unsafe {
         match crate::fs::js_fs_chown_result(path_value, uid_value, gid_value, true) {
             Ok(()) => call_cb0(cb),
-            Err(err_val) => call_cb_err1(cb, err_val),
+            Err(err_val) => call_cb_err1(cb, err_val.value()),
         }
     }
     f64::from_bits(TAG_UNDEFINED)
@@ -542,7 +546,7 @@ pub extern "C" fn js_fs_lchown_callback(
     unsafe {
         match crate::fs::js_fs_chown_result(path_value, uid_value, gid_value, false) {
             Ok(()) => call_cb0(cb),
-            Err(err_val) => call_cb_err1(cb, err_val),
+            Err(err_val) => call_cb_err1(cb, err_val.value()),
         }
     }
     f64::from_bits(TAG_UNDEFINED)
@@ -558,15 +562,14 @@ pub extern "C" fn js_fs_lchmod_callback(path_value: f64, mode_value: f64, callba
         let _ = (path_value, mode_value, callback);
         let message = "fs.lchmod is not a function";
         let msg = crate::string::js_string_from_bytes(message.as_ptr(), message.len() as u32);
-        let err = crate::error::js_typeerror_new(msg);
-        crate::exception::js_throw(crate::value::js_nanbox_pointer(err as i64));
+        crate::exception::throw_core(crate::error::CoreError::type_error(msg));
     }
     crate::fs::validate::validate_path("path", path_value);
     let cb = required_callback(callback);
     unsafe {
         match crate::fs::js_fs_lchmod_result(path_value, mode_value) {
             Ok(()) => call_cb0(cb),
-            Err(err_val) => call_cb_err1(cb, err_val),
+            Err(err_val) => call_cb_err1(cb, err_val.value()),
         }
     }
     f64::from_bits(TAG_UNDEFINED)
@@ -589,7 +592,7 @@ pub extern "C" fn js_fs_truncate_callback(path_value: f64, len_value: f64, callb
     unsafe {
         match crate::fs::js_fs_truncate_result(path_value, len) {
             Ok(()) => call_cb0(cb),
-            Err(err_val) => call_cb_err1(cb, err_val),
+            Err(err_val) => call_cb_err1(cb, err_val.value()),
         }
     }
     f64::from_bits(TAG_UNDEFINED)
@@ -603,7 +606,7 @@ pub extern "C" fn js_fs_link_callback(from_value: f64, to_value: f64, callback: 
     unsafe {
         match crate::fs::js_fs_link_result(from_value, to_value) {
             Ok(()) => call_cb0(cb),
-            Err(err_val) => call_cb_err1(cb, err_val),
+            Err(err_val) => call_cb_err1(cb, err_val.value()),
         }
     }
     f64::from_bits(TAG_UNDEFINED)
@@ -622,7 +625,7 @@ pub extern "C" fn js_fs_symlink_callback(
     unsafe {
         match crate::fs::js_fs_symlink_result(from_value, to_value) {
             Ok(()) => call_cb0(cb),
-            Err(err_val) => call_cb_err1(cb, err_val),
+            Err(err_val) => call_cb_err1(cb, err_val.value()),
         }
     }
     f64::from_bits(TAG_UNDEFINED)
@@ -642,7 +645,7 @@ pub extern "C" fn js_fs_readlink_callback(path_value: f64, arg1: f64, arg2: f64)
     let value = match crate::fs::js_fs_readlink_value_result(path_value, options) {
         Ok(v) => v,
         Err(err_val) => {
-            unsafe { call_cb_err2(cb, err_val) };
+            unsafe { call_cb_err2(cb, err_val.value()) };
             return f64::from_bits(TAG_UNDEFINED);
         }
     };
@@ -666,7 +669,7 @@ pub extern "C" fn js_fs_realpath_callback(path_value: f64, arg1: f64, arg2: f64)
     let value = match crate::fs::js_fs_realpath_value_result(path_value, options, "lstat") {
         Ok(value) => value,
         Err(err_val) => {
-            unsafe { call_cb_err2(cb, err_val) };
+            unsafe { call_cb_err2(cb, err_val.value()) };
             return f64::from_bits(TAG_UNDEFINED);
         }
     };
@@ -700,7 +703,7 @@ pub extern "C" fn js_fs_mkdtemp_callback(prefix_value: f64, arg1: f64, arg2: f64
             }
         }
         Err(err_val) => unsafe {
-            call_cb_err1(cb, err_val);
+            call_cb_err1(cb, err_val.value());
             return f64::from_bits(TAG_UNDEFINED);
         },
     };
@@ -818,11 +821,11 @@ pub extern "C" fn js_fs_rmdir_callback(path_value: f64, arg1: f64, arg2: f64) ->
     let cb = callback_or_arg2(arg1, arg2);
     unsafe {
         if let Err(err_val) = crate::fs::validate_rmdir_options(options) {
-            crate::exception::js_throw(err_val);
+            crate::exception::throw_core(err_val);
         }
         match crate::fs::js_fs_rmdir_result(path_value, options) {
             Ok(()) => call_cb0(cb),
-            Err(err_val) => call_cb_err1(cb, err_val),
+            Err(err_val) => call_cb_err1(cb, err_val.value()),
         }
     }
     f64::from_bits(TAG_UNDEFINED)
@@ -840,7 +843,7 @@ pub extern "C" fn js_fs_ftruncate_callback(fd_value: f64, len_value: f64, callba
     unsafe {
         match crate::fs::js_fs_ftruncate_result(fd_value, len_value) {
             Ok(()) => call_cb0(cb),
-            Err(err_val) => call_cb_err1(cb, err_val),
+            Err(err_val) => call_cb_err1(cb, err_val.value()),
         }
     }
     f64::from_bits(TAG_UNDEFINED)
@@ -910,7 +913,7 @@ pub extern "C" fn js_fs_fchown_callback(
     unsafe {
         match crate::fs::js_fs_fchown_result(fd_value, uid_value, gid_value) {
             Ok(()) => call_cb0(cb),
-            Err(err_val) => call_cb_err1(cb, err_val),
+            Err(err_val) => call_cb_err1(cb, err_val.value()),
         }
     }
     f64::from_bits(TAG_UNDEFINED)
@@ -929,7 +932,7 @@ pub extern "C" fn js_fs_utimes_callback(
     unsafe {
         match crate::fs::js_fs_utimes_result(path_value, atime_value, mtime_value, false) {
             Ok(()) => call_cb0(cb),
-            Err(err_val) => call_cb_err1(cb, err_val),
+            Err(err) => call_cb_err1(cb, err.value()),
         }
     }
     f64::from_bits(TAG_UNDEFINED)
@@ -948,7 +951,7 @@ pub extern "C" fn js_fs_lutimes_callback(
     unsafe {
         match crate::fs::js_fs_utimes_result(path_value, atime_value, mtime_value, true) {
             Ok(()) => call_cb0(cb),
-            Err(err_val) => call_cb_err1(cb, err_val),
+            Err(err) => call_cb_err1(cb, err.value()),
         }
     }
     f64::from_bits(TAG_UNDEFINED)
@@ -971,7 +974,7 @@ pub extern "C" fn js_fs_futimes_callback(
     unsafe {
         match crate::fs::js_fs_futimes_result(fd_value, atime_value, mtime_value) {
             Ok(()) => call_cb0(cb),
-            Err(err_val) => call_cb_err1(cb, err_val),
+            Err(err) => call_cb_err1(cb, err.value()),
         }
     }
     f64::from_bits(TAG_UNDEFINED)
@@ -1036,7 +1039,10 @@ pub extern "C" fn js_fs_read_callback_options(
     let offset = unsafe { options_number_field(options_value, b"offset") }.unwrap_or(0.0);
     let length = unsafe { options_number_field(options_value, b"length") }
         .unwrap_or_else(|| (buffer_len - offset).max(0.0));
-    let position = unsafe { options_number_field(options_value, b"position") }
+    // A number or a bigint (Node accepts both); absent/null reads at the
+    // current file position.
+    let position = unsafe { crate::fs::dirent::options_field_value(options_value, b"position") }
+        .map(|v| f64::from_bits(v.bits()))
         .unwrap_or(f64::from_bits(crate::value::TAG_NULL));
     let bytes = match crate::fs::read_sync_result(fd_value, buffer_value, offset, length, position)
     {
@@ -1052,6 +1058,28 @@ pub extern "C" fn js_fs_read_callback_options(
         defer_fs_callback(cb, &[f64::from_bits(TAG_NULL), bytes, buffer_value]);
     }
     f64::from_bits(TAG_UNDEFINED)
+}
+
+/// `fs.read(fd, callback)`, `fs.read(fd, options, callback)` and
+/// `fs.read(fd, buffer, callback)`: the buffer is `options.buffer` (or the
+/// buffer argument), else a fresh 16 KiB Buffer, as in Node.
+#[no_mangle]
+pub extern "C" fn js_fs_read_callback_short(fd_value: f64, second: f64, callback: f64) -> f64 {
+    let undefined = f64::from_bits(crate::value::TAG_UNDEFINED);
+    let is_buffer = |v: f64| crate::buffer::js_buffer_is_buffer(v.to_bits() as i64) != 0;
+    let (buffer, options) = if is_buffer(second) {
+        (second, undefined)
+    } else {
+        let from_options = unsafe { crate::fs::dirent::options_field_value(second, b"buffer") }
+            .map(|v| f64::from_bits(v.bits()))
+            .filter(|v| is_buffer(*v));
+        let buffer = from_options.unwrap_or_else(|| {
+            let fresh = crate::buffer::js_buffer_alloc(16384, 0);
+            f64::from_bits(crate::value::JSValue::pointer(fresh as *const u8).bits())
+        });
+        (buffer, second)
+    };
+    js_fs_read_callback_options(fd_value, buffer, options, callback)
 }
 
 /// `fs.write(fd, string, callback)` / deterministic string subset.
@@ -1217,7 +1245,7 @@ pub extern "C" fn js_fs_rename_callback(from_value: f64, to_value: f64, callback
     unsafe {
         match crate::fs::js_fs_rename_result(from_value, to_value) {
             Ok(()) => call_cb0(cb),
-            Err(err_val) => call_cb_err1(cb, err_val),
+            Err(err_val) => call_cb_err1(cb, err_val.value()),
         }
     }
     f64::from_bits(TAG_UNDEFINED)
@@ -1244,7 +1272,7 @@ pub extern "C" fn js_fs_copy_file_callback(
     unsafe {
         match crate::fs::js_fs_copy_file_result(from_value, to_value, flags) {
             Ok(()) => call_cb0(cb),
-            Err(err_val) => call_cb_err1(cb, err_val),
+            Err(err_val) => call_cb_err1(cb, err_val.value()),
         }
     }
     f64::from_bits(TAG_UNDEFINED)

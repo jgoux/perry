@@ -57,12 +57,20 @@ fn read_kinds(ctx: &FnCtx<'_>, object: &Expr, property: &str) -> Option<u16> {
 
 /// Classify the caller-side operand `e`.
 pub(crate) fn operand(ctx: &FnCtx<'_>, e: &Expr) -> Option<Operand> {
+    // Inside a loop region's F copy, a bare read the region proves a Number
+    // (R: an identity F64 lane, or the guard's value test) is a raw double.
+    // That proof is stronger than the facts' kind mask, so the read must not
+    // take the `Prim` lowering, whose `js_number_coerce` leaf is a call the
+    // region verifier counts as one that may run JS.
+    if crate::stmt::region_loop::is_f64_read(ctx, e) {
+        return Some(Operand::Number);
+    }
     if let Expr::PropertyGet {
         object, property, ..
     } = e
     {
         if let Some(mask) = read_kinds(ctx, object, property) {
-            if wpfacts_access::proves_raw_f64(ctx, e) {
+            if wpfacts_access::proves_number(ctx, e) {
                 return Some(Operand::Number);
             }
             if mask & !K_PRIMS == 0 {
@@ -118,15 +126,6 @@ pub(crate) fn emit_prim_to_number(ctx: &mut FnCtx<'_>, raw: &str) -> String {
         .phi(DOUBLE, &[(raw, &fast_label), (&coerced, &slow_end)])
 }
 
-/// A primitive-kind field read, lowered as a number operand.
-pub(crate) fn lower_prim_operand(ctx: &mut FnCtx<'_>, e: &Expr) -> Result<Option<String>> {
-    if operand(ctx, e) != Some(Operand::Prim) {
-        return Ok(None);
-    }
-    let raw = lower_expr(ctx, e)?;
-    Ok(Some(emit_prim_to_number(ctx, &raw)))
-}
-
 /// `left + right` over proven Numbers and primitive-kind reads: an `fadd`
 /// of the two `ToNumber` values, no dynamic helper. Both operands are
 /// evaluated left to right; neither conversion can run user code.
@@ -174,6 +173,9 @@ pub(crate) fn closed_number_call(ctx: &FnCtx<'_>, e: &Expr) -> bool {
     };
     if ctx.wpfacts_off {
         return false;
+    }
+    if crate::codegen::facts_rep::number_call(ctx, callee) {
+        return true;
     }
     let Some((cids, _nullable)) = wpfacts_access::proven_receiver_classes(ctx, object) else {
         return false;
@@ -281,7 +283,12 @@ fn this_kinds(ctx: &FnCtx<'_>, cids: &[u32], key: &str) -> Option<u16> {
     let mut mask = 0u16;
     for &cid in cids {
         let f = ctx.wpfacts.field(cid, key)?;
-        if f.declared {
+        crate::verify_facts::consumed(
+            crate::verify_facts::Fact::NumericResult,
+            || serde_json::json!({"class":cid,"key":key,"mask":f.kind_mask}),
+        );
+        crate::facts_consumed::used();
+        if f.declared || f.reserved {
             return None;
         }
         mask |= f.kind_mask;
@@ -321,7 +328,10 @@ fn expr_is_number(ctx: &FnCtx<'_>, e: &Expr, cids: &[u32], depth: u8) -> bool {
             then_expr,
             else_expr,
             ..
-        } => expr_is_number(ctx, then_expr, cids, depth) && expr_is_number(ctx, else_expr, cids, depth),
+        } => {
+            expr_is_number(ctx, then_expr, cids, depth)
+                && expr_is_number(ctx, else_expr, cids, depth)
+        }
         Expr::Call { callee, .. } => match callee.as_ref() {
             Expr::PropertyGet {
                 object, property, ..

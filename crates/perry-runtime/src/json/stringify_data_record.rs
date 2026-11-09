@@ -66,8 +66,7 @@ unsafe fn inline_fields_with_live<'a>(
     }
     Some(std::slice::from_raw_parts(
         // A1_UNPROVEN: record-first: no proof of the object form at this slot read (kind-A/B question for S0f).
-        crate::meta_slots_of!(crate::meta_obj_runtime_born!(obj as *mut _))
-            .cast(),
+        crate::meta_slots_of!(crate::meta_obj_runtime_born!(obj as *mut _)).cast(),
         count,
     ))
 }
@@ -153,7 +152,7 @@ pub(super) unsafe fn try_emit_with_live(
         return false;
     };
     if !template.own_keys_exclude_to_json
-        || crate::object::prototype_chain::object_static_prototype(obj as usize).is_some()
+        || crate::object::prototype_chain::object_static_prototype_is_linked(obj as usize)
     {
         return false;
     }

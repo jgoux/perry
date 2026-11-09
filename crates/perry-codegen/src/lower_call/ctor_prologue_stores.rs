@@ -148,7 +148,7 @@ pub(super) fn prologue_store_plan(
         || !class.decorators.is_empty()
         || !class.getters.is_empty()
         || !class.setters.is_empty()
-        || !class.computed_members.is_empty()
+        || class.has_evaluated_members()
         || class.alloc_width_hint != 0
     {
         return None;
@@ -195,6 +195,20 @@ pub(super) fn prologue_store_plan(
         let arg_index = *param_slot.get(&param_id)?;
         if numeric_addend.is_some()
             && !matches!(ctor.params[arg_index].ty, perry_hir::types::Type::Number)
+        {
+            return None;
+        }
+        // A reservation field is added by this `[[Set]]`, not defined before
+        // the body runs: an inherited setter or non-writable key decides it,
+        // so the store is a slot store only when no prototype can intercept
+        // the add (the census). A defined field is already own, and a
+        // literal's keys are definitions.
+        if !class.is_literal_shape()
+            && class
+                .fields
+                .iter()
+                .any(|f| f.name == property && f.origin.is_reservation())
+            && !crate::proto_constants::create_add_free(property)
         {
             return None;
         }
@@ -276,6 +290,7 @@ fn param_store(stmt: &perry_hir::Stmt) -> Option<(&str, u32, Option<f64>)> {
             object,
             property,
             value,
+            ..
         }) if matches!(object.as_ref(), Expr::This) => {
             let (id, addend) = value_spec(value.as_ref())?;
             Some((property.as_str(), id, addend))
@@ -286,6 +301,7 @@ fn param_store(stmt: &perry_hir::Stmt) -> Option<(&str, u32, Option<f64>)> {
             value,
             receiver,
             strict: _,
+            ..
         }) if matches!(target.as_ref(), Expr::This) && matches!(receiver.as_ref(), Expr::This) => {
             let Expr::String(property) = key.as_ref() else {
                 return None;

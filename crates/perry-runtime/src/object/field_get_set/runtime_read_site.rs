@@ -106,6 +106,56 @@ pub(crate) unsafe fn probe(obj: *const ObjectHeader, key: Key<'_>) -> Option<Ans
     crate::object::method_site::read_holder::shape_answer(obj, key)
 }
 
+/// `OrdinaryGet(obj, key, receiver)` in one walk of `obj`'s layouts, for a
+/// receiver that is not `obj` (a function whose [[Prototype]] is `obj`, such as
+/// a callable class instance): a data property's value, `undefined` for a
+/// proven absence, or the getter's result with `receiver` as `this` (a compiled
+/// class getter or a getter closure). `None` when only the complete read can
+/// answer (a key with no property atom, a chain or pair the layouts decline,
+/// a static or setter-only pair); nothing has run then.
+///
+/// `name` is the key text; `key` is null or its header (`name`'s text). It
+/// can run a getter, collect and throw.
+///
+/// # Safety
+/// `obj` is a live `GC_TYPE_OBJECT` above the handle band (see
+/// [`object_receiver`]); `key` is null or a live string header; `receiver` is
+/// rooted by the caller.
+pub(crate) unsafe fn get_with_receiver(
+    obj: *const ObjectHeader,
+    name: &[u8],
+    key: *const crate::StringHeader,
+    receiver: f64,
+) -> Option<f64> {
+    let atom = if key.is_null() {
+        let hash = crate::object::key_bytes_hash(name.as_ptr(), name.len());
+        crate::string::atom_lookup(name, hash).filter(|a| crate::string::is_property_atom(*a))?
+    } else if crate::string::is_property_atom(key) {
+        key
+    } else {
+        crate::string::existing_property_atom(key)?
+    };
+    let key_bits = crate::value::STRING_TAG | atom as u64;
+    let hash = crate::string::property_atom_hash(atom);
+    // The caller's receiver is a function whose own read and site probe
+    // missed: an inherited getter is the common answer here, so the
+    // accessor walk goes first (it answers the first holder of the key,
+    // `None` when that holder is data or the layouts cannot say).
+    let Some(acc) = crate::object::layout_probe::probe_accessor_word(obj, key_bits, hash) else {
+        let v = probe_word(obj, key_bits, hash);
+        // A data value does not depend on the receiver.
+        return (v.to_bits() != crate::value::TAG_HOLE).then_some(v);
+    };
+    if acc.static_get != 0 || (acc.raw_get == 0 && acc.get == 0) {
+        // A static pair, a setter-only pair or one this word cannot read
+        // (`Accessor::default()`): the complete read decides.
+        return None;
+    }
+    // Nothing collected since the probe: `acc` names live getters.
+    let (value, _) = crate::object::class_registry::invoke_instance_getter(acc, receiver);
+    Some(f64::from_bits(value.bits()))
+}
+
 /// `Get(obj, key)`: the probe, else the complete read. It can run a getter,
 /// collect and throw.
 ///
@@ -162,6 +212,22 @@ pub(crate) unsafe fn get_with_memo(
     }
 }
 
+/// [`get`] for a key already in hand as its property atom: the probe on the
+/// key word, else the complete read. Nothing is looked up by text. It can
+/// run a getter, collect and throw.
+///
+/// # Safety
+/// As [`probe`]; `atom` is a live property atom.
+pub(crate) unsafe fn get_atom(obj: *mut ObjectHeader, atom: *const crate::StringHeader) -> f64 {
+    debug_assert!(crate::string::is_property_atom(atom));
+    let key_bits = crate::value::STRING_TAG | atom as u64;
+    let v = probe_word(obj, key_bits, crate::string::property_atom_hash(atom));
+    if v.to_bits() != crate::value::TAG_HOLE {
+        return v;
+    }
+    super::js_object_get_field_slow(obj as i64, atom)
+}
+
 /// The integer a Number property key names, when its canonical text is a
 /// plain decimal integer: an INT32-tagged key, or an integral double of
 /// magnitude at most 2^53 (`-0` names `"0"`). Every other Number keeps the
@@ -169,7 +235,7 @@ pub(crate) unsafe fn get_with_memo(
 #[inline]
 pub(crate) fn integer_key(key: f64) -> Option<i64> {
     let bits = key.to_bits();
-    if bits & crate::value::TAG_MASK == crate::value::INT32_TAG {
+    if crate::value::is_int32_bits(bits) {
         return Some(i64::from(crate::value::JSValue::from_bits(bits).as_int32()));
     }
     (key.is_finite() && key.fract() == 0.0 && key.abs() <= 9_007_199_254_740_992.0)

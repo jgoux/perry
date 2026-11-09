@@ -234,7 +234,7 @@ fn census_pass1_if_armed_impl() {
             }
         }
     });
-    marked.sort_unstable();
+    crate::cold_sort::sort_by(&mut marked, |a, b| a.cmp(b));
     PASS1_MARKED.with(|p| *p.borrow_mut() = Some(marked));
 }
 
@@ -281,7 +281,9 @@ fn slot_kind(bits: u64) -> usize {
         POINTER_TAG => 0,
         STRING_TAG => 1,
         SHORT_STRING_TAG => 2,
-        INT32_TAG => 3,
+        INT32_TAG if crate::value::is_int32_bits(bits) => 3,
+        // A non-Number `0x7FFE` word (a `C.prototype` ref).
+        INT32_TAG => 11,
         BIGINT_TAG => 9,
         JS_HANDLE_TAG => 10,
         TAG_MARKER => match bits {
@@ -449,6 +451,7 @@ impl Census {
             }
         }
         self.space_live[space].add(size);
+        crate::snap_census::census_live(header.cast(), obj_type, size);
         if t > GC_TYPE_MAX as usize {
             return;
         }
@@ -485,8 +488,11 @@ impl Census {
         entry.count += 1;
         entry.bytes += size as u64;
         entry.slot_capacity += slot_capacity as u64;
-        if !crate::meta_read!(crate::meta_obj_from_type!(obj as *mut crate::object::ObjectHeader, t))
-            .is_null()
+        if !crate::meta_read!(crate::meta_obj_from_type!(
+            obj as *mut crate::object::ObjectHeader,
+            t
+        ))
+        .is_null()
         {
             entry.meta_objects += 1;
             self.obj_meta += 1;
@@ -638,6 +644,16 @@ pub(super) fn side_tables() -> Vec<SideTableRow> {
         super::policy::external_side_live_bytes(),
     ));
     rows
+}
+
+#[cfg(test)]
+mod int32_exact_tests {
+    #[test]
+    fn a_non_number_0x7ffe_word_is_not_the_int32_kind() {
+        assert_eq!(super::slot_kind(0x7FFE_0000_0000_0005), 3);
+        assert_ne!(super::slot_kind(0x7FFE_0001_0000_0005), 3);
+        assert_ne!(super::slot_kind(0x7FFE_00FF_0000_0001), 3);
+    }
 }
 
 #[cfg(test)]
@@ -856,7 +872,7 @@ fn take_census(label: &str, pass1: Option<Vec<usize>>) {
         })
         .collect();
 
-    c.live_shape_ids.sort_unstable();
+    crate::cold_sort::sort_by(&mut c.live_shape_ids, |a, b| a.cmp(b));
     c.live_shape_ids.dedup();
     let mut side_rows = side_tables();
     side_rows.extend(crate::object::shapes::shape_table_liveness_census(

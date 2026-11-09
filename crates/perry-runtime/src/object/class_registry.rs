@@ -20,18 +20,19 @@
 pub use super::class_handles::{
     fetch_handle_kind_probe, handle_method_dispatch, handle_own_property_names_dispatch,
     handle_property_dispatch, handle_property_set_dispatch, handle_prototype_dispatch,
-    handle_receiver_value, http_agent_handle_probe, js_register_fetch_handle_kind_probe,
-    js_register_handle_method_dispatch, js_register_handle_own_property_names_dispatch,
-    js_register_handle_property_dispatch, js_register_handle_property_set_dispatch,
-    js_register_handle_prototype_dispatch, js_register_http_agent_handle_probe,
+    handle_receiver_value, http_agent_handle_probe, http_server_handle_kind_probe,
+    js_register_fetch_handle_kind_probe, js_register_handle_method_dispatch,
+    js_register_handle_own_property_names_dispatch, js_register_handle_property_dispatch,
+    js_register_handle_property_set_dispatch, js_register_handle_prototype_dispatch,
+    js_register_http_agent_handle_probe, js_register_http_server_handle_kind_probe,
     js_register_net_socket_handle_probe, js_register_stream_expando_set,
     js_register_stream_handle_kind_probe, js_register_stream_handle_probe,
     js_register_tls_handle_kind_probe, net_socket_handle_probe, stream_expando_set,
     stream_handle_id, stream_handle_kind_probe, stream_handle_probe, tls_handle_kind_probe,
     FetchHandleKindProbeFn, HandleMethodDispatchFn, HandleOwnPropertyNamesDispatchFn,
     HandlePropertyDispatchFn, HandlePropertySetDispatchFn, HandlePrototypeDispatchFn,
-    HttpAgentHandleProbeFn, NetSocketHandleProbeFn, StreamHandleKindProbeFn, StreamHandleProbeFn,
-    TlsHandleKindProbeFn,
+    HttpAgentHandleProbeFn, HttpServerHandleKind, HttpServerHandleKindProbeFn,
+    NetSocketHandleProbeFn, StreamHandleKindProbeFn, StreamHandleProbeFn, TlsHandleKindProbeFn,
 };
 use super::*;
 
@@ -51,7 +52,7 @@ pub(crate) use decl_accessors::{
     class_chain_getter_value, class_chain_getter_value_bytes, class_chain_setter_apply,
     decl_prototype_own_accessor, decl_prototype_own_accessor_bytes,
     install_decl_prototype_accessor_at, instance_chain_getter_value, instance_chain_setter_apply,
-    instance_chain_setter_apply_bytes,
+    instance_chain_setter_apply_bytes, invoke_instance_getter,
 };
 pub use declarations::{
     js_register_class_declaration, ClassDeclaration, ClassMemberDecl, CLASS_MEMBER_GETTER,
@@ -120,8 +121,7 @@ pub(crate) use state::{
 pub use state::{
     AccessorDecl, CLASS_DYNAMIC_PARENT_VALUE, CLASS_METHOD_BIND_LENGTHS, CLASS_OBJECT_VALUES,
     CLASS_PARENT_CLOSURES, CLASS_PROTOTYPE_OBJECTS, CLASS_STATIC_ACCESSORS, CLASS_STATIC_METHODS,
-    CLASS_STATIC_METHOD_BIND_LENGTHS, CLASS_STRING_MEMBER_ORDERS, CLASS_SYMBOL_ACCESSORS,
-    CLASS_SYMBOL_MEMBER_ORDERS, CLASS_SYMBOL_METHODS, REGISTERED_CLASS_IDS,
+    CLASS_STATIC_METHOD_BIND_LENGTHS, CLASS_STRING_MEMBER_ORDERS, REGISTERED_CLASS_IDS,
 };
 
 // ── prototype_objects.rs ────────────────────────────────────────────────────
@@ -230,13 +230,11 @@ pub(crate) use parent_static::{
     class_method_slot_value, class_method_slot_value_bytes, class_object_own_field_bytes,
     class_object_owns_key_bytes, class_object_pinned_parent, class_own_static_method_code,
     class_own_static_method_code_bytes, class_own_static_method_entry,
-    class_own_symbol_accessor_ptrs, class_own_symbol_member_keys, class_own_symbol_method,
     class_private_instance_getter_value, class_private_instance_setter_apply,
     class_static_accessor_getter_value, class_static_accessor_getter_value_bytes,
     class_static_accessor_setter_apply, class_static_accessor_setter_apply_bytes,
-    class_symbol_getter_value, class_symbol_setter_apply, dynamic_value_class_id,
-    get_parent_class_id, lookup_class_symbol_method_in_chain, lookup_static_method_in_chain,
-    lookup_static_method_in_chain_bytes, lookup_static_method_owner,
+    dynamic_value_class_id, get_parent_class_id, install_prototype_symbol_members,
+    lookup_static_method_in_chain, lookup_static_method_in_chain_bytes, lookup_static_method_owner,
     lookup_static_method_owner_bytes, register_class, register_class_dynamic_static_accessor,
     static_accessor_in_chain,
 };

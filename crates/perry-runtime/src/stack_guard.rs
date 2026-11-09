@@ -88,6 +88,7 @@ pub(crate) fn publish_stack_limit() {
 /// restored before the throw; an overflow inside that window is fatal.
 #[no_mangle]
 #[cold]
+#[optimize(size)]
 #[inline(never)]
 pub extern "C-unwind" fn js_stack_overflow() -> ! {
     let (limit, relaxed) = LIMITS.with(|l| l.get());
@@ -99,9 +100,9 @@ pub extern "C-unwind" fn js_stack_overflow() -> ! {
     publish(AGENT_PTR_STACK_LIMIT, relaxed as *const u8);
     let msg = b"Maximum call stack size exceeded";
     let msg = crate::string::js_string_from_bytes(msg.as_ptr(), msg.len() as u32);
-    let err = crate::error::js_rangeerror_new(msg);
+    let err = crate::error::CoreError::range_error(msg);
     publish(AGENT_PTR_STACK_LIMIT, limit as *const u8);
-    crate::exception::js_throw(crate::value::js_nanbox_pointer(err as i64))
+    crate::exception::throw_core(err)
 }
 
 #[cfg(test)]

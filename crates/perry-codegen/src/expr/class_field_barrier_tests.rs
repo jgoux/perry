@@ -60,8 +60,9 @@ pub(super) fn assert_default_barrier_env_not_disabled() {
     );
 }
 
-pub(super) fn ir_opts() -> CompileOptions {
+pub(crate) fn ir_opts() -> CompileOptions {
     CompileOptions {
+        namespace_self_import: false,
         static_shape_ids: Vec::new(),
         program_layout_ordinals: Default::default(),
         program_class_shape_ids: Default::default(),
@@ -92,8 +93,6 @@ pub(super) fn ir_opts() -> CompileOptions {
         cjs_interop_namespaces: Vec::new(),
         constructor_param_counts: Default::default(),
         imported_classes: Vec::new(),
-        short_spread_method_candidates: std::sync::Arc::default(),
-        program_class_accessor_names: Default::default(),
         object_literal_method_candidates: std::sync::Arc::default(),
         imported_enums: Vec::new(),
         imported_async_funcs: std::collections::HashSet::new(),
@@ -175,6 +174,8 @@ fn param_prologue_ctor() -> Function {
             object: Box::new(Expr::This),
             property: "v".to_string(),
             value: Box::new(Expr::LocalGet(PARAM_ID)),
+            byte_offset: 0,
+            byte_end: 0,
         })],
         is_async: false,
         is_generator: false,
@@ -256,6 +257,8 @@ fn probe_module() -> Module {
                 object: Box::new(Expr::LocalGet(BOXED_ID)),
                 property: "v".to_string(),
                 value: Box::new(Expr::LocalGet(STORED_ID)),
+                byte_offset: 0,
+                byte_end: 0,
             }),
             Stmt::Return(Some(Expr::LocalGet(BOXED_ID))),
         ],
@@ -308,6 +311,8 @@ pub(super) fn wide_prologue_ir() -> String {
                 object: Box::new(Expr::This),
                 property: name,
                 value: Box::new(Expr::LocalGet(PARAM_ID)),
+                byte_offset: 0,
+                byte_end: 0,
             }));
     }
     let mut opts = ir_opts();
@@ -330,7 +335,7 @@ pub(super) fn wide_prologue_ir() -> String {
 fn class_field_store_is_the_store_site_and_refuses_by_shape() {
     let ir = ir();
     assert!(
-        ir.contains(&format!("{}.", super::put_value_store_ic::STORE_IC_STEM)),
+        ir.contains("call double @perry_store_or_put("),
         "the constructor's class-field store must be the static-key store site:\n{ir}"
     );
     assert!(
@@ -346,14 +351,15 @@ fn class_field_store_is_the_store_site_and_refuses_by_shape() {
 
 /// A pointer-valued class-field store keeps its write barrier on the store
 /// probe path: the site emits no inline slot store at all (the deleted store
-/// IC's `put.pic.hit.store` block), only `perry_probe_set` (whose own-slot
-/// store is the runtime's barriered funnel) and, when it declines, the
-/// complete `[[Set]]`, so no pointer reaches a slot without the barrier.
+/// IC's `put.pic.hit.store` block), only `perry_store_or_put` (the store
+/// probe, whose own-slot store is the runtime's barriered funnel, and when it
+/// declines the complete `[[Set]]`), so no pointer reaches a slot without the
+/// barrier.
 #[test]
 fn a_pointer_class_field_store_is_the_barriered_store_probe() {
     let ir = ir();
     assert!(
-        ir.contains("call i32 @perry_probe_set(") && ir.contains("call double @js_put_value_set("),
+        ir.contains("call double @perry_store_or_put("),
         "the class-field store must be the store probe, then [[Set]]:\n{ir}"
     );
     assert!(
@@ -531,10 +537,10 @@ fn the_class_field_barrier_sits_behind_a_live_parent_generation_test() {
     );
     // The barrier must be on the TAKEN edge. A swapped `cond_br` compiles,
     // prints the right answer, and strands a child on the next minor GC.
-    let successors: Vec<&str> = branch
+    let successors: Vec<String> = branch
         .split("label %")
         .skip(1)
-        .map(|part| part.split([',', ' ']).next().unwrap())
+        .map(|part| through_stack_check(&ir, part.split([',', ' ']).next().unwrap()))
         .collect();
     assert_eq!(successors.len(), 2, "expected a two-way branch: {branch}");
     assert!(
@@ -578,4 +584,39 @@ fn the_gated_arm_still_reaches_the_barrier_call() {
         "the module must still declare to the runtime that generated barriers \
          exist — the remembered set's arming protocol reads this:\n{ir}"
     );
+}
+
+/// The block an edge into `label` really enters: a body's moved stack check
+/// (`stack_guard::move_check_to_call_sites`) sits in front of a calling block
+/// as `stack_guard.*` blocks, which this follows to the one block they lead to.
+pub(super) fn through_stack_check(ir: &str, label: &str) -> String {
+    let mut work = vec![label.to_string()];
+    let mut seen = std::collections::HashSet::new();
+    let mut exits = std::collections::BTreeSet::new();
+    while let Some(l) = work.pop() {
+        if !l.starts_with("stack_guard.") {
+            exits.insert(l);
+            continue;
+        }
+        if !seen.insert(l.clone()) {
+            continue;
+        }
+        let start = format!("{l}:");
+        for line in ir
+            .lines()
+            .skip_while(|line| *line != start)
+            .skip(1)
+            .take_while(|line| !line.ends_with(':'))
+        {
+            if line.trim_start().starts_with("br ") {
+                for part in line.split("label %").skip(1) {
+                    work.push(part.split([',', ' ']).next().unwrap().to_string());
+                }
+            }
+        }
+    }
+    match exits.len() {
+        1 => exits.into_iter().next().unwrap(),
+        _ => label.to_string(),
+    }
 }

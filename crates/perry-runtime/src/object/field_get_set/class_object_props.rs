@@ -170,13 +170,15 @@ pub(crate) unsafe fn finish_class_evaluation_prototype(
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             let proto_value = proto
                 .with_mut_ptr::<ObjectHeader, _>(|p| crate::value::js_nanbox_pointer(p as i64));
-            crate::object::install_evaluation_generator_symbols(
-                proto_value,
-                class.with_const_ptr::<ObjectHeader, _>(|c| {
-                    crate::value::js_nanbox_pointer(c as i64)
-                }),
-                class_id,
-            );
+            proto.with_mut_ptr::<ObjectHeader, _>(|p| {
+                crate::object::class_registry::install_prototype_symbol_members(
+                    p,
+                    class_id,
+                    class.with_const_ptr::<ObjectHeader, _>(|c| {
+                        crate::value::js_nanbox_pointer(c as i64)
+                    }),
+                )
+            });
             class.with_mut_ptr::<ObjectHeader, _>(|class| {
                 super::class_object_template::class_object_add_internal_for(
                     class,
@@ -274,11 +276,13 @@ pub(crate) unsafe fn finish_class_evaluation_prototype(
         });
     }
 
-    crate::object::install_evaluation_generator_symbols(
-        proto.with_const_ptr::<ObjectHeader, _>(|p| crate::value::js_nanbox_pointer(p as i64)),
-        class.with_const_ptr::<ObjectHeader, _>(|c| crate::value::js_nanbox_pointer(c as i64)),
-        class_id,
-    );
+    proto.with_mut_ptr::<ObjectHeader, _>(|p| {
+        crate::object::class_registry::install_prototype_symbol_members(
+            p,
+            class_id,
+            class.with_const_ptr::<ObjectHeader, _>(|c| crate::value::js_nanbox_pointer(c as i64)),
+        )
+    });
     if let Some(parent_proto) = &parent_proto {
         proto.with_mut_ptr::<ObjectHeader, _>(|proto| {
             super::super::prototype_chain::object_link_class_evaluation_prototype(
@@ -637,12 +641,13 @@ pub(super) unsafe fn instance_constructor_value(
     // fell through to `undefined`.
     if class_id == crate::weakref::CLASS_ID_WEAKMAP || class_id == crate::weakref::CLASS_ID_WEAKSET
     {
-        let name: &[u8] = if class_id == crate::weakref::CLASS_ID_WEAKMAP {
-            b"WeakMap"
-        } else {
-            b"WeakSet"
-        };
-        let v = js_get_global_this_builtin_value(name.as_ptr(), name.len());
+        let v = super::super::builtin_constructor_value(
+            if class_id == crate::weakref::CLASS_ID_WEAKMAP {
+                "WeakMap"
+            } else {
+                "WeakSet"
+            },
+        );
         return Some(JSValue::from_bits(v.to_bits()));
     }
     if class_id != 0 && class_has_own_method(class_id, "constructor") {

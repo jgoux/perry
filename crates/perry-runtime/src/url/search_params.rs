@@ -177,10 +177,7 @@ fn throw_invalid_query_pair_tuple() -> ! {
     let msg = b"Each query pair must be an iterable [name, value] tuple";
     let s = js_string_from_bytes(msg.as_ptr(), msg.len() as u32);
     crate::node_submodules::register_error_code_pub(s, "ERR_INVALID_TUPLE");
-    let err = crate::error::js_typeerror_new(s);
-    crate::exception::js_throw(f64::from_bits(
-        crate::value::JSValue::pointer(err as *const u8).bits(),
-    ))
+    crate::exception::throw_core(crate::error::CoreError::type_error(s))
 }
 
 fn throw_missing_args(name_and_value: bool) -> ! {
@@ -191,8 +188,7 @@ fn throw_missing_args(name_and_value: bool) -> ! {
     };
     let msg = js_string_from_bytes(message.as_ptr(), message.len() as u32);
     crate::node_submodules::register_error_code_pub(msg, "ERR_MISSING_ARGS");
-    let err = crate::error::js_typeerror_new(msg);
-    crate::exception::js_throw(crate::value::js_nanbox_pointer(err as i64))
+    crate::exception::throw_core(crate::error::CoreError::type_error(msg))
 }
 
 #[no_mangle]
@@ -306,9 +302,9 @@ pub(crate) fn create_url_search_params_object(entries: Vec<(String, String)>) ->
         crate::object::js_get_global_this();
     }
     let obj = unsafe {
-        crate::object::layout_desc::perry_alloc_layout(std::ptr::addr_of!(
-            crate::object::runtime_layouts::URL_SEARCH_PARAMS
-        ))
+        crate::object::layout_desc::perry_alloc_layout(
+            crate::object::runtime_layouts::URL_SEARCH_PARAMS::desc(),
+        )
     };
     // Owner starts as undefined; the URL constructor sets it when it adopts
     // this params object as its `.searchParams`.
@@ -1026,8 +1022,7 @@ fn search_params_of(object: f64) -> Option<*mut ObjectHeader> {
 fn throw_invalid_search_params_this() -> ! {
     let message = "Value of \"this\" must be of type URLSearchParams";
     let msg = js_string_from_bytes(message.as_ptr(), message.len() as u32);
-    let err = crate::error::js_typeerror_new(msg);
-    crate::exception::js_throw(crate::value::js_nanbox_pointer(err as i64));
+    crate::exception::throw_core(crate::error::CoreError::type_error(msg));
 }
 
 fn search_params_proto_call(name: &str, this: crate::closure::JsThis, args: &[f64]) -> f64 {
@@ -1119,6 +1114,16 @@ pub(crate) fn try_url_search_params_dynamic_dispatch(
     url_search_params_dynamic_call(params, method_name, args_ptr, args_len)
 }
 
+/// The array iterator object over an eager view array (a boxed array).
+fn iterator_over(view: f64) -> f64 {
+    let array = (view.to_bits() & crate::value::POINTER_MASK) as *const crate::array::ArrayHeader;
+    if array.is_null() {
+        return view;
+    }
+    let iterator = crate::array::js_array_values_iter_obj(array);
+    f64::from_bits(crate::value::JSValue::pointer(iterator as usize as *const u8).bits())
+}
+
 pub(crate) fn url_search_params_dynamic_call(
     params: *mut ObjectHeader,
     name: &str,
@@ -1183,14 +1188,16 @@ pub(crate) fn url_search_params_dynamic_call(
                 .join("&");
             create_string_f64(&joined)
         }
-        // Iteration helpers surface as eager arrays, matching the convention
-        // the static lowering uses (`js_get_iterator` wraps an eager array in
-        // the runtime array iterator when driven through for-of). mysql2's
-        // `parseUrl` iterates `url.searchParams` and Node code commonly calls
-        // `.entries()` / `.getAll()` on dynamic receivers.
-        "entries" => js_url_search_params_entries_arr(params),
-        "keys" => js_url_search_params_keys_arr(params),
-        "values" => js_url_search_params_values_arr(params),
+        // mysql2's `parseUrl` iterates `url.searchParams` and Node code
+        // commonly calls `.entries()` / `.getAll()` on dynamic receivers.
+        // WHATWG: entries/keys/values (and [Symbol.iterator]) return an
+        // iterator, not an array — callers drive it with `.next()`. Each one
+        // walks a snapshot of the list with the standard array iterator
+        // object, which is itself iterable, so for-of/spread/Array.from over
+        // the result keep working.
+        "entries" => iterator_over(js_url_search_params_entries_arr(params)),
+        "keys" => iterator_over(js_url_search_params_keys_arr(params)),
+        "values" => iterator_over(js_url_search_params_values_arr(params)),
         "getAll" => {
             // The FFI helper returns RAW pointer bits (the static lowering
             // boxes them); re-box for the dynamic call path.

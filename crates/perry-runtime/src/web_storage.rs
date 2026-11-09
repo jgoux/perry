@@ -372,15 +372,10 @@ fn install_storage_length_accessor(proto: *mut ObjectHeader) {
     obj
 }
 
-fn set_global_storage_property(global: *mut ObjectHeader, name: &str, value: *mut ObjectHeader) {
-    crate::object::define_builtin_data_property(
-        global,
-        string(name),
-        crate::value::js_nanbox_pointer(value as i64),
-        name.to_string(),
-        PropertyAttrs::new(true, true, true),
-    );
-
+/// The global's `localStorage` / `sessionStorage` accessor (the global
+/// object's static layout declares both as accessors; the getter reads the
+/// rooted store object, so `_value` is not a property value).
+fn set_global_storage_property(global: *mut ObjectHeader, name: &str, _value: *mut ObjectHeader) {
     let getter_fn = match name {
         "localStorage" => crate::fn_info!(#[realm("localStorage.<get>", constructible = true, spec = {name = property_key}, emit = metadata(realm_localStorage))] export crate::web_storage::storage_local_global_getter, 0; with_declared(0)),
         _ => crate::fn_info!(#[realm("sessionStorage.<get>", constructible = true, spec = {name = property_key}, emit = metadata(realm_sessionStorage))] export crate::web_storage::storage_session_global_getter, 0; with_declared(0)),
@@ -399,7 +394,8 @@ fn set_global_storage_property(global: *mut ObjectHeader, name: &str, value: *mu
                 get: crate::value::js_nanbox_pointer(getter as i64).to_bits(),
                 set: crate::value::js_nanbox_pointer(setter as i64).to_bits(),
             },
-            PropertyAttrs::new(false, true, true),
+            // node: `localStorage` is not enumerable, `sessionStorage` is.
+            PropertyAttrs::new(false, name != "localStorage", true),
         );
     }
 }
@@ -515,18 +511,15 @@ fn boxed_str(value: &str) -> f64 {
 
 fn throw_error(message: &str) -> f64 {
     let msg = string(message);
-    let err = crate::error::js_error_new_with_message(msg);
-    crate::exception::js_throw(crate::value::js_nanbox_pointer(err as i64))
+    crate::exception::throw_core(crate::error::CoreError::error(msg))
 }
 
 fn throw_type_error(message: &str) -> f64 {
     let msg = string(message);
-    let err = crate::error::js_typeerror_new(msg);
-    crate::exception::js_throw(crate::value::js_nanbox_pointer(err as i64))
+    crate::exception::throw_core(crate::error::CoreError::type_error(msg))
 }
 
 fn throw_quota_exceeded() -> f64 {
     let msg = string("The quota has been exceeded.");
-    let err = crate::error::js_error_new_with_name_message(b"QuotaExceededError", msg);
-    crate::exception::js_throw(crate::value::js_nanbox_pointer(err as i64))
+    crate::exception::throw_core(crate::error::CoreError::named(b"QuotaExceededError", msg))
 }

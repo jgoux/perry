@@ -341,7 +341,7 @@ pub(crate) fn collect_readdir_recursive_strings(
             Some((e.path(), is_dir))
         })
         .collect();
-    items.sort_by(|a, b| a.0.cmp(&b.0));
+    crate::cold_sort::sort_by(&mut items, |a, b| a.0.cmp(&b.0));
     for (path, _) in &items {
         let rel = path
             .strip_prefix(root)
@@ -365,7 +365,7 @@ pub(crate) fn collect_readdir_recursive_dirents(
         return;
     };
     let mut paths: Vec<std::path::PathBuf> = entries.flatten().map(|e| e.path()).collect();
-    paths.sort();
+    crate::cold_sort::sort_by(&mut paths, |a, b| a.cmp(b));
     let mut dirs = Vec::new();
     for path in &paths {
         let Ok(meta) = fs::symlink_metadata(path) else {
@@ -390,6 +390,7 @@ pub(crate) fn collect_readdir_recursive_dirents(
     }
 }
 
+crate::realm_decl! { "node:fs.readdirSync", effects = { path(arg(0)); reads(field(arg(1), withFileTypes)); reads(field(arg(1), recursive)); reads(field(arg(1), encoding)); stores(fresh); returns(fresh(Array.prototype, elems = [prim(str) | fresh(Buffer.prototype) | fresh(Object.prototype, fields = {name: prim(str), parentPath: prim(str), path: prim(str), isFile: native("%FsStatsPredicate%"), isDirectory: native("%FsStatsPredicate%"), isSymbolicLink: native("%FsStatsPredicate%"), isBlockDevice: native("%FsStatsPredicate%"), isCharacterDevice: native("%FsStatsPredicate%"), isFIFO: native("%FsStatsPredicate%"), isSocket: native("%FsStatsPredicate%")})])) } }
 /// Read directory entries synchronously. By default returns an array of
 /// string filenames. With `{ withFileTypes: true }` as the second arg,
 /// returns an array of Dirent objects (each with `name`, `parentPath`
@@ -470,7 +471,7 @@ pub extern "C" fn js_fs_readdir_sync(path_value: f64, options_value: f64) -> f64
                             }
                         }
                     }
-                    items.sort_by(|a, b| a.0.cmp(&b.0));
+                    crate::cold_sort::sort_by(&mut items, |a, b| a.0.cmp(&b.0));
 
                     let mut arr = js_array_alloc(items.len() as u32);
                     for (name, ft) in &items {
@@ -486,7 +487,7 @@ pub extern "C" fn js_fs_readdir_sync(path_value: f64, options_value: f64) -> f64
                             names.push(name.to_string());
                         }
                     }
-                    names.sort();
+                    crate::cold_sort::sort_by(&mut names, |a, b| a.cmp(b));
 
                     let mut arr = js_array_alloc(names.len() as u32);
                     for name in &names {
@@ -501,7 +502,7 @@ pub extern "C" fn js_fs_readdir_sync(path_value: f64, options_value: f64) -> f64
             // (or ENOTDIR/EACCES); callers such as Next.js's recursiveReadDir
             // branch on `err.code`, so an empty array would read as an empty
             // directory that exists.
-            Err(err) => crate::exception::js_throw(crate::fs::errors::build_fs_error_value(
+            Err(err) => crate::exception::throw_core(crate::fs::errors::fs_error(
                 &err, "scandir", &path_str,
             )),
         }
