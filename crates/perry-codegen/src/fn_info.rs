@@ -28,7 +28,7 @@ use crate::runtime_abi::{
     FN_ARROW, FN_ASYNC, FN_ASYNC_GENERATOR, FN_COMPILED_BODY, FN_GENERATOR, FN_HAS_DECLARED,
     FN_HAS_LENGTH, FN_HAS_NAME, FN_HAS_SOURCE, FN_NAME_IMAGE, FN_NON_CONSTRUCTOR,
     FN_NON_STRICT_ORDINARY, FN_PERMANENT_IMAGE, FN_REST_SYNTHETIC_ARGUMENTS, FN_REST_USER,
-    FN_REST_USER_AND_ARGUMENTS, FN_SOURCE_BLOCKS, FN_STRICT, NOT_PLAIN,
+    FN_REST_USER_AND_ARGUMENTS, FN_RETURNS_CAPTURE, FN_SOURCE_BLOCKS, FN_STRICT, NOT_PLAIN,
 };
 
 /// The LLVM type of a `JsFunctionInfo`, field for field (perry-abi's
@@ -96,6 +96,8 @@ pub(crate) struct FnInfoFacts {
     pub declared: u16,
     pub trusted: Option<CloneTarget>,
     pub versioned: Option<CloneTarget>,
+    /// The body is exactly `return <captured binding>` ([`ReturnedCapture`]).
+    pub returns_capture: Option<ReturnedCapture>,
     pub source: Option<RetainedSource>,
     pub name: Option<RetainedName>,
     pub constructor_layout: Option<ConstructorLayout>,
@@ -108,6 +110,18 @@ pub(crate) struct FnInfoFacts {
     pub call_entry: Option<String>,
     pub call_entry_offset_words: u8,
     pub metadata: Option<(String, u32)>,
+}
+
+/// `FN_RETURNS_CAPTURE` (perry-abi): what a body that is exactly `return
+/// <captured binding>` loads. It takes the info's trusted-clone words, so an
+/// info carrying it names no trusted clone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReturnedCapture {
+    /// The capture slot the body reads.
+    pub index: u32,
+    /// 0 when the capture word is the value; else one plus the value's byte
+    /// offset in the cell the capture word names (a box, a scope object).
+    pub cell: u64,
 }
 
 /// The rest kind of a body with a rest / `arguments` array.
@@ -224,7 +238,7 @@ pub(crate) struct DefinedBody {
 }
 
 /// The module's info requests and facts.
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct FnInfoState {
     requested: BTreeSet<String>,
     facts: BTreeMap<String, FnInfoFacts>,
@@ -347,7 +361,15 @@ fn render_definition(
         Some(t) => (format!("@{}", t.symbol), t.captures, t.boxed_mask),
         None => ("null".to_string(), 0, 0),
     };
-    let (trusted_code, trusted_captures, trusted_mask) = clone(&facts.trusted);
+    // A body whose whole effect is one capture read gains nothing from a
+    // trusted direct-call clone; its fact takes the clone's words.
+    let (trusted_code, trusted_captures, trusted_mask, returns_flag) = match facts.returns_capture {
+        Some(rc) => ("null".to_string(), rc.index, rc.cell, FN_RETURNS_CAPTURE),
+        None => {
+            let (code, captures, mask) = clone(&facts.trusted);
+            (code, captures, mask, 0)
+        }
+    };
     let (versioned_code, versioned_captures, versioned_mask) = clone(&facts.versioned);
     let info = info_symbol(body);
     let source_flags = facts.source.as_ref().map_or(0, |source| {
@@ -371,6 +393,7 @@ fn render_definition(
         }
         | (u32::from(facts.call_entry_offset_words) << crate::runtime_abi::FN_CALL_ENTRY_SHIFT)
         | FN_COMPILED_BODY
+        | returns_flag
         | source_flags
         | if facts.constructor_layout.is_some() {
             crate::runtime_abi::FN_HAS_CONSTRUCTOR_LAYOUT
@@ -668,6 +691,40 @@ mod tests {
         );
     }
 
+    /// A `return <captured binding>` body's fact takes the trusted-clone
+    /// words: flag, capture index, cell word, and no trusted clone even when
+    /// one was recorded.
+    #[test]
+    fn a_returned_capture_fact_takes_the_trusted_clone_words() {
+        let mut state = FnInfoState::default();
+        state.request("perry_closure_m__9");
+        let facts = state.facts_mut("perry_closure_m__9");
+        facts.set_arrow();
+        facts.trusted = Some(CloneTarget {
+            symbol: "perry_closure_m__9$trusted_boxes".into(),
+            captures: 1,
+            boxed_mask: 1,
+        });
+        facts.returns_capture = Some(ReturnedCapture { index: 3, cell: 17 });
+        let lines = state.render_globals(
+            |b| {
+                (b == "perry_closure_m__9")
+                    .then(|| defined(0, "internal"))
+                    .flatten()
+            },
+            [],
+            false,
+        );
+        assert_eq!(
+            lines,
+            vec![format!(
+                "@perry_closure_m__9$info = internal constant {INFO_TYPE} {{ ptr @perry_closure_m__9, \
+                 i16 0, i16 0, i32 {}, i32 0, i32 3, ptr null, i64 17, ptr null, i32 0, i16 0, i16 1, i64 0 }}",
+                FN_ARROW | FN_COMPILED_BODY | FN_RETURNS_CAPTURE
+            )]
+        );
+    }
+
     #[test]
     fn async_generator_info_retains_common_generator_kind() {
         let mut state = FnInfoState::default();
@@ -937,4 +994,82 @@ mod constructor_tail_tests {
 /// The private scalar capture body shares the typed closure's identity.
 pub(crate) fn normalized_capture_body_symbol(typed: &str) -> String {
     format!("{typed}.$normalized_captures")
+}
+
+impl FnInfoState {
+    /// Apply worker changes relative to its immutable starting facts. Other
+    /// workers may have set independent flag bits on the same closure body.
+    pub(crate) fn merge_callable(&mut self, base: &Self, worker: Self) {
+        self.requested.extend(worker.requested);
+        self.static_seed_bodies.extend(worker.static_seed_bodies);
+        for (body, incoming) in worker.facts {
+            let previous = base.facts.get(&body);
+            if previous == Some(&incoming) {
+                continue;
+            }
+            // An explicitly created default fact still requests a local info
+            // definition. Absence and a present default record are distinct.
+            let previous = previous.cloned().unwrap_or_default();
+            let current = self.facts.entry(body).or_default();
+            let changed = previous.flags ^ incoming.flags;
+            current.flags = (current.flags & !changed) | (incoming.flags & changed);
+            macro_rules! field {
+                ($name:ident) => {
+                    if incoming.$name != previous.$name {
+                        assert!(
+                            current.$name == previous.$name || current.$name == incoming.$name,
+                            "conflicting callable function metadata"
+                        );
+                        current.$name = incoming.$name;
+                    }
+                };
+            }
+            field!(rest_fixed);
+            field!(length);
+            field!(declared);
+            field!(trusted);
+            field!(versioned);
+            field!(source);
+            field!(name);
+            field!(fixed_generator_state);
+            field!(returns_capture);
+            field!(constructor_layout);
+            field!(private_resume_frame);
+            field!(private_async_resume_frame);
+            field!(call_entry);
+            field!(call_entry_offset_words);
+            field!(metadata);
+        }
+    }
+}
+
+#[cfg(test)]
+mod callable_merge_tests {
+    use super::*;
+    #[test]
+    fn callable_merge_keeps_explicit_default_body_info() {
+        let base = FnInfoState::default();
+        let mut serial = base.clone();
+        serial.facts_mut("body");
+        let mut merged = base.clone();
+        merged.merge_callable(&base, serial.clone());
+        let render = |s: &FnInfoState| {
+            s.render_globals(
+                |name| {
+                    (name == "body").then(|| DefinedBody {
+                        params: 0,
+                        linkage: "internal".into(),
+                    })
+                },
+                [],
+                false,
+            )
+        };
+        assert_eq!(
+            render(&serial).len(),
+            1,
+            "an explicit default emits its info"
+        );
+        assert_eq!(render(&merged), render(&serial));
+    }
 }

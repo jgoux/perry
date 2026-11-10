@@ -9,14 +9,18 @@
 //! `D` nodes are marked `obs`, receive every call's arguments, and only
 //! run read rules (read-site facts), never effects.
 //!
-//! Whether a function is summarized follows from its body alone; nothing
-//! depends on a size, count or depth.
+//! The batch planner chooses slices, capture ownership and refusals over
+//! the whole model. The body encoder receives those choices through an
+//! adapter; moving encoding does not make the planner body-local.
 use crate::delta::Tokens;
 use crate::model::*;
 use crate::pts::{FxHashMap, FxHashSet};
 use std::rc::Rc;
 
+pub(crate) mod body;
 mod build;
+#[cfg(test)]
+pub(crate) mod packet;
 use build::build_summaries;
 
 /// A summary term: a slot index with this bit, else an absolute node.
@@ -30,7 +34,9 @@ pub const BORN: CallId = NO_CTX - 1;
 /// The layout of no object receiver (a primitive, `undefined`, a function
 /// without a `this` term).
 pub const LAY_NONE: u32 = 0;
-/// The lexical context of a kind-0 instance: its program site.
+/// The lexical context of a per-site run: a kind-0 instance's program site,
+/// a kind-7 instance's call site (rule C). What the run births is per
+/// (birth site, that site) (`made_ctx`).
 const LAY_SITE: u32 = 5 << 28;
 /// The lexical context of a kind-5 instance: the object it constructs.
 const LAY_BIRTH: u32 = 6 << 28;
@@ -38,6 +44,15 @@ const LAY_BIRTH: u32 = 6 << 28;
 /// token (`recv_lay`), the kind `layout_of` gives one-value tokens.
 const LAY_TOK: u32 = 4 << 28;
 const LAY_MASK: u32 = (1 << 28) - 1;
+
+/// What made a maker-context birth (`SumState::made`): an object (its
+/// construction, or with `true` a method of it), or a per-site run, the
+/// program or call site whose instance births it (`LAY_SITE`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Maker {
+    Obj(Tok, bool),
+    Site(CallId),
+}
 /// A closure context key for a closure whose captured cells are its
 /// creator's context's (`CAP_OUTER`): the creator's context id with this
 /// bit. Lexical contexts never set it (kinds stop at 7 << 28).
@@ -66,9 +81,24 @@ pub enum Deferred {
     /// Births wait for summaries so a summary's call is born per instance,
     /// never once into the shared body (whose nodes seed every instance).
     Construct(CallId, Tok),
+    ReflectConstruct(CallId, Tok, Tok),
     NewNamed(Atom, CallId),
     /// A for-in body token run over an object token (`Model::for_in_tok`).
     ForIn(CallId, Tok, Tok),
+    /// A native method run at a call (`builtins::own_method`,
+    /// `proto_method`, `prim_method`): like a birth, it waits for summaries,
+    /// so what the method births and calls at a summary's call is per
+    /// instance, and no node of the method holds a literal of the body.
+    Native(NativeRecv, Key, CallId),
+}
+
+/// The receiver a native method runs on: a token's own builtin behaviour,
+/// a prototype's methods with `this` = the origin token, or a primitive's.
+#[derive(Clone, Copy, Debug)]
+pub enum NativeRecv {
+    Own(Tok),
+    Proto(Tok, Tok),
+    Prim(u16),
 }
 
 #[derive(Default, Clone, Debug)]
@@ -84,7 +114,8 @@ pub struct Summary {
     /// The `this` term (slot, absolute node or `NO_NODE`: an arrow, or a
     /// `this` a closure captured, keeps the shared node).
     pub this: NodeId,
-    pub seeds: Vec<(u32, Vec<Tok>, u16)>,
+    /// Value seeds and the independent own-test refutation marker.
+    pub seeds: Vec<(u32, Vec<Tok>, u16, bool)>,
     pub edges: Vec<(NodeId, NodeId)>,
     pub cons: Vec<(NodeId, Cons)>,
     /// (template call, the call with terms in place of nodes).
@@ -110,6 +141,10 @@ pub struct Summary {
     /// call result or seed puts a value into it), so it holds only what
     /// the calls pass (DECISIONS 44 (b), `relative_params`).
     pub rel: Vec<bool>,
+    /// The result is a closure this body creates over its own frame
+    /// (`return (arg) => ... map ...`, through copies): a closure maker
+    /// (rule C, `Model::closure_maker`).
+    pub maker: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -124,6 +159,11 @@ pub struct Inst {
     pub params: Vec<NodeId>,
     pub ret: NodeId,
     pub this: NodeId,
+    /// The instance's first fresh slot node (`NO_NODE`: none). Its fresh
+    /// slots, the summary's slots outside `Summary::outer` in slot order,
+    /// are the nodes from here on: the copy of slot `i` is a run of the
+    /// shared node `Summary::orig[i]` (`Inst::copies`).
+    pub fresh: NodeId,
 }
 
 #[derive(Default)]
@@ -141,7 +181,9 @@ pub struct SumState {
     /// key, else its layout, `recv_lay`; without one `LAY_NONE`), 2 unknown-code
     /// entry, 3 setter group, 4 getter group, 5 a birth run (the
     /// constructor chain or field initializer of the object token being
-    /// born), 6 a for-in body's run for one key (the key's atom, FVA 4.3b).
+    /// born), 6 a for-in body's run for one key (the key's atom, FVA 4.3b),
+    /// 7 a closure maker's run for one call site (rule C, `closure_maker`:
+    /// the call's template, so one run per site of the program text).
     /// Nothing in a key is another instance: the count is (sites +
     /// object tokens + layouts) x functions, and the object tokens are the
     /// program's birth sites under their maker contexts (`made_of`).
@@ -205,369 +247,18 @@ pub struct SumState {
     /// calls started from (`maker_key`), so results of results never form
     /// a chain. A site already on the maker chain folds onto the object
     /// born there.
-    pub made_of: FxHashMap<(CallId, Tok), CallId>,
-    /// Maker context `BORN - 1 - i` -> (its birth site, its maker object,
-    /// made by a method of the maker rather than its construction).
-    pub made: Vec<(CallId, Tok, bool)>,
+    /// A per-site run's births are per (birth site, site) the same way
+    /// (`Maker::Site`): each run of a closure maker has its own `new Map()`.
+    pub made_of: FxHashMap<(CallId, Maker), CallId>,
+    /// Maker context `BORN - 1 - i` -> (its birth site, its maker).
+    pub made: Vec<(CallId, Maker)>,
 }
 
-fn is_slot(x: NodeId) -> bool {
-    x != NO_NODE && x & SLOT != 0
-}
+mod map;
+pub use map::*;
 
-fn act_map(
-    a: ChainAct,
-    n: &mut impl FnMut(NodeId) -> NodeId,
-    k: &mut impl FnMut(CallId) -> CallId,
-) -> ChainAct {
-    match a {
-        ChainAct::Load(x) => ChainAct::Load(n(x)),
-        ChainAct::Store(x) => ChainAct::Store(n(x)),
-        ChainAct::Call(c) => ChainAct::Call(k(c)),
-    }
-}
-
-/// Rename every node and call field of a constraint (every variant).
-pub fn map_cons(
-    c: &Cons,
-    mut n: impl FnMut(NodeId) -> NodeId,
-    mut k: impl FnMut(CallId) -> CallId,
-) -> Cons {
-    use Cons::*;
-    match *c {
-        Load { key, dst } => Load { key, dst: n(dst) },
-        OwnValues { dst } => OwnValues { dst: n(dst) },
-        CjsPublish { dst } => CjsPublish { dst: n(dst) },
-        Store { key, src, site } => Store {
-            key,
-            src: n(src),
-            site,
-        },
-        Call { call } => Call { call: k(call) },
-        CallThis { call, this } => CallThis {
-            call: k(call),
-            this,
-        },
-        New { call } => New { call: k(call) },
-        NewNamed { name, call } => NewNamed {
-            name,
-            call: k(call),
-        },
-        MCall { key, call } => MCall { key, call: k(call) },
-        Chain { origin, key, act } => Chain {
-            origin,
-            key,
-            act: act_map(act, &mut n, &mut k),
-        },
-        TopSink { reason } => TopSink { reason },
-        HandOver { reason, ctor, arg } => HandOver { reason, ctor, arg },
-        OwnOnly { f, dst } => OwnOnly { f, dst: n(dst) },
-        StoreOut {
-            f,
-            dst,
-            reach,
-            via,
-            key,
-            reason,
-            at,
-            to,
-        } => StoreOut {
-            f,
-            dst,
-            reach,
-            via,
-            key,
-            reason,
-            at,
-            to,
-        },
-        ContractThis {
-            tmpl,
-            reason,
-            statics,
-            this,
-        } => ContractThis {
-            tmpl,
-            reason,
-            statics,
-            this,
-        },
-        OverrideThis { tmpl, key, reason } => OverrideThis { tmpl, key, reason },
-        TopIfAny { dst, from, reason } => TopIfAny {
-            dst: n(dst),
-            from: n(from),
-            reason,
-        },
-        Hard { kind, reason } => Hard { kind, reason },
-        DeleteKey { key, reason } => DeleteKey { key, reason },
-        AddsKeys => AddsKeys,
-        DefineKey { key, data, reason } => DefineKey { key, data, reason },
-        DefineAll {
-            o,
-            descs,
-            value,
-            site,
-            reason,
-        } => DefineAll {
-            o: n(o),
-            descs: n(descs),
-            value: n(value),
-            site,
-            reason,
-        },
-        DefineDesc {
-            o,
-            key,
-            site,
-            reason,
-        } => DefineDesc {
-            o: n(o),
-            key,
-            site,
-            reason,
-        },
-        Implicit { reason, proto } => Implicit { reason, proto },
-        CreateProto { reason } => CreateProto { reason },
-        ChainUnion { key, dst, of } => ChainUnion {
-            key,
-            dst: n(dst),
-            of,
-        },
-        ProtoGiven { protos } => ProtoGiven { protos: n(protos) },
-        ProtoClosure { dst } => ProtoClosure { dst: n(dst) },
-        ProtoMethods { origin, key, call } => ProtoMethods {
-            origin,
-            key,
-            call: k(call),
-        },
-        AnyAccessors { origin, act } => AnyAccessors {
-            origin,
-            act: act_map(act, &mut n, &mut k),
-        },
-        PlainKey { origin, act } => PlainKey {
-            origin,
-            act: act_map(act, &mut n, &mut k),
-        },
-        StoreTopProto { origin, src } => StoreTopProto {
-            origin,
-            src: n(src),
-        },
-        Super { start, key, act } => Super {
-            start,
-            key,
-            act: act_map(act, &mut n, &mut k),
-        },
-        SuperCtor { class, call } => SuperCtor {
-            class,
-            call: k(call),
-        },
-        SuperCtorParent {
-            class,
-            call,
-            origin,
-        } => SuperCtorParent {
-            class,
-            call: k(call),
-            origin,
-        },
-        ThisFrom { recv } => ThisFrom { recv: n(recv) },
-        BirthField { key, src } => BirthField { key, src: n(src) },
-        Accessor {
-            holder,
-            key,
-            setter,
-        } => Accessor {
-            holder: n(holder),
-            key,
-            setter,
-        },
-        AccessorInstall { key, f, setter } => AccessorInstall { key, f, setter },
-        ProtoFrom { src } => ProtoFrom { src: n(src) },
-        ProtoOf { dst } => ProtoOf { dst: n(dst) },
-        ProtoValues { dst } => ProtoValues { dst: n(dst) },
-        IterNext { dst } => IterNext { dst: n(dst) },
-        NewTargetHard { reason } => NewTargetHard { reason },
-        IdxLoad { idx, dst } => IdxLoad {
-            idx: n(idx),
-            dst: n(dst),
-        },
-        IdxKey { obj, dst } => IdxKey { obj, dst: n(dst) },
-        IdxMCall { idx, call } => IdxMCall {
-            idx: n(idx),
-            call: k(call),
-        },
-        IdxKeyCall { obj, prim, call } => IdxKeyCall {
-            obj,
-            prim,
-            call: k(call),
-        },
-        ForInBody { obj, call } => ForInBody {
-            obj: n(obj),
-            call: k(call),
-        },
-        ForInKeys { ft, call } => ForInKeys { ft, call: k(call) },
-        DefineKeyed {
-            o,
-            reason,
-            accessor,
-        } => DefineKeyed {
-            o: n(o),
-            reason,
-            accessor,
-        },
-        StoreKeyed { o, src, site } => StoreKeyed {
-            o: n(o),
-            src: n(src),
-            site,
-        },
-        AccessorKeyed { holder, f, setter } => AccessorKeyed {
-            holder: n(holder),
-            f: n(f),
-            setter,
-        },
-        Arith { dst, add } => Arith { dst: n(dst), add },
-        ArrayLenArg { dst } => ArrayLenArg { dst: n(dst) },
-        ShareBuffer { ta } => ShareBuffer { ta },
-        ThisTo { origin } => ThisTo { origin },
-        CallArgs { call } => CallArgs { call: k(call) },
-        RetInto { call, run } => RetInto { call: k(call), run },
-        ArgInto { call, run, i } => ArgInto {
-            call: k(call),
-            run,
-            i,
-        },
-        Spread { into, site } => Spread {
-            into: n(into),
-            site,
-        },
-        SpreadFrom { src, site } => SpreadFrom { src, site },
-        ThisInst { call, ft } => ThisInst { call: k(call), ft },
-        BuiltinCallee => BuiltinCallee,
-        HolderStep { key, pass, stop } => HolderStep {
-            key,
-            pass: n(pass),
-            stop: n(stop),
-        },
-        VisitHolders { origin, key, act } => VisitHolders {
-            origin,
-            key,
-            act: act_map(act, &mut n, &mut k),
-        },
-        VisitStop { origin, key, act } => VisitStop {
-            origin,
-            key,
-            act: act_map(act, &mut n, &mut k),
-        },
-    }
-}
-
-pub fn map_call(c: &CallSite, mut n: impl FnMut(NodeId) -> NodeId) -> CallSite {
-    CallSite {
-        this: match c.this {
-            ThisArg::Node(x) => ThisArg::Node(n(x)),
-            ThisArg::Tok(t) => ThisArg::Tok(t),
-            ThisArg::Undef => ThisArg::Undef,
-        },
-        args: c.args.iter().map(|&x| n(x)).collect(),
-        spread: c.spread.iter().map(|&x| n(x)).collect(),
-        ret: n(c.ret),
-        site: c.site,
-    }
-}
-
-fn cons_fields(c: &Cons) -> (Vec<NodeId>, Vec<CallId>) {
-    let mut ns = Vec::new();
-    let mut ks = Vec::new();
-    map_cons(
-        c,
-        |x| {
-            ns.push(x);
-            x
-        },
-        |k| {
-            ks.push(k);
-            k
-        },
-    );
-    (ns, ks)
-}
-
-fn call_nodes(c: &CallSite) -> Vec<NodeId> {
-    let mut v = Vec::new();
-    map_call(c, |x| {
-        v.push(x);
-        x
-    });
-    v
-}
-
-/// The constraint kinds generation attaches to program nodes: the summary
-/// language. The solver's own relays are rebuilt by applying these.
-fn gen_kind(c: &Cons) -> bool {
-    use Cons::*;
-    matches!(
-        c,
-        Load { .. }
-            | OwnValues { .. }
-            | CjsPublish { .. }
-            | Spread { .. }
-            | Store { .. }
-            | Call { .. }
-            | New { .. }
-            | NewNamed { .. }
-            | SuperCtor { .. }
-            | MCall { .. }
-            | TopSink { .. }
-            | HandOver { .. }
-            | ContractThis { .. }
-            | OverrideThis { .. }
-            | TopIfAny { .. }
-            | Hard { .. }
-            | DeleteKey { .. }
-            | DefineKey { .. }
-            | DefineAll { .. }
-            | AddsKeys
-            | Implicit { .. }
-            | IdxLoad { .. }
-            | IdxKey { .. }
-            | IdxMCall { .. }
-            | IdxKeyCall { .. }
-            | ForInBody { .. }
-            | DefineKeyed { .. }
-            | StoreKeyed { .. }
-            | AccessorKeyed { .. }
-            | Arith { .. }
-            | ArrayLenArg { .. }
-            | IterNext { .. }
-            | ProtoOf { .. }
-            | ThisFrom { .. }
-            | BirthField { .. }
-            | CreateProto { .. }
-            | NewTargetHard { .. }
-            | ShareBuffer { .. }
-            | Accessor { .. }
-            | ProtoFrom { .. }
-    )
-}
-
-/// Read rules: their only output is `dst`; per-token effects (getters,
-/// protocols) are the same for every call.
-fn read_dst(c: &Cons) -> Option<NodeId> {
-    use Cons::*;
-    match *c {
-        Load { dst, .. }
-        | OwnValues { dst }
-        | CjsPublish { dst }
-        | IdxLoad { dst, .. }
-        | IdxKey { dst, .. }
-        | Arith { dst, .. }
-        | ArrayLenArg { dst }
-        | IterNext { dst }
-        | ProtoOf { dst }
-        | ProtoValues { dst } => Some(dst),
-        _ => None,
-    }
-}
+mod for_in;
+mod this_arg;
 
 impl Model {
     /// The shared body skips this rule on `n`: an effect on an observation
@@ -578,7 +269,19 @@ impl Model {
         }
         if self.nodes[n as usize].obs {
             let dst = match *c {
-                Cons::TopIfAny { dst, .. } => Some(dst),
+                Cons::TopIfAny { dst, .. }
+                | Cons::TopIfTop { dst, .. }
+                | Cons::Guard { dst, .. }
+                | Cons::Defined { dst }
+                | Cons::NotNullish { dst }
+                | Cons::Falsy { dst }
+                | Cons::NotUndefined { dst }
+                // The gate of an own-only read runs where the read does.
+                | Cons::OwnGate { dst, .. } => Some(dst),
+                // Two outputs: both must be observation nodes.
+                Cons::Plus { str, num } => {
+                    return !(self.nodes[str as usize].obs && self.nodes[num as usize].obs);
+                }
                 _ => read_dst(c),
             };
             return !dst.is_some_and(|d| self.nodes[d as usize].obs);
@@ -587,9 +290,14 @@ impl Model {
             return false;
         }
         let call = match *c {
-            Cons::Call { call }
+            Cons::AnnexBLookup { call, .. }
+            | Cons::Call { call }
             | Cons::CallThis { call, .. }
+            | Cons::NativeThis { call, .. }
             | Cons::New { call }
+            | Cons::NewProgram { call }
+            | Cons::ReflectNew { call, .. }
+            | Cons::ReflectNewTarget { call, .. }
             | Cons::NewNamed { call, .. }
             | Cons::MCall { call, .. }
             | Cons::IdxMCall { call, .. }
@@ -632,7 +340,7 @@ impl Model {
     /// The program site behind `call`: itself for a call of the program,
     /// the template a call an instance made renames, or the site a call the
     /// solver made was made for.
-    fn origin_of(&self, call: CallId) -> Option<CallId> {
+    pub(crate) fn origin_of(&self, call: CallId) -> Option<CallId> {
         if (call as usize) < self.sum.n_prog {
             return Some(call);
         }
@@ -649,6 +357,12 @@ impl Model {
     pub(crate) fn solver_call(&mut self, by: CallId, cs: CallSite) -> CallId {
         let id = self.calls.len() as CallId;
         self.calls.push(cs);
+        if !self.sum.ready && self.diagnostic.is_some() {
+            // Dump only: a call made before the summaries counts as a
+            // program call (`origin_of` never reads it); the dump still
+            // names the source call it was made for.
+            self.sum.origin.insert(id, by);
+        }
         if self.sum.ready {
             if let Some(o) = self.origin_of(by) {
                 self.sum.origin.insert(id, o);
@@ -695,27 +409,40 @@ impl Model {
     /// If that object, or an object on its maker chain, was itself born at
     /// `site`, the birth is that object's context again (a recursive maker
     /// folds onto its ancestor).
+    /// A per-site run (`LAY_SITE`) births per (birth site, site): sites are
+    /// the program's call sites, so there are at most births x sites.
     pub(crate) fn made_ctx(&mut self, site: CallId, lay: u32) -> CallId {
+        if lay & !LAY_MASK == LAY_SITE {
+            return self.made_at(site, Maker::Site(lay & LAY_MASK));
+        }
         let Some((o, by_method)) = self.lay_object(lay) else {
             return site;
         };
         let mut x = o;
         while let TokKind::Obj(_, c) = self.toks[x as usize] {
             // The walk is solve work: the bound covers a chain that grows.
-            self.work += 1;
+            self.charge_work(1);
             match self.made_entry(c) {
-                Some((s, _, _)) if s == site => return c,
-                Some((_, m, _)) => x = m,
+                Some((s, _)) if s == site => return c,
+                Some((_, Maker::Obj(m, _))) => x = m,
+                // A per-site run made `x`: no maker object behind it.
+                Some((_, Maker::Site(_))) => break,
                 None if c == site => return c,
                 None => break,
             }
         }
-        let key = (site, self.maker_key(o, by_method));
+        let k = self.maker_key(o, by_method);
+        self.made_at(site, Maker::Obj(k, by_method))
+    }
+
+    /// The maker context of (birth site, maker), made on first use.
+    fn made_at(&mut self, site: CallId, maker: Maker) -> CallId {
+        let key = (site, maker);
         if let Some(&c) = self.sum.made_of.get(&key) {
             return c;
         }
         let c = BORN - 1 - self.sum.made.len() as CallId;
-        self.sum.made.push((site, o, by_method));
+        self.sum.made.push(key);
         self.sum.made_of.insert(key, c);
         c
     }
@@ -728,7 +455,7 @@ impl Model {
         if by_method {
             while let TokKind::Obj(_, c) = self.toks[o as usize] {
                 match self.made_entry(c) {
-                    Some((_, m, true)) => o = m,
+                    Some((_, Maker::Obj(m, true))) => o = m,
                     _ => break,
                 }
             }
@@ -736,8 +463,8 @@ impl Model {
         o
     }
 
-    /// The (site, maker, by a method) of maker context `c`, if it is one.
-    fn made_entry(&self, c: CallId) -> Option<(CallId, Tok, bool)> {
+    /// The (birth site, maker) of maker context `c`, if it is one.
+    fn made_entry(&self, c: CallId) -> Option<(CallId, Maker)> {
         if c >= BORN {
             return None;
         }
@@ -810,6 +537,24 @@ impl Model {
         }
     }
 
+    /// Every (shared node, this instance's copy of it) pair of instance
+    /// `inst`'s fresh slots (`Inst::fresh`).
+    pub(crate) fn inst_copies(&self, inst: u32, mut f: impl FnMut(NodeId, NodeId)) {
+        let it = &self.sum.insts[inst as usize];
+        if it.fresh == NO_NODE {
+            return;
+        }
+        let s = &self.sum.of[&it.f];
+        let mut next = it.fresh;
+        for (i, &orig) in s.orig.iter().enumerate() {
+            if s.outer.contains(&(i as u32)) {
+                continue;
+            }
+            f(orig, next);
+            next += 1;
+        }
+    }
+
     pub(crate) fn summarized(&self, f: FnIdx) -> bool {
         self.sum.of.contains_key(&f)
     }
@@ -826,19 +571,23 @@ impl Model {
         let s = self.sum.of[&f].clone();
         let inst = self.sum.insts.len() as u32;
         // An instance is solve work: the work bound covers instances too.
-        self.work += s.nslots as u64 + 1;
+        self.charge_work(s.nslots as u64 + 1);
         // Outer slots are the context's nodes (the enclosing instance's);
         // a token without a context observes through the shared nodes.
         let mut outer_at = vec![u32::MAX; s.nslots as usize];
         for (j, &sl) in s.outer.iter().enumerate() {
             outer_at[sl as usize] = j as u32;
         }
+        let fresh = self.nodes.len() as NodeId;
         let base: Vec<NodeId> = (0..s.nslots)
             .map(|i| match outer_at[i as usize] {
                 u32::MAX => {
                     let n = self.node_named("inst", || format!("inst{inst}.{i}"));
                     // A fresh slot holds one run's values.
                     self.nodes[n as usize].frame = inst + 1;
+                    if let Some(d) = &mut self.diagnostic {
+                        d.inst_orig.insert(n, s.orig[i as usize]);
+                    }
                     n
                 }
                 _ if ctx == NO_CTX => s.orig[i as usize],
@@ -881,7 +630,7 @@ impl Model {
             }
         }
         let lay = match key.0 {
-            0 => LAY_SITE | key.1,
+            0 | 7 => LAY_SITE | key.1,
             5 => LAY_BIRTH | key.1,
             1 if this != NO_NODE => key.1,
             2 if this != NO_NODE => self.layout_of(TOP),
@@ -895,6 +644,11 @@ impl Model {
             params: s.params.iter().map(|&p| tr(p)).collect(),
             ret,
             this,
+            fresh: if (self.nodes.len() as NodeId) > fresh {
+                fresh
+            } else {
+                NO_NODE
+            },
         });
         self.sum.inst_key.insert(key, inst);
         self.sum.pending.push((inst, base));
@@ -922,9 +676,23 @@ impl Model {
             _ => LAY_NONE,
         };
         let key = match x {
-            _ if self.sum.site_calls.contains(&call) => (0, call, ft),
+            // Rule C: a closure maker's runs are per call site.
+            _ if call != NO_NODE && self.closure_maker(f, x) => {
+                let site = self.sum.tmpl_of.get(&call).copied().unwrap_or(call);
+                (7, site, ft)
+            }
+            _ if let Some(site) = self.site_of_call(call) => (0, site, ft),
             Some(t) if self.constructs(f, t) => (5, t, ft),
             _ => (1, lay, ft),
+        };
+        // Widened (`past_work_bound`): no new calling context. The call
+        // runs the function's shared instance, which gets this receiver
+        // and these arguments by the same edges (below): a merge of
+        // callers. A birth's run (5) stays per object: its key is what
+        // it births.
+        let key = match key.0 {
+            0 | 1 | 7 if self.widened && !self.sum.inst_key.contains_key(&key) => (1, LAY_NONE, ft),
+            _ => key,
         };
         let inst = self.instance(key);
         let it = self.sum.insts[inst as usize].this;
@@ -939,385 +707,42 @@ impl Model {
         if call != NO_NODE && self.sum.bound.insert((call, inst)) {
             self.wire_args(call, inst);
         }
-    }
-
-    /// The `this` term of summarized `f`'s instances, if it has one.
-    fn has_this_term(&self, f: FnIdx) -> bool {
-        self.sum.of.get(&f).is_some_and(|s| s.this != NO_NODE)
-    }
-
-    /// `this` of `call` into `f`: the shared node observes it; `f`'s
-    /// instance for the call gets the explicit token (the call's own
-    /// operand reaches it in `bind_summarized`).
-    pub(crate) fn this_into(&mut self, call: CallId, ft: Tok, this_tok: Option<Tok>) {
-        if self.act.is_some() {
-            let f = self.tok_fn(ft);
-            self.activate(f, "this");
-        }
-        if self.diagnostic.is_some() {
-            let f = self.tok_fn(ft);
-            self.diagnostic_reach(f, "this", call);
-        }
-        if !self.sum.ready {
-            self.sum.deferred.push(Deferred::This(call, ft, this_tok));
-            return;
-        }
-        let f = self.tok_fn(ft);
-        let fthis = self.funcs[f as usize].this;
-        match (this_tok, &self.calls[call as usize].this) {
-            (Some(x), _) => self.add_tok(fthis, x),
-            (None, &ThisArg::Tok(x)) => self.add_tok(fthis, x),
-            (None, &ThisArg::Node(n)) => self.edge(n, fthis),
-            (None, ThisArg::Undef) => self.add_prim(fthis, prim::UNDEF),
-        }
-        if !self.has_this_term(f) || self.sum.templates.contains(&call) {
-            return;
-        }
-        // The instance half: each receiver binds its layout's instance.
-        match (this_tok, self.calls[call as usize].this.clone()) {
-            (Some(x), _) | (None, ThisArg::Tok(x)) => self.bind_layout(call, ft, Some(x), 0),
-            (None, ThisArg::Undef) => self.bind_layout(call, ft, None, prim::UNDEF),
-            // A call bound through a method lookup gets each receiver from
-            // the lookup (`this_calls`).
-            (None, ThisArg::Node(_)) if self.relays.contains_key(&call) => {}
-            (None, ThisArg::Node(n)) => {
-                if self.sum.this_inst.insert((call, ft)) {
-                    self.cons(n, Cons::ThisInst { call, ft });
-                }
+        // A contract function run on a receiver no call of this unit holds
+        // (`this_any`: another unit runs it there): no call takes its
+        // result, its contract does (design §11.2), as for its escaped
+        // instance (`escape_summarized`).
+        if call == NO_NODE && self.contract_fns.contains(&f) {
+            let r = self.sum.insts[inst as usize].ret;
+            if r != NO_NODE && !self.contract_rets.contains(&(f, r)) {
+                self.contract_rets.push((f, r));
             }
         }
     }
 
-    /// `this` of `f` from a method lookup on receiver `origin`: the shared
-    /// node observes it; the instances get the call's receiver operand.
-    pub(crate) fn this_lookup(&mut self, ft: Tok, origin: Tok) {
-        if !self.sum.ready {
-            self.sum.deferred.push(Deferred::ThisTo(ft, origin));
-            return;
+    /// Rule C: `f` has no `this` term (or no receiver) and returns a closure
+    /// over its own frame: each run has its own environment (the cells the
+    /// closure captures, and what the run births into them), so the runs of
+    /// distinct call sites are distinct instances (key kind 7). The runs of
+    /// one site share one (a loop making memos merges them); a site inside
+    /// an instance is its template, so instances never multiply instances.
+    /// The program site whose kind-0 run `call` is: a plain call at a
+    /// program site outside every summary (`site_calls`), or a call the
+    /// solver made for a call at such a site (a native method's callback, a
+    /// bound target): the site's own call of that function would be one run
+    /// per site, and so is this one.
+    fn site_of_call(&self, call: CallId) -> Option<CallId> {
+        if self.sum.site_calls.contains(&call) {
+            return Some(call);
         }
-        let f = self.tok_fn(ft);
-        let this = self.funcs[f as usize].this;
-        self.add_tok(this, origin);
+        let o = *self.sum.origin.get(&call)?;
+        ((o as usize) < self.sum.n_prog && !self.sum.templates.contains(&o)).then_some(o)
     }
 
-    /// The node that takes `this` values of `f` no call is behind: every
-    /// instance of `f` (and its shared instance, so the effect runs even
-    /// if no call ever does) sees them.
-    pub(crate) fn this_any(&mut self, ft: Tok) -> NodeId {
-        let f = self.tok_fn(ft);
-        let fthis = self.funcs[f as usize].this;
-        if !self.sum.ready || !self.has_this_term(f) {
-            return fthis;
-        }
-        if let Some(&u) = self.sum.this_any.get(&ft) {
-            return u;
-        }
-        let u = self.node_named("this-any", || format!("this-any({f})"));
-        self.sum.this_any.insert(ft, u);
-        self.edge(u, fthis);
-        // The receiver-less instance runs the effect even if no value does.
-        if self.instantiable(ft) {
-            self.instance((1, LAY_NONE, ft));
-        }
-        self.cons(u, Cons::ThisInst { call: NO_NODE, ft });
-        u
-    }
-
-    /// An instance of `ft` has its outer terms: a closure with outer terms
-    /// is instantiated only through a context (the token without one lives
-    /// on observation nodes only, which never run effects).
-    fn instantiable(&self, ft: Tok) -> bool {
-        match self.toks[ft as usize] {
-            TokKind::Func(f, NO_CTX) => self.sum.of.get(&f).is_some_and(|s| s.outer.is_empty()),
-            TokKind::Func(_, _) => true,
-            _ => false,
-        }
-    }
-
-    /// Unknown code calls `f`: its `this` is ⊤ (the unknown-code instance's
-    /// and the shared node).
-    /// DECISIONS 116: a contract method published with sealed classes'
-    /// receivers only.
-    pub(crate) fn sealed_method(&self, f: FnIdx) -> bool {
-        self.contract_fns.contains(&f)
-            && self.published_this.get(&f).is_some_and(|rs| {
-                !rs.is_empty()
-                    && rs.iter().all(|r| {
-                        self.recv_class
-                            .get(r)
-                            .is_some_and(|c| self.sealed.contains(c))
-                    })
-            })
-    }
-
-    /// DECISIONS 125: a method run on published receivers runs on an
-    /// instance `t` this unit gave out when the join names `t`'s class (its
-    /// own token `Obj(tm, NO_CTX)` is in the join, `Gen::published_receivers`).
-    pub(crate) fn join_holds(&self, f: FnIdx, t: Tok) -> bool {
-        let Some(&n) = self.this_args.get(&f) else {
-            return true;
-        };
-        let Some(tm) = self.tmpl_of(t) else {
+    fn closure_maker(&self, f: FnIdx, x: Option<Tok>) -> bool {
+        let Some(s) = self.sum.of.get(&f) else {
             return false;
         };
-        self.tok_index
-            .get(&TokKind::Obj(tm, NO_CTX))
-            .is_some_and(|&w| self.nodes[n as usize].pts.contains_tok(w))
-    }
-
-    /// The nodes `this` of function value `ft` reaches its body through:
-    /// the shared node, and its instance's when the body is summarized.
-    pub(crate) fn this_nodes(&mut self, ft: Tok) -> Vec<NodeId> {
-        let f = self.tok_fn(ft);
-        let mut dsts = vec![self.funcs[f as usize].this];
-        if self.has_this_term(f) {
-            let inst = self.instance((2, 0, ft));
-            dsts.push(self.sum.insts[inst as usize].this);
-        }
-        dsts
-    }
-
-    pub(crate) fn escape_this(&mut self, ft: Tok, reason: u32) {
-        if !self.sum.ready {
-            self.sum.deferred.push(Deferred::EscapeThis(ft, reason));
-            return;
-        }
-        let f = self.tok_fn(ft);
-        let why = |m: &Self| format!("this of escaped function: {}", m.reasons[reason as usize]);
-        let dsts = self.this_nodes(ft);
-        let insts = self.published_this.get(&f).cloned().unwrap_or_default();
-        // DECISIONS 116: a method of sealed classes only, published through
-        // its contract, runs on the instances this unit gave out (and the
-        // ones it gives out later, `give_out`): no other unit constructs or
-        // extends them, and a reader's `ContractThis` admits nothing else.
-        if self.pub_reason == Some(reason) && self.sealed_method(f) {
-            let given: Vec<Tok> = insts
-                .iter()
-                .flat_map(|r| self.contract_recv.get(r).cloned().unwrap_or_default())
-                .collect();
-            for &d in &dsts {
-                for &t in &given {
-                    self.add_tok(d, t);
-                }
-            }
-            self.given_this.entry(f).or_default().extend(dsts);
-            return;
-        }
-        // A published method's receiver is one more contract parameter
-        // (DECISIONS 57): its marker records what the body does to it, and
-        // stands for instances of the classes it is published with
-        // (DECISIONS 59).
-        let mk = (!insts.is_empty() && self.contract_fns.contains(&f)).then(|| {
-            let mk = self.param_marker_tok(f, u32::MAX);
-            let classes: Vec<TmplId> = insts
-                .iter()
-                .filter_map(|r| self.recv_class.get(r).copied())
-                .collect();
-            self.register_virt(mk, &classes);
-            mk
-        });
-        // Published through its contract, the receiver is the class's
-        // instances (the receiver token) or what the marker stands for: a
-        // reader's `ContractThis` admits nothing else, and reports a use
-        // beyond that (DECISIONS 85). Any other escape lets unknown code
-        // call it with any receiver.
-        let contract_only = mk.is_some() && self.pub_reason == Some(reason);
-        let joined = contract_only && self.this_args.contains_key(&f);
-        if joined {
-            self.given_this
-                .entry(f)
-                .or_default()
-                .extend(dsts.iter().copied());
-        }
-        for d in dsts {
-            if !contract_only {
-                self.add_top(d, why);
-                self.add_prim(d, prim::ALL);
-            }
-            // DECISIONS 107: the receivers the running units published.
-            // DECISIONS 125: they include the instances this unit gave out
-            // (a published class's instance another unit holds may be one
-            // of them), and the ones it gives out later (`give_out`).
-            match self.this_args.get(&f) {
-                Some(&n) if joined => {
-                    self.edge(n, d);
-                    let given: Vec<Tok> = insts
-                        .iter()
-                        .flat_map(|r| self.contract_recv.get(r).cloned().unwrap_or_default())
-                        .filter(|&t| self.join_holds(f, t))
-                        .collect();
-                    for t in given {
-                        self.add_tok(d, t);
-                    }
-                }
-                _ => {
-                    for &i in &insts {
-                        self.add_tok(d, i);
-                    }
-                }
-            }
-            if let Some(mk) = mk {
-                self.add_tok(d, mk);
-            }
-        }
-    }
-
-    /// Run for-in body `ft` (through template call `call`) over the iterated
-    /// value `t` (FVA 4.3b): once per key of a literal whose keys are exactly
-    /// its birth keys (`for_in_keys`), each run's key parameter holding its
-    /// one key, else once with every key.
-    pub(crate) fn for_in_tok(&mut self, call: CallId, ft: Tok, t: Tok) {
-        if self.act.is_some() {
-            let f = self.tok_fn(ft);
-            self.activate(f, "for-in");
-        }
-        if !self.sum.ready {
-            self.sum.deferred.push(Deferred::ForIn(call, ft, t));
-            return;
-        }
-        let f = self.tok_fn(ft);
-        let keys = match self.summarized(f) && self.instantiable(ft) {
-            true => self.for_in_keys(f, t, None),
-            false => None,
-        };
-        let Some(keys) = keys else {
-            return self.for_in_every_key(call, ft);
-        };
-        for k in keys {
-            let inst = self.instance((6, k, ft));
-            match self.sum.insts[inst as usize].params.first().copied() {
-                // The run reads no key.
-                Some(NO_NODE) => {}
-                // A fresh slot: the run's key (its key variable's copy holds
-                // the key's atom, `instance`).
-                Some(p) if self.nodes[p as usize].frame == inst + 1 => self.add_prim(p, prim::STR),
-                _ => return self.for_in_every_key(call, ft),
-            }
-        }
-        self.for_in_runs.push((call, ft, t));
-    }
-
-    /// Run for-in body `ft` once with every key (the loop as it is).
-    pub(crate) fn for_in_every_key(&mut self, call: CallId, ft: Tok) {
-        if self.for_in_any.insert((call, ft)) {
-            self.call_tok(call, ft, None);
-        }
-    }
-
-    /// The keys a for-in run of body `f` over `t` visits, when they are
-    /// exactly `t`'s: a literal not escaped and not HARD, with no key added
-    /// after birth or stored under a computed key, no computed member, no
-    /// `__proto__`, whose chain gets no enumerable key from the program
-    /// (nothing writes `Object.prototype`, `object_proto_written`); a body
-    /// defining a property under its key also needs each key to be one
-    /// generation named (`for_in_define_keys`). `late`: the keys stored into
-    /// each template (`settle_for_in`; the check before it only knows the
-    /// cheap facts).
-    fn for_in_keys(
-        &self,
-        f: FnIdx,
-        t: Tok,
-        late: Option<&FxHashMap<TmplId, Vec<Atom>>>,
-    ) -> Option<Vec<Atom>> {
-        let TokKind::Obj(tm, _) = self.toks[t as usize] else {
-            return None;
-        };
-        let tpl = &self.tmpls[tm as usize];
-        let literal = matches!(
-            tpl.kind,
-            TmplKind::Lit { .. }
-                | TmplKind::Class {
-                    literal_shape: true,
-                    ..
-                }
-        );
-        if !literal
-            || tpl.has_computed_members
-            || self.is_escaped(t)
-            || self.hard.contains_key(&t)
-            || self.adds_keys.get(&tm).is_some_and(|&n| n > 0)
-            || self.any_writers.contains_key(&tm)
-            || self.object_proto_written()
-        {
-            return None;
-        }
-        let mut keys: Vec<Atom> = Vec::new();
-        let own = tpl.birth_keys.iter().chain(&tpl.accessor_keys);
-        // The literal's methods, not its prototype's `constructor` (which
-        // is not enumerable).
-        let methods = tpl
-            .proto_members
-            .iter()
-            .filter(|&&a| self.atoms[a as usize] != "constructor");
-        for &a in own.chain(methods) {
-            let name = self.atoms[a as usize].as_str();
-            if name == "__proto__" {
-                return None;
-            }
-            // A symbol is no for-in key.
-            if !name.starts_with(crate::builtins::WK_PREFIX) && !keys.contains(&a) {
-                keys.push(a);
-            }
-        }
-        if late.is_some_and(|l| {
-            l.get(&tm)
-                .is_some_and(|ws| ws.iter().any(|a| !keys.contains(a)))
-        }) {
-            return None;
-        }
-        if self.for_in_defines.contains(&f)
-            && keys.iter().any(|a| !self.for_in_define_keys.contains(a))
-        {
-            return None;
-        }
-        Some(keys)
-    }
-
-    /// May `Object.prototype`, the chain of every literal, hold a key the
-    /// program wrote (`native_writes` on it: a store, an accessor, E5/E6/E7,
-    /// a reach into unmodeled code, another unit's write)? A for-in over a
-    /// literal visits such a key when it is enumerable. A write into ⊤ is
-    /// no such write: ⊤ holds no builtin prototype (`escape`: a runtime
-    /// object reaches unknown code as itself, and what may write it is
-    /// noted on it), and a literal whose keys are exactly its own is not
-    /// escaped, so not in ⊤ either. The write into ⊤ stays a fact about
-    /// ⊤'s members, which lookups through ⊤ already read as anything.
-    fn object_proto_written(&self) -> bool {
-        self.native_writes
-            .keys()
-            .any(|&(w, _)| matches!(self.toks[w as usize], TokKind::ObjectProto))
-    }
-
-    /// Once the worklist is empty: a literal a for-in body ran per key over
-    /// that gained a key after birth (or escaped, or turned HARD) since runs
-    /// the body once more with every key. True when one did.
-    pub(crate) fn settle_for_in(&mut self) -> bool {
-        if self.for_in_runs.is_empty() {
-            return false;
-        }
-        let tms: crate::pts::FxHashSet<TmplId> = self
-            .for_in_runs
-            .iter()
-            .filter_map(|&(_, _, t)| self.tmpl_of(t))
-            .collect();
-        let mut late: FxHashMap<TmplId, Vec<Atom>> = FxHashMap::default();
-        for &(tm, a) in self.writers.keys().chain(self.proto_writers.keys()) {
-            if tms.contains(&tm) {
-                late.entry(tm).or_default().push(a);
-            }
-        }
-        let mut more = false;
-        for (call, ft, t) in self.for_in_runs.clone() {
-            if self.for_in_any.contains(&(call, ft)) {
-                continue;
-            }
-            let f = self.tok_fn(ft);
-            if self.for_in_keys(f, t, Some(&late)).is_none() {
-                self.for_in_every_key(call, ft);
-                more = true;
-            }
-        }
-        more
+        (x.is_none() || s.this == NO_NODE) && s.maker
     }
 
     /// Apply the entries of every pending instance (a worklist: instances
@@ -1327,8 +752,7 @@ impl Model {
         while i < self.sum.pending.len() {
             // Instances queue more instances: the work bound holds here too,
             // not only between worklist pops.
-            if self.max_work != 0 && self.work > self.max_work {
-                self.aborted = true;
+            if self.past_work_bound() {
                 self.sum.pending.clear();
                 return;
             }
@@ -1355,6 +779,13 @@ impl Model {
             let id = self.calls.len() as CallId;
             self.calls.push(map_call(cs, tr));
             self.sum.tmpl_of.insert(id, *t);
+            // The copy is the template's operation in this context: a
+            // runtime protocol's call (`Model::protocol_calls`: the step of
+            // an iterated value, ToPrimitive ...) stays one, so every rule
+            // that asks gets the template's answer.
+            if self.protocol_calls.contains(t) {
+                self.protocol_calls.insert(id);
+            }
             if lay != LAY_NONE {
                 self.sum.call_lay.insert(id, lay);
             }
@@ -1367,8 +798,23 @@ impl Model {
             self.sum.composed.insert((kmap[i as usize], g));
             self.activate(g, "composed");
         }
-        for &(slot, ref toks, prim) in &s.seeds {
+        for &(slot, ref toks, prim, refuted) in &s.seeds {
+            // The summary's own slot is where the instance's seed came from
+            // (the dump follows it to the ⊤'s origin).
+            let saved = (self.cur_src, self.cur_why);
+            self.cur_src = s.orig.get(slot as usize).copied().unwrap_or(NO_NODE);
+            self.cur_why = u32::MAX;
+            // The seed's Numbers are values its original node held when the
+            // summary was built: that node's interval covers them (it only
+            // grows).
+            let saved_range = self.cur_range;
+            self.cur_range = (self.cur_src != NO_NODE).then(|| self.rg(self.cur_src));
             self.add(base[slot as usize], toks, prim);
+            self.cur_range = saved_range;
+            if refuted {
+                self.refute_own_test(base[slot as usize]);
+            }
+            (self.cur_src, self.cur_why) = saved;
         }
         // Closures born here carry this instance's nodes for their outer
         // terms, in the context those cells differ by (design §14.2): its
@@ -1443,7 +889,15 @@ impl Model {
             self.edge(x, c);
             self.edge(c, x);
         }
-        self.tok(TokKind::Func(g, ctx))
+        let t = self.tok(TokKind::Func(g, ctx));
+        // A generator function's per-context `prototype` is one its
+        // generator objects may inherit from (`FuncInfo::gen_fn_protos`).
+        if let Some(gp) = self.funcs[g as usize].gen_fn_protos {
+            let pa = self.atom("prototype");
+            let f = self.field(t, pa);
+            self.edge(f, gp);
+        }
+        t
     }
 
     /// Arguments and result of `call` into summarized function token `ft`.
@@ -1488,10 +942,11 @@ impl Model {
         for j in 0..self.calls[c].spread.len() {
             let s = self.calls[c].spread[j];
             let elems = self.node_l("spread-elems");
+            let ek = self.elem_key();
             self.cons(
                 s,
                 Cons::Load {
-                    key: Key::Any,
+                    key: ek,
                     dst: elems,
                 },
             );
@@ -1623,7 +1078,7 @@ impl Model {
             }
             for &m in args[i].as_ref().unwrap() {
                 // Each lifted token is solve work, as a delivery is.
-                self.work += 1;
+                self.charge_work(1);
                 let x = self.lift(m, b, t);
                 lifted.push(x);
             }
@@ -1663,7 +1118,7 @@ impl Model {
         let mut out = Vec::with_capacity(ms.len() * held.len());
         for &m in &ms {
             for &t in &held {
-                self.work += 1;
+                self.charge_work(1);
                 out.push(self.lift(m, b, t));
             }
         }
@@ -1811,11 +1266,7 @@ impl Model {
             // Beyond its publication (an export or a published literal's
             // field, DECISIONS 210, or known closed callers, DECISIONS 19),
             // unknown code calls it and retains its result.
-            if !contract
-                || (self.pub_reason != Some(reason)
-                    && self.field_fn_reason != Some(reason)
-                    && closed.is_none())
-            {
+            if self.unknown_caller(f, reason) {
                 self.sink_node(r, reason);
             }
         }
@@ -1823,10 +1274,36 @@ impl Model {
 
     /// Accessor group binding of summarized `f`: the group's setter value
     /// into the first parameter, or the getter result into the group's.
-    pub(crate) fn group_summarized(&mut self, ft: Tok, sp: NodeId, ar: NodeId, setter: bool) {
+    /// The group's receivers (`this`) are the instance's `this`: what the
+    /// accessor reads or writes on its receiver flows through this
+    /// instance, as its result and its parameter do.
+    pub(crate) fn group_summarized(
+        &mut self,
+        ft: Tok,
+        this: Option<NodeId>,
+        sp: NodeId,
+        ar: NodeId,
+        setter: bool,
+    ) {
         let f = self.tok_fn(ft);
+        let inst = self.instance(if setter { (3, sp, ft) } else { (4, ar, ft) });
+        let it = self.sum.insts[inst as usize].this;
+        if let Some(this) = this {
+            if it != NO_NODE {
+                self.edge(this, it);
+            }
+        }
+        for i in usize::from(setter)..self.funcs[f as usize].params.len() {
+            let t = self.sum.insts[inst as usize].params[i];
+            if t != NO_NODE {
+                self.add_prim(t, prim::UNDEF);
+            }
+            let p = self.funcs[f as usize].params[i];
+            if self.nodes[p as usize].obs {
+                self.add_prim(p, prim::UNDEF);
+            }
+        }
         if setter {
-            let inst = self.instance((3, sp, ft));
             if let Some(&p0) = self.funcs[f as usize].params.first() {
                 let t = self.sum.insts[inst as usize].params[0];
                 if t != NO_NODE {
@@ -1837,7 +1314,6 @@ impl Model {
                 }
             }
         } else {
-            let inst = self.instance((4, ar, ft));
             let r = self.sum.insts[inst as usize].ret;
             if r != NO_NODE {
                 self.edge(r, ar);
@@ -1878,11 +1354,21 @@ impl Model {
                 Deferred::ThisTo(f, origin) => self.this_lookup(f, origin),
                 Deferred::EscapeThis(f, reason) => self.escape_this(f, reason),
                 // A summary's call: its instances construct.
-                Deferred::Construct(call, _) | Deferred::NewNamed(_, call)
+                Deferred::Construct(call, _)
+                | Deferred::ReflectConstruct(call, _, _)
+                | Deferred::NewNamed(_, call)
                     if self.sum.templates.contains(&call) => {}
                 Deferred::Construct(call, t) => self.construct(call, t),
+                Deferred::ReflectConstruct(call, target, new_target) => {
+                    self.reflect_construct(call, target, new_target)
+                }
                 Deferred::NewNamed(name, call) => self.new_named(name, call),
                 Deferred::ForIn(call, ft, t) => self.for_in_tok(call, ft, t),
+                // A summary's call: its instances run the method.
+                Deferred::Native(_, _, call) if self.sum.templates.contains(&call) => {}
+                Deferred::Native(r, key, call) => {
+                    self.with_b(|m| crate::builtins::native_method_at(m, r, key, call))
+                }
             }
         }
         // A `this` with values from generation (static blocks, field
@@ -1914,5 +1400,5 @@ impl Model {
 
 #[path = "summary/compose.rs"]
 mod compose;
+pub use body::compress;
 use compose::compose;
-pub use compose::compress;

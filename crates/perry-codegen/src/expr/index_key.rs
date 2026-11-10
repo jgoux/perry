@@ -2,7 +2,7 @@
 //! numeric normalizer otherwise. Rejected keys keep their original JS value.
 use super::FnCtx;
 use crate::function::LlFunction;
-use crate::types::{DOUBLE, I1, I32, I64};
+use crate::types::{DOUBLE, I1, I32};
 use perry_hir::Expr;
 
 const NORMALIZE: &str = "perry_array_index_normalize_i32";
@@ -114,22 +114,10 @@ fn publish(ctx: &mut FnCtx<'_>) {
     f.linkage = "linkonce_odr".into();
     f.no_inline = true;
     let b = f.create_block("entry");
-    let bits = b.bitcast_double_to_i64("%key");
-    let tag = b.lshr(I64, &bits, "48");
-    let boxed = b.icmp_eq(I64, &tag, crate::nanbox::INT32_TAG_TOP16_I64);
-    b.cond_br(&boxed, "boxed.1", "raw.2");
-
-    let b = f.create_block("boxed");
-    let payload = b.trunc(I64, &bits, I32);
-    let nonnegative = b.icmp_sge(I32, &payload, "0");
-    let index = b.select(I1, &nonnegative, I32, &payload, "-1");
-    b.ret(I32, &index);
-
-    let b = f.create_block("raw");
     let ge = b.fcmp("oge", "%key", "0.0");
     let le = b.fcmp("ole", "%key", "2147483647.0");
     let range = b.and(I1, &ge, &le);
-    b.cond_br(&range, "convert.3", "reject.4");
+    b.cond_br(&range, "convert.1", "reject.2");
 
     // The ordered range branch dominates conversion. No speculative fptosi
     // can see NaN, a tag, an infinity, or an out-of-range Number.
@@ -155,6 +143,7 @@ mod tests {
         let mut module = Module::new("intkey.ts");
         let mut body = prelude;
         body.push(Stmt::Return(Some(Expr::IndexGet {
+            element_offset: 0,
             byte_offset: 0,
             byte_end: 0,
             object: Box::new(Expr::LocalGet(1)),
@@ -228,8 +217,19 @@ mod tests {
             ir.contains("call i32 @perry_array_index_normalize_i32"),
             "{ir}"
         );
+        // The runtime-key arm hands the original key to the shared cold read
+        // (#119da3bb1); the retired helper may still be declared, so assert
+        // the call inside that block, not the symbol's presence.
+        let runtime_block = ir
+            .split_once("\naidx.runtime_key.")
+            .map(|(_, rest)| rest.split("\n\n").next().unwrap_or(rest))
+            .unwrap_or_else(|| panic!("no runtime-key block: {ir}"));
         assert!(
-            ir.contains("aidx.runtime_key") && ir.contains("js_array_get_index_or_string"),
+            runtime_block.contains("call double @perry_array_read_cold_shared("),
+            "{runtime_block}"
+        );
+        assert!(
+            !ir.contains("call double @js_array_get_index_or_string("),
             "{ir}"
         );
     }
@@ -397,6 +397,7 @@ mod tests {
                     init: Some(code),
                 },
                 Stmt::Expr(Expr::IndexGet {
+                    element_offset: 0,
                     byte_offset: 0,
                     byte_end: 0,
                     object: Box::new(Expr::LocalGet(1)),
@@ -441,5 +442,78 @@ mod tests {
             ir.contains("call i32 @perry_array_index_normalize_i32"),
             "{ir}"
         );
+    }
+    fn literal_choice_index(other: Expr) -> String {
+        let choice = Expr::Conditional {
+            condition: Box::new(Expr::Compare {
+                op: perry_hir::CompareOp::Lt,
+                left: Box::new(Expr::LocalGet(5)),
+                right: Box::new(Expr::Integer(0)),
+            }),
+            then_expr: Box::new(Expr::Integer(1)),
+            else_expr: Box::new(other),
+        };
+        let index = Expr::Binary {
+            op: BinaryOp::Add,
+            left: Box::new(Expr::LocalGet(5)),
+            right: Box::new(Expr::Logical {
+                op: perry_hir::LogicalOp::Coalesce,
+                left: Box::new(choice),
+                right: Box::new(Expr::Integer(0)),
+            }),
+        };
+        read_ir(
+            Expr::LocalGet(4),
+            vec![
+                Stmt::Let {
+                    id: 5,
+                    name: "origin".into(),
+                    ty: Type::Any,
+                    mutable: false,
+                    init: Some(Expr::Binary {
+                        op: BinaryOp::BitAnd,
+                        left: Box::new(Expr::NumberCoerce(Box::new(Expr::LocalGet(2)))),
+                        right: Box::new(Expr::Integer(127)),
+                    }),
+                },
+                Stmt::Let {
+                    id: 4,
+                    name: "square".into(),
+                    ty: Type::Any,
+                    mutable: false,
+                    init: Some(index),
+                },
+            ],
+        )
+    }
+
+    #[test]
+    fn literal_selection_carries_numeric_and_index_proofs_through_a_const_add() {
+        let ir = literal_choice_index(Expr::Integer(17));
+        assert!(
+            !ir.contains("call i32 @perry_array_index_normalize_i32"),
+            "{ir}"
+        );
+        assert!(
+            !ir.contains("call double @js_dynamic_string_or_number_add("),
+            "{ir}"
+        );
+        assert!(ir.contains("fadd double") || ir.contains("add i32"), "{ir}");
+    }
+
+    #[test]
+    fn literal_selection_keeps_fractional_nan_overflow_and_dynamic_key_fallbacks() {
+        for value in [
+            Expr::Number(0.5),
+            Expr::Number(f64::NAN),
+            Expr::Integer(1i64 << 40),
+            Expr::LocalGet(2),
+        ] {
+            let ir = literal_choice_index(value);
+            assert!(
+                ir.contains("call i32 @perry_array_index_normalize_i32"),
+                "{ir}"
+            );
+        }
     }
 }

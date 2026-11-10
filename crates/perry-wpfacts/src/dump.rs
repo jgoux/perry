@@ -92,6 +92,15 @@ fn fact_lines(t: &TemplateFacts) -> Vec<String> {
             crate::model::esc_key(&f.key),
             b(f.ta_stable)
         ));
+        // DESIGN-p4l1 §3.1: only a field the facts give `Arr` gets a line.
+        if matches!(f.rep, crate::bindings::Rep::Arr(_)) {
+            v.push(format!(
+                "FACT FR rep {}.{} = {}",
+                t.display,
+                crate::model::esc_key(&f.key),
+                f.rep.name()
+            ));
+        }
     }
     v
 }
@@ -119,6 +128,57 @@ pub fn dump_text(pf: &ProgramFacts) -> String {
             if let Some(o) = &b.indexed_owner {
                 out.push_str(&format!("# indexed_owner module={mi} local={id} kind={} min_len={} exact_len={:?} allocations={:?}\n", o.kind, o.min_len, o.exact_len, o.allocations));
             }
+            // DESIGN-p4l1 §5.6: each binding the facts give `Arr`.
+            if matches!(b.rep, crate::bindings::Rep::Arr(_)) {
+                out.push_str(&format!(
+                    "# arr_rep module={mi} local={id} rep={}\n",
+                    b.rep.name()
+                ));
+            }
+            // Fact IM (`const_arrays`): a rooted `const` of immutable Arrays,
+            // and its constant contents.
+            if b.immutable_array {
+                out.push_str(&format!("# immutable_array module={mi} local={id}\n"));
+            }
+            if let Some(c) = &b.const_elems {
+                let v: Vec<String> = c
+                    .iter()
+                    .map(|b| format!("{}", f64::from_bits(*b)))
+                    .collect();
+                out.push_str(&format!(
+                    "# const_array module={mi} local={id} elems=[{}]\n",
+                    v.join(",")
+                ));
+            }
+        }
+    }
+    // DESIGN-p4l1 §5.6: each field read call (b1), its key's interval at
+    // the call, what the read reads from, and the in-floor verdict.
+    for (mi, bindings) in pf.bindings.iter().enumerate() {
+        for (offset, c) in &bindings.field_read_calls {
+            let key = bindings
+                .call_arg_ranges
+                .binary_search_by_key(offset, |(o, _)| *o)
+                .ok()
+                .and_then(|at| bindings.call_arg_ranges[at].1.get(c.index_arg as usize))
+                .copied()
+                .flatten()
+                .map_or("top".to_string(), |(lo, hi)| format!("[{lo},{hi}]"));
+            let rep = c
+                .array
+                .map_or("boxed".to_string(), |r| crate::bindings::Rep::Arr(r).name());
+            out.push_str(&format!(
+                "# field_read_call module={mi} call={offset} field={} key={key} rep={rep} in_floor={}\n",
+                c.field, c.in_floor as u8
+            ));
+        }
+    }
+    // N6: each module binding the facts give one Number.
+    for (mi, bindings) in pf.bindings.iter().enumerate() {
+        for (id, value) in &bindings.const_numbers {
+            out.push_str(&format!(
+                "# const_number module={mi} local={id} value={value}\n"
+            ));
         }
     }
     out.push_str(&format!(
@@ -150,6 +210,15 @@ pub fn dump_text(pf: &ProgramFacts) -> String {
     for (l, n, mix) in &s.big_nodes {
         out.push_str(&format!("# bignode {l} {n} {mix}\n"));
     }
+    out.push_str(&format!("# r1fields {}\n", s.builtin_fields.0));
+    let k = s.builtin_fields.2;
+    out.push_str(&format!(
+        "# r1sinks ns={} ns_with_fields={} fn={} fn_with_fields={}\n",
+        k[0], k[1], k[2], k[3]
+    ));
+    for (l, n) in &s.builtin_fields.1 {
+        out.push_str(&format!("# r1field {l} {n}\n"));
+    }
     out.push_str(&format!(
         "# sabotage {}\n",
         pf.sabotage.clone().unwrap_or_else(|| "none".into())
@@ -173,7 +242,8 @@ pub fn dump_text(pf: &ProgramFacts) -> String {
     }
     for st in &pf.sites {
         let v = match &st.verdict {
-            Verdict::StringLength => "native:string-length".to_string(),
+            Verdict::OwnLength => "native:own-length".to_string(),
+            Verdict::NativeMember => "native:member".to_string(),
             Verdict::T0Mono => "T0".to_string(),
             Verdict::T0Set => "T0set".to_string(),
             Verdict::E0 => "E0".to_string(),
@@ -206,10 +276,16 @@ pub fn dump_text(pf: &ProgramFacts) -> String {
                 .map(|(id, name)| format!("[{id},{}]", crate::diagnostics::quote(name)))
                 .collect();
             out.push_str(&format!(
-                "D {{\"record\":\"verdict\",\"unit\":{},\"file\":{},\"start\":{},\"key\":{},\"call\":{},\"verdict\":{},\"bodies\":[{}]}}\n",
+                "D {{\"record\":\"verdict\",\"unit\":{},\"file\":{},\"start\":{},\"key\":{},\"call\":{},\"verdict\":{},\"cause\":{},\"bodies\":[{}]}}\n",
                 crate::diagnostics::quote(unit), crate::diagnostics::quote(&pf.module_paths[site.module as usize]),
                 site.byte_offset, crate::diagnostics::quote(&site.key), site.is_call,
-                crate::diagnostics::quote(&format!("{:?}", site.verdict)), bodies.join(",")));
+                crate::diagnostics::quote(&format!("{:?}", site.verdict)),
+                match crate::ledger::verdict_cause(&site.verdict) {
+                    None => "null".to_string(),
+                    Some(Ok(c)) => crate::diagnostics::quote(c.name()),
+                    Some(Err(_)) => crate::diagnostics::quote("unclassified"),
+                },
+                bodies.join(",")));
             for (copy, v) in &site.diagnostic_copies {
                 out.push_str(&format!(
                     "D {{\"record\":\"copy-verdict\",\"unit\":{},\"file\":{},\"start\":{},\"key\":{},\"call\":{},\"copy\":{},\"verdict\":{}}}\n",
@@ -220,10 +296,13 @@ pub fn dump_text(pf: &ProgramFacts) -> String {
         }
         // DECISIONS 225: the bodies the whole program can run, the
         // exemption of the per-unit <= whole residual (`dead_site`).
-        for (file, id, name) in pf.active_bodies.iter().flatten() {
+        for (file, id, name) in &pf.body_reach.bodies {
             out.push_str(&format!(
                 "D {{\"record\":\"active\",\"unit\":{},\"file\":{},\"fn\":{id},\"name\":{}}}\n",
-                crate::diagnostics::quote(unit), crate::diagnostics::quote(file), crate::diagnostics::quote(name)));
+                crate::diagnostics::quote(unit),
+                crate::diagnostics::quote(file),
+                crate::diagnostics::quote(name)
+            ));
         }
         for line in lines {
             out.push_str("D {");
@@ -233,6 +312,28 @@ pub fn dump_text(pf: &ProgramFacts) -> String {
         }
     }
     out
+}
+
+/// Dump only: appends the diagnostic records that were streamed to the sidecar
+/// (`FactsConfig::diag_sidecar`) in unit order, then removes the sidecar.
+pub fn append_streamed(pf: &ProgramFacts, out: &mut impl std::io::Write) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let Some((path, spans)) = &pf.diag_stream else {
+        return Ok(());
+    };
+    let mut f = std::fs::File::open(path)?;
+    let mut buf = Vec::new();
+    for &(at, n) in spans {
+        if n == 0 {
+            continue;
+        }
+        buf.resize(n as usize, 0);
+        f.seek(SeekFrom::Start(at))?;
+        f.read_exact(&mut buf)?;
+        out.write_all(&buf)?;
+    }
+    drop(f);
+    std::fs::remove_file(path)
 }
 
 pub fn relations_text(pf: &ProgramFacts) -> Option<String> {
@@ -444,4 +545,34 @@ pub fn apply_sabotage(ts: &mut [TemplateFacts], spec: &str) {
         }
         t.sabotaged = true;
     }
+}
+
+/// Complete bounded-test solver output, including primitive and activation state.
+#[cfg(test)]
+pub(crate) fn solver_state(m: &crate::model::Model) -> String {
+    use std::fmt::Write;
+    let mut out = format!("solve work={} aborted={}\n", m.work.get(), m.aborted);
+    for (i, n) in m.nodes.iter().enumerate() {
+        writeln!(
+            out,
+            "node {i} prim={} dropped={} pts={:?}",
+            n.prim,
+            n.dropped,
+            n.pts.to_sorted()
+        )
+        .unwrap();
+    }
+    if let Some(a) = &m.act {
+        let mut on: Vec<_> = a.on.iter().collect();
+        on.sort();
+        let mut walked: Vec<_> = a.walked.iter().collect();
+        walked.sort();
+        writeln!(
+            out,
+            "activation fixed={} on={on:?} walked={walked:?}",
+            a.fixed
+        )
+        .unwrap();
+    }
+    out
 }

@@ -1351,6 +1351,7 @@ fn is_redundant_cell_propagation(items: &[Expr], index_uses: &HashSet<LocalId>) 
         object,
         property,
         value,
+        ..
     }] = items
     else {
         return false;
@@ -1361,7 +1362,7 @@ fn is_redundant_cell_propagation(items: &[Expr], index_uses: &HashSet<LocalId>) 
     };
     index_uses.contains(&written)
         && matches!(object.as_ref(), Expr::This)
-        && property.starts_with("__perry_cap_")
+        && crate::cap_fields::is_cap_field_name(property)
         && matches!(value.as_ref(), Expr::LocalGet(id) if *id == written)
 }
 
@@ -1472,6 +1473,7 @@ fn rewrite_stmt(stmt: &mut Stmt, shared: &HashSet<LocalId>, index_uses: &HashSet
                     Box::new(Expr::Array(
                         vec![Expr::IndexGet {
                             byte_end: 0,
+                            element_offset: 0,
                             byte_offset: 0,
                             object: Box::new(Expr::LocalGet(id)),
                             index: Box::new(Expr::Integer(0)),
@@ -1543,6 +1545,7 @@ fn rewrite_expr(expr: &mut Expr, shared: &HashSet<LocalId>, index_uses: &HashSet
         // the ARRAY handle and is not re-rewritten.
         Expr::LocalGet(id) if index_uses.contains(id) => {
             *expr = Expr::IndexGet {
+                element_offset: 0,
                 byte_offset: 0,
                 byte_end: 0,
                 object: Box::new(Expr::LocalGet(*id)),
@@ -1566,6 +1569,9 @@ fn rewrite_expr(expr: &mut Expr, shared: &HashSet<LocalId>, index_uses: &HashSet
                 object: Box::new(Expr::LocalGet(*id)),
                 index: Box::new(Expr::Integer(0)),
                 value: Box::new(v),
+                element_offset: 0,
+                byte_offset: 0,
+                byte_end: 0,
             };
             return;
         }
@@ -1573,7 +1579,9 @@ fn rewrite_expr(expr: &mut Expr, shared: &HashSet<LocalId>, index_uses: &HashSet
         // handle on the instance field so methods snapshot the shared array.
         Expr::PropertySet {
             object, property, ..
-        } if matches!(object.as_ref(), Expr::This) && property.starts_with("__perry_cap_") => {
+        } if matches!(object.as_ref(), Expr::This)
+            && crate::cap_fields::is_cap_field_name(property) =>
+        {
             return;
         }
         // Constructor PUBLISH `ClassEnvSet { value: LocalGet(param) }`: the
@@ -1593,6 +1601,9 @@ fn rewrite_expr(expr: &mut Expr, shared: &HashSet<LocalId>, index_uses: &HashSet
                 },
                 prefix: *prefix,
                 strict: false,
+                element_offset: 0,
+                byte_offset: 0,
+                byte_end: 0,
             };
             return;
         }

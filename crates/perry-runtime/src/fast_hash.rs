@@ -347,6 +347,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_pointer_width = "64")]
     /// Pointer-aligned keys collide trivially with multiply-only on the
     /// low bits — Fibonacci-hash mixing into the upper bits is what
     /// keeps the buckets evenly populated. Sanity-check that 1000 8-byte-
@@ -383,10 +384,15 @@ mod tests {
         let here = seeded_hash(b"member");
         let _stack_pad = [0u8; 4096];
         let deeper = std::hint::black_box(seeded_hash(b"member"));
-        let other_thread = std::thread::spawn(|| seeded_hash(b"member")).join().unwrap();
+        let other_thread = std::thread::spawn(|| seeded_hash(b"member"))
+            .join()
+            .unwrap();
         assert_eq!(here, deeper);
         assert_eq!(here, other_thread);
-        assert_eq!(here, ahash::RandomState::with_seed(0).hash_one(&b"member"[..]));
+        assert_eq!(
+            here,
+            ahash::RandomState::with_seed(0).hash_one(&b"member"[..])
+        );
         std::hint::black_box(&PAD);
         // `RandomState::new()` mixes addresses in; it must differ from the seed.
         assert_ne!(
@@ -529,6 +535,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_pointer_width = "64")]
     /// Bare-`usize`-keyed `FastKeyHashMap`s exist too (`attr_keys_by_owner`,
     /// `SYMBOL_PROPERTY_ATTRS`' first half), and a bare key runs only ONE fold
     /// round. Aligned heap addresses must still spread.
@@ -549,6 +556,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_pointer_width = "64")]
     /// The descriptor side tables key on `(usize, String)`. Verify the FNV-1a
     /// composite-key hasher round-trips: distinct owner addresses and distinct
     /// key strings must not alias, and lookups by borrowed `&str`/`&(…)` keys

@@ -1,6 +1,7 @@
 //! The optional runtime/stdlib features a program installs from the prebuilt
 //! archives, and the compile-time instrument requests.
 
+use perry_runtime_manifest::NodeApiReach;
 use std::collections::BTreeSet;
 
 use super::super::CompilationContext;
@@ -60,7 +61,6 @@ pub(crate) fn gc_instruments_requested() -> bool {
 /// `hot_diag_knobs_match_the_runtime`).
 pub(crate) const HOT_DIAG_KNOBS: &[&str] = &[
     "PERRY_REGEX_DIAG",
-    "PERRY_IC_DIAG",
     "PERRY_ENUM_DIAG",
     "PERRY_RECEIVER_REPR_DIAG",
 ];
@@ -74,6 +74,36 @@ pub(crate) fn hot_diag_requested() -> bool {
         || HOT_DIAG_KNOBS.iter().any(|knob| {
             std::env::var(knob)
                 .is_ok_and(|v| !matches!(v.trim(), "" | "0" | "off" | "false" | "no"))
+        })
+}
+
+/// Run-time knobs served only by the GC diagnostics that
+/// `js_runtime_install_diagnostics` installs (perry-runtime
+/// `gc::diagnostic_hooks::install`): the per-collection `[gc-log]` line, the
+/// `PERRY_GC_DIAG` reports, and the evacuation verifier, which runs only in the
+/// diagnostic collector specialization.
+pub(crate) const GC_DIAGNOSTIC_KNOBS: &[&str] = &[
+    "PERRY_GC_DIAG",
+    "PERRY_GC_LOG",
+    "PERRY_GC_VERIFY_EVACUATION",
+];
+
+/// Install the GC diagnostics in this build: one of [`GC_DIAGNOSTIC_KNOBS`]
+/// on while compiling (by the runtime's value rules: `1`/`true`/`on`/`yes`),
+/// or `PERRY_GC_TRACE`, whose JSON is built by the same install. A program
+/// whose installs are selected from its own features (auto-optimized native
+/// links, every WASI link) otherwise installs them only for a diagnostics API,
+/// so `PERRY_GC_LOG=1 perry compile … && PERRY_GC_LOG=1 ./a.out` logs, as the
+/// instrument knobs do.
+pub(crate) fn gc_diagnostics_requested() -> bool {
+    gc_trace_requested()
+        || GC_DIAGNOSTIC_KNOBS.iter().any(|knob| {
+            std::env::var(knob).is_ok_and(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "on" | "yes"
+                )
+            })
         })
 }
 
@@ -178,11 +208,12 @@ pub(crate) fn auto_optimized_cross_features(
     let needs_dyn_eval = perry_hir::has_deferred_dynamic_code_sites()
         || ctx.native_module_imports.contains("vm")
         || ctx.uses_data_url_dynamic_import;
-    if ctx.uses_temporal
-        || ctx.uses_get_builtin_module
-        || needs_dyn_eval
-        || !ctx.native_addons.is_empty()
-    {
+    // A native addon reaches what its Node-API imports reach: an open one
+    // every global subsystem, a closed one the subsystems of the values it
+    // creates (`node_api_host_symbols.txt`). The Node-API host itself is
+    // installed for any addon (above).
+    let addon_world = ctx.native_addons_reach(NodeApiReach::World);
+    if ctx.uses_temporal || ctx.uses_get_builtin_module || needs_dyn_eval || addon_world {
         cross_features.push("perry-runtime/temporal".to_string());
     }
     if ctx.uses_url
@@ -191,7 +222,7 @@ pub(crate) fn auto_optimized_cross_features(
             .native_module_imports
             .iter()
             .any(|module| matches!(module.as_str(), "url" | "module"))
-        || !ctx.native_addons.is_empty()
+        || addon_world
     {
         cross_features.push("perry-runtime/url-engine".to_string());
     }
@@ -234,13 +265,12 @@ pub(crate) fn auto_optimized_cross_features(
     // must keep the generic BigInt operators and formatting paths installed.
     if features.contains("crypto")
         || features.contains("database-sqlite")
-        || features.contains("bundled-ethers")
         || ctx.uses_bigint
         || ctx.uses_proc_ipc
         || ctx.uses_get_builtin_module
         || ctx.uses_temporal
         || ctx.needs_wasm_runtime
-        || !ctx.native_addons.is_empty()
+        || ctx.native_addons_reach(NodeApiReach::Bigint)
         || needs_dyn_eval
         || ctx.native_module_imports.iter().any(|m| {
             matches!(
@@ -254,7 +284,6 @@ pub(crate) fn auto_optimized_cross_features(
                     | "bun"
                     | "bun:ffi"
                     | "crypto"
-                    | "ethers"
                     | "sqlite"
                     | "bun:sqlite"
             )
@@ -266,7 +295,7 @@ pub(crate) fn auto_optimized_cross_features(
         || ctx.uses_get_builtin_module
         || ctx.uses_proc_ipc
         || needs_dyn_eval
-        || !ctx.native_addons.is_empty()
+        || ctx.native_addons_reach(NodeApiReach::Date)
         || ctx.native_module_imports.iter().any(|m| {
             matches!(
                 m.as_str(),
@@ -285,7 +314,7 @@ pub(crate) fn auto_optimized_cross_features(
     if ctx.uses_perf_hooks
         || ctx.uses_get_builtin_module
         || needs_dyn_eval
-        || !ctx.native_addons.is_empty()
+        || addon_world
         || ctx.native_module_imports.contains("perf_hooks")
     {
         cross_features.push("perry-runtime/perf-hooks".to_string());
@@ -294,7 +323,7 @@ pub(crate) fn auto_optimized_cross_features(
         || ctx.uses_get_builtin_module
         || ctx.uses_proc_ipc
         || needs_dyn_eval
-        || !ctx.native_addons.is_empty()
+        || addon_world
         || ctx.native_module_imports.iter().any(|m| {
             matches!(
                 m.as_str(),
@@ -314,7 +343,7 @@ pub(crate) fn auto_optimized_cross_features(
     if ctx.uses_messaging
         || ctx.uses_get_builtin_module
         || needs_dyn_eval
-        || !ctx.native_addons.is_empty()
+        || addon_world
         || ctx.native_module_imports.contains("worker_threads")
     {
         cross_features.push("perry-runtime/messaging".to_string());
@@ -329,7 +358,7 @@ pub(crate) fn auto_optimized_cross_features(
         || ctx.uses_global_webcrypto
         || ctx.uses_global_websocket
         || needs_dyn_eval
-        || !ctx.native_addons.is_empty()
+        || addon_world
         || ctx.native_module_imports.iter().any(|m| {
             matches!(
                 m.as_str(),
@@ -338,6 +367,9 @@ pub(crate) fn auto_optimized_cross_features(
         })
     {
         cross_features.push("perry-runtime/event-target".to_string());
+    }
+    if ctx.uses_navigator || ctx.uses_get_builtin_module || needs_dyn_eval || addon_world {
+        cross_features.push("perry-runtime/navigator".to_string());
     }
     if ctx.uses_typedarray
         || ctx.uses_proc_ipc
@@ -348,7 +380,7 @@ pub(crate) fn auto_optimized_cross_features(
         || ctx.uses_global_webcrypto
         || ctx.uses_global_websocket
         || needs_dyn_eval
-        || !ctx.native_addons.is_empty()
+        || ctx.native_addons_reach(NodeApiReach::Typedarray)
         || ctx.native_module_imports.iter().any(|m| {
             matches!(
                 m.as_str(),
@@ -384,7 +416,7 @@ pub(crate) fn auto_optimized_cross_features(
         || ctx.uses_global_atomics
         || ctx.uses_get_builtin_module
         || needs_dyn_eval
-        || !ctx.native_addons.is_empty()
+        || addon_world
         || ctx.native_module_imports.iter().any(|m| {
             matches!(
                 m.as_str(),
@@ -407,15 +439,11 @@ pub(crate) fn auto_optimized_cross_features(
         .any(|m| matches!(m.as_str(), "async_hooks" | "events"))
         || ctx.uses_get_builtin_module
         || needs_dyn_eval
-        || !ctx.native_addons.is_empty()
+        || addon_world
     {
         cross_features.push("perry-runtime/async-hooks".to_string());
     }
-    if ctx.uses_proxy
-        || ctx.uses_get_builtin_module
-        || needs_dyn_eval
-        || !ctx.native_addons.is_empty()
-    {
+    if ctx.uses_proxy || ctx.uses_get_builtin_module || needs_dyn_eval || addon_world {
         cross_features.push("perry-runtime/proxy".to_string());
     }
     if ctx.uses_turnloop
@@ -431,8 +459,7 @@ pub(crate) fn auto_optimized_cross_features(
     // A formatter-only program can reach stringify, without creating a global
     // namespace or constructing parser/tape values. The full JSON installer
     // also fills formatting slots when the JSON API itself is reachable.
-    let json_namespace =
-        ctx.uses_global_json || (ctx.uses_json_format && !ctx.native_addons.is_empty());
+    let json_namespace = ctx.uses_global_json || (ctx.uses_json_format && addon_world);
     if ctx.uses_json_engine && !json_namespace && !needs_dyn_eval {
         cross_features.push("perry-runtime/json-engine".to_string());
     }
@@ -458,7 +485,7 @@ pub(crate) fn auto_optimized_cross_features(
                 || ctx.uses_get_builtin_module
                 || ctx.native_module_imports.contains("cluster")
                 || needs_dyn_eval
-                || !ctx.native_addons.is_empty(),
+                || addon_world,
             "proc-ipc",
         ),
     ] {
@@ -474,13 +501,16 @@ pub(crate) fn auto_optimized_cross_features(
     }
     // Heap snapshots and `process.report` (~95 KB of JSON serializers plus the
     // `serde_json` pulled only by them): user APIs, always compiled into the
-    // archive and installed only for a program that references one. The GC and
+    // archive and installed only for a program that references one. The GC
+    // diagnostics ride this install and are installed when one of their knobs
+    // is set while compiling (`gc_diagnostics_requested`). The GC and
     // typed-feedback instruments are not installs at all: they exist only in
     // the instrumented archives (`instrumented_variant_requested`).
     if ctx.uses_diagnostics
+        || gc_diagnostics_requested()
         || ctx.uses_get_builtin_module
         || needs_dyn_eval
-        || !ctx.native_addons.is_empty()
+        || addon_world
     {
         cross_features.push("perry-runtime/diagnostics".to_string());
     }
@@ -552,7 +582,7 @@ pub(crate) fn auto_optimized_cross_features(
     // path the stub has won the link and returned garbage the caller derefs ->
     // SIGSEGV in `js_object_get_class_id`. Enabling the feature drops the stubs from
     // libperry_runtime.a so only the real symbols remain.
-    if ctx.uses_fetch {
+    if ctx.uses_fetch || ctx.uses_global_webfetch {
         cross_features.push("perry-runtime/external-fetch-symbols".to_string());
     }
     cross_features

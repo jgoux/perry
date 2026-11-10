@@ -43,9 +43,11 @@ enum TypedArrayProtoReceiver {
 /// brand check is the only behavioral change for them, and on a real TypedArray
 /// receiver they still reach the existing mutator impls via the dispatch tower.
 #[rustfmt::skip] pub(super) const TYPED_ARRAY_PROTO_METHODS: &[(&str, u32)] = &[
+    ("entries", realm_typedarray_prototype_entries_metadata!(length)),
+    ("keys", realm_typedarray_prototype_keys_metadata!(length)),
+    ("values", realm_typedarray_prototype_values_metadata!(length)),
     ("at", realm_typedarray_prototype_at_metadata!(length)),
     ("copyWithin", realm_typedarray_prototype_copywithin_metadata!(length)),
-    ("entries", realm_typedarray_prototype_entries_metadata!(length)),
     ("every", realm_typedarray_prototype_every_metadata!(length)),
     ("fill", realm_typedarray_prototype_fill_metadata!(length)),
     ("filter", realm_typedarray_prototype_filter_metadata!(length)),
@@ -57,22 +59,20 @@ enum TypedArrayProtoReceiver {
     ("includes", realm_typedarray_prototype_includes_metadata!(length)),
     ("indexOf", realm_typedarray_prototype_indexof_metadata!(length)),
     ("join", realm_typedarray_prototype_join_metadata!(length)),
-    ("keys", realm_typedarray_prototype_keys_metadata!(length)),
     ("lastIndexOf", 1),
     ("map", realm_typedarray_prototype_map_metadata!(length)),
+    ("reverse", realm_typedarray_prototype_reverse_metadata!(length)),
     ("reduce", 1),
     ("reduceRight", 1),
-    ("reverse", realm_typedarray_prototype_reverse_metadata!(length)),
     ("set", realm_typedarray_prototype_set_metadata!(length)),
     ("slice", realm_typedarray_prototype_slice_metadata!(length)),
     ("some", realm_typedarray_prototype_some_metadata!(length)),
     ("sort", realm_typedarray_prototype_sort_metadata!(length)),
     ("subarray", realm_typedarray_prototype_subarray_metadata!(length)),
-    ("toLocaleString", realm_typedarray_prototype_tolocalestring_metadata!(length)),
     ("toReversed", realm_typedarray_prototype_toreversed_metadata!(length)),
     ("toSorted", realm_typedarray_prototype_tosorted_metadata!(length)),
-    ("values", realm_typedarray_prototype_values_metadata!(length)),
     ("with", realm_typedarray_prototype_with_metadata!(length)),
+    ("toLocaleString", realm_typedarray_prototype_tolocalestring_metadata!(length)),
 ];
 
 /// Install the brand-checking `%TypedArray%.prototype` methods onto a per-kind
@@ -83,6 +83,7 @@ enum TypedArrayProtoReceiver {
 /// through the normal closure-dispatch path straight into the thunk, where the
 /// brand check runs.
 pub(super) fn install_typed_array_proto_methods(proto_obj: *mut ObjectHeader) {
+    // `TYPED_ARRAY_PROTO_METHODS` is in node's own-key order (`Reflect.ownKeys`).
     use super::global_this::install_proto_method as ipm;
     for &(name, arity) in TYPED_ARRAY_PROTO_METHODS {
         // The visible spec `.length` is `arity`; the body's info declares the
@@ -202,10 +203,7 @@ fn thunk_for(name: &str) -> *const crate::closure::JsFunctionInfo {
 fn throw_not_typed_array(method: &str) -> ! {
     let msg = format!("Method %TypedArray%.prototype.{method} called on incompatible receiver");
     let s = crate::string::js_string_from_bytes(msg.as_ptr(), msg.len() as u32);
-    let err = crate::error::js_typeerror_new(s);
-    crate::exception::js_throw(f64::from_bits(
-        crate::value::JSValue::pointer(err as *const u8).bits(),
-    ))
+    crate::exception::throw_core(crate::error::CoreError::type_error(s))
 }
 
 /// Brand-check the `this` receiver as a real TypedArray.
@@ -678,7 +676,7 @@ impl<'s> RootedUint8Buffer<'s> {
 /// scan. `js_array_map` has carried the same root since gh #6206 / #6081; this
 /// dispatcher had it on one of its three entries.
 ///
-/// `test-files/test_gap_gc_uint8_buffer_callback_rooting.ts` reproduces it on
+/// `tests/parity/language/typed-array/test_gap_gc_uint8_buffer_callback_rooting.ts` reproduces it on
 /// the SHIPPED DEFAULT (`TypeError: value is not a function`, exit 1) and,
 /// under `PERRY_GC_SCHEDULE_RATE=1 PERRY_GC_SCHEDULE_SEED=7
 /// PERRY_GC_PROTECT_FROMSPACE=1`, faults precisely — on the FIRST scheduled
@@ -705,17 +703,32 @@ macro_rules! rooted_callback {
     ($name:ident, $site:ident, $($arg:ident),+) => {
         struct $name<'s> {
             handle: crate::gc::RuntimeHandle<'s>,
+            /// The callback's `this`: the method's `thisArg` argument, rooted
+            /// because the callback can collect and the value can move.
+            this_arg: crate::gc::RuntimeHandle<'s>,
             site: crate::closure::$site,
         }
 
         impl<'s> $name<'s> {
+            // Not every instantiation of this macro is built through `new`.
+            #[allow(dead_code)]
             #[inline]
             fn new(
                 scope: &'s crate::gc::RuntimeHandleScope,
                 callback: *const crate::closure::ClosureHeader,
             ) -> Self {
+                Self::with_this(scope, callback, undefined())
+            }
+
+            #[inline]
+            fn with_this(
+                scope: &'s crate::gc::RuntimeHandleScope,
+                callback: *const crate::closure::ClosureHeader,
+                this_arg: f64,
+            ) -> Self {
                 Self {
                     handle: scope.root_raw_const_ptr(callback),
+                    this_arg: scope.root_nanbox_f64(this_arg),
                     site: crate::closure::$site::resolve(callback),
                 }
             }
@@ -736,7 +749,7 @@ macro_rules! rooted_callback {
             fn call(&self, $($arg: f64),+) -> f64 {
                 self.handle
                     .with_const_ptr::<crate::closure::ClosureHeader, _>(|cb| {
-                        self.site.call(cb, crate::closure::plain_call_receiver(), $($arg),+)
+                        self.site.call(cb, crate::closure::JsThis::from_f64(self.this_arg.get_nanbox_f64()), $($arg),+)
                     })
             }
         }
@@ -818,7 +831,11 @@ pub(crate) unsafe fn dispatch_uint8_buffer_method(
             receiver
         }
         "map" => {
-            let cb = RootedCallback3::new(&scope, validate_callback(args));
+            let cb = RootedCallback3::with_this(
+                &scope,
+                validate_callback(args),
+                arg_or_undefined(args, 1),
+            );
             // `uint8_alloc_like` allocates, so the receiver read is
             // sequenced AFTER it.
             // Keep the fresh output live while the callback can run a full
@@ -835,7 +852,11 @@ pub(crate) unsafe fn dispatch_uint8_buffer_method(
             out.live().1
         }
         "filter" => {
-            let cb = RootedCallback3::new(&scope, validate_callback(args));
+            let cb = RootedCallback3::with_this(
+                &scope,
+                validate_callback(args),
+                arg_or_undefined(args, 1),
+            );
             let (addr, receiver) = recv.live();
             let mut kept = Vec::new();
             for i in 0..len {
@@ -852,7 +873,11 @@ pub(crate) unsafe fn dispatch_uint8_buffer_method(
             pointer_value(out as usize)
         }
         "every" => {
-            let cb = RootedCallback3::new(&scope, validate_callback(args));
+            let cb = RootedCallback3::with_this(
+                &scope,
+                validate_callback(args),
+                arg_or_undefined(args, 1),
+            );
             let (addr, receiver) = recv.live();
             for i in 0..len {
                 let value = uint8_get(addr, i) as f64;
@@ -864,7 +889,11 @@ pub(crate) unsafe fn dispatch_uint8_buffer_method(
             bool_value(true)
         }
         "some" => {
-            let cb = RootedCallback3::new(&scope, validate_callback(args));
+            let cb = RootedCallback3::with_this(
+                &scope,
+                validate_callback(args),
+                arg_or_undefined(args, 1),
+            );
             let (addr, receiver) = recv.live();
             for i in 0..len {
                 let value = uint8_get(addr, i) as f64;
@@ -881,7 +910,11 @@ pub(crate) unsafe fn dispatch_uint8_buffer_method(
         // node: `2`). Its sibling `findLastIndex` was already served below,
         // which is why the hole survived: the two are always cited together.
         "find" | "findLast" => {
-            let cb = RootedCallback3::new(&scope, validate_callback(args));
+            let cb = RootedCallback3::with_this(
+                &scope,
+                validate_callback(args),
+                arg_or_undefined(args, 1),
+            );
             let (addr, receiver) = recv.live();
             let indexes: Box<dyn Iterator<Item = usize>> = if method == "find" {
                 Box::new(0..len)
@@ -898,7 +931,11 @@ pub(crate) unsafe fn dispatch_uint8_buffer_method(
             undefined()
         }
         "findIndex" | "findLastIndex" => {
-            let cb = RootedCallback3::new(&scope, validate_callback(args));
+            let cb = RootedCallback3::with_this(
+                &scope,
+                validate_callback(args),
+                arg_or_undefined(args, 1),
+            );
             let (addr, receiver) = recv.live();
             let indexes: Box<dyn Iterator<Item = usize>> = if method == "findIndex" {
                 Box::new(0..len)
@@ -915,7 +952,11 @@ pub(crate) unsafe fn dispatch_uint8_buffer_method(
             -1.0
         }
         "forEach" => {
-            let cb = RootedCallback3::new(&scope, validate_callback(args));
+            let cb = RootedCallback3::with_this(
+                &scope,
+                validate_callback(args),
+                arg_or_undefined(args, 1),
+            );
             let (addr, receiver) = recv.live();
             for i in 0..len {
                 let value = uint8_get(addr, i) as f64;
@@ -1200,10 +1241,7 @@ pub(super) extern "C" fn ta_generic_thunk(
 fn throw_not_uint8_array(method: &str) -> ! {
     let msg = format!("Method Uint8Array.prototype.{method} called on incompatible receiver");
     let s = crate::string::js_string_from_bytes(msg.as_ptr(), msg.len() as u32);
-    let err = crate::error::js_typeerror_new(s);
-    crate::exception::js_throw(f64::from_bits(
-        crate::value::JSValue::pointer(err as *const u8).bits(),
-    ))
+    crate::exception::throw_core(crate::error::CoreError::type_error(s))
 }
 
 /// Resolve the `this` receiver to a Uint8Array-backed buffer address.
@@ -1290,14 +1328,14 @@ pub(super) fn install_uint8array_base64_hex_proto_methods(proto_obj: *mut Object
             realm_uint8array_prototype_tobase64_metadata!(length),
         ),
         (
-            "toHex",
-            fn_info!(#[realm(Uint8Array.prototype.toHex, spec = {length = 0}, emit = metadata(realm_uint8array_prototype_tohex_metadata))] export crate::object::typed_array_proto_thunks::u8_to_hex_thunk, 3; with_declared(3), with_flags(FN_BUILTIN)),
-            realm_uint8array_prototype_tohex_metadata!(length),
-        ),
-        (
             "setFromBase64",
             fn_info!(#[realm(Uint8Array.prototype.setFromBase64, spec = {length = 1}, emit = metadata(realm_uint8array_prototype_setfrombase64_metadata))] export crate::object::typed_array_proto_thunks::u8_set_from_base64_thunk, 3; with_declared(3), with_flags(FN_BUILTIN)),
             realm_uint8array_prototype_setfrombase64_metadata!(length),
+        ),
+        (
+            "toHex",
+            fn_info!(#[realm(Uint8Array.prototype.toHex, spec = {length = 0}, emit = metadata(realm_uint8array_prototype_tohex_metadata))] export crate::object::typed_array_proto_thunks::u8_to_hex_thunk, 3; with_declared(3), with_flags(FN_BUILTIN)),
+            realm_uint8array_prototype_tohex_metadata!(length),
         ),
         (
             "setFromHex",

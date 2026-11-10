@@ -55,6 +55,8 @@ pub(crate) enum ExcludingFact {
     /// The family is never a collection element.
     P6,
     /// The family is never a constructor-return override.
+    // No reason is excluded by P7 today; the numbering is the design's.
+    #[allow(dead_code)]
     P7,
     /// The family's class has no evaluation brand.
     P8,
@@ -159,8 +161,12 @@ pub(crate) unsafe fn object_meta_ensure_for_cell(
     // barrier, exactly as `object_meta_ensure` does for an `ObjectHeader`.
     // The reloaded cell is live; consume its current generation proof.
     // Young arena holders need only the active incremental-mark barrier.
+    #[cfg(perry_gc_instruments)]
+    crate::snap_census::meta_install(slot as usize);
     *slot = meta;
     crate::gc::runtime_write_barrier_resolved_slot(user_ptr, slot as usize, meta as u64);
+    #[cfg(perry_gc_instruments)]
+    crate::snap_census::meta_installed(slot as usize, meta as usize);
     Some(meta)
 }
 
@@ -214,12 +220,16 @@ pub(crate) unsafe fn object_meta_ensure(obj: MetaObj, reason: MetaReason) -> *mu
     // followed by an object-slot barrier, mirroring `set_object_keys_array`.
     // Reloaded after the allocation: promotion, if any, is reflected in the
     // live header. No safepoint intervenes before the resolved-slot barrier.
+    #[cfg(perry_gc_instruments)]
+    crate::snap_census::meta_install(&(*obj).meta as *const _ as usize);
     (*obj).meta = meta;
     crate::gc::runtime_write_barrier_resolved_slot(
         obj as usize,
         &(*obj).meta as *const _ as usize,
         meta as u64,
     );
+    #[cfg(perry_gc_instruments)]
+    crate::snap_census::meta_installed(&(*obj).meta as *const _ as usize, meta as usize);
     meta
 }
 
@@ -244,6 +254,7 @@ pub(crate) unsafe fn gc_object_meta_slot(user_ptr: usize) -> Option<*mut u64> {
 /// # Safety
 /// `obj` is the user pointer of a live ordinary object.
 #[cold]
+#[optimize(size)]
 #[inline(never)]
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) unsafe fn a1_internal_error(obj: *const ObjectHeader, reason: MetaReason) -> ! {

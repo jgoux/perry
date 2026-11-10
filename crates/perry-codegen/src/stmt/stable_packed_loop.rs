@@ -1004,12 +1004,13 @@ pub(crate) fn try_lower_index_get(
         if let Some(base) = access.contiguous_base.as_ref() {
             let element_addr = ctx.block().add(I64, base, &byte_offset);
             let element_ptr = ctx.block().inttoptr(I64, &element_addr);
-            let (direct, native_u32) = if fact.u32_index_elements {
-                let native = ctx.block().load(I32, &element_ptr);
-                (ctx.block().uitofp(I32, &native, DOUBLE), Some(native))
-            } else {
-                (ctx.block().load(DOUBLE, &element_ptr), None)
-            };
+            // A Number element is always the raw double. Under the mode-2
+            // admission the element is proven integral in 0..=i32::MAX, so
+            // `fptosi` yields the exact entity id.
+            let direct = ctx.block().load(DOUBLE, &element_ptr);
+            let native_u32 = fact
+                .u32_index_elements
+                .then(|| ctx.block().fptosi(DOUBLE, &direct, I32));
             let resolved = finish_revalidated_read(ctx, direct, idx_i32.clone(), per_read_fallback);
             return Some(finish_repeated_read_cache(
                 ctx,
@@ -1579,6 +1580,13 @@ pub(super) fn lower(
         true
     };
 
+    // Keep the entire admission speculative until the fast clone's final
+    // call scan. Rejected clones must skip the receiver/bound reloads and
+    // guard, so ordinary CFG cleanup can also remove their unused descriptor.
+    let entry_idx = ctx.current_block;
+    let admission_entry_idx = ctx.new_block("stable_packed.loop.admission");
+    let admission_entry_label = ctx.block_label(admission_entry_idx);
+    ctx.current_block = admission_entry_idx;
     let receiver = crate::expr::lower_expr(ctx, &Expr::LocalGet(candidate.array_id))?;
     let bound_box = match candidate.bound {
         LoopBound::Snapshot(bound_id) => crate::expr::lower_expr(ctx, &Expr::LocalGet(bound_id))?,
@@ -1809,11 +1817,15 @@ pub(super) fn lower(
         || candidate.nested_requires_access_revalidation;
     if fast_clone_is_safe {
         record_artifacts(ctx, &candidate, &receiver);
-        ctx.block()
-            .cond_br(&admitted, &fast_pre_label, &slow_pre_label);
-    } else {
-        ctx.block().br(&slow_pre_label);
     }
+    ctx.block()
+        .cond_br(&admitted, &fast_pre_label, &slow_pre_label);
+    ctx.current_block = entry_idx;
+    ctx.block().br(if fast_clone_is_safe {
+        &admission_entry_label
+    } else {
+        &slow_pre_label
+    });
 
     ctx.current_block = slow_pre_idx;
     super::loops::lower_for_after_init(

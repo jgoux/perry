@@ -32,6 +32,7 @@ fn param(id: u32, name: &str, ty: Type) -> Param {
 
 fn at(arr: u32) -> Expr {
     Expr::IndexGet {
+        element_offset: 0,
         byte_offset: 0,
         byte_end: 0,
         object: Box::new(Expr::LocalGet(arr)),
@@ -47,6 +48,9 @@ fn set(arr: u32, value: Expr) -> Stmt {
         value: Box::new(value),
         receiver: Box::new(Expr::LocalGet(arr)),
         strict: false,
+        element_offset: 0,
+        byte_offset: 0,
+        byte_end: 0,
     })
 }
 
@@ -144,6 +148,7 @@ fn number_array() -> Type {
 /// The probe function's text, split into (label, lines) blocks.
 fn masked(arr: u32) -> Expr {
     Expr::IndexGet {
+        element_offset: 0,
         byte_offset: 0,
         byte_end: 0,
         object: Box::new(Expr::LocalGet(arr)),
@@ -348,6 +353,8 @@ fn value_numeric_and_property_consumers_share_checked_element_reads() {
                 object: Box::new(Expr::LocalGet(10)),
                 property: "d".into(),
                 value: Box::new(Expr::LocalGet(I)),
+                byte_offset: 0,
+                byte_end: 0,
             }),
         ],
         None,

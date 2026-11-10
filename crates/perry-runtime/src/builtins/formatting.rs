@@ -32,6 +32,7 @@ mod prototype_equality;
 mod strip_vt;
 mod typed_array_equality;
 mod util_format;
+mod array_layout;
 pub(crate) use util_format::install_json_format;
 mod value_repr;
 pub(crate) use value_repr::{int32_or_class_repr, is_array_hole};
@@ -111,22 +112,18 @@ fn inspect_finish_circular(ptr_addr: usize, body: String) -> String {
 }
 
 /// Format a finite, non-zero, non-integer-like f64 per ECMAScript
-/// NumberToString. Caller has already filtered NaN / ±Infinity / ±0 /
-/// integer-shaped values; this only decides decimal vs scientific
-/// notation per the |n| < 10^-6 / |n| >= 10^21 thresholds.
+/// Number::toString: the same formatter as `String(n)` (`js_format_f64`).
+/// Caller has already filtered NaN / ±Infinity / ±0 / integer-shaped values.
 ///
-/// Without the threshold split, Rust's Display impl produces 300-digit
-/// decimals for `Number.MAX_VALUE` (`1.7976931348623157e+308` → 309
-/// zeros) and 16-digit `0.000…0002…` decimals for `Number.EPSILON`,
-/// neither of which matches Node.
+/// Rust's `{}` / `{:e}` also emit a shortest round-tripping decimal, but when
+/// the two shortest candidates are equidistant they can pick the odd final
+/// digit (`2 ** -25` printed `2.9802322387695313e-8`); ECMA-262 requires the
+/// even one (`…312e-8`). `ryu-js` implements that tie-break together with the
+/// |n| < 10^-6 / |n| >= 10^21 notation thresholds.
 #[inline]
 pub(crate) fn format_finite_number_js(value: f64) -> String {
-    let abs = value.abs();
-    if !(1e-6..1e21).contains(&abs) {
-        crate::string::fix_exponent_format(&format!("{:e}", value))
-    } else {
-        format!("{}", value)
-    }
+    let mut buffer = ryu_js::Buffer::new();
+    buffer.format_finite(value).to_owned()
 }
 
 /// 2^53 — the largest magnitude below which every integer is exactly
@@ -771,22 +768,23 @@ pub(crate) fn format_jsvalue(value: f64, depth: usize) -> String {
                             let elem_jsval = JSValue::from_bits(elem.to_bits());
                             // Quote string elements like Node's util.inspect: 'hello'
                             if elem_jsval.is_any_string() {
-                                let s = format_jsvalue(elem, depth + 1);
-                                return value_repr::ArrayEntry::new(format!("'{}'", s), false);
+                                let s = jsvalue_string_content(elem).unwrap_or_default();
+                                return value_repr::ArrayEntry::new(
+                                    array_layout::inspect_string_value(&s, depth + 1),
+                                    false,
+                                );
                             }
                             let rendered = format_jsvalue(elem, depth + 1);
                             let numeric = value_repr::entry_is_numeric(elem, &rendered);
                             value_repr::ArrayEntry::new(rendered, numeric)
                         });
-                    let body_str = if inspect_show_hidden() {
+                    if inspect_show_hidden() {
                         // #9463: `%o` is `util.inspect(v, { showHidden: true,
                         // depth: 4 })`; the array's own `length` is part of that
                         // surface.
                         parts.push(value_repr::hidden_length_entry(length));
-                        value_repr::render_array_body_with_hidden(&parts)
-                    } else {
-                        value_repr::render_array_body(&parts, inspect_compact_enabled())
-                    };
+                    }
+                    let body_str = value_repr::array_body(parts, depth, inspect_compact_enabled());
                     inspect_finish_circular(ptr as usize, body_str)
                 } else if crate::gc_type_is_object!(gc_type) {
                     // Object — check for keys_array. Cycle check FIRST so the
@@ -919,6 +917,11 @@ unsafe fn format_buffer_value(buf_ptr: *const crate::buffer::BufferHeader) -> St
             return out;
         }
 
+        // node prints an empty Buffer as `<Buffer >` (the payload slot is
+        // always preceded by a space).
+        if len == 0 {
+            return "<Buffer >".to_string();
+        }
         // Node caps at 50 bytes then shows "... N more bytes"
         let display_len = len.min(50);
         let mut out = String::with_capacity(9 + display_len * 3);
@@ -1144,12 +1147,8 @@ unsafe fn format_object_as_json(
     };
     // Node prefixes a null-prototype object with `[Object: null prototype]`
     // (e.g. `Object.create(null)`), since it has no constructor to name.
-    // The flag is set at allocation by `js_object_alloc_null_proto`.
-    let is_null_proto = {
-        let gc =
-            (obj_ptr as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
-        (*gc)._reserved & crate::gc::OBJ_FLAG_NULL_PROTO != 0
-    };
+    // The object's shape (or recorded prototype) says whether it has one.
+    let is_null_proto = crate::object::shapes::cell_prototype_is_null(obj_ptr as usize);
     // The display prefix before the `{ … }` body: a real class/constructor
     // name when present, otherwise `[Object: null prototype]` for a
     // null-proto plain object, otherwise nothing. (Distinct from
@@ -1300,7 +1299,7 @@ unsafe fn format_object_as_json(
     }
 
     if inspect_sorted_enabled() {
-        string_parts.sort_by(|(left, _), (right, _)| left.cmp(right));
+        crate::cold_sort::sort_by(&mut string_parts, |(left, _), (right, _)| left.cmp(right));
     }
 
     let mut parts: Vec<String> = string_parts
@@ -1422,10 +1421,11 @@ fn format_jsvalue_for_json(value: f64, depth: usize) -> String {
         } else if jsval.is_bool() {
             jsval.as_bool().to_string()
         } else if jsval.is_any_string() {
-            // Escape and quote strings for JSON-like output. SSO + heap
-            // strings handled identically via the central decoder.
+            // A string value is quoted and escaped the way node's
+            // `util.inspect` prints it. SSO + heap strings handled
+            // identically via the central decoder.
             let s = jsvalue_string_content(value).unwrap_or_default();
-            format!("'{}'", escape_string(&s))
+            array_layout::inspect_string_value(&s, depth)
         } else if jsval.is_bigint() {
             let ptr = jsval.as_bigint_ptr();
             if ptr.is_null() {
@@ -1547,10 +1547,9 @@ fn format_jsvalue_for_json(value: f64, depth: usize) -> String {
                         // `{ h: [ NaN, NaN, NaN ] }`.
                         let mut parts =
                             value_repr::array_entries_with_holes(data_ptr, length, |elem| {
-                                value_repr::ArrayEntry::new(
-                                    format_jsvalue_for_json(elem, depth + 1),
-                                    false,
-                                )
+                                let rendered = format_jsvalue_for_json(elem, depth + 1);
+                                let numeric = value_repr::entry_is_numeric(elem, &rendered);
+                                value_repr::ArrayEntry::new(rendered, numeric)
                             });
                         // #9463: the `showHidden` tail belongs on nested arrays
                         // too — node's `%o` on `{ a: [1, 2] }` is
@@ -1558,15 +1557,8 @@ fn format_jsvalue_for_json(value: f64, depth: usize) -> String {
                         if inspect_show_hidden() {
                             parts.push(value_repr::hidden_length_entry(length));
                         }
-                        // Node formats empty arrays as `[]` and non-empty
-                        // arrays with a space inside the brackets:
-                        // `[ 1, 2, 3 ]`. Match byte-for-byte.
-                        let body_str = if parts.is_empty() {
-                            "[]".to_string()
-                        } else {
-                            let texts: Vec<&str> = parts.iter().map(|p| p.text.as_str()).collect();
-                            format!("[ {} ]", texts.join(", "))
-                        };
+                        let body_str =
+                            value_repr::array_body(parts, depth, inspect_compact_enabled());
                         inspect_finish_circular(ptr as usize, body_str)
                     } else if crate::gc_type_is_object!(gc_type) {
                         // Cycle check FIRST so back-edges win over the

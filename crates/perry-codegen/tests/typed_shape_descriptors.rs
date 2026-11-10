@@ -7,6 +7,7 @@ use perry_hir::{
 
 fn empty_opts() -> CompileOptions {
     CompileOptions {
+        namespace_self_import: false,
         static_shape_ids: Vec::new(),
         program_layout_ordinals: Default::default(),
         program_class_shape_ids: Default::default(),
@@ -35,8 +36,6 @@ fn empty_opts() -> CompileOptions {
         cjs_interop_namespaces: Vec::new(),
         constructor_param_counts: Default::default(),
         imported_classes: Vec::new(),
-        short_spread_method_candidates: std::sync::Arc::default(),
-        program_class_accessor_names: Default::default(),
         object_literal_method_candidates: std::sync::Arc::default(),
         imported_enums: Vec::new(),
         imported_async_funcs: std::collections::HashSet::new(),
@@ -147,6 +146,7 @@ fn base_module(name: &str, body: Vec<Stmt>, interfaces: Vec<Interface>) -> Modul
         async_step_closures: std::collections::HashSet::new(),
         closure_display_names: std::collections::HashMap::new(),
         class_display_names: std::collections::HashMap::new(),
+        non_constructor_funcs: Default::default(),
         closure_source_text: std::collections::HashMap::new(),
         class_source_text: std::collections::HashMap::new(),
         async_generator_funcs: std::collections::HashSet::new(),
@@ -154,6 +154,7 @@ fn base_module(name: &str, body: Vec<Stmt>, interfaces: Vec<Interface>) -> Modul
         gen_param_prologue_len: std::collections::HashMap::new(),
         class_family_syntax: None,
         requested_modules: Vec::new(),
+        locally_redeclared_imports: Vec::new(),
     }
 }
 
@@ -239,6 +240,7 @@ fn scalar_array_literal_skips_pure_unobserved_initializers() {
                 )),
             },
             Stmt::Return(Some(Expr::IndexGet {
+                element_offset: 0,
                 byte_offset: 0,
                 byte_end: 0,
                 object: Box::new(Expr::LocalGet(1)),
@@ -316,6 +318,8 @@ fn scalar_object_literal_keeps_initializers_read_by_update() {
                 op: BinaryOp::Add,
                 prefix: false,
                 strict: true,
+                byte_offset: 0,
+                byte_end: 0,
             })),
         ],
         Vec::new(),
@@ -590,15 +594,15 @@ fn bounded_integer_array_store_omits_layout_note_and_barrier() {
                 // `js_array_fill_f64_iota_len_extend` — covered by
                 // `numeric_iota_fill_loop_uses_bulk_helper_without_barrier`
                 // below.
-                body: vec![Stmt::Expr(Expr::IndexSet {
-                    object: Box::new(Expr::LocalGet(1)),
-                    index: Box::new(Expr::LocalGet(2)),
-                    value: Box::new(Expr::Binary {
+                body: vec![Stmt::Expr(Expr::synthetic_index_set(
+                    Box::new(Expr::LocalGet(1)),
+                    Box::new(Expr::LocalGet(2)),
+                    Box::new(Expr::Binary {
                         op: BinaryOp::Add,
                         left: Box::new(Expr::LocalGet(2)),
                         right: Box::new(Expr::Integer(1)),
                     }),
-                })],
+                ))],
             },
             Stmt::Return(Some(Expr::LocalGet(1))),
         ],
@@ -676,11 +680,11 @@ fn numeric_iota_fill_loop_uses_bulk_helper_without_barrier() {
                     op: UpdateOp::Increment,
                     prefix: false,
                 }),
-                body: vec![Stmt::Expr(Expr::IndexSet {
-                    object: Box::new(Expr::LocalGet(1)),
-                    index: Box::new(Expr::LocalGet(2)),
-                    value: Box::new(Expr::LocalGet(2)),
-                })],
+                body: vec![Stmt::Expr(Expr::synthetic_index_set(
+                    Box::new(Expr::LocalGet(1)),
+                    Box::new(Expr::LocalGet(2)),
+                    Box::new(Expr::LocalGet(2)),
+                ))],
             },
             Stmt::Return(Some(Expr::LocalGet(1))),
         ],
@@ -824,11 +828,11 @@ fn pointer_store_into_numeric_array_keeps_layout_note_and_barrier() {
                 mutable: true,
                 init: Some(Expr::Array(vec![Expr::Number(0.0)], None)),
             },
-            Stmt::Expr(Expr::IndexSet {
-                object: Box::new(Expr::LocalGet(2)),
-                index: Box::new(Expr::Integer(0)),
-                value: Box::new(Expr::LocalGet(1)),
-            }),
+            Stmt::Expr(Expr::synthetic_index_set(
+                Box::new(Expr::LocalGet(2)),
+                Box::new(Expr::Integer(0)),
+                Box::new(Expr::LocalGet(1)),
+            )),
             Stmt::Return(Some(Expr::LocalGet(2))),
         ],
         Vec::new(),

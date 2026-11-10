@@ -25,74 +25,17 @@ use std::time::Instant;
 
 use crate::OutputFormat;
 
+mod codegen_helpers;
+use codegen_helpers::{configured_module_codegen_threads, namespace_local_function_wrapper_symbol};
+
+mod dylib_target;
+use dylib_target::{apple_dylib_cross_target, apple_sdk_sysroot, verify_dylib_target_linkable};
+
 /// #5916: how many `export { X } from "src"` hops to follow when resolving an
 /// imported name back to the module that actually declares it. Barrel chains in
 /// the wild are a handful of levels deep at most; the cap is a belt-and-braces
 /// stop so a pathological (or cyclic) re-export graph can never spin forever.
 const MAX_REEXPORT_HOPS: usize = 16;
-
-/// How many module codegen jobs may run at once: `PERRY_MODULE_JOBS` when set
-/// to a positive count, else one per CPU slot of the compile's budget. Memory,
-/// not this count, is what keeps large graphs in bounds (see
-/// `module_schedule`).
-fn configured_module_codegen_threads(total_modules: usize, budget_cpus: usize) -> usize {
-    std::env::var("PERRY_MODULE_JOBS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|&value| value > 0)
-        .unwrap_or(budget_cpus)
-        .clamp(1, total_modules.max(1))
-}
-
-/// Whether `name` is metadata for an erased TypeScript declaration rather
-/// than a JavaScript binding in `module`.
-///
-/// Interfaces and type aliases remain in `Module::exports` so cross-module
-/// type resolution can follow re-export chains. Runtime namespace builders
-/// must filter them back out, while preserving declaration-merged names that
-/// also have a value binding.
-fn is_type_only_export_binding(module: &perry_hir::Module, name: &str) -> bool {
-    let has_type_declaration = module
-        .interfaces
-        .iter()
-        .any(|interface| interface.name == name)
-        || module.type_aliases.iter().any(|alias| alias.name == name);
-    if !has_type_declaration {
-        return false;
-    }
-
-    let has_runtime_value = module
-        .functions
-        .iter()
-        .any(|function| function.name == name)
-        || module
-            .exported_functions
-            .iter()
-            .any(|(exported, _)| exported == name)
-        || module
-            .exported_objects
-            .iter()
-            .any(|exported| exported == name)
-        || module.classes.iter().any(|class| class.name == name)
-        || module
-            .enums
-            .iter()
-            .any(|enumeration| enumeration.name == name)
-        || module.globals.iter().any(|global| global.name == name);
-
-    !has_runtime_value
-}
-
-/// Wrapper symbol used when a dynamic-import namespace materializes a local
-/// function as a JavaScript value. Keep this routed through codegen's own
-/// function mangler: module-name sanitization is intentionally not injective
-/// for `$` and would point `$a` at `_a`'s symbol instead.
-fn namespace_local_function_wrapper_symbol(module_name: &str, function_name: &str) -> String {
-    format!(
-        "__perry_wrap_{}",
-        perry_codegen::user_function_symbol(module_name, function_name)
-    )
-}
 
 /// Design §4.4: a module's emitted registry symbols (or a cached object's
 /// manifest) must name only providers the HIR pass put in the link set.
@@ -249,22 +192,6 @@ impl Drop for ModuleCodegenCompletion<'_> {
             elapsed / 60.0,
             eta / 60.0
         );
-    }
-}
-
-#[cfg(test)]
-mod module_codegen_job_tests {
-    use super::configured_module_codegen_threads;
-
-    #[test]
-    fn one_job_per_cpu_slot_but_never_more_than_modules() {
-        if std::env::var("PERRY_MODULE_JOBS").is_ok() {
-            return;
-        }
-        assert_eq!(configured_module_codegen_threads(764, 48), 48);
-        assert_eq!(configured_module_codegen_threads(3, 48), 3);
-        assert_eq!(configured_module_codegen_threads(0, 48), 1);
-        assert_eq!(configured_module_codegen_threads(10, 0), 1);
     }
 }
 
@@ -569,9 +496,17 @@ pub fn run_with_parse_cache(
     use_color: bool,
     verbose: u8,
 ) -> Result<CompileResult> {
+    // #13953: `wasm32-wasip2` / `wasip2` / `wasm32-wasip1` name Perry's WASI
+    // targets; fold them first so every later `args.target` read sees one name.
+    let mut args = args;
+    args.target = super::wasi_flavour::canonical_target(args.target.take())?;
     #[cfg(feature = "target-wasi")]
     if args.target.as_deref() == Some("wasi") {
         perry_codegen::wasi_toolchain::check()?;
+    }
+    if perry_codegen::verify_facts::enabled() {
+        std::env::set_var("PERRY_NO_CACHE", "1");
+        perry_codegen::verify_facts::reset();
     }
     if perry_codegen::fallback_diag::enabled() {
         perry_codegen::fallback_diag::reset();
@@ -581,7 +516,6 @@ pub fn run_with_parse_cache(
     // #4826: fold `--libc musl` into the effective target up-front (before any
     // downstream code reads `args.target`) so the rest of the pipeline only
     // ever sees the concrete `linux-musl` triple family.
-    let mut args = args;
     args.target = apply_libc_to_target(args.target.take(), args.libc.as_deref())?;
 
     // `--source-root` / `PERRY_SOURCE_ROOT`: bake module source paths relative
@@ -841,6 +775,7 @@ pub fn run_with_parse_cache(
         .unwrap_or_else(|| PathBuf::from("."));
 
     let mut ctx = CompilationContext::new(project_root.clone());
+    ctx.macro_import_stack = args.macro_import_stack.clone();
     ctx.bun_platform = args.platform == JavaScriptPlatform::Bun;
     // #10281: the package `exports` / `imports` resolvers rank `bun` above
     // `node` for this target, so a package shipping both entries resolves the
@@ -996,6 +931,10 @@ pub fn run_with_parse_cache(
             Vec::new()
         };
 
+    // Declared addons can be reached by computed loaders, with no literal
+    // graph edge. Admit them before settling the lowering census as well.
+    collect_modules::collect_declared_addons(&mut ctx, args.target.as_deref())?;
+
     rerun_collect_with_class_field_types(
         &args,
         &mut ctx,
@@ -1018,8 +957,18 @@ pub fn run_with_parse_cache(
     for hir_module in ctx.native_modules.values_mut() {
         super::cjs_link::resolve_open_sites(hir_module, ctx.cjs_closed)?;
     }
+    // Select from the surviving HIR, never from the wrapper's discarded
+    // dynamic loader. In particular a dead createRequire import cannot
+    // select URL/dgram, or contribute opaque keys to streams selection.
+    collect_modules::feature_detect::detect_program_optional_feature_usage(&mut ctx);
 
     collect_modules::collect_declared_addons(&mut ctx, args.target.as_deref())?;
+    // The lowering and the closed-world bit above saw every open addon; one
+    // first admitted here would be linked against a census that missed it.
+    anyhow::ensure!(
+        !admit_open_native_addons(&mut ctx),
+        "an open Node-API addon was admitted after the program's dynamic-code census"
+    );
 
     // "Just works" transparency (#466 follow-up): when perry auto-preferred a
     // bundled PARTIAL well-known binding over a `node_modules/<pkg>` copy the
@@ -1036,6 +985,21 @@ pub fn run_with_parse_cache(
                  (a partial drop-in), ignoring your installed `node_modules/{pkg}`. \
                  Add `{pkg}` to `perry.compilePackages` to AOT-compile the real JS instead."
             );
+        }
+    }
+    // A `perry.nativeAddons` grant for a package Perry implements natively has
+    // nothing to grant: every loader of that specifier gets the native module,
+    // so the package's own files and its Node-API addon are never reached.
+    if matches!(format, OutputFormat::Text) {
+        for pkg in &ctx.native_addon_packages {
+            if perry_hir::is_native_module_specifier(pkg) && !ctx.compile_packages.contains(pkg) {
+                eprintln!(
+                    "  note: `perry.nativeAddons` lists `{pkg}`, which Perry implements \
+                     natively; the entry has no effect. Add `{pkg}` to \
+                     `perry.compilePackages` to compile the package and host its Node-API \
+                     addon instead."
+                );
+            }
         }
     }
 
@@ -1066,14 +1030,30 @@ pub fn run_with_parse_cache(
     // #2309: tree-shake the final module graph — prune unreachable
     // node_modules modules and re-raise any deferred refusal that survives.
     // No-op unless tree-shaking is enabled (byte-identical to pre-#2309).
-    {
+    // The compile's one activation pass (dynamic reach runs it) and its roots
+    // go to the facts (`perry_wpfacts::Activation`).
+    let (activation, activation_roots) = {
         let entry_canonical = ctx.entry_canonical.clone().unwrap_or_else(|| {
             args.input
                 .canonicalize()
                 .unwrap_or_else(|_| args.input.clone())
         });
         reachability::tree_shake(&mut ctx, &entry_canonical)?;
-    }
+        // DCE layer 2: modules only unreachable `import()` sites load.
+        let mut roots = vec![entry_canonical.clone()];
+        roots.extend(
+            super::program_facts::module_roots(&ctx)
+                .into_iter()
+                .map(PathBuf::from),
+        );
+        if let Some(ext_dir) = &args.bundle_extensions {
+            for (entry_path, _) in super::resolve::discover_extension_entries(ext_dir)? {
+                roots.push(entry_path.canonicalize().unwrap_or(entry_path));
+            }
+        }
+        let activation = super::dynamic_reach::prune(&mut ctx, &roots)?;
+        (activation, roots)
+    };
 
     // --- Web/WASM target: emit WASM binary + JS runtime bridge ---
     if matches!(args.target.as_deref(), Some("web") | Some("wasm")) {
@@ -1267,10 +1247,9 @@ pub fn run_with_parse_cache(
         Vec::new()
     };
     // Object model step 3: prototype slots written once are constants.
-    if std::env::var_os("PERRY_PROTO_CENSUS_REPORT").is_some() {
-        eprintln!("{}", ctx.proto_census.summary());
-    }
-    perry_codegen::set_program_proto_census(Some(ctx.proto_census.clone()));
+    let proto_census = super::foreign_native_census::census(&ctx).into_owned();
+    super::foreign_native_census::report(&proto_census);
+    perry_codegen::set_program_proto_census(Some(proto_census));
     // Object model §3.6: the program's export facts (constant keys, literal
     // keys) that prototype images in importing modules read.
     {
@@ -1318,10 +1297,22 @@ pub fn run_with_parse_cache(
     // the runtime creates itself (a CommonJS `require('net')` goes through
     // `createRequire`, not codegen). A `tls` import counts as `net`
     // (`well_known_iteration_set`): `tls.connect` is perry-ext-net's.
-    let program_modules = optimized_libs::well_known_iteration_set(&ctx);
+    // A `child_process` import links perry-ext-net without calling its hook
+    // here: the runtime installs it at the first pipe socket.
+    let program_modules = optimized_libs::program_module_set(&ctx);
     let mut native_provider_installs: Vec<String> = ctx
         .native_routing
         .wrapper_install_hooks(program_modules.iter().map(String::as_str));
+    // `net`'s hook is `node:net` alone; a program that reaches TLS also
+    // registers perry-ext-net's `tls.connect` and its sockets' TLS members,
+    // so a net-only program links no TLS.
+    if native_provider_installs
+        .iter()
+        .any(|hook| hook == "js_ext_net_nm_install")
+        && optimized_libs::reaches_tls(&ctx)
+    {
+        native_provider_installs.push("js_ext_net_tls_install".to_string());
+    }
     // A program that names `dns` arms the router for the lookup/resolve
     // exports a CommonJS `require('node:dns')` reaches through the dynamic
     // native module dispatch (`js_dns_install_exports`); one that does not
@@ -1498,6 +1489,13 @@ pub fn run_with_parse_cache(
                 perry_hir::fix_imported_enums(hir_module, imported_enums_for_module);
             }
         }
+        // #10421: an `E.Function` read reaches the `Function` constructor
+        // unless `E` is an enum; the pre-scan deferred the imported ones.
+        perry_hir::eval_classifier::resolve_enum_member_receivers(|path, local| {
+            module_enums
+                .get(std::path::Path::new(path))
+                .is_some_and(|enums| enums.contains_key(local))
+        });
     }
 
     // Resolve imported and generic type-alias references in every module's
@@ -2097,7 +2095,7 @@ pub fn run_with_parse_cache(
         // Named exports (export { foo, bar as baz })
         for export in &hir_module.exports {
             if let perry_hir::Export::Named { local, exported } = export {
-                if is_type_only_export_binding(hir_module, local) {
+                if hir_module.is_type_only_export_binding(local) {
                     continue;
                 }
                 exports.insert(exported.clone(), path_str.clone());
@@ -2167,7 +2165,7 @@ pub fn run_with_parse_cache(
             let name = match export {
                 // A type-only `export { T }` is erased; it shadows nothing.
                 perry_hir::Export::Named { local, .. }
-                    if is_type_only_export_binding(hir_module, local) =>
+                    if hir_module.is_type_only_export_binding(local) =>
                 {
                     continue
                 }
@@ -3090,6 +3088,31 @@ pub fn run_with_parse_cache(
             }
         }
     }
+
+    // A module that namespace-imports ITSELF (`import * as Self from
+    // "./this-module.ts"`) is its own namespace consumer: it needs its own
+    // `@__perry_ns_<prefix>` global emitted and populated, which is what
+    // membership in this set means. The populator runs before the module's
+    // top-level body (see `CompileOptions::namespace_self_import`), because
+    // that body may hand the whole namespace to a function that enumerates it
+    // — trails' activesupport does exactly that through `include()`.
+    for (path, hir_module) in &ctx.native_modules {
+        let self_namespace_import = hir_module.imports.iter().any(|import| {
+            !import.type_only
+                && !import.runtime_erased
+                && import
+                    .specifiers
+                    .iter()
+                    .any(|spec| matches!(spec, perry_hir::ImportSpecifier::Namespace { .. }))
+                && import
+                    .resolved_path
+                    .as_deref()
+                    .is_some_and(|resolved| Path::new(resolved) == path.as_path())
+        });
+        if self_namespace_import {
+            dyn_target_paths.insert(path.clone());
+        }
+    }
     // #7189: `export * as ns from "./m.ts"` names a member whose VALUE is
     // another module's namespace object. That object is exactly what
     // `@__perry_ns_<prefix>` already holds for dynamic-import targets, and
@@ -3163,7 +3186,7 @@ pub fn run_with_parse_cache(
             // enumerable properties with `undefined` values (#8904).
             if fe.nested_namespace_of.is_none()
                 && source_mod
-                    .map(|module| is_type_only_export_binding(module, &fe.source_local))
+                    .map(|module| module.is_type_only_export_binding(&fe.source_local))
                     .unwrap_or(false)
             {
                 continue;
@@ -3563,38 +3586,6 @@ pub fn run_with_parse_cache(
             )
         })
         .collect();
-    // #8772: harvest producer-authored concrete method capabilities across
-    // the final whole-program HIR before parallel codegen. This is a reverse
-    // flow as well as an import flow: a generic library can own
-    // `value.reset(...args)` while an adapter that imports that library owns
-    // every concrete `reset` implementation. Arc keeps the whole-program map
-    // shared rather than cloning it once per module job.
-    let mut short_spread_method_candidates: std::collections::HashMap<
-        String,
-        Vec<perry_codegen::ShortSpreadMethodCandidate>,
-    > = std::collections::HashMap::new();
-    for hir_module in ctx.native_modules.values() {
-        for candidate in perry_codegen::short_spread_method_capabilities(hir_module) {
-            short_spread_method_candidates
-                .entry(candidate.method_name.clone())
-                .or_default()
-                .push(candidate);
-        }
-    }
-    for candidates in short_spread_method_candidates.values_mut() {
-        candidates.sort_unstable_by(|a, b| {
-            a.class_id
-                .cmp(&b.class_id)
-                .then_with(|| a.target.cmp(&b.target))
-        });
-        candidates.dedup_by(|a, b| a.class_id == b.class_id && a.target == b.target);
-    }
-    let short_spread_method_candidates = std::sync::Arc::new(short_spread_method_candidates);
-    // #10498: the accessor names every compiled class declares decide which
-    // sites carry a class-accessor arm.
-    let program_class_accessor_names = std::sync::Arc::new(
-        perry_codegen::ClassAccessorNames::collect(ctx.native_modules.values()),
-    );
     // #8775: a generic library module can receive an exported adapter object
     // through a parameter without importing its defining module. Publish the
     // producer's exact immutable object/method facts to every codegen job so a
@@ -3657,10 +3648,13 @@ pub fn run_with_parse_cache(
     // `js_node_http_create_server`), so the import-driven flips alone miss
     // them; the HIR pass sees the native surfaces themselves.
     //
-    // Codegen still sees `needs_stdlib` as feature detection left it: the
-    // entry module's event-loop shape keys on it, and folding the providers
-    // in first would change the emitted code (`codegen_needs_stdlib`).
-    let codegen_needs_stdlib = ctx.needs_stdlib;
+    // After this pass `ctx.needs_stdlib` is the one answer to "is
+    // perry-stdlib linked", and codegen reads that same answer: the entry
+    // prologue's `js_stdlib_init_dispatch`, the worker-entry registrations
+    // and the cron arms of the event loop all exist because stdlib's symbols
+    // are on the link line. A provider-only program (`new SQL()` from "bun",
+    // an Effect `Stream`) links stdlib here, so it initializes it too;
+    // otherwise its handle dispatchers stay unregistered.
     let program_providers = perry_codegen::providers::program_providers(
         ctx.native_modules.values(),
         &perry_codegen::providers::ProviderInputs {
@@ -3694,6 +3688,18 @@ pub fn run_with_parse_cache(
         }
     }
     let program_providers = std::sync::Arc::new(program_providers);
+    // A module the program links without importing it (`net` for a program
+    // that reaches `child_process`, whose stdio pipes are net sockets:
+    // `optimized_libs::well_known_iteration_set`) carries its own stdlib
+    // requirement, as an import of it would (`perry_hir::requires_stdlib`):
+    // perry-ext-net resolves against perry-stdlib (perry-ffi's promise shims,
+    // the TLS client preflight).
+    if optimized_libs::well_known_iteration_set(&ctx)
+        .iter()
+        .any(|module| perry_hir::requires_stdlib(module))
+    {
+        ctx.needs_stdlib = true;
+    }
 
     // A standalone WASI build links against the wasm32 runtime after
     // codegen and has no native link set.
@@ -3841,9 +3847,14 @@ pub fn run_with_parse_cache(
         let nextjs_path_init_modules: Vec<(String, String)> = if is_entry {
             ctx.native_modules
                 .iter()
-                .filter(|(p, module)| {
-                    module.init_kind == perry_hir::ModuleInitKind::Deferred
-                            || self::collect_modules::is_nextjs_runtime_module(p)
+                // A module is on this list by WHERE it is (a Next.js server
+                // module, or a compilePackages module), never by how it is
+                // loaded: a non-empty list makes the entry seed
+                // `globalThis.AsyncLocalStorage`, which node has only in a
+                // Next.js process. A module reached only through `import()`
+                // gets its path anchor from the lazy list below.
+                .filter(|(p, _)| {
+                    self::collect_modules::is_nextjs_runtime_module(p)
                             // A `perry.compilePackages` module may be reachable
                             // ONLY through a runtime-computed require (Next's
                             // require-hook aliases `styled-jsx` to its resolved
@@ -3860,13 +3871,19 @@ pub fn run_with_parse_cache(
         } else {
             Vec::new()
         };
-        // A require edge runs its target's init directly; only a program that
-        // can require by path (not closed) needs the anchor of an on-demand
-        // module, and only once it looks a path up: registered lazily.
+        // A require edge runs its target's init directly, and an `import()`
+        // site calls its target's init directly; only a program that can
+        // require by path (not closed) needs the anchor of an on-demand or
+        // deferred module, and only once it looks a path up: registered lazily.
         let lazy_path_init_modules: Vec<(String, String)> = if is_entry && !ctx.cjs_closed {
             ctx.native_modules
                 .iter()
-                .filter(|(_, module)| module.init_kind == perry_hir::ModuleInitKind::OnDemand)
+                .filter(|(_, module)| {
+                    matches!(
+                        module.init_kind,
+                        perry_hir::ModuleInitKind::OnDemand | perry_hir::ModuleInitKind::Deferred
+                    )
+                })
                 .map(|(p, m)| (p.to_string_lossy().into_owned(), sanitize_name(&m.name)))
                 .filter(|pair| !nextjs_path_init_modules.contains(pair))
                 .collect()
@@ -6166,6 +6183,25 @@ pub fn run_with_parse_cache(
             disable_buffer_fast_path,
             namespace_imports,
             namespace_source_prefixes,
+            // A module that namespace-imports ITSELF (`import * as Self from
+            // "./this-module.ts"`) is its own namespace consumer: its
+            // `@__perry_ns_<prefix>` populator must run before its top-level
+            // body, because that body may pass the whole namespace to a
+            // function that enumerates it. Per-member reads already worked,
+            // which is why the undefined value stayed silent.
+            namespace_self_import: ctx.native_modules.get(path).is_some_and(|hir_module| {
+                hir_module.imports.iter().any(|import| {
+                    !import.type_only
+                        && !import.runtime_erased
+                        && import.specifiers.iter().any(|spec| {
+                            matches!(spec, perry_hir::ImportSpecifier::Namespace { .. })
+                        })
+                        && import
+                            .resolved_path
+                            .as_deref()
+                            .is_some_and(|resolved| Path::new(resolved) == path.as_path())
+                })
+            }),
             namespace_member_nested: namespace_member_nested.into_iter().collect(),
             cjs_interop_namespaces: cjs_interop_namespaces.into_iter().collect(),
             imported_classes,
@@ -6177,10 +6213,6 @@ pub fn run_with_parse_cache(
             program_facts: Default::default(),
             program_layouts: Default::default(),
             gc_effects: std::sync::Arc::clone(&gc_effects),
-            short_spread_method_candidates: std::sync::Arc::clone(&short_spread_method_candidates),
-            program_class_accessor_names: Some(std::sync::Arc::clone(
-                &program_class_accessor_names,
-            )),
             object_literal_method_candidates: std::sync::Arc::clone(
                 &object_literal_method_candidates,
             ),
@@ -6198,7 +6230,7 @@ pub fn run_with_parse_cache(
             disable_constfn_shapes: std::env::var("PERRY_CONSTFN_SHAPE").as_deref() == Ok("0"),
             program_has_worker,
             program_has_thread_agents,
-            needs_stdlib: codegen_needs_stdlib,
+            needs_stdlib: ctx.needs_stdlib,
             program_is_synchronous,
             needs_ui: ctx.needs_ui,
             needs_geisterhand: ctx.needs_geisterhand,
@@ -6273,6 +6305,7 @@ pub fn run_with_parse_cache(
             module_source: if args.debug_symbols
                 || opt_report_format == Some(OptReportFormat::Text)
                 || perry_codegen::fallback_diag::enabled()
+                || perry_codegen::verify_facts::enabled()
             {
                 match ctx.cjs_wrap_debug_sources.get(path) {
                     Some(w) => Some(w.wrapped_source.clone()),
@@ -6466,6 +6499,31 @@ pub fn run_with_parse_cache(
         );
     }
     realm_reach.program_signals(&ctx.patched_builtins);
+    // Test-only input of the realm-diff gate (DESIGN §3.2, "The R-restricted
+    // realm-diff gate"; scripts/realm_diff_gate.py): R becomes exactly the
+    // file's names with top dropped, so the dumper, which reflects over
+    // globalThis, is built with a partial image; the close below applies the
+    // birth relation. A top program's own names are not kept (a top scan is
+    // already closed to the whole catalog). Inert when unset; the line it
+    // prints lets the gate assert the input took effect, and the gate checks
+    // that the closed R equals the file. The cache keys hash the path
+    // (compile_env), not the file, so the gate compiles with PERRY_NO_CACHE.
+    if let Some(path) = std::env::var_os("PERRY_REALM_REACH_NAMES") {
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| anyhow::anyhow!("PERRY_REALM_REACH_NAMES {path:?}: {e}"))?;
+        let names: Vec<String> = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| serde_json::from_value(v.get("names")?.clone()).ok())
+            .ok_or_else(|| {
+                anyhow::anyhow!("PERRY_REALM_REACH_NAMES {path:?}: expected {{\"names\": [...]}}")
+            })?;
+        eprintln!(
+            "[realm-reach-names] {} {}",
+            path.to_string_lossy(),
+            names.len()
+        );
+        realm_reach.restrict_to(names);
+    }
     realm_reach.close(perry_codegen::realm_manifest::REALM);
     if std::env::var("PERRY_REALM_REACH").is_ok_and(|v| v == "1") {
         let reasons: Vec<_> = realm_reach.top.iter().map(|r| r.reason()).collect();
@@ -6483,6 +6541,9 @@ pub fn run_with_parse_cache(
             })
         );
     }
+    // R drives the entry module's realm emission (WRT3p-A1: the runtime
+    // layouts' descriptors and key lists).
+    let realm_reach = std::sync::Arc::new(realm_reach);
     let reach_report = super::reach_report::start(&ctx, args.output_type != "executable")?;
     let source_need = super::source_need::start(need, &dropped_source, source_need_seconds)?;
     // fninfer (decision 140): per-function inferred signatures over the
@@ -6503,8 +6564,19 @@ pub fn run_with_parse_cache(
         perry_hir::has_deferred_dynamic_code_sites()
             || ctx.native_module_imports.contains("vm")
             || ctx.uses_data_url_dynamic_import,
+        // A real eval-like source site (DECISIONS 235); the link decision
+        // above also counts a `Function` member name.
+        !perry_hir::interpreted_source_sites().is_empty()
+            || ctx.native_module_imports.contains("vm")
+            || ctx.uses_data_url_dynamic_import,
         &ctx.patched_builtins.dynamic_code_reach,
         &ctx.cjs_wrap_debug_sources,
+        activation_roots
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect(),
+        &ctx.cache_dir,
+        activation,
     );
     program_step("whole-program facts", Some(facts_started));
     #[allow(clippy::type_complexity)]
@@ -6582,13 +6654,7 @@ pub fn run_with_parse_cache(
         opts.program_layout_ordinals = std::sync::Arc::clone(&program_layout_ordinals);
         if let Some((ids, class_ids)) = static_shape_ids_by_module.get(path) {
             opts.static_shape_ids = ids.clone();
-            let foreign: BTreeSet<u32> = opts
-                .short_spread_method_candidates
-                .values()
-                .flatten()
-                .map(|c| c.class_id)
-                .collect();
-            for cid in class_ids.iter().chain(foreign.iter()) {
+            for cid in class_ids.iter() {
                 if let Some(finals) = class_final_shapes.get(cid) {
                     opts.static_shape_ids.extend(finals.iter().cloned());
                 }
@@ -6596,7 +6662,7 @@ pub fn run_with_parse_cache(
             opts.static_shape_ids.sort();
             opts.static_shape_ids.dedup();
             opts.program_class_shape_ids =
-                program_class_shape_ids.restricted_to(class_ids.iter().copied().chain(foreign));
+                program_class_shape_ids.restricted_to(class_ids.iter().copied());
         }
     };
     let prepared_options: Vec<_> = module_pool.install(|| {
@@ -6620,6 +6686,9 @@ pub fn run_with_parse_cache(
                 std::sync::Arc::make_mut(&mut opts.program_facts.elision).dynamic_code_reach =
                     ctx.patched_builtins.dynamic_code_reach.clone();
                 opts.program_layouts = std::sync::Arc::clone(&program_layouts);
+                if opts.is_entry_module {
+                    opts.program_facts.realm_reach = Some(std::sync::Arc::clone(&realm_reach));
+                }
                 Ok::<_, String>(opts)
             })
             .collect::<Vec<_>>()
@@ -6636,8 +6705,6 @@ pub fn run_with_parse_cache(
         std::sync::Arc::clone(&program_layouts),
         constructor_contracts,
         static_shape_ids,
-        short_spread_method_candidates,
-        program_class_accessor_names,
         object_literal_method_candidates,
     ));
     let mut owned_modules = std::mem::take(&mut ctx.native_modules);
@@ -7403,6 +7470,14 @@ pub fn run_with_parse_cache(
             )?;
             obj_cleanup_paths.push(installer.clone());
             obj_paths.push(installer);
+            for input in
+                super::link::wasi::addon_link_inputs(flavour, &ctx, &object_output_dir, verbose)?
+            {
+                if input.starts_with(&object_output_dir) {
+                    obj_cleanup_paths.push(input.clone());
+                }
+                obj_paths.push(input);
+            }
             obj_cleanup_paths.push(seed_path.clone());
             obj_paths.push(seed_path);
             if is_staticlib {
@@ -7941,6 +8016,9 @@ pub fn run_with_parse_cache(
     asset_manifest::write(&ctx, &embedded_assets, format)?;
 
     if args.no_link {
+        if perry_codegen::verify_facts::enabled() {
+            perry_codegen::verify_facts::write_manifest(&exe_path)?;
+        }
         let codegen_cache_stats = if object_cache.is_enabled() {
             Some((
                 object_cache.hits(),
@@ -7991,6 +8069,30 @@ pub fn run_with_parse_cache(
                 embedded_assets.len(),
                 total
             );
+        }
+    }
+
+    // SNAP census compiles: the TLS anchors around the program objects (begin
+    // first, end after every other compiled object, before the pads and the
+    // runtime archive), so the program's TLS slots get pages of their own.
+    if std::env::var_os("PERRY_SNAP_CENSUS").is_some_and(|v| !v.is_empty()) {
+        for end in [false, true] {
+            let bytes =
+                perry_codegen::stubs::generate_snap_tls_anchor_object(end, target.as_deref())?;
+            let path = object_output_dir.join(if end {
+                "_perry_snap_tls_end.o"
+            } else {
+                "_perry_snap_tls_begin.o"
+            });
+            fs::write(&path, &bytes)?;
+            obj_cleanup_paths.push(path.clone());
+            if end {
+                obj_paths.push(path);
+                obj_fingerprints.push(None);
+            } else {
+                obj_paths.insert(0, path);
+                obj_fingerprints.insert(0, None);
+            }
         }
     }
 
@@ -8304,6 +8406,7 @@ pub fn run_with_parse_cache(
         for obj_path in &obj_paths {
             cmd.arg(obj_path);
         }
+        cmd.args(link::link_pad_args());
 
         if is_dylib_windows {
             // MSVC link.exe takes the output path as `/OUT:<path>`, not `-o`.
@@ -8834,73 +8937,4 @@ pub fn run_with_parse_cache(
         link_cache_stats: Some(link_cache_status.stats()),
         build_cache_stats: Some(build_cache_stats),
     })
-}
-
-/// (#6222) Apple SDK + clang triple for a cross-compiled **shared library** link.
-///
-/// The dylib path links with the host `cc` driver and does NOT link the runtime
-/// (symbols resolve from the host at `dlopen` time), so nothing else in that path
-/// consults `--target`. Without these flags the linker happily consumes a correctly
-/// cross-compiled iOS object and emits a **host-arch** dylib — the failure the user
-/// sees is a link error or a dylib that will never load on device.
-fn apple_dylib_cross_target(target: &str) -> Option<(&'static str, &'static str)> {
-    Some(match target {
-        "ios" => ("iphoneos", "arm64-apple-ios17.0"),
-        "ios-simulator" => ("iphonesimulator", "arm64-apple-ios17.0-simulator"),
-        "tvos" => ("appletvos", "arm64-apple-tvos17.0"),
-        "tvos-simulator" => ("appletvsimulator", "arm64-apple-tvos17.0-simulator"),
-        "watchos" => ("watchos", "arm64_32-apple-watchos10.0"),
-        "watchos-simulator" => ("watchsimulator", "arm64-apple-watchos10.0-simulator"),
-        "visionos" => ("xros", "arm64-apple-xros1.0"),
-        "visionos-simulator" => ("xrsimulator", "arm64-apple-xros1.0-simulator"),
-        _ => return None,
-    })
-}
-
-/// Resolve an Apple SDK sysroot via `xcrun`.
-fn apple_sdk_sysroot(sdk: &str) -> Result<PathBuf> {
-    let out = Command::new("xcrun")
-        .args(["--sdk", sdk, "--show-sdk-path"])
-        .output()
-        .with_context(|| {
-            format!("Failed to invoke `xcrun --sdk {sdk} --show-sdk-path` (is Xcode installed?)")
-        })?;
-    if !out.status.success() {
-        bail!(
-            "`xcrun --sdk {sdk} --show-sdk-path` failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if path.is_empty() {
-        bail!("`xcrun --sdk {sdk} --show-sdk-path` returned nothing");
-    }
-    Ok(PathBuf::from(path))
-}
-
-/// (#6222) Reject a `--target` the dylib link step cannot honour on this host,
-/// instead of silently linking the cross object into a host-arch shared library.
-/// The executable path already fails early and cleanly (it has to find a
-/// per-target `libperry_runtime.a`); the dylib path links no runtime, so it had
-/// no such check and produced a host binary in silence.
-fn verify_dylib_target_linkable(target: Option<&str>) -> Result<()> {
-    let Some(t) = target else { return Ok(()) };
-    let host_ok = match t {
-        "windows" | "windows-winui" | "windows-x86_64" | "windows-aarch64" | "windows-arm64" => {
-            true
-        }
-        t if t.starts_with("linux") => cfg!(target_os = "linux"),
-        t if apple_dylib_cross_target(t).is_some() => cfg!(target_os = "macos"),
-        _ => false,
-    };
-    if !host_ok {
-        bail!(
-            "--output-type dylib cannot link for target \"{t}\" on this host.\n\
-             The object is cross-compiled correctly, but the shared-library link step \
-             runs the host toolchain, so it would emit a host-architecture dylib.\n\
-             Apple targets (ios, ios-simulator, tvos, watchos, visionos and their \
-             simulators) require a macOS host with Xcode."
-        );
-    }
-    Ok(())
 }

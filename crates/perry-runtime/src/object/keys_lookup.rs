@@ -242,7 +242,7 @@ pub(crate) unsafe fn keys_find_slot_by_bytes_resolved(
         // unresolved entry so its behaviour is bit-for-bit what it was.
         return keys_find_slot_by_bytes(view, key_count, key_bytes);
     }
-    keys_find_slot_by_bytes_dense_resolved(keys, key_count, key_bytes)
+    keys_find_slot_by_bytes_dense_resolved(keys, key_count, 0, key_bytes)
 }
 
 /// The same descriptor-owned lookup when its caller has already computed
@@ -250,9 +250,21 @@ pub(crate) unsafe fn keys_find_slot_by_bytes_resolved(
 ///
 /// # Safety
 /// As keys_array_dense_slots_resolved; hash is key_bytes_hash(key_bytes).
+///
+/// `key_word` is the probe key's own value word (0 when only its text is at
+/// hand). A list word identical to it is the key, without reading bytes: the
+/// same string is the same text. Any other word is still compared by bytes,
+/// because a list may hold a string of the key's text that is not the probe's
+/// word: a list written before its text's atom existed, a later noncanonical
+/// declaration (the most-derived spelling wins, #10595), an inline short
+/// string, or a compiled image atom whose registration met a live data atom
+/// of the same text (two strings flagged as atoms, one text). So identity is
+/// tried word by word inside the one back-to-front scan, never as a pass ahead
+/// of it.
 pub(crate) unsafe fn keys_find_slot_by_bytes_resolved_hashed(
     view: super::ObjectKeys,
     key_count: u32,
+    key_word: u64,
     key_bytes: &[u8],
     hash: u64,
 ) -> Option<u32> {
@@ -265,13 +277,14 @@ pub(crate) unsafe fn keys_find_slot_by_bytes_resolved_hashed(
             shapes::KeysIndexVerdict::Unindexed => {}
         }
     }
-    keys_find_slot_by_bytes_dense_resolved(keys, key_count, key_bytes)
+    keys_find_slot_by_bytes_dense_resolved(keys, key_count, key_word, key_bytes)
 }
 
 #[inline]
 unsafe fn keys_find_slot_by_bytes_dense_resolved(
     keys: *const crate::array::ArrayHeader,
     key_count: u32,
+    key_word: u64,
     key_bytes: &[u8],
 ) -> Option<u32> {
     let (slots, slot_len) = keys_array_dense_slots_resolved(keys);
@@ -288,7 +301,11 @@ unsafe fn keys_find_slot_by_bytes_dense_resolved(
     // read) returned the never-initialised ancestor slot for exactly the
     // receiver #10595 fixed everywhere else.
     for i in (0..n).rev() {
-        let v = crate::JSValue::from_bits((*slots.add(i)).to_bits());
+        let bits = (*slots.add(i)).to_bits();
+        if key_word != 0 && bits == key_word {
+            return Some(i as u32);
+        }
+        let v = crate::JSValue::from_bits(bits);
         if let Some(stored) = crate::string::js_string_key_bytes(v, &mut sso) {
             if crate::string::key_bytes_equal(stored, key_bytes) {
                 return Some(i as u32);
@@ -434,7 +451,11 @@ mod tests_10595 {
             // brought in line with the other two. Pinned separately because
             // its fast arm is a separate loop, not a delegation.
             assert_eq!(
-                keys_find_slot_by_bytes_resolved(crate::object::ObjectKeys::new(keys, 2), 2, b"tag"),
+                keys_find_slot_by_bytes_resolved(
+                    crate::object::ObjectKeys::new(keys, 2),
+                    2,
+                    b"tag"
+                ),
                 Some(1),
                 "the resolved lookup must agree: most-derived slot (index 1), \
                  not the ancestor's (index 0)"
@@ -455,8 +476,14 @@ mod tests_10595 {
         let lookup_x = crate::string::js_string_from_bytes(b"x".as_ptr(), 1);
         let lookup_y = crate::string::js_string_from_bytes(b"y".as_ptr(), 1);
         unsafe {
-            assert_eq!(keys_find_slot_by_key_ptr(crate::object::ObjectKeys::new(keys, 2), 2, lookup_x), Some(0));
-            assert_eq!(keys_find_slot_by_key_ptr(crate::object::ObjectKeys::new(keys, 2), 2, lookup_y), Some(1));
+            assert_eq!(
+                keys_find_slot_by_key_ptr(crate::object::ObjectKeys::new(keys, 2), 2, lookup_x),
+                Some(0)
+            );
+            assert_eq!(
+                keys_find_slot_by_key_ptr(crate::object::ObjectKeys::new(keys, 2), 2, lookup_y),
+                Some(1)
+            );
         }
     }
 
@@ -470,7 +497,10 @@ mod tests_10595 {
 
         let lookup = crate::string::js_string_from_bytes(b"tagViaGetter".as_ptr(), 12);
         unsafe {
-            assert_eq!(keys_find_slot_by_key_ptr(crate::object::ObjectKeys::new(keys, 1), 1, lookup), None);
+            assert_eq!(
+                keys_find_slot_by_key_ptr(crate::object::ObjectKeys::new(keys, 1), 1, lookup),
+                None
+            );
         }
     }
 }
@@ -503,7 +533,11 @@ pub(crate) unsafe fn keys_find_private_slot_by_bytes(
     if super::overflow::is_table(keys) {
         return keys_find_slot_in_namespace(keys, count, bytes, true);
     }
-    let slot = keys_find_slot_by_bytes(crate::object::ObjectKeys::new(keys as *mut _, count), count, bytes)?;
+    let slot = keys_find_slot_by_bytes(
+        crate::object::ObjectKeys::new(keys as *mut _, count),
+        count,
+        bytes,
+    )?;
     if super::key_attrs::entry_is_private(super::key_attrs::keys_entry(keys, slot)) {
         return Some(slot);
     }
@@ -564,12 +598,13 @@ pub(crate) unsafe fn keys_find_property_slot_by_key_ptr(
 pub(crate) unsafe fn keys_find_property_slot_by_bytes_resolved_hashed(
     view: super::ObjectKeys,
     count: u32,
+    key_word: u64,
     bytes: &[u8],
     hash: u64,
 ) -> Option<u32> {
     let list: super::shapes::ShapeKeys = view.into();
     let keys = list.arr();
-    let slot = keys_find_slot_by_bytes_resolved_hashed(view, count, bytes, hash)?;
+    let slot = keys_find_slot_by_bytes_resolved_hashed(view, count, key_word, bytes, hash)?;
     if !super::key_attrs::entry_is_private(super::key_attrs::keys_entry(keys, slot)) {
         return Some(slot);
     }

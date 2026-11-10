@@ -1315,7 +1315,7 @@ pub(crate) unsafe fn object_accessor_key_names(
             out.push(String::from_utf8_lossy(bytes).into_owned());
         }
     }
-    out.sort();
+    crate::cold_sort::sort_by(&mut out, |a, b| a.cmp(b));
     out
 }
 
@@ -1400,6 +1400,19 @@ pub(crate) enum AttrsEdit<'a> {
 }
 
 impl AttrsEdit<'_> {
+    /// Does the edit leave its key with default attributes (or keep the
+    /// attributes it had)? `Data` with all of W, E and C, and the clears.
+    #[inline]
+    pub(crate) fn leaves_default(&self) -> bool {
+        match *self {
+            AttrsEdit::Data(_, bits) => bits == 0x07,
+            AttrsEdit::ClearData(_) | AttrsEdit::ClearAccessor(_) => true,
+            #[cfg(test)]
+            AttrsEdit::ClearAll => true,
+            AttrsEdit::Accessor(..) | AttrsEdit::Integrity { .. } | AttrsEdit::Private(_) => false,
+        }
+    }
+
     /// The single key this edit is about, or `None` for a whole-list edit.
     #[inline]
     pub(crate) fn key(&self) -> Option<&[u8]> {
@@ -1508,7 +1521,9 @@ unsafe fn fold_edits(
     }
     let mut entry = old;
     for (edit, &key_at) in edits.iter().zip(at) {
-        if edit.key().is_some() && (key_at != pos || matches!(edit, AttrsEdit::Private(_)) != entry_is_private(old)) {
+        if edit.key().is_some()
+            && (key_at != pos || matches!(edit, AttrsEdit::Private(_)) != entry_is_private(old))
+        {
             continue;
         }
         entry = edit.apply(entry);
@@ -1629,10 +1644,12 @@ pub(crate) unsafe fn apply_edits(obj: *mut crate::object::ObjectHeader, edits: &
     let Some(proof) = crate::object::canonical_keys::SharedLayout::of_receiver(obj) else {
         return;
     };
-    let rebuilt =
-        crate::object::canonical_keys::rebuild_with_entries(&proof, keys, from, |pos, slot, old| {
-            fold_edits(edits, at, pos, slot, old)
-        });
+    let rebuilt = crate::object::canonical_keys::rebuild_with_entries(
+        &proof,
+        keys,
+        from,
+        |pos, slot, old| fold_edits(edits, at, pos, slot, old),
+    );
     crate::object::set_object_keys(obj, rebuilt.view());
 }
 

@@ -491,8 +491,9 @@ impl GuardState<'_> {
                 // which owns that path.
                 if index < live_slots {
                     // A1_UNPROVEN: record-first: no proof of the object form at this slot read (kind-A/B question for S0f).
-                    let fields = crate::meta_slots_of!(crate::meta_obj_runtime_born!(object as *mut _))
-                        as *const u64;
+                    let fields =
+                        crate::meta_slots_of!(crate::meta_obj_runtime_born!(object as *mut _))
+                            as *const u64;
                     let bits = std::ptr::read(fields.add(index));
                     // Mirror `js_object_get_field`: a null POINTER_TAG payload
                     // is never a legitimate value and reads as `undefined`.
@@ -1147,7 +1148,7 @@ mod tests {
     fn primitive_descriptors_reject_lying_values() {
         let number = one_node(&[OP_NUMBER]);
         assert_eq!(guard(JSValue::number(12.5), &number), 1);
-        assert_eq!(guard(JSValue::int32(12), &number), 1);
+        assert_eq!(guard(JSValue::number(f64::from(12)), &number), 1);
         assert_eq!(guard(JSValue::bool(true), &number), 0);
 
         let boolean = one_node(&[OP_BOOLEAN]);

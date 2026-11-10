@@ -774,11 +774,16 @@ mod tests {
                 object: Box::new(Expr::This),
                 property: "label".into(),
                 value: Box::new(t("property")),
+                byte_offset: 0,
+                byte_end: 0,
             },
             Expr::IndexSet {
                 object: Box::new(Expr::This),
                 index: Box::new(Expr::String("slot".into())),
                 value: Box::new(t("index")),
+                element_offset: 0,
+                byte_offset: 0,
+                byte_end: 0,
             },
             Expr::PutValueSet {
                 target: Box::new(Expr::This),
@@ -786,6 +791,9 @@ mod tests {
                 value: Box::new(t("put-value")),
                 receiver: Box::new(Expr::This),
                 strict: true,
+                element_offset: 0,
+                byte_offset: 0,
+                byte_end: 0,
             },
         ]
     }
@@ -959,11 +967,16 @@ mod tests {
                 object: Box::new(Expr::This),
                 property: "a".into(),
                 value: Box::new(t("repeat")),
+                byte_offset: 0,
+                byte_end: 0,
             },
             Expr::IndexSet {
                 object: Box::new(Expr::This),
                 index: Box::new(Expr::String("b".into())),
                 value: Box::new(t("next")),
+                element_offset: 0,
+                byte_offset: 0,
+                byte_end: 0,
             },
             Expr::PutValueSet {
                 target: Box::new(Expr::This),
@@ -971,6 +984,9 @@ mod tests {
                 value: Box::new(t("repeat")),
                 receiver: Box::new(Expr::This),
                 strict: false,
+                element_offset: 0,
+                byte_offset: 0,
+                byte_end: 0,
             },
         ]);
         assert_eq!(collect(&expr), ["repeat", "next"]);
@@ -994,6 +1010,8 @@ mod tests {
                 object: Box::new(Expr::This),
                 property: "label".into(),
                 value: Box::new(t("body")),
+                byte_offset: 0,
+                byte_end: 0,
             })],
             captures: Vec::new(),
             mutable_captures: Vec::new(),

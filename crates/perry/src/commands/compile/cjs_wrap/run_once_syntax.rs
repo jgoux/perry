@@ -6,9 +6,13 @@ use swc_ecma_visit::{Visit, VisitWith};
 fn name(m: &ast::MemberExpr) -> Option<String> {
     perry_hir::patched_builtins::static_member_name(&m.prop)
 }
-fn native_capability(source: &str) -> bool {
-    source.ends_with(".node")
-        || source.starts_with("data:")
+/// A loader, module record or dynamic-code capability named by a module
+/// specifier. A `.node` addon is not one: only compile-time authenticated
+/// addons load, and their reach is a program fact (an addon reaches what its
+/// Node-API imports reach; an open one is a dynamic-code site,
+/// `bootstrap::admit_open_native_addons`).
+pub(super) fn native_capability(source: &str) -> bool {
+    source.starts_with("data:")
         || matches!(
             source,
             "module"
@@ -26,7 +30,7 @@ fn native_capability(source: &str) -> bool {
                 | "bun:ffi"
         )
 }
-fn loader_property(name: &str) -> bool {
+pub(super) fn loader_property(name: &str) -> bool {
     matches!(
         name,
         "cache"
@@ -105,12 +109,12 @@ impl Visit for Uses {
             return;
         }
         // A named `process` property other than a loader capability
-        // (`mainModule`, `binding`, `getBuiltinModule`, …) or a native-code
-        // load (`dlopen`) cannot reach a module record. A computed key can.
+        // (`mainModule`, `binding`, `getBuiltinModule`, …) cannot reach a
+        // module record. A computed key can. `dlopen` loads only the
+        // authenticated addons, whose reach is the program's (see
+        // `native_capability`).
         if matches!(m.obj.as_ref(), ast::Expr::Ident(i) if i.sym == *"process")
-            && name(m)
-                .as_deref()
-                .is_some_and(|n| !loader_property(n) && n != "dlopen")
+            && name(m).as_deref().is_some_and(|n| !loader_property(n))
         {
             return;
         }
@@ -169,6 +173,33 @@ pub(super) fn module_capability_uses(module: &ast::Module) -> u32 {
     module.visit_with(&mut uses);
     uses.0
 }
+/// A direct intrinsic descriptor call is eligible for the HIR provenance
+/// proof. An aliased/reflected method remains an ordinary capability use.
+pub(super) fn descriptor_capability_uses(module: &ast::Module) -> u32 {
+    #[derive(Default)]
+    struct Candidates {
+        count: u32,
+    }
+    impl Visit for Candidates {
+        fn visit_call_expr(&mut self, c: &ast::CallExpr) {
+            if let ast::Callee::Expr(e) = &c.callee {
+                if let ast::Expr::Member(m) = e.as_ref() {
+                    if matches!(m.obj.as_ref(), ast::Expr::Ident(i) if i.sym == *"Object")
+                        && name(m).as_deref() == Some("getOwnPropertyDescriptor")
+                        && c.args.len() == 2
+                        && c.args.iter().all(|a| a.spread.is_none())
+                    {
+                        self.count += 1;
+                    }
+                }
+            }
+            c.visit_children_with(self);
+        }
+    }
+    let mut candidates = Candidates::default();
+    module.visit_with(&mut candidates);
+    candidates.count
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,8 +223,6 @@ mod tests {
             "globalThis.process;",
             "Object.getPrototypeOf(function(){});",
             "({}).__proto__;",
-            "require('./addon.node');",
-            "import native from './addon.node';",
             "import('./plugin.js');",
             "Bun.dlopen('x');",
             "const key = 'get' + 'BuiltinModule'; process[key]('module');",
@@ -205,13 +234,25 @@ mod tests {
             "const {_cache: cache} = host; delete cache[k];",
             "import x from 'data:text/javascript,export default 1';",
             "require('node:repl');",
-            "process.dlopen(m, './x.node');",
             "process.binding('fs');",
             "process.mainModule.require('./x');",
             "process[name];",
             "f(process);",
         ] {
             assert!(uses(source) > 0, "{source}");
+        }
+    }
+    /// An authenticated addon load is an exact edge, not a loader: an addon
+    /// reaches what its Node-API imports reach, a program fact.
+    #[test]
+    fn native_addon_loads_are_not_loader_capabilities() {
+        for source in [
+            "require('./addon.node');",
+            "import native from './addon.node';",
+            "const direct = { exports: {} }; process.dlopen(direct, 'fixture-addon/addon.node');",
+            "module.exports = require('./native.node');",
+        ] {
+            assert_eq!(uses(source), 0, "{source}");
         }
     }
     /// Design CJS_LINK §2.5: each listed capability makes the program not
@@ -230,7 +271,6 @@ mod tests {
             "require('node:inspector');",
             "require('repl');",
             "process.getBuiltinModule('node:module');",
-            "require('./native.node');",
             "import('data:text/javascript,1');",
             "import('./x.js');",
             // cache and extensions writes or escapes

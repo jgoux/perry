@@ -81,6 +81,7 @@ use crate::types::{DOUBLE, F32, I1, I16, I32, I64, I8, PTR};
 // (`perry_abi::AGENT_PTR_SLOTS`).
 #[allow(dead_code)]
 pub(crate) mod agent_ptr;
+pub(crate) mod borrowed_call;
 pub(crate) mod function_bind;
 pub(crate) mod layout_read;
 
@@ -104,6 +105,7 @@ pub(crate) mod hot_tls;
 pub(crate) mod inline_birth;
 pub(crate) mod literal_chunks;
 mod literal_descriptor;
+pub(crate) mod snap_env_site;
 /// A worker program's literal-descriptor IR, for the dialect reader's round trip.
 #[cfg(test)]
 pub(crate) fn literal_descriptor_worker_ir() -> String {
@@ -111,7 +113,11 @@ pub(crate) fn literal_descriptor_worker_ir() -> String {
 }
 #[cfg(test)]
 mod map_entry_at_tests;
+#[cfg(test)]
+mod member_update_class_field_tests;
 pub(crate) mod stack_guard;
+#[cfg(test)]
+mod stack_guard_leaf_tests;
 pub(crate) mod tdz_module_check;
 pub(crate) use bitset_test::is_u32_bitset_test;
 mod buffer_access;
@@ -120,6 +126,7 @@ mod channel;
 #[cfg(test)]
 mod class_method_arguments_object_tests;
 pub(crate) mod collection_receiver;
+pub(crate) mod facts_canonical;
 pub(crate) mod facts_number;
 mod helpers;
 mod i32_fast_path;
@@ -151,7 +158,7 @@ pub(crate) use buffer_access::{
     access_facts_for_spec, can_lower_buffer_access_without_calls,
     can_lower_integer_typed_array_store_value, emit_buffer_access_pointer,
     lower_buffer_access_proof, lower_buffer_load, lower_buffer_store, lower_typed_array_load,
-    lower_typed_array_store, BufferAccessSpec,
+    lower_typed_array_store, BufferAccessSpec, OutOfBoundsArm,
 };
 pub(crate) use buffer_views::{
     alias_buffer_view_slot, attach_buffer_view_facts, attach_buffer_view_pointer_state_for_expr,
@@ -174,7 +181,7 @@ pub(crate) use helpers::{
     store_needs_string_addref, unbox_ffi_str_arg, unbox_str_handle, unbox_to_i64,
 };
 pub(crate) use i32_fast_path::{
-    can_lower_expr_as_i32, can_lower_expr_as_i32_in_current_region,
+    can_lower_expr_as_i32, can_lower_expr_as_i32_in_current_region, flat_const_index_get_target,
     imul_operand_i32_lowerable_in_current_region, is_known_i32_range, lower_expr_as_i32,
     lower_expr_native, lower_imul_operand_i32, lower_packed_u32_loop_index_get,
     try_flat_const_2d_int, try_lower_flat_const_index_get,
@@ -222,15 +229,16 @@ pub(crate) use v8_interop::{
 pub(crate) use write_barrier::{
     emit_array_numeric_write_note_on_block, emit_gated_root_nanbox_store,
     emit_jsvalue_slot_store_on_block, emit_jsvalue_slot_store_pointer_tested,
-    emit_jsvalue_slot_store_scalar_aware_on_block, emit_jsvalue_slot_store_with_flags_on_block,
-    emit_jsvalue_slot_store_with_value_bits_on_block, emit_layout_note_slot_on_block,
-    emit_may_carry_heap_pointer_check, emit_root_nanbox_store_for_expr,
-    emit_root_nanbox_store_on_block, emit_scalar_aware_store_gated_on_pointerness,
-    emit_write_barrier, emit_write_barrier_birth_slots_generation_tested,
-    emit_write_barrier_slot_generation_tested, emit_write_barrier_slot_on_block,
-    emit_write_barrier_slot_value_and_generation_tested, lower_array_super_init,
-    lower_event_emitter_async_resource_subclass_init, lower_event_emitter_subclass_init,
-    lower_node_stream_super_init, lower_stream_super_init, EVENT_EMITTER_INIT_KEYS,
+    emit_jsvalue_slot_store_pointer_tested_known, emit_jsvalue_slot_store_scalar_aware_on_block,
+    emit_jsvalue_slot_store_with_flags_on_block, emit_jsvalue_slot_store_with_value_bits_on_block,
+    emit_layout_note_slot_on_block, emit_may_carry_heap_pointer_check,
+    emit_root_nanbox_store_for_expr, emit_root_nanbox_store_on_block,
+    emit_scalar_aware_store_gated_on_pointerness, emit_write_barrier,
+    emit_write_barrier_birth_slots_generation_tested, emit_write_barrier_slot_generation_tested,
+    emit_write_barrier_slot_on_block, emit_write_barrier_slot_value_and_generation_tested,
+    lower_array_super_init, lower_event_emitter_async_resource_subclass_init,
+    lower_event_emitter_subclass_init, lower_node_stream_super_init, lower_stream_super_init,
+    EVENT_EMITTER_INIT_KEYS,
 };
 
 // Issue #1098 phase 3: the `FnCtx` definition stays in this trunk, but its
@@ -248,7 +256,9 @@ mod barrier_stem_census_tests;
 #[cfg(test)]
 mod bounded_array_hole_tests;
 #[cfg(test)]
-mod class_field_barrier_tests;
+mod class_evaluation_owner_tests;
+#[cfg(test)]
+pub(crate) mod class_field_barrier_tests;
 #[cfg(test)]
 mod class_field_get_shape_tests;
 mod dispatch;
@@ -256,6 +266,8 @@ mod dispatch;
 mod ek_prefix_tests;
 #[cfg(test)]
 mod entry_block_alloca_tests;
+#[cfg(test)]
+mod family_guard_tests;
 #[cfg(test)]
 mod hit_path_access_tests;
 #[cfg(test)]
@@ -275,6 +287,8 @@ mod scalar_slot_root;
 pub(crate) mod shadow_inline;
 #[cfg(test)]
 mod typed_element_tests;
+#[cfg(all(test, feature = "target-wasi"))]
+mod wasm32_site_tests;
 // `pub(crate)` since #7615 slice 8: `rooting/temp_root.rs` binds a pooled
 // temp alloca through the same shadow-slot emission every named local uses,
 // and it now lives outside `crate::expr`.
@@ -284,9 +298,6 @@ mod bounded_array_index_tests;
 mod call_return_array_index_tests;
 #[cfg(test)]
 mod call_spread_rooting_tests;
-mod call_spread_short;
-#[cfg(test)]
-mod call_spread_short_tests;
 #[cfg(test)]
 mod issue7628_rooting_tests;
 #[cfg(test)]
@@ -317,7 +328,10 @@ pub(crate) use slot_rep::{
     PTR_SHAPE_REGION_AUTHORITY, PTR_SHAPE_SCALAR_REPLACED,
 };
 
-pub(crate) use dispatch::{lower_expr, lower_math_operand};
+pub(crate) use dispatch::{
+    inert_math_enabled, lower_expr, lower_math_operand, math_intrinsic_operands,
+    math_operand_is_proven_number,
+};
 pub(crate) use scalar_slot_root::{
     entry_init_load_rooted_global, root_entry_alloca, root_scalar_replaced_slot,
     root_scalar_replaced_slot_unconditional,
@@ -405,11 +419,6 @@ pub(crate) struct FnCtx<'a> {
     pub wpfacts_off: bool,
     pub program_has_worker: bool,
     pub program_has_thread_agents: bool,
-    /// The program's accessor names (`ClassAccessorNames`): a fixed-name read
-    /// owns a shape/slot memo only for a name some getter of the program is
-    /// declared under. `None` (a compile that did not collect them) gives
-    /// every fixed-name read its memo.
-    pub program_class_accessor_names: Option<std::sync::Arc<crate::codegen::ClassAccessorNames>>,
     /// Function being built (blocks, params, registers).
     pub func: &'a mut LlFunction,
     /// Stable slug for native-region ids derived from this module.
@@ -420,6 +429,10 @@ pub(crate) struct FnCtx<'a> {
     pub source_function_slug: String,
     /// Stable id for the labeled loop currently being lowered.
     pub active_region_id: Option<String>,
+    /// Set by `stmt/byte_view_loop.rs` right before it lowers the original
+    /// (fallback) copy of a versioned loop; the next for-loop lowering takes
+    /// it and marks its latch (see `crate::inst::LoopTag`).
+    pub byte_view_fallback_loop: bool,
     /// Full native-region fact graph collected for this lowered HIR region.
     ///
     /// Existing fields below borrow individual subgraphs for compatibility
@@ -558,6 +571,12 @@ pub(crate) struct FnCtx<'a> {
     /// `continue inner` both resolve to that same loop's blocks. Stored
     /// outermost-first; the innermost label is `.last()`.
     pub pending_labels: Vec<String>,
+    /// A label that only names its loop's region: no `break`/`continue`
+    /// targets it (`Stmt::Labeled` checked). It is NOT a pending label, so
+    /// every loop tier lowers the loop exactly as without the label; the
+    /// generic loop lowerings read it (by the loop's body address) only to
+    /// tag their latch with the region ID. A label never changes codegen.
+    pub region_only_label: Option<(String, usize)>,
     /// Map from class name → HIR Class definition. Built once in
     /// `compile_module` from `hir.classes`. Used by `Expr::New` to look up
     /// the field count, constructor body, and (eventually) method table.
@@ -606,13 +625,20 @@ pub(crate) struct FnCtx<'a> {
     /// `class_stack` names the owning class in a static body too (it is what
     /// `super.x` resolves against), and `receiver_class_name(Expr::This)`
     /// reads `class_stack.last()`. That answer is right for an instance
-    /// method and wrong here: a static body's `this` is the INT32-tagged
-    /// class ref `0x7FFE_0000_0000_00cc`, never a heap instance of the class.
+    /// method and wrong here: a static body's `this` is the constructor
+    /// function object, never an instance of the class.
     /// Lowerings that turn a proven receiver class into an INSTANCE-shaped
     /// access — anything that strips the NaN-box to a raw `ObjectHeader*`, or
     /// loads a packed field slot — must consult this flag before trusting
     /// `Expr::This` (#9369).
     pub in_static_member: bool,
+    /// The local an instance method binds its [[HomeObject]] to (the HIR
+    /// `let __perry_method_home = ClassMethodHome { class_stack.last(), .. }`
+    /// that `class_home::finish` puts first in the body). `super.m(...)`
+    /// through it is the class's home, so `super_method` can prove the call.
+    /// `(id, true)`: every read of it is such a proven call, so the binding
+    /// itself is not emitted (`super_method::elided_method_home`).
+    pub method_home_local: Option<(u32, bool)>,
     /// Method registry: `(class_name, method_name) → LLVM function name`.
     /// Built by `compile_module` from `hir.classes[*].methods`. Used by
     /// `lower_call` to dispatch `obj.method(args)` to the right
@@ -812,6 +838,16 @@ pub(crate) struct FnCtx<'a> {
     /// (`collectors::string_accumulator_locals`): selected for the in-place
     /// self-append and demoted on ordinary reads, like a declared `string`.
     pub string_accumulator_locals: &'a std::collections::HashSet<u32>,
+    /// Module-wide contents-stable bindings
+    /// (`collectors::contents_stable_bindings`): the only bindings that may
+    /// keep a proof about their object's contents (`admits_contents_proof`).
+    pub contents_stable_bindings: &'a std::collections::HashSet<u32>,
+    /// Empty-literal bindings a later loop pushes into
+    /// (`collectors::loop_pushed_arrays`): their `[]` is born with the larger
+    /// append reserve.
+    pub loop_pushed_arrays: &'a crate::collectors::PushedArrays,
+    /// Set by `lower_let` while it lowers such a binding's `[]` initializer.
+    pub pushed_array_birth: bool,
     /// Set while lowering `<id>.length`: that read of `id` cannot hand the
     /// string anywhere, so it skips the unique-owner demote.
     pub string_length_read_of: Option<u32>,
@@ -980,10 +1016,6 @@ pub(crate) struct FnCtx<'a> {
     pub method_has_synthetic_arguments: &'a std::collections::HashMap<(String, String), bool>,
     /// Methods whose producer emitted a scalar `arguments.length` direct ABI.
     pub method_arguments_length_only: &'a std::collections::HashMap<(String, String), bool>,
-    /// Whole-program reverse capabilities for guarded short-spread method
-    /// calls. See `CompileOptions::short_spread_method_candidates`.
-    pub short_spread_method_candidates:
-        &'a std::collections::HashMap<String, Vec<crate::ShortSpreadMethodCandidate>>,
     /// Whole-program exported object-literal candidates for dynamic receiver
     /// calls. See `CompileOptions::object_literal_method_candidates`.
     pub object_literal_method_candidates:
@@ -1042,6 +1074,11 @@ pub(crate) struct FnCtx<'a> {
     /// new-expression then loads `result_slot` as its value. One entry per
     /// nested inline ctor; the innermost (`last()`) governs a `return`.
     pub inline_ctor_return: Vec<InlineCtorReturn>,
+    /// The receiver run in flight (`layout_read::RecvRun`).
+    pub recv_run: Option<crate::expr::layout_read::RecvRun>,
+    /// The by-name store being lowered was a 2c member of the run
+    /// (`layout_read::RunTransparency::Store`).
+    pub recv_run_store_member: bool,
 
     /// Cross-module function declarations to add to `LlModule` after
     /// lowering finishes. Each entry is `(llvm_name, return_type, param_types)`.
@@ -1115,6 +1152,14 @@ pub(crate) struct FnCtx<'a> {
     /// `js_number_coerce`. Structural, never a declared type — see
     /// `collectors::collect_number_by_construction_locals`.
     pub number_by_construction_locals: &'a std::collections::HashSet<u32>,
+    /// `let` bindings the whole-program facts prove hold only Numbers
+    /// (`codegen/facts_number_locals.rs`). A read is a Number; unlike
+    /// `number_by_construction_locals` this says nothing about the operands
+    /// of the writes, which keep their own lowering.
+    pub facts_number_locals: &'a std::collections::HashSet<u32>,
+    /// Locals the whole-program interval proof shows hold only int32 values
+    /// (`codegen/facts_int32_locals.rs`).
+    pub facts_int32_locals: &'a std::collections::HashSet<u32>,
 
     /// Gen-GC Phase A sub-phase 3a: pointer-typed local → shadow-
     /// frame slot index. Empty on native statepoint targets.
@@ -1476,6 +1521,13 @@ pub(crate) struct FnCtx<'a> {
     /// is never written, its truthiness is tag identity. Empty in the generic
     /// body, in module init, in methods and in every closure.
     pub spec_bool_params: std::collections::HashSet<u32>,
+    /// P2: the signature's `ret` when this body is a typed entry (`F$sig`):
+    /// an I32 `return` hands back the raw i32 (DESIGN-p2 §3.1), and check
+    /// mode witnesses every returned value against it (§5).
+    pub sig_return: Option<crate::codegen::FactsRep>,
+    /// P2: the module's typed methods (`CrossModuleCtx::typed_methods`).
+    pub typed_methods:
+        &'a std::collections::HashMap<u32, crate::codegen::signature_entry::TypedMethod>,
     /// Bindings initialized from a declared typed-array element read
     /// (`typed_element::yields_element`). A selection hint for the relational
     /// lowering, which is exact for any value.
@@ -1875,13 +1927,10 @@ pub(crate) struct FnCtx<'a> {
     /// Exposed only by statements of their own body: their views stay trusted
     /// until `lower_stmt` meets the first statement that may expose them.
     pub late_exposed_buffer_locals: &'a std::collections::HashSet<u32>,
-    /// Starting alias-scope id for buffers registered in this function.
-    /// Seeded from `LlModule::buffer_alias_counter` at FnCtx creation so
-    /// scope ids don't collide across functions in the same LLVM module.
-    /// New scopes are allocated as `base + buffer_data_slots.len()`;
-    /// after the function finishes lowering the caller bumps the module
-    /// counter by the number of slots it used (closes #71).
-    pub buffer_alias_base: u32,
+    /// Buffer alias scopes of this function: ids continue the module's
+    /// metadata id counter (`LlModule::buffer_alias_scope_allocator`) and
+    /// are committed back after the body lowers (closes #71).
+    pub buffer_alias_scopes: crate::module::BufferAliasScopes,
 }
 
 #[derive(Clone)]
@@ -2282,6 +2331,13 @@ pub(crate) struct MaskedWindowArrayFact {
     /// the i32 tier's all-slots-i32 materialization proof, and the TA tiers'
     /// hoisted data pointers serve reads only.
     pub allows_stores: bool,
+    /// Plain-array tiers: an entry `i64` slot caching the array's element
+    /// base (`array_elements_addr` of the validated handle). Written once
+    /// after the guard and re-derived from the refreshed handle at every
+    /// fired back-edge poll (`emit_armed_gc_loop_safepoint`), the clone's only
+    /// collection point; nothing in the call-free clone can move the backing.
+    /// `None` keeps the per-read derivation.
+    pub elements_slot: Option<String>,
 }
 
 /// Read-only masked-index window over a plain array of boxed strings.
@@ -2630,6 +2686,9 @@ pub(crate) fn inline_cache_global_name(ctx: &FnCtx<'_>, site_id: u32) -> String 
     inline_cache_global_name_for_prefix(ctx.strings.module_prefix(), site_id)
 }
 
+mod array_iteration;
+pub(crate) use array_iteration::{array_iteration_facts, array_program_facts};
+
 /// The definition emitted for every name in `FnCtx::ic_globals`.
 ///
 /// #9708: an inline-cache site owns an 8-byte pointer **slot**, not its cache
@@ -2642,43 +2701,6 @@ pub(crate) fn inline_cache_global_name(ctx: &FnCtx<'_>, site_id: u32) -> String 
 /// inline hit path loads the slot through [`emit_inline_cache_slot`] and
 /// proves it non-null before reading a cache word; every runtime miss entry
 /// takes the slot's address.
-/// The program's array-iteration facts (object model step 7), from the
-/// whole-program write census fixed before module codegen starts: bit 0, a
-/// write may reach a `Symbol.iterator` member (or re-parent an array), so
-/// iteration reads `%Array.prototype%`'s fixed slot (and an array's own
-/// member); bit 1, `%ArrayIteratorPrototype%` may be named, so iteration also
-/// checks its `next`. Zero: iteration is the builtin element walk, unchecked.
-pub(crate) fn array_iteration_facts() -> u32 {
-    let names = crate::program_patched_proto_methods();
-    let mut facts = 0;
-    if names
-        .iter()
-        .any(|n| n == perry_hir::patched_builtins::ARRAY_ITERATOR_WRITABLE)
-    {
-        facts |= 1;
-    }
-    if names
-        .iter()
-        .any(|n| n == perry_hir::patched_builtins::ARRAY_ITERATOR_PROTO_REACHABLE)
-    {
-        facts |= 2;
-    }
-    facts
-}
-
-/// Immutable whole-program array facts handed to the runtime at startup.
-pub(crate) fn array_program_facts() -> u32 {
-    array_iteration_facts()
-        | if crate::program_patched_proto_methods()
-            .iter()
-            .any(|name| name == perry_hir::patched_builtins::ARRAY_ELEMENT_DESCRIPTORS)
-        {
-            4
-        } else {
-            0
-        }
-}
-
 pub(crate) fn inline_cache_global_definition(name: &str) -> String {
     format!("@{name} = private global ptr null")
 }
@@ -2845,7 +2867,7 @@ mod inline_cache_name_tests {
 
 impl<'a> FnCtx<'a> {
     /// Is `e` the `this` of a STATIC class member — i.e. a receiver that holds
-    /// the class CONSTRUCTOR (an INT32 class ref) rather than an instance?
+    /// the class CONSTRUCTOR function object rather than an instance?
     ///
     /// `receiver_class_name` answers `Some(<owning class>)` for `Expr::This`
     /// in a static body just as it does in an instance body, because both read
@@ -2884,6 +2906,42 @@ impl<'a> FnCtx<'a> {
     /// type after a non-dominating write is a wrong-code bug (#7846). Declared
     /// annotations are never inserted into this map, so a successful lookup is
     /// both provenance-checked and write-stable.
+    /// May binding `id` keep the runtime-derived `proof`?
+    ///
+    /// A proof about the CONTENTS of an object (its property types) is
+    /// established once, at the binding; a later `delete`, store or
+    /// `defineProperty` changes a property without touching the binding. Such
+    /// a proof is kept only for a binding whose object nothing writes for its
+    /// whole life (`collectors::contents_stable_bindings`). A class identity
+    /// claims no contents: its field reads are re-checked as declared-only.
+    pub(crate) fn admits_contents_proof(&self, id: u32, proof: &HirType) -> bool {
+        !self.proof_claims_contents(proof, 0) || self.contents_stable_bindings.contains(&id)
+    }
+
+    fn proof_claims_contents(&self, ty: &HirType, depth: usize) -> bool {
+        if depth > 16 {
+            return true;
+        }
+        match ty {
+            HirType::Object(_) => true,
+            HirType::Named(name) => {
+                if let Some(alias) = self.type_aliases.get(name) {
+                    self.proof_claims_contents(alias, depth + 1)
+                } else {
+                    self.interfaces.contains_key(name)
+                }
+            }
+            HirType::Union(variants) | HirType::Tuple(variants) => variants
+                .iter()
+                .any(|v| self.proof_claims_contents(v, depth + 1)),
+            HirType::Array(element) => self.proof_claims_contents(element, depth + 1),
+            HirType::Generic { base, type_args } if base == "Array" => type_args
+                .iter()
+                .any(|v| self.proof_claims_contents(v, depth + 1)),
+            _ => false,
+        }
+    }
+
     pub(crate) fn stable_local_type_proof(&self, id: &u32) -> Option<&HirType> {
         if self.reassigned_locals.contains(id) {
             self.typed_locals.get(id)
@@ -3279,7 +3337,8 @@ mod env_clones;
 mod fs_await;
 #[cfg(test)]
 mod hit_path_tests;
-mod index_get;
+pub(crate) mod index_get;
+pub(crate) use index_get::guarded_array::emit_spread_stack_admission;
 #[cfg(test)]
 mod index_get_claim_tests;
 mod index_key;
@@ -3365,7 +3424,7 @@ pub(crate) mod static_method;
 pub(crate) mod store_census;
 mod string_regex_proc;
 pub(crate) mod super_constructor;
-mod super_method;
+pub(crate) mod super_method;
 #[cfg(test)]
 mod super_property_set_order_tests;
 pub(crate) mod this_super_call;
@@ -4401,6 +4460,7 @@ fn lower_compare_value(
 /// when an existing caller still expects the generic JSValue/`double` ABI.
 pub(crate) fn lower_expr_value(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<Option<LoweredValue>> {
     let _fallback = crate::fallback_diag::enter_expr(ctx, expr);
+    let _consumed = crate::facts_consumed::enter(expr, &ctx.func.name);
     match expr {
         Expr::Bool(value) => {
             let lowered = LoweredValue::i1(if *value { "true" } else { "false" });
@@ -4846,6 +4906,8 @@ mod byte_prepass_tests;
 #[cfg(test)]
 mod array_layout_loop_tests;
 
+#[cfg(test)]
+mod buffer_bounds_source_tests;
 #[cfg(test)]
 mod sort_numeric_source_tests;
 

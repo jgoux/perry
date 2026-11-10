@@ -59,7 +59,7 @@
                 // the live head the proof resolves (bit 1); its loop consumes
                 // that bit instead of classifying the receiver again.
                 let counted = matches!(args.get(1), Some(Expr::Bool(true)));
-                let writable = crate::expr::array_iteration_facts().to_string();
+                let writable = crate::expr::array_iteration_facts(&ctx.wpfacts).to_string();
                 let verdict = ctx.block().call(I32,
                     if counted { "js_array_record_enter_counted" } else { "js_array_record_enter" },
                     &[(DOUBLE, &values[0]), (crate::types::PTR, &slot), (I32, &writable)]);
@@ -137,14 +137,52 @@
                 let done_flag = ctx.block().zext(crate::types::I1, &done, I32);
                 let done_flag = ctx.block().shl(I32, &done_flag, "1");
                 let flags = ctx.block().or(I32, &mode_flag, &done_flag);
-                let flags = if matches!(args[6], Expr::Bool(true)) {
+                let throwing = matches!(args[6], Expr::Bool(true));
+                let flags = if throwing {
                     ctx.block().or(I32, &flags, "4")
                 } else { flags };
-                let result = ctx.block().call(DOUBLE, "js_array_record_finish",
-                    &[(DOUBLE, &payload), (DOUBLE, values[2].1), (DOUBLE, values[5].1), (I32, &flags)]);
+                // #13645: with no `return` on the array iterator chain the
+                // array arm's IteratorClose is unobservable: only the
+                // protocol arm reaches the runtime.
+                let result = if ctx.wpfacts.array_iterator_close_unwritten {
+                    crate::verify_facts::consumed(crate::verify_facts::Fact::IteratorClose,
+                        || serde_json::json!({}));
+                    let skipped = if throwing { values[5].1.to_owned() } else {
+                        double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED))
+                    };
+                    let close_idx = ctx.new_block("arec.close");
+                    let join_idx = ctx.new_block("arec.closed");
+                    let (close_label, join_label) = (ctx.block_label(close_idx), ctx.block_label(join_idx));
+                    let skip_pred = ctx.block().label.clone();
+                    ctx.block().cond_br(&mode, &close_label, &join_label);
+                    ctx.current_block = close_idx;
+                    let closed = ctx.block().call(DOUBLE, "js_array_record_finish",
+                        &[(DOUBLE, &payload), (DOUBLE, values[2].1), (DOUBLE, values[5].1), (I32, &flags)]);
+                    let close_pred = ctx.block().label.clone();
+                    ctx.block().br(&join_label);
+                    ctx.current_block = join_idx;
+                    ctx.block().phi(DOUBLE, &[(&closed, &close_pred), (&skipped, &skip_pred)])
+                } else {
+                    ctx.block().call(DOUBLE, "js_array_record_finish",
+                        &[(DOUBLE, &payload), (DOUBLE, values[2].1), (DOUBLE, values[5].1), (I32, &flags)])
+                };
 
                 roots.release(ctx);
                 return Ok(result);
+            }
+            "arrayRecordCloseAbsent" if ctx.wpfacts.array_iterator_close_unwritten => {
+                crate::verify_facts::consumed(crate::verify_facts::Fact::IteratorClose,
+                    || serde_json::json!({}));
+                return Ok(double_literal(f64::from_bits(crate::nanbox::TAG_TRUE)));
+            }
+            // The array arm of IteratorClose: nothing to observe (#13645).
+            "arrayRecordClose" if ctx.wpfacts.array_iterator_close_unwritten => {
+                crate::verify_facts::consumed(crate::verify_facts::Fact::IteratorClose,
+                    || serde_json::json!({}));
+                if matches!(args.get(4), Some(Expr::Bool(true))) {
+                    return lower_expr(ctx, &args[3]);
+                }
+                return Ok(double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED)));
             }
             "arrayRecordCloseAbsent" => {
                 let needs = ctx.block().call(I32, "js_array_record_close_absent", &[]);
@@ -206,12 +244,42 @@ return crate::lower_array_record_length::lower(ctx, &args[0]);
                     .block()
                     .call(DOUBLE, "js_iterator_next_result", &[(DOUBLE, &iter)]));
             }
+            // The counted entry of a for-of source walk (`for_of_guard`):
+            // `arrayRecordNeedsIterator(t, true)` over the walk's own source
+            // temp. One call answers the IteratorRecord's array-mode proof
+            // (bit 0) and the packed-f64 loop admission of the live head it
+            // resolved (bit 1); the walk's counted loop over `t` consumes bit
+            // 1 (`record_packed_admissions`) in place of its own guard call.
+            // `t` is rebound to the resolved head, as the record entry does.
+            "arrayRecordNeedsIterator"
+                if matches!(args, [Expr::LocalGet(_), Expr::Bool(true)]) =>
+            {
+                let Expr::LocalGet(source_id) = &args[0] else {
+                    unreachable!("matched above");
+                };
+                let (values, roots) = super::lower_call_args_rooted(ctx, &args[..1])?;
+                let (verdict, source) = walk_entry::lower(ctx, &values[0]);
+                let admission = ctx
+                    .record_packed_admissions
+                    .get(source_id)
+                    .cloned()
+                    .unwrap_or_else(|| ctx.func.alloca_entry(crate::types::I1));
+                let bit = ctx.block().and(I32, &verdict, "2");
+                let admitted = ctx.block().icmp_ne(I32, &bit, "0");
+                ctx.block().store(crate::types::I1, &admitted, &admission);
+                ctx.record_packed_admissions.insert(*source_id, admission);
+                let needs = ctx.block().and(I32, &verdict, "1");
+                roots.release(ctx);
+                crate::expr::invalidate_local_write_facts(ctx, *source_id);
+                crate::expr::bind_lowered_value_to_local(ctx, *source_id, &source, &args[0])?;
+                return Ok(crate::expr::i32_bool_to_nanbox(ctx.block(), &needs));
+            }
             // #10524: the runtime guard of array destructuring over a source
             // with no static array proof — a NaN-boxed boolean, the same shape
             // `Expr::ArrayIterationPatched` produces for the proven arm.
             "arrayDestructureNeedsIterator" | "arrayRecordNeedsIterator" => {
                 if method == "arrayRecordNeedsIterator" && args.is_empty() {
-                    let writable = crate::expr::array_iteration_facts().to_string();
+                    let writable = crate::expr::array_iteration_facts(&ctx.wpfacts).to_string();
                     let needs = ctx.block().call(I32, "js_array_record_literal_needs_iterator", &[(I32, &writable)]);
                     return Ok(crate::expr::i32_bool_to_nanbox(ctx.block(), &needs));
                 }
@@ -342,7 +410,16 @@ return crate::lower_array_record_length::lower(ctx, &args[0]);
                 let init_fn = format!("{prefix}__init");
                 ctx.pending_declares
                     .push((init_fn.clone(), crate::types::VOID, vec![]));
+                // SNAP census: the evaluation this guard starts was reached
+                // by `require`, not by `import()` (instrumented compiles only).
+                let census = crate::expr::snap_env_site::census_compile();
+                if census {
+                    ctx.block().call_void("js_snap_require_edge", &[(crate::types::I32, "1")]);
+                }
                 ctx.block().call_void(&init_fn, &[]);
+                if census {
+                    ctx.block().call_void("js_snap_require_edge", &[(crate::types::I32, "0")]);
+                }
                 return lower_expr(ctx, &args[0]);
             }
             "isBuiltin" => {
@@ -708,3 +785,4 @@ return crate::lower_array_record_length::lower(ctx, &args[0]);
         return Ok(ctx.block().call(DOUBLE, runtime, &[(DOUBLE, &input)]));
     }
 }
+
