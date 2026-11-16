@@ -101,6 +101,7 @@ fn widen_mutable_captures_stmt(
             body,
             catch,
             finally,
+            ..
         } => {
             widen_mutable_captures_stmts(body);
             if let Some(catch_clause) = catch {
@@ -226,6 +227,7 @@ fn widen_mutable_captures_expr(
             object,
             index,
             value,
+            ..
         } => {
             widen_mutable_captures_expr(object, scope_mutable);
             widen_mutable_captures_expr(index, scope_mutable);
@@ -427,6 +429,7 @@ fn collect_closure_assigned_stmt(stmt: &Stmt, out: &mut std::collections::HashSe
             body,
             catch,
             finally,
+            ..
         } => {
             for s in body {
                 collect_closure_assigned_stmt(s, out);
@@ -539,6 +542,7 @@ fn collect_closure_assigned_expr(expr: &Expr, out: &mut std::collections::HashSe
             object,
             index,
             value,
+            ..
         } => {
             collect_closure_assigned_expr(object, out);
             collect_closure_assigned_expr(index, out);
@@ -733,6 +737,7 @@ fn collect_closure_captures_stmt(stmt: &Stmt, out: &mut std::collections::HashSe
             body,
             catch,
             finally,
+            ..
         } => {
             for s in body {
                 collect_closure_captures_stmt(s, out);
@@ -849,6 +854,7 @@ fn collect_closure_captures_expr(expr: &Expr, out: &mut std::collections::HashSe
             object,
             index,
             value,
+            ..
         } => {
             collect_closure_captures_expr(object, out);
             collect_closure_captures_expr(index, out);
@@ -1027,6 +1033,7 @@ fn collect_scope_level_assigns_stmt(stmt: &Stmt, out: &mut std::collections::Has
             body,
             catch,
             finally,
+            ..
         } => {
             for s in body {
                 collect_scope_level_assigns_stmt(s, out);
@@ -1155,6 +1162,7 @@ fn collect_closure_assigned_in_closure_body_stmt(
             body,
             catch,
             finally,
+            ..
         } => {
             for s in body {
                 collect_closure_assigned_in_closure_body_stmt(s, out);
@@ -1277,6 +1285,7 @@ fn collect_closure_assigned_in_body_expr(
             object,
             index,
             value,
+            ..
         } => {
             collect_closure_assigned_in_body_expr(object, out);
             collect_closure_assigned_in_body_expr(index, out);

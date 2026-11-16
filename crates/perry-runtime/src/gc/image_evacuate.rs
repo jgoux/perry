@@ -69,7 +69,9 @@ pub(crate) fn evacuate_realm_image() -> RealmEvacuation {
     crate::value::addr_class::realm::for_each_cell(&mut |header| unsafe {
         // Canonical lists are immutable facts shared by all agents. Their
         // addresses, including prefix/interior addresses, never forward.
-        if (*header).obj_type == GC_TYPE_ARRAY && (*header).gc_flags & GC_FLAG_SHAPE_SHARED != 0 {
+        if crate::gc_type_is_array!((*header).obj_type)
+            && (*header).gc_flags & GC_FLAG_SHAPE_SHARED != 0
+        {
             return;
         }
         let size = (*header).size as usize;
@@ -82,7 +84,9 @@ pub(crate) fn evacuate_realm_image() -> RealmEvacuation {
         // GC_STORE_AUDIT(INIT): an unpublished copy, filled byte for byte; its
         // pointer slots are forwarded and barriered below.
         std::ptr::copy_nonoverlapping((header as *const u8).add(GC_HEADER_SIZE), user, payload);
-        if crate::gc_type_is_object!((*copy).obj_type) && !crate::arena::pointer_in_nursery(user as usize) {
+        if crate::gc_type_is_object!((*copy).obj_type)
+            && !crate::arena::pointer_in_nursery(user as usize)
+        {
             // What an old-generation birth of this layout records.
             let word = crate::codegen_abi::LayoutWord(
                 (*(user as *const crate::object::ObjectHeader)).parent_class_id,
@@ -128,7 +132,7 @@ pub(crate) fn words_pointing_into_image(evacuation: &RealmEvacuation) -> Vec<(us
             if (start..end).contains(&addr)
                 && !unsafe {
                     crate::value::addr_class::realm::header(addr).is_some_and(|h| {
-                        h.as_ref().obj_type == GC_TYPE_ARRAY
+                        crate::gc_type_is_array!(h.as_ref().obj_type)
                             && h.as_ref().gc_flags & GC_FLAG_SHAPE_SHARED != 0
                     })
                 }

@@ -580,7 +580,7 @@ fn shape_table_rederivation_rejects_a_suppressed_logging_site() {
     }
     let valid = build_valid_pointer_set();
     let mut visitor = RuntimeRootVisitor::for_mark_scoped(&valid, true);
-    let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let rejected = crate::test_support::child_unwind(std::panic::AssertUnwindSafe(|| {
         crate::object::shapes::scan_shape_table_rekey_mut(&mut visitor);
     }));
     assert!(
@@ -602,7 +602,7 @@ fn full_shape_walk_rejects_a_suppressed_logging_site() {
     }
     let valid = build_valid_pointer_set();
     let mut visitor = RuntimeRootVisitor::for_mark_scoped(&valid, false);
-    let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let rejected = crate::test_support::child_unwind(std::panic::AssertUnwindSafe(|| {
         crate::object::shapes::scan_shape_table_rekey_mut(&mut visitor);
     }));
     assert!(
@@ -688,4 +688,17 @@ fn shape_mutation_to_new_young_key_rearms_minor_log() {
         );
         assert!(walk("shapes.families+indices").visited >= 1);
     }
+}
+
+/// The native-export classification reads a closure's info record without a
+/// null test; DEBUG builds assert the invariant at the read.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "a reachable closure carries an info record")]
+fn a_closure_without_an_info_record_trips_the_native_export_read() {
+    let _guard = CopyingNurseryTestGuard::new(0);
+    let owner = old_closure();
+    unsafe { (*(owner as *mut crate::closure::ClosureHeader)).info = std::ptr::null() };
+    let value = crate::value::js_nanbox_pointer(owner as i64);
+    let _ = unsafe { crate::object::bound_native_callable_value_arity(value) };
 }

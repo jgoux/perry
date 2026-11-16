@@ -16,46 +16,12 @@ use super::opts::{NamespaceEntry, NamespaceEntryKind};
 // existing `helpers::init_static_fields_*` paths keep resolving.
 pub(super) use super::static_fields::{init_static_fields_early, init_static_fields_late};
 
-/// A generator birth that owns its resume record: a sync generator's
-/// fixed-state record, or an async generator's step body
-/// (`js_async_generator_create`). Both link the instance to the function's
-/// prototype themselves and retain the owner function.
-pub(crate) fn is_record_generator_birth(expr: &perry_hir::Expr) -> bool {
-    record_generator_birth_kind(expr).is_some()
-}
-
-/// Which generator function kind a record birth belongs to.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum GeneratorRecordKind {
-    Sync,
-    Async,
-}
-
-/// The kind of a record birth: the birth itself says whether the body is an
-/// async generator (`js_async_generator_create`) or a sync one.
-pub(crate) fn record_generator_birth_kind(expr: &perry_hir::Expr) -> Option<GeneratorRecordKind> {
-    match expr {
-        perry_hir::Expr::LinkGeneratorPrototype {
-            fixed_state: true, ..
-        } => Some(GeneratorRecordKind::Sync),
-        perry_hir::Expr::LinkGeneratorPrototype {
-            is_async: true,
-            obj,
-            ..
-        } if matches!(obj.as_ref(), perry_hir::Expr::Closure { .. }) => {
-            Some(GeneratorRecordKind::Async)
-        }
-        _ => None,
-    }
-}
-
-/// The record-birth kind of a generator wrapper body, if it returns one.
-pub(crate) fn body_generator_record_kind(body: &[perry_hir::Stmt]) -> Option<GeneratorRecordKind> {
-    body.iter().find_map(|stmt| match stmt {
-        perry_hir::Stmt::Return(Some(e)) => record_generator_birth_kind(e),
-        _ => None,
-    })
-}
+// The generator body predicates are the function prototype-kind
+// predicate's (`perry_hir::fn_proto`), which the whole-program solver reads
+// too: one definition.
+pub(crate) use perry_hir::fn_proto::{
+    function_body_returns_generator_object, is_record_generator_birth,
+};
 
 /// A generator wrapper whose body returns a record birth, which links the
 /// instance to the function's prototype itself.
@@ -63,36 +29,6 @@ pub(crate) fn function_body_is_fixed_state_generator(body: &[perry_hir::Stmt]) -
     body.iter().any(
         |stmt| matches!(stmt, perry_hir::Stmt::Return(Some(e)) if is_record_generator_birth(e)),
     )
-}
-
-pub(crate) fn function_body_returns_generator_object(body: &[perry_hir::Stmt]) -> bool {
-    let has_gen_state = body
-        .iter()
-        .any(|stmt| matches!(stmt, perry_hir::Stmt::Let { name, .. } if name == "__gen_state"));
-    if !has_gen_state {
-        return false;
-    }
-    body.iter().any(|stmt| match stmt {
-        perry_hir::Stmt::Return(Some(e)) if is_record_generator_birth(e) => true,
-        // The generator transform may wrap the returned iterator in the
-        // instance-prototype linker; unwrap it so the iterator shape remains
-        // the stable signal that this is a lowered generator wrapper.
-        perry_hir::Stmt::Return(Some(expr)) => {
-            let inner = match expr {
-                perry_hir::Expr::LinkGeneratorPrototype { obj, .. } => obj.as_ref(),
-                other => other,
-            };
-            matches!(inner, perry_hir::Expr::Object(props)
-                if props.len() == 3
-                    && props[0].0 == "next"
-                    && props[1].0 == "return"
-                    && props[2].0 == "throw"
-                    && props
-                        .iter()
-                        .all(|(_, value)| matches!(value, perry_hir::Expr::Closure { .. })))
-        }
-        _ => false,
-    })
 }
 
 /// Precise-root analysis always runs. Only target capabilities select its lowering.
@@ -381,7 +317,7 @@ pub(super) fn guarded_specialization_fits_preinline_budget(ir_bytes: usize) -> b
 
 /// [`guarded_specialization_fits_preinline_budget`] plus the source-small arm.
 #[inline]
-pub(super) fn guarded_specialization_admits_preinline(ir_bytes: usize, statements: usize) -> bool {
+pub(crate) fn guarded_specialization_admits_preinline(ir_bytes: usize, statements: usize) -> bool {
     guarded_specialization_fits_preinline_budget(ir_bytes)
         || (guarded_specialization_source_small(statements)
             && ir_bytes <= guarded_specialization_source_small_max_ir_bytes())
@@ -390,6 +326,9 @@ pub(super) fn guarded_specialization_admits_preinline(ir_bytes: usize, statement
 #[cfg(test)]
 #[path = "guarded_preinline_admission_tests.rs"]
 mod guarded_preinline_admission_tests;
+
+#[path = "preinline_growth.rs"]
+pub(super) mod preinline_growth;
 
 /// Maximum total (module-wide) direct call sites a function may have and still
 /// be hinted. This is the anti-bloat backstop: the raised `-inlinehint-threshold`
@@ -518,6 +457,34 @@ pub(crate) fn write_barriers_enabled() -> bool {
             Ok("0") | Ok("off") | Ok("false")
         )
     })
+}
+
+thread_local! {
+    static JS_TEXT_SECTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The output section every compiled JS function is placed in on x86_64
+/// Linux. There the runtime unwinds by DWARF and meets every runtime frame;
+/// an `Error` capture keeps the JS frames only, and a frame is JS when its
+/// pc lies between the linker's `__start_`/`__stop_` symbols of this section:
+/// a range test on the code's own placement, no table (the runtime side is
+/// `error_stack_frames.rs`). Elsewhere the frame-pointer chain skips the
+/// runtime's frames by itself, so no section is named.
+pub(crate) const JS_TEXT_SECTION_NAME: &str = "perry_js_text";
+
+/// Whether the CURRENT module places its functions in
+/// [`JS_TEXT_SECTION_NAME`] (`set_js_text_section_for_target`).
+pub(crate) fn js_text_section() -> Option<&'static str> {
+    JS_TEXT_SECTION
+        .with(|c| c.get())
+        .then_some(JS_TEXT_SECTION_NAME)
+}
+
+pub(crate) fn set_js_text_section_for_target(triple: &str) {
+    let on = triple.starts_with("x86_64")
+        && target_os_of(triple) == Some("linux")
+        && !triple.contains("android");
+    JS_TEXT_SECTION.with(|c| c.set(on));
 }
 
 thread_local! {
@@ -830,6 +797,7 @@ pub(super) fn collect_return_class(
                 body,
                 catch,
                 finally,
+                ..
             } => {
                 collect_return_class(body, produced, disqualified, func_returns_class);
                 if let Some(cc) = catch {
@@ -916,8 +884,8 @@ pub(crate) fn default_target_triple() -> String {
 ///  * `watchos-simulator`              → arm64-apple-watchos10.0-simulator
 ///  * `tvos`, `tvos-simulator`         → aarch64-apple-tvos
 ///  * `android`                        → aarch64-unknown-linux-android
-///  * `linux` (x86_64 alias)           → x86_64-unknown-linux-gnu
-///  * `linux-aarch64`                  → aarch64-unknown-linux-gnu
+///  * `linux` / `linux-x86_64`         → x86_64-unknown-linux-gnu
+///  * `linux-aarch64` / `linux-arm64`  → aarch64-unknown-linux-gnu
 ///  * `linux-musl` (x86_64 alias)      → x86_64-unknown-linux-musl (fully static)
 ///  * `linux-aarch64-musl`             → aarch64-unknown-linux-musl (fully static)
 ///  * `macos` (aarch64 alias)          → arm64-apple-macosx15.0.0
@@ -958,8 +926,8 @@ pub fn resolve_target_triple(name: &str) -> Option<String> {
         "android-x86_64" => Some("x86_64-unknown-linux-android".to_string()),
         // Wear OS is Android-on-a-watch: same arm64 Android object format.
         "wearos" => Some("aarch64-unknown-linux-android".to_string()),
-        "linux" => Some("x86_64-unknown-linux-gnu".to_string()),
-        "linux-aarch64" => Some("aarch64-unknown-linux-gnu".to_string()),
+        "linux" | "linux-x86_64" => Some("x86_64-unknown-linux-gnu".to_string()),
+        "linux-aarch64" | "linux-arm64" => Some("aarch64-unknown-linux-gnu".to_string()),
         // musl targets — fully static binaries that run on Lambda
         // provided.al2023, scratch/distroless containers, Cloud Run, etc.
         // (no glibc loader dependency). See link/platform_cmd.rs for the
@@ -997,7 +965,9 @@ pub const TARGET_NAMES: &[&str] = &[
     "android-x86_64",
     "wearos",
     "linux",
+    "linux-x86_64",
     "linux-aarch64",
+    "linux-arm64",
     "linux-musl",
     "linux-x86_64-musl",
     "linux-aarch64-musl",
@@ -1099,8 +1069,8 @@ mod target_os_tests {
                 "tvos" | "tvos-simulator" => "tvos",
                 "harmonyos" | "harmonyos-simulator" => "ohos",
                 "android" | "android-x86_64" | "wearos" => "android",
-                "linux" | "linux-aarch64" | "linux-musl" | "linux-x86_64-musl"
-                | "linux-aarch64-musl" => "linux",
+                "linux" | "linux-x86_64" | "linux-aarch64" | "linux-arm64" | "linux-musl"
+                | "linux-x86_64-musl" | "linux-aarch64-musl" => "linux",
                 "macos" | "macos-x86_64" => "macos",
                 "windows" | "windows-winui" | "windows-x86_64" | "windows-aarch64"
                 | "windows-arm64" => "windows",
@@ -1115,6 +1085,18 @@ mod target_os_tests {
             };
             assert_eq!(target_os_of(&triple), Some(expected), "{name}: {triple}");
         }
+    }
+
+    #[test]
+    fn linux_architecture_aliases_resolve_to_matching_triples() {
+        assert_eq!(
+            resolve_target_triple("linux-x86_64").as_deref(),
+            Some("x86_64-unknown-linux-gnu")
+        );
+        assert_eq!(
+            resolve_target_triple("linux-arm64").as_deref(),
+            Some("aarch64-unknown-linux-gnu")
+        );
     }
 
     #[test]
@@ -1176,37 +1158,29 @@ pub(super) fn is_macos_triple(triple: &str) -> bool {
     target_os_of(triple) == Some("macos")
 }
 
-pub(super) fn emit_buffer_alias_metadata(llmod: &mut LlModule, count: u32) {
-    if count == 0 {
+/// Define every buffer alias scope the module's functions committed: one
+/// shared domain, then per scope `S` its node, its single-scope list `S+1`
+/// and its noalias list `S+2` (every other scope). All ids come from the
+/// module's one metadata id counter (`LlModule::buffer_alias_scope_allocator`),
+/// so no count of scopes can make two definitions share an id.
+pub(crate) fn emit_buffer_alias_metadata(llmod: &mut LlModule) {
+    let scopes = llmod.buffer_alias_scopes().to_vec();
+    if scopes.is_empty() {
         return;
     }
-    // Shared domain.
-    llmod.add_metadata_line("!100 = distinct !{!100}".to_string());
-    // Per-buffer scope nodes.
-    for i in 0..count {
-        let sid = 101 + i;
-        llmod.add_metadata_line(format!("!{} = distinct !{{!{}, !100}}", sid, sid));
-    }
-    // Single-element alias-scope lists (one per buffer).
-    for i in 0..count {
-        let list_id = 201 + i;
-        let scope_id = 101 + i;
-        llmod.add_metadata_line(format!("!{} = !{{!{}}}", list_id, scope_id));
-    }
-    // Noalias lists: for buffer i, every *other* buffer's scope.
-    for i in 0..count {
-        let list_id = 301 + i;
-        let others: Vec<String> = (0..count)
-            .filter(|j| *j != i)
-            .map(|j| format!("!{}", 101 + j))
+    let domain = llmod.allocate_metadata_id();
+    llmod.add_metadata_line(format!("!{domain} = distinct !{{!{domain}}}"));
+    for &scope in &scopes {
+        llmod.add_metadata_line(format!("!{scope} = distinct !{{!{scope}, !{domain}}}"));
+        llmod.add_metadata_line(format!("!{} = !{{!{scope}}}", scope + 1));
+        let others: Vec<String> = scopes
+            .iter()
+            .filter(|other| **other != scope)
+            .map(|other| format!("!{other}"))
             .collect();
-        if others.is_empty() {
-            // Single buffer: empty noalias set — LLVM accepts `!{}` but
-            // it's a no-op. Still emit so `!noalias !{N}` references resolve.
-            llmod.add_metadata_line(format!("!{} = !{{}}", list_id));
-        } else {
-            llmod.add_metadata_line(format!("!{} = !{{{}}}", list_id, others.join(", ")));
-        }
+        // A single buffer still gets its (empty) noalias set so the
+        // `!noalias !{S+2}` reference resolves.
+        llmod.add_metadata_line(format!("!{} = !{{{}}}", scope + 2, others.join(", ")));
     }
 }
 
@@ -1417,6 +1391,8 @@ pub(super) fn emit_namespace_populator(
                     let handle = blk.call(I64, "js_closure_alloc_singleton", &[(PTR, &info)]);
                     crate::expr::nanbox_pointer_inline(blk, &handle)
                 }
+                NamespaceEntryKind::DeferredNamespace { source_prefix } => ctx.block().call(
+                    DOUBLE, &format!("{source_prefix}__deferred_namespace"), &[]),
                 NamespaceEntryKind::NestedNamespace { source_prefix } => ctx
                     .block()
                     .load(DOUBLE, &format!("@__perry_ns_{}", source_prefix)),
@@ -1803,7 +1779,7 @@ pub(super) fn emit_callee_binding_resolutions(
 pub(crate) fn generator_method_owner_name(body: &str) -> String {
     format!("{body}$generator_owner")
 }
-pub(crate) fn body_has_fixed_generator_state(body: &[perry_hir::Stmt]) -> bool {
+pub fn body_has_fixed_generator_state(body: &[perry_hir::Stmt]) -> bool {
     function_body_is_fixed_state_generator(body)
 }
 
@@ -1826,4 +1802,34 @@ pub(crate) fn body_needs_method_owner(body: &[perry_hir::Stmt]) -> bool {
 /// their resume state) and per-evaluation homes need an explicit owner ABI.
 pub(crate) fn body_needs_explicit_method_owner(body: &[perry_hir::Stmt], fresh: bool) -> bool {
     body_has_fixed_generator_state(body) || (fresh && body_needs_method_owner(body))
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CallableTargetState {
+    native: bool,
+    ilp32: bool,
+    outline: bool,
+    jscvt: bool,
+    #[cfg(any(test, feature = "testing"))]
+    pinned: Option<bool>,
+}
+pub(crate) fn callable_target_state() -> CallableTargetState {
+    CallableTargetState {
+        native: NATIVE_ROOTS_TARGET_OK.with(|s| s.get()),
+        ilp32: ILP32_TARGET.with(|s| s.get()),
+        outline: FULL_OUTLINE_IC.with(|s| s.get()),
+        jscvt: JSCVT.with(|s| s.get()),
+        #[cfg(any(test, feature = "testing"))]
+        pinned: NATIVE_ROOTS_OVERRIDE.with(|s| s.get()),
+    }
+}
+impl CallableTargetState {
+    pub(crate) fn install(self) {
+        NATIVE_ROOTS_TARGET_OK.with(|s| s.set(self.native));
+        ILP32_TARGET.with(|s| s.set(self.ilp32));
+        FULL_OUTLINE_IC.with(|s| s.set(self.outline));
+        JSCVT.with(|s| s.set(self.jscvt));
+        #[cfg(any(test, feature = "testing"))]
+        NATIVE_ROOTS_OVERRIDE.with(|s| s.set(self.pinned));
+    }
 }

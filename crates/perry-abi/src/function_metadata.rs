@@ -7,28 +7,57 @@ pub const FN_HAS_METADATA: u32 = 1 << 25;
 /// The owner and all its relative info records are permanent image data.
 pub const METADATA_PERMANENT: u32 = 1;
 
-/// One image's canonical entry inventory. Each signed entry is relative to
-/// `entries` and names the info that owns its name/source. Runtime-native
-/// owners have one entry and a null entries pointer. `state` owns copied
-/// metadata and sparse overrides; null means no mutable payload exists.
+/// One module's metadata owner: the identity its infos name (with an
+/// ordinal below `count`) and, in `state`, its copied metadata and sparse
+/// overrides (null: no mutable payload). It lists no bodies: each body's
+/// record lives in its image's records section, which `bounds` names: a
+/// signed offset from the `bounds` field itself to the image's
+/// [`FunctionRecordBounds`] (a link-time constant, so no relocation), or 0
+/// for none. Runtime-native owners have one ordinal and no records.
 #[repr(C)]
 pub struct FunctionMetadataOwner {
-    pub entries: *const i32,
     pub count: u32,
     pub flags: u32,
     pub state: AtomicPtr<c_void>,
+    pub bounds: i32,
 }
 unsafe impl Sync for FunctionMetadataOwner {}
 impl FunctionMetadataOwner {
     pub const fn native() -> Self {
         Self {
-            entries: core::ptr::null(),
             count: 1,
             flags: 0,
             state: AtomicPtr::new(core::ptr::null_mut()),
+            bounds: 0,
         }
     }
+
+    /// The image records this owner's module registers, if any.
+    pub fn record_bounds(&self) -> Option<&FunctionRecordBounds> {
+        if self.bounds == 0 {
+            return None;
+        }
+        let at = (&self.bounds as *const i32 as usize).wrapping_add_signed(self.bounds as isize);
+        // SAFETY: a nonzero offset is the linker-resolved distance to the
+        // bounds descriptor of the image this owner was emitted into.
+        unsafe { (at as *const FunctionRecordBounds).as_ref() }
+    }
 }
+
+/// One image's function records section, as the linker left it: the records
+/// of the bodies the link kept, between `start` and `stop`. A record begins
+/// with the signed offset from itself to its body's `JsFunctionInfo`; a zero
+/// offset is no record (the image sentinel, a section marker, padding).
+/// Mach-O records carry a second word (the code, which keeps them live).
+#[repr(C)]
+pub struct FunctionRecordBounds {
+    pub start: *const u8,
+    pub stop: *const u8,
+    pub sentinel: *const u8,
+}
+unsafe impl Sync for FunctionRecordBounds {}
+/// Bytes per record in this target's records section.
+pub const FUNCTION_RECORD_BYTES: usize = if cfg!(target_vendor = "apple") { 8 } else { 4 };
 
 /// Indexing never derives identity from a code or owner address.
 #[repr(C)]
@@ -150,10 +179,14 @@ mod tests {
     }
     #[test]
     fn layouts_and_native_identity_are_pinned() {
-        assert_eq!(
-            core::mem::offset_of!(FunctionMetadataOwner, count),
-            core::mem::size_of::<usize>()
-        );
+        // perry-codegen (module.rs, emit_function_metadata_owner) emits the
+        // owner as the literal LLVM type { i32, i32, ptr, i32 } and the
+        // self-relative bounds offset at field 3; the runtime reads the
+        // fields by name. Pin that shape so a field move fails here.
+        assert_eq!(core::mem::offset_of!(FunctionMetadataOwner, count), 0);
+        assert_eq!(core::mem::offset_of!(FunctionMetadataOwner, flags), 4);
+        assert_eq!(core::mem::offset_of!(FunctionMetadataOwner, state), 8);
+        assert_eq!(core::mem::offset_of!(FunctionMetadataOwner, bounds), 16);
         assert_eq!(
             core::mem::offset_of!(FunctionMetadataIdentity, ordinal),
             core::mem::size_of::<usize>()
@@ -179,5 +212,80 @@ mod tests {
             assert_eq!(core::mem::size_of::<FunctionMetadataIdentity>(), 16);
             assert_eq!(core::mem::size_of::<NativeFunctionInfo>(), 80);
         }
+    }
+}
+
+impl JsFunctionInfo {
+    /// Declares that the record is stored as a [`NamedNativeFunctionInfo`]:
+    /// the name text sits in the same static, so the name is read from the
+    /// record with no run-time naming call. Only `fn_info!` forms that name a
+    /// literal use it; the argument is the text the storage carries.
+    pub const fn with_name(self, _name: &'static str) -> Self {
+        self.with_flags(FN_HAS_NAME)
+    }
+}
+
+/// A native declaration's record with its JS-visible name stored in the same
+/// static: the name tail (self-relative offset and length) follows the info
+/// and the identity follows the tail, exactly the layout every reader of
+/// `FN_HAS_NAME` records expects. The text follows the identity.
+#[repr(C)]
+pub struct NamedNativeFunctionInfo<const N: usize> {
+    pub info: JsFunctionInfo,
+    name: [u32; 2],
+    pub identity: FunctionMetadataIdentity,
+    bytes: [u8; N],
+}
+impl<const N: usize> NamedNativeFunctionInfo<N> {
+    pub const fn new(
+        info: JsFunctionInfo,
+        owner: &'static FunctionMetadataOwner,
+        name: &str,
+    ) -> Self {
+        assert!(name.len() == N && N != 0);
+        let text = name.as_bytes();
+        let mut bytes = [0u8; N];
+        let mut i = 0;
+        while i < N {
+            bytes[i] = text[i];
+            i += 1;
+        }
+        Self {
+            info: info.with_flags(FN_HAS_METADATA | FN_HAS_NAME),
+            name: [core::mem::offset_of!(Self, bytes) as u32, N as u32],
+            identity: FunctionMetadataIdentity { owner, ordinal: 0 },
+            bytes,
+        }
+    }
+}
+
+#[cfg(test)]
+mod named_record_tests {
+    use super::*;
+    extern "C" fn body(_: *const (), _: crate::JsThis) -> f64 {
+        0.0
+    }
+    #[test]
+    fn named_record_tails_read_where_readers_expect_them() {
+        static OWNER: FunctionMetadataOwner = FunctionMetadataOwner::native();
+        static NAMED: NamedNativeFunctionInfo<8> = NamedNativeFunctionInfo::new(
+            unsafe { JsFunctionInfo::from_code(body as *const u8, 0) },
+            &OWNER,
+            "parseInt",
+        );
+        let info = &NAMED.info;
+        assert!(info.flags & FN_HAS_NAME != 0 && info.flags & FN_HAS_METADATA != 0);
+        let base = info as *const JsFunctionInfo as *const u8;
+        let tail = unsafe { base.add(core::mem::size_of::<JsFunctionInfo>()) };
+        let (delta, len) = unsafe {
+            (
+                tail.cast::<i32>().read_unaligned(),
+                tail.add(4).cast::<u32>().read_unaligned() as usize,
+            )
+        };
+        let text = unsafe { core::slice::from_raw_parts(base.offset(delta as isize), len) };
+        assert_eq!(text, b"parseInt");
+        let identity = info.metadata_identity().expect("identity follows the name tail");
+        assert_eq!(identity.owner, &OWNER as *const _);
     }
 }

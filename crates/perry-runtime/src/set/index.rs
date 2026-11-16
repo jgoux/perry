@@ -1,7 +1,8 @@
 //! Owner-local Set index. Buckets contain only a hash and a raw element index;
 //! equality always reads the authoritative (GC-rewritten) elements buffer.
 //! Strings are never rehashed merely because they move. Pointer keys get a
-//! scalar identity token in their own metadata, shared by every Set.
+//! scalar identity token in their own metadata, shared by every Set (and by
+//! Map and WeakMap/WeakSet for array keys, whose address growth changes).
 //! Only inserting into an index allocates a token; a probe for a key without
 //! one is a definite miss.
 
@@ -16,11 +17,11 @@ crate::perry_thread_local! {
 /// A scalar identity belongs to its key's private metadata. Array and
 /// closure keys use their existing traced property holders; other public
 /// object cells already have a direct metadata edge.
-unsafe fn key_identity(addr: usize, create: bool) -> Option<u64> {
+pub(crate) unsafe fn key_identity(addr: usize, create: bool) -> Option<u64> {
     let header = crate::value::addr_class::try_read_gc_header(addr)?;
     let _no_move = crate::gc::GcSuppressScope::new();
     let meta = match header.obj_type {
-        crate::gc::GC_TYPE_ARRAY => {
+        crate::gc_array_type_pat!() => {
             let bag = if create {
                 crate::array::array_property_bag_ensure(addr as *mut crate::array::ArrayHeader)
             } else {
@@ -138,7 +139,7 @@ fn hash_value(value: f64, insert: bool) -> Option<u32> {
     }
     let tag = bits >> 48;
     let addr = (bits & crate::value::POINTER_MASK) as usize;
-    if matches!(tag, 0 | 0x7FFD | 0x7FFA) {
+    if matches!(tag, 0x7FFD | 0x7FFA) {
         if let Some(header) = unsafe { crate::value::addr_class::try_read_gc_header(addr) }
             .filter(|h| crate::gc::gc_type_is_movable(h.obj_type))
         {
@@ -153,7 +154,7 @@ fn hash_value(value: f64, insert: bool) -> Option<u32> {
             } else if matches!(
                 kind,
                 crate::gc_object_type_pat!()
-                    | crate::gc::GC_TYPE_ARRAY
+                    | crate::gc_array_type_pat!()
                     | crate::gc::GC_TYPE_CLOSURE
                     | crate::gc::GC_TYPE_PROMISE
                     | crate::gc::GC_TYPE_ERROR
@@ -302,8 +303,15 @@ pub(super) unsafe fn lookup_value(set: *const SetHeader, value: f64) -> Option<i
 pub(super) unsafe fn insert_value(set: *mut SetHeader, value: f64, raw: u32) {
     let index = mutable_index(set);
     if index.is_null() {
-        if (*set).size > SMALL_SET_SCAN_MAX {
-            rebuild_index(set);
+        // The threshold crossing: the index the Set's insertions build, by
+        // the one rule the compiler's image Sets are emitted with.
+        let elements = (*set).elements;
+        let born = SetIndex::from_insertions((0..(*set).used).filter_map(|i| {
+            let value = *elements.add(i as usize);
+            (value.to_bits() != SET_HOLE_VALUE_BITS).then(|| (value_hash(value), i))
+        }));
+        if let Some(index) = born {
+            install_owned_index(set, Box::new(index));
         }
     } else {
         let before = (*index).byte_len();
@@ -405,6 +413,11 @@ pub(crate) unsafe fn test_snapshot(set: *const SetHeader) -> (usize, usize, usiz
         index.as_ref().map_or(0, |i| i.byte_len()),
         TEST_HASH_CALLS.with(Cell::get),
     )
+}
+
+#[cfg(test)]
+pub(crate) unsafe fn test_has_index(set: *const SetHeader) -> bool {
+    !index_ptr(set).is_null()
 }
 
 #[cfg(test)]
@@ -527,15 +540,18 @@ mod tests {
     }
 
     #[test]
-    fn raw_object_keys_keep_the_relocation_stable_hash() {
+    fn a_number_with_an_objects_address_as_bits_does_not_hash_as_that_object() {
         unsafe {
+            // A word with clear top 16 bits is a Number (a denormal) in value
+            // context: it hashes by its bits, never by the identity of the
+            // object that happens to live at that address.
             let object = crate::object::js_object_alloc(0, 0) as usize;
             let id = key_identity(object, true).unwrap();
-            let mut expected = crate::fast_hash::PtrHasher.build_hasher();
-            (0u64, id).hash(&mut expected);
-            assert_eq!(
+            let mut identity = crate::fast_hash::PtrHasher.build_hasher();
+            (0u64, id).hash(&mut identity);
+            assert_ne!(
                 existing_hash(f64::from_bits(object as u64)),
-                Some(expected.finish() as u32)
+                Some(identity.finish() as u32)
             );
         }
     }

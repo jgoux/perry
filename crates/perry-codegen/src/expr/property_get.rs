@@ -56,7 +56,7 @@ mod tests;
 pub(crate) use generic_dispatch::lower_generic_property_get;
 pub(crate) use globalget::lower_globalget_property;
 pub(crate) use helpers::{
-    builtin_prototype_method_read, class_has_computed_runtime_members,
+    builtin_prototype_method_read, class_has_evaluated_accessor,
     guarded_declared_class_get_candidate, is_global_builtin_value_expr, lower_class_method_bind,
     lower_global_builtin_static_value, lower_raw_f64_class_field_get_for_number_context,
     lower_runtime_property_get_by_name, promise_static_function_length_expr,
@@ -70,7 +70,22 @@ use super::{
 };
 
 pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
+    if let Expr::PropertyGet {
+        object, property, ..
+    } = expr
+    {
+        if let Expr::ExternFuncRef { name, .. } = object.as_ref() {
+            if ctx.deferred_namespace_imports.contains(name) {
+                return lower_runtime_property_get_by_name(ctx, object, property);
+            }
+        }
+    }
     let _fallback = crate::fallback_diag::enter_expr(ctx, expr);
+    let _consumed = crate::facts_consumed::enter(expr, &ctx.func.name);
+    // I32 at rest (PR C): a read of a key some class keeps in an I32 lane.
+    if let Some(value) = super::rest_fields::try_lower(ctx, expr)? {
+        return Ok(value);
+    }
     // Object model step 1: a literal family's added key, one slot load.
     if let Expr::PropertyGet {
         object, property, ..
@@ -94,6 +109,20 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             return super::private_field_site::lower_get(ctx, site, property);
         }
     }
+    // ACCBUILD2 P3: a read proven to call one getter.
+    if let Expr::PropertyGet {
+        object,
+        property,
+        byte_offset,
+        ..
+    } = expr
+    {
+        if let Some(v) =
+            super::wpfacts_access::try_lower_proven_getter(ctx, object, property, *byte_offset)?
+        {
+            return Ok(v);
+        }
+    }
     if let Expr::PropertyGet {
         object, property, ..
     } = expr
@@ -104,6 +133,9 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             return Ok(value);
         }
         buffer_alias::invalidate_buffer_alias_for_read(ctx, object, property);
+    }
+    if let Some(value) = crate::codegen::facts_const_length::lower(ctx, expr)? {
+        return Ok(value);
     }
     // `split("literal")[constant].length` on a scalar-replaced split can
     // read the precomputed numeric length directly. The split part itself was
@@ -378,7 +410,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             // refusal is too — a claim now costs a guard branch and nothing else,
             // which is exactly the deal element reads have always taken.
             //
-            // `test-files/test_gap_7853_declared_array_length_runtime_value.ts`
+            // `tests/parity/typescript/type-erasure/test_gap_7853_declared_array_length_runtime_value.ts`
             // and `test_gap_declared_field_type_refine_guarded.ts` are the
             // sabotage: both feed a `string[]`-declared local an array, a
             // string, a number, an array-like object with numeric and
@@ -423,7 +455,9 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     .cached_length_slot(*arr_id)
                     .map(str::to_owned)
                 {
-                    return Ok(ctx.block().load(DOUBLE, &slot));
+                    let cached = ctx.block().load(DOUBLE, &slot);
+                    super::held_len::length_read(ctx, *arr_id, &cached)?;
+                    return Ok(cached);
                 }
             }
             if is_array_expr(ctx, object) {
@@ -545,7 +579,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             let gc_type_addr = ctx.block().sub(I64, &recv_handle, "8");
             let gc_type_ptr = ctx.block().inttoptr(I64, &gc_type_addr);
             let gc_type = ctx.block().load(I8, &gc_type_ptr);
-            let is_array = ctx.block().icmp_eq(I8, &gc_type, "1"); // GC_TYPE_ARRAY
+            let is_array = crate::target_layout::emit_gc_type_is_array(ctx.block(), I8, &gc_type);
             let is_string = ctx.block().icmp_eq(I8, &gc_type, "3"); // GC_TYPE_STRING
             let has_length = ctx.block().or(I1, &is_array, &is_string);
             // Issue #233: a FORWARDED array's first 4 bytes are no
@@ -1194,8 +1228,8 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     // `typeof Lib.A` is "undefined", `Lib.A` reads as
                     // undefined too. Resolve the class reference inline
                     // (mirrors the `Expr::ExternFuncRef` arm at the
-                    // bottom of this function): emit the INT32-tagged
-                    // class-id NaN-box that `Expr::ClassRef` produces.
+                    // bottom of this function): fetch the constructor
+                    // function object that `Expr::ClassRef` produces.
                     // #1758: a renamed export (`export { Number$ as Number }`)
                     // is keyed in `class_ids` under the ORIGIN name (`Number$`),
                     // but `property` here is the EXPORTED alias (`Number`). Try
@@ -1476,7 +1510,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 // which classifies the receiver tag and has a class-ref arm —
                 // exactly what the same static method gets when its class
                 // carries no computed member.
-                if class_has_computed_runtime_members(ctx, &class_name)
+                if class_has_evaluated_accessor(ctx, &class_name)
                     && !ctx.is_static_class_this(object)
                 {
                     return lower_runtime_property_get_by_name(ctx, object, property);

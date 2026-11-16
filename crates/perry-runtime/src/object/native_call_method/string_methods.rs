@@ -33,6 +33,18 @@ pub(super) unsafe fn dispatch_string(
     } else if crate::builtins::boxed_primitive_to_string_tag(object_handle.get_nanbox_f64())
         == Some("String")
     {
+        // A String wrapper is an ordinary object: its own keys and its own
+        // `[[Prototype]]` decide the method (`Call(Get(w, name), w, args)`),
+        // so only the builtin itself continues to the native arms below.
+        let args = refreshed_args();
+        if let Some(value) = crate::object::builtin_proto::redirect_call(
+            object_handle.get_nanbox_f64(),
+            method_name.as_bytes(),
+            args.as_ptr(),
+            args.len(),
+        ) {
+            return Some(value);
+        }
         crate::builtins::boxed_primitive_payload(object_handle.get_nanbox_f64())
             .map(|(_, payload)| payload)
     } else {
@@ -342,7 +354,7 @@ pub(super) unsafe fn dispatch_string(
                         .unwrap_or(std::ptr::null());
                     let s_ptr = receiver_string();
                     // Integer-returning methods MUST return raw `i as f64` (not
-                    // NaN-boxed INT32_TAG) — otherwise downstream comparisons
+                    // NaN-boxed INTERNAL_WORD_TAG) — otherwise downstream comparisons
                     // like `idx < url.length` fail because NaN-boxed values
                     // are NaN and any comparison with NaN returns false. The
                     // typed string-method path in `lower_string_method.rs`

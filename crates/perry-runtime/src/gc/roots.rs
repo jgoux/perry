@@ -16,12 +16,16 @@ pub(super) use stack_maps::install_verify_walker;
 mod stack_roots;
 pub(crate) use stack_maps::census_rows::stack_map_index_census;
 mod temp_roots;
+mod walk_origin;
 pub(super) use stack_maps::ensure_built as ensure_stack_maps_built;
 pub(super) use stack_maps::initialize as initialize_stack_maps;
 pub(super) use stack_maps::native_maps_active as native_stack_maps_active;
 pub(super) use stack_maps::publish_rewrite_walk_stats as stack_maps_publish_rewrite_walk_stats;
 pub(super) use stack_maps::record_native_stack_walk_source;
 pub(super) use stack_maps::verify_native_slots_post_walk as stack_maps_native_slot_verify;
+#[cfg(all(target_arch = "x86_64", target_os = "linux", target_env = "gnu"))]
+pub(crate) use walk_origin::offering_entry_asm;
+pub(crate) use walk_origin::{EntryOrigin as EntryWalkOrigin, WalkOrigin};
 
 pub use rooted_values::RootedValues;
 pub(super) use runtime_handles::{
@@ -53,7 +57,7 @@ pub(crate) use stack_roots::with_stack_roots;
 pub(crate) use scan_mode::ConservativeScanEffectiveTestGuard;
 #[allow(unused_imports)]
 pub(crate) use scan_mode::{
-    conservative_scan_is_effective, conservative_stack_scan_decision,
+    collection_point_is_precise, conservative_scan_is_effective, conservative_stack_scan_decision,
     conservative_stack_scan_decision_for, conservative_stack_scan_mode,
     conservative_stack_scan_mode_from_value, resolve_conservative_stack_scan_mode,
     set_conservative_stack_scan_override, ConservativeStackScanDecision, ConservativeStackScanMode,
@@ -555,6 +559,7 @@ pub extern "C" fn js_gc_register_global_root(ptr: i64) {
 /// failure unwinds from here; across the C ABI it aborts the process.
 pub(super) fn register_global_root(root: *mut u64) {
     if !root.is_null() {
+        let _bookkeeping = crate::snap_census::bookkeeping();
         unsafe {
             super::root_words::verify_jsvalue_root_word(*root, "global");
             runtime_write_barrier_root_nanbox(*root);
@@ -562,6 +567,19 @@ pub(super) fn register_global_root(root: *mut u64) {
     }
     GLOBAL_ROOTS.with(|roots| {
         roots.borrow_mut().push(root);
+    });
+    crate::snap_census::global_root(root as usize);
+}
+
+/// Every registered module-global root slot (the SNAP census tracks them).
+#[cfg(all(perry_gc_instruments, target_os = "linux", target_arch = "x86_64"))]
+pub(crate) fn for_each_global_root_slot(mut f: impl FnMut(usize)) {
+    GLOBAL_ROOTS.with(|roots| {
+        for &root in roots.borrow().iter() {
+            if !root.is_null() {
+                f(root as usize);
+            }
+        }
     });
 }
 
@@ -1968,5 +1986,75 @@ pub(super) extern "C" fn perry_ffi_mark_root(value: f64, ctx: *mut c_void) {
                 (*ctx.legacy_stats).pinned_bytes += bytes;
             }
         }
+    }
+}
+
+/// Every root the full trace reads, as the words the slots hold, for the
+/// image capture. Read-only: the visitors run in copy mode and only report.
+pub(crate) fn image_visit_roots(visit: &mut dyn FnMut(u64)) {
+    ensure_stack_maps_built();
+    visit_shadow_stack_root_slots(|slot| visit(unsafe { slot.read() }));
+    visit_global_root_slots(|slot| visit(unsafe { slot.read() }));
+    let scanners: Vec<MutableRootScannerEntry> = MUTABLE_ROOT_SCANNERS.with(|s| s.borrow().clone());
+    for entry in scanners {
+        let mut mark = |value: f64| visit(value.to_bits());
+        let mut visitor = RuntimeRootVisitor::for_copy(&mut mark);
+        (entry.scanner)(&mut visitor);
+    }
+    let mut mark = |value: f64| visit(value.to_bits());
+    let mut visitor = RuntimeRootVisitor::for_copy(&mut mark);
+    visit_ffi_mutable_registered_roots(&mut visitor);
+    let legacy: Vec<fn(&mut dyn FnMut(f64))> = ROOT_SCANNERS.with(|s| s.borrow().clone());
+    for scanner in legacy {
+        scanner(&mut |value: f64| visit(value.to_bits()));
+    }
+    let ffi: Vec<PerryFfiRootScanner> = FFI_ROOT_SCANNERS.with(|s| s.borrow().clone());
+    for scanner in ffi {
+        let mut sink: &mut dyn FnMut(u64) = &mut *visit;
+        let ctx = &mut sink as *mut &mut dyn FnMut(u64) as *mut c_void;
+        extern "C" fn emit(value: f64, ctx: *mut c_void) {
+            let sink = unsafe { &mut *(ctx as *mut &mut dyn FnMut(u64)) };
+            sink(value.to_bits());
+        }
+        scanner(emit, ctx);
+    }
+}
+
+/// The censuss mark: every root the collectors full trace reads, by
+/// source, as the words the slots hold. Instrumented builds only.
+#[cfg(perry_gc_instruments)]
+pub(crate) fn census_visit_roots(visit: &mut dyn FnMut(&'static str, u64)) {
+    ensure_stack_maps_built();
+    visit_shadow_stack_root_slots(|slot| {
+        let source = match slot.kind {
+            MutableRootSlotKind::ShadowStack => "shadow_stack",
+            _ => "stack_map",
+        };
+        visit(source, unsafe { slot.read() });
+    });
+    visit_global_root_slots(|slot| visit("module_global", unsafe { slot.read() }));
+    let scanners: Vec<MutableRootScannerEntry> = MUTABLE_ROOT_SCANNERS.with(|s| s.borrow().clone());
+    for entry in scanners {
+        let name = entry.name;
+        let mut mark = |value: f64| visit(name, value.to_bits());
+        let mut visitor = RuntimeRootVisitor::for_copy(&mut mark);
+        (entry.scanner)(&mut visitor);
+    }
+    let mut mark = |value: f64| visit("ffi_mutable_scanner", value.to_bits());
+    let mut visitor = RuntimeRootVisitor::for_copy(&mut mark);
+    visit_ffi_mutable_registered_roots(&mut visitor);
+    let legacy: Vec<fn(&mut dyn FnMut(f64))> = ROOT_SCANNERS.with(|s| s.borrow().clone());
+    for scanner in legacy {
+        scanner(&mut |value: f64| visit("legacy_scanner", value.to_bits()));
+    }
+    let ffi: Vec<PerryFfiRootScanner> = FFI_ROOT_SCANNERS.with(|s| s.borrow().clone());
+    for scanner in ffi {
+        let mut sink: &mut dyn FnMut(&'static str, u64) = &mut *visit;
+        let ctx = &mut sink as *mut &mut dyn FnMut(&'static str, u64) as *mut c_void;
+        extern "C" fn emit(value: f64, ctx: *mut c_void) {
+            let sink = unsafe { &mut *(ctx as *mut &mut dyn FnMut(&'static str, u64)) };
+            sink("ffi_scanner", value.to_bits());
+        }
+        scanner(emit, ctx);
     }
 }

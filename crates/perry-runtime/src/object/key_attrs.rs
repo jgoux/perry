@@ -19,7 +19,7 @@
 //!
 //! A keys array that carries any non-default entry owns an *attributes
 //! array*: a pointer-free `GC_TYPE_ARRAY` with one element per key position,
-//! `INT32_TAG | cumulative << 8 | entry`. `cumulative` is the OR of
+//! `INTERNAL_WORD_TAG | cumulative << 8 | entry`. `cumulative` is the OR of
 //! [`entry_summary`] over positions `0..=i`, so the summary of any PREFIX of
 //! the list — which is what a shape names, since one canonical backing serves
 //! a whole growth chain (`canonical_keys.rs`) — is one load:
@@ -57,7 +57,7 @@
 //! position, so they stay exact.
 
 use crate::array::ArrayHeader;
-use crate::value::{INT32_TAG, POINTER_MASK, POINTER_TAG, TAG_MASK};
+use crate::value::{INTERNAL_WORD_TAG, POINTER_MASK, POINTER_TAG, TAG_MASK};
 
 /// `[[Writable]]` is false. On an accessor this is the internal writable bit
 /// (`install_fresh_accessor_property` keeps it true for a fresh accessor).
@@ -222,7 +222,7 @@ impl Word {
 
     #[inline]
     const fn encode(self) -> u64 {
-        INT32_TAG
+        INTERNAL_WORD_TAG
             | self.entry as u64
             | (self.summary as u64) << 8
             | (self.entry_bloom as u64) << 16
@@ -387,7 +387,7 @@ unsafe fn keys_attrs_resolved(keys: *const ArrayHeader) -> *mut ArrayHeader {
 #[inline]
 pub(crate) unsafe fn keys_attrs_checked(keys: *const ArrayHeader) -> *mut ArrayHeader {
     match crate::value::addr_class::try_read_gc_header(keys as usize) {
-        Some(h) if h.obj_type == crate::gc::GC_TYPE_ARRAY => keys_attrs(keys),
+        Some(h) if crate::gc_type_is_array!(h.obj_type) => keys_attrs(keys),
         _ => std::ptr::null_mut(),
     }
 }
@@ -571,7 +571,7 @@ pub(crate) unsafe fn keys_have_slots(keys: *const ArrayHeader, count: u32) -> bo
         return true;
     }
     if header.gc_flags & crate::gc::GC_FLAG_FORWARDED == 0
-        && (header.obj_type != crate::gc::GC_TYPE_ARRAY
+        && (crate::gc_type_is_not_array!(header.obj_type)
             || header._reserved & crate::gc::GC_ARRAY_KEY_ATTRS == 0)
     {
         return false;
@@ -848,7 +848,7 @@ pub(crate) unsafe fn list_storage_slot(keys: *const ArrayHeader, pos: u32) -> Op
         return None;
     }
     if header.gc_flags & crate::gc::GC_FLAG_FORWARDED == 0
-        && (header.obj_type != crate::gc::GC_TYPE_ARRAY
+        && (crate::gc_type_is_not_array!(header.obj_type)
             || header._reserved & crate::gc::GC_ARRAY_KEY_ATTRS == 0)
     {
         return Some(pos);
@@ -1315,7 +1315,7 @@ pub(crate) unsafe fn object_accessor_key_names(
             out.push(String::from_utf8_lossy(bytes).into_owned());
         }
     }
-    out.sort();
+    crate::cold_sort::sort_by(&mut out, |a, b| a.cmp(b));
     out
 }
 
@@ -1400,6 +1400,19 @@ pub(crate) enum AttrsEdit<'a> {
 }
 
 impl AttrsEdit<'_> {
+    /// Does the edit leave its key with default attributes (or keep the
+    /// attributes it had)? `Data` with all of W, E and C, and the clears.
+    #[inline]
+    pub(crate) fn leaves_default(&self) -> bool {
+        match *self {
+            AttrsEdit::Data(_, bits) => bits == 0x07,
+            AttrsEdit::ClearData(_) | AttrsEdit::ClearAccessor(_) => true,
+            #[cfg(test)]
+            AttrsEdit::ClearAll => true,
+            AttrsEdit::Accessor(..) | AttrsEdit::Integrity { .. } | AttrsEdit::Private(_) => false,
+        }
+    }
+
     /// The single key this edit is about, or `None` for a whole-list edit.
     #[inline]
     pub(crate) fn key(&self) -> Option<&[u8]> {
@@ -1508,7 +1521,9 @@ unsafe fn fold_edits(
     }
     let mut entry = old;
     for (edit, &key_at) in edits.iter().zip(at) {
-        if edit.key().is_some() && (key_at != pos || matches!(edit, AttrsEdit::Private(_)) != entry_is_private(old)) {
+        if edit.key().is_some()
+            && (key_at != pos || matches!(edit, AttrsEdit::Private(_)) != entry_is_private(old))
+        {
             continue;
         }
         entry = edit.apply(entry);
@@ -1629,10 +1644,12 @@ pub(crate) unsafe fn apply_edits(obj: *mut crate::object::ObjectHeader, edits: &
     let Some(proof) = crate::object::canonical_keys::SharedLayout::of_receiver(obj) else {
         return;
     };
-    let rebuilt =
-        crate::object::canonical_keys::rebuild_with_entries(&proof, keys, from, |pos, slot, old| {
-            fold_edits(edits, at, pos, slot, old)
-        });
+    let rebuilt = crate::object::canonical_keys::rebuild_with_entries(
+        &proof,
+        keys,
+        from,
+        |pos, slot, old| fold_edits(edits, at, pos, slot, old),
+    );
     crate::object::set_object_keys(obj, rebuilt.view());
 }
 

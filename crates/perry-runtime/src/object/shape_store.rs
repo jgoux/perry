@@ -9,7 +9,7 @@ pub(crate) unsafe fn named_bag(
 ) -> Option<*const ObjectHeader> {
     let header = crate::value::addr_class::try_read_gc_header(receiver as usize)?;
     let bag = match header.obj_type {
-        crate::gc::GC_TYPE_ARRAY => {
+        crate::gc_array_type_pat!() => {
             let bag = crate::array::array_property_bag(receiver.cast());
             if bag.is_null() {
                 return None;
@@ -81,7 +81,7 @@ pub(crate) unsafe fn try_own_store(
             return named_bag(obj, crate::JSValue::string_ptr(key as *mut _).bits())
                 .is_some_and(|bag| try_own_store(bag.cast_mut(), key, value));
         }
-        if header.obj_type == crate::gc::GC_TYPE_ARRAY {
+        if crate::gc_type_is_array!(header.obj_type) {
             let arr = crate::array::clean_arr_ptr_mut(obj.cast());
             if crate::array::array_object_flags_resolved(arr) & crate::gc::OBJ_FLAG_FROZEN != 0 {
                 return false;
@@ -243,12 +243,22 @@ unsafe fn record_own_overwrite(
             if record.summary()
                 & (super::key_attrs::SUMMARY_BLOCKS_OVERWRITE | super::key_attrs::SUMMARY_PRIVATE)
                 != 0
-                && !super::key_attrs::entry_is_plain_overwrite(super::key_attrs::keys_entry(
+            {
+                let entry = super::key_attrs::keys_entry(
                     record.keys() as usize as *const crate::ArrayHeader,
                     slot as u32,
-                ))
-            {
-                return Some(false);
+                );
+                // An optional layout key is present while its slot holds a
+                // value (`key_view`, object model §3.2): overwriting it then
+                // is the plain overwrite of a writable data binding. While
+                // the slot holds the hole the key is absent and the store is
+                // an add, which this overwrite never makes.
+                if !super::key_attrs::entry_is_plain_writable_data(entry)
+                    || entry & super::key_attrs::ENTRY_OPTIONAL != 0
+                        && super::key_view::position_is_hole(obj, record.keys_view(), slot as u32)
+                {
+                    return Some(false);
+                }
             }
             let slot = super::key_attrs::key_storage_slot(
                 record.keys() as usize as *const crate::ArrayHeader,
@@ -281,7 +291,7 @@ pub(crate) unsafe fn store_proven_own_slot(
         // and flag test): an own-key overwrite of `%Array.prototype%`'s
         // `join` must set its shadow bit like any other slot store.
         super::builtin_proto::note_value_store(obj, slot, false, "own store");
-        let rep = super::field_rep::slot_rep(record.rep(), slot as u32);
+        let rep = record.lane(slot as u32);
         let address = obj
             .cast::<u8>()
             .add(std::mem::size_of::<ObjectHeader>())
@@ -365,7 +375,7 @@ pub(crate) unsafe fn try_warm_transition(
         record
     } else {
         let header = crate::value::addr_class::try_read_gc_header(obj as usize)?;
-        if header.obj_type == crate::gc::GC_TYPE_ARRAY {
+        if crate::gc_type_is_array!(header.obj_type) {
             return try_warm_array_transition(obj.cast(), key, value, refresh);
         }
         if crate::gc_type_is_not_object!(header.obj_type)
@@ -659,7 +669,7 @@ unsafe fn try_array_store(
         let proto_root = scope.root_nanbox_f64(prototype);
         let proto_addr = (prototype.to_bits() & crate::value::POINTER_MASK) as usize;
         let header = crate::value::addr_class::try_read_gc_header(proto_addr)?;
-        let prototype = if header.obj_type == crate::gc::GC_TYPE_ARRAY {
+        let prototype = if crate::gc_type_is_array!(header.obj_type) {
             let proto_arr = crate::array::clean_arr_ptr_mut(proto_addr as *mut crate::ArrayHeader);
             if crate::array::array_object_flags_resolved(proto_arr)
                 & crate::gc::GC_ARRAY_CUSTOM_PROTO
@@ -705,6 +715,24 @@ unsafe fn try_array_store(
                 bag as usize,
                 prototype.to_bits(),
             );
+        }
+    }
+    if !existing {
+        // A key the bag's layout lists ahead of its first store (an array
+        // layout's declared late key) is absent while its slot holds the
+        // hole (`key_view`): the store is the layout's add, which proves the
+        // chain through the edge linked above and fills the slot in order
+        // (`layout_desc::family_store`). Any other key is not its add.
+        let bag = bag_root.get_raw_mut_ptr::<ObjectHeader>();
+        let key = key_root.get_raw_const_ptr::<crate::StringHeader>();
+        let bytes = crate::string::header_str_checked(key)?.as_bytes();
+        if super::layout_desc::family_store(
+            bag,
+            crate::value::js_nanbox_string(key as i64).to_bits(),
+            bytes,
+            value_root.get_nanbox_f64().to_bits(),
+        ) {
+            return Some(value_root.get_nanbox_f64());
         }
     }
     let bag = bag_root.get_raw_mut_ptr::<ObjectHeader>();
@@ -772,7 +800,7 @@ pub(crate) unsafe fn try_store_with_refresh(
     }
     let addr = (target.to_bits() & POINTER_MASK) as usize;
     let header = crate::value::addr_class::try_read_gc_header(addr)?;
-    if header.obj_type == crate::gc::GC_TYPE_ARRAY {
+    if crate::gc_type_is_array!(header.obj_type) {
         return try_array_store(target, key, value, name, may_move);
     }
     if header.obj_type == crate::gc::GC_TYPE_CLOSURE {
@@ -970,6 +998,11 @@ unsafe fn try_function_store(
     {
         return None;
     }
+    // A plain data key on a described function: a key-add on its shape
+    // (`function_own_put`), no generic tail.
+    if let Some(stored) = super::function_own_put::function_own_put(target, key, value, false) {
+        return Some(stored);
+    }
     let closure = ptr as *const crate::closure::ClosureHeader;
     let descriptor = shapes::shape_descriptor_of_receiver(((*closure).shape_id).0)?;
     if crate::closure::shape::is_class_info((*closure).info) {
@@ -984,9 +1017,16 @@ unsafe fn try_function_store(
         return super::try_existing_own_data_overwrite_by_content(bag, key, name.as_bytes(), value)
             .then_some(value);
     }
+    // A bound function keeps its own keys in the same bag as any function
+    // (its intrinsic `name`/`length` were declined above), and its shape
+    // names its [[Prototype]] as any described function's does.
     if !matches!(
         descriptor.object_kind,
-        shapes::ShapeObjectKind::Function | shapes::ShapeObjectKind::FunctionDictionary
+        shapes::ShapeObjectKind::Function
+            | shapes::ShapeObjectKind::FunctionDictionary
+            | shapes::ShapeObjectKind::FunctionBound
+            | shapes::ShapeObjectKind::FunctionBoundCall
+            | shapes::ShapeObjectKind::FunctionBoundApply
     ) || flags & (crate::gc::OBJ_FLAG_SEALED | crate::gc::OBJ_FLAG_NO_EXTEND) != 0
     {
         return None;

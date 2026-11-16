@@ -219,7 +219,13 @@ impl LoweringContext {
         name: &str,
         scope_key: u32,
     ) -> Option<Option<(String, u32)>> {
-        if self.lookup_class(name).is_none() {
+        // A class that shadows a global built-in constructor (`function f() {
+        // class MessageChannel {} }`) is scope-local too: registered under its
+        // plain name, it captured every `new MessageChannel()` of the module,
+        // the global ones outside its scope included.
+        if self.lookup_class(name).is_none()
+            && !super::expr_new_builtins::is_reified_global_builtin_constructor(name)
+        {
             return None;
         }
         if self
@@ -1006,6 +1012,8 @@ impl LoweringContext {
                 object: Box::new(Expr::This),
                 property: name.clone(),
                 value: Box::new(Expr::LocalGet(param_id)),
+                byte_offset: 0,
+                byte_end: 0,
             }));
         }
         let constructor = Function {
@@ -1055,6 +1063,7 @@ impl LoweringContext {
             // Synthetic anon-shape class; no static fields, so static-init
             // timing is irrelevant.
             is_nested: false,
+            decl_stmt: None,
             alloc_width_hint,
             specialized_from: None,
         });
@@ -1130,6 +1139,7 @@ impl LoweringContext {
             is_exported: false,
             aliases: Vec::new(),
             is_nested: false,
+            decl_stmt: None,
             alloc_width_hint: 0,
             specialized_from: None,
         });
@@ -1160,6 +1170,18 @@ impl LoweringContext {
                     *has_synth_args,
                 )
             })
+    }
+
+    /// True when `name` reads the global `WebSocket` (Perry's native client,
+    /// served by perry-ext-ws): not an import binding, not a local and not a
+    /// class in scope. npm `ws` compiles from source, so an imported or
+    /// `require`d `WebSocket` is that package's JS class and must not be
+    /// tagged as the native client.
+    pub(crate) fn names_global_websocket(&self, name: &str) -> bool {
+        name == "WebSocket"
+            && !self.imported_functions_index.contains_key(name)
+            && self.lookup_local(name).is_none()
+            && self.lookup_class(name).is_none()
     }
 
     pub(crate) fn lookup_imported_func(&self, name: &str) -> Option<&str> {

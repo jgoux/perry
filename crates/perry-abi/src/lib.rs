@@ -6,6 +6,7 @@
 //! compile until the number is right — so emitted code can never disagree
 //! with the struct it indexes. No dependencies.
 
+mod array_type;
 pub mod function_metadata;
 mod object_type;
 pub use function_metadata::*;
@@ -15,6 +16,7 @@ pub mod accessor_guards;
 mod builtin_proto;
 pub use builtin_proto::{BuiltinProto, FunctionProtoKind};
 pub mod intrinsic_serials;
+pub mod lock;
 pub mod object_meta_flags;
 mod shape_kind;
 pub use shape_kind::ShapeObjectKind;
@@ -25,6 +27,11 @@ pub use realm_cells::*;
 pub mod layouts;
 pub use layouts::*;
 pub mod realm_header;
+pub mod realm_phase;
+pub use realm_phase::{
+    realm_core_global, realm_rest_global, realm_value_global, REALM_CORE_GLOBALS,
+    REALM_REST_GLOBALS, REALM_REST_NAMES, REALM_UNBOUND_POISON, REALM_VALUE_GLOBALS,
+};
 
 /// `object::shapes::SHAPE_ID_BASE`: the first ShapeId.
 pub const SHAPE_ID_BASE: u32 = 0x8000_0000;
@@ -55,6 +62,29 @@ pub const WEAKSET_BIRTH_LAYOUT: u32 = WEAKMAP_BIRTH_LAYOUT + 1;
 
 /// `array::ArrayHeader` size: element 0 follows it.
 pub const ARRAY_HEADER_SIZE: usize = 24;
+
+/// The longest fresh `new Array(k)` the runtime backs with a dense store
+/// (`js_array_constructor_single`): `capacity >= k`, every slot a hole. A
+/// longer one records length `k` over an empty store, as a sparse length
+/// extension does, so its capacity says nothing about its length. wpfacts
+/// proves an element read slot-addressable only up to this length
+/// (`bindings::element_read`).
+pub const MAX_FRESH_DENSE_ARRAY_LENGTH: u32 = 1_000_000;
+
+/// The packed `ArrayHeader` length/capacity word (length in the low 32 bits,
+/// capacity in the high 32) that generated code stores at an inline array
+/// birth (`perry-codegen` `expr/array_literal.rs`). A birth's capacity is at
+/// least its length: wpfacts records an array literal's birth length as a
+/// length floor that the element storage holds (`solve::arr_len`), and the
+/// runtime's own allocations keep the same bound
+/// (`perry-runtime/src/array/capacity_writes_tests.rs`).
+pub const fn array_birth_header(length: u32, capacity: u32) -> u64 {
+    assert!(
+        capacity >= length,
+        "an array birth's capacity is below its length"
+    );
+    length as u64 | (capacity as u64) << 32
+}
 
 /// `PerryLayoutKey.attrs` bit (the runtime's key entry byte, `ENTRY_OPTIONAL`):
 /// the key is a layout's optional or late member. Its slot may hold the hole
@@ -123,6 +153,12 @@ pub const ATOM_KIND_PROGRAM_SYMBOL: u8 = 2;
 /// its registry key, `hash` the compiler's hash of it (a key index position
 /// only: the runtime resolves the symbol through the registry).
 pub const ATOM_KIND_REGISTERED_SYMBOL: u8 = 3;
+/// The index hash of the runtime's `n`-th own symbol atom (a kind-2 atom
+/// of node's library, `perry_runtime_symbol_atom_<n>`). The runtime's
+/// declaration and the compiler's emitted descriptors both read it here.
+pub const fn runtime_symbol_atom_hash(n: u32) -> u64 {
+    0x9e37_79b9_7f4a_7c15u64.wrapping_mul(n as u64 + 0x100)
+}
 /// `StaticAtom.kind`: a module-local symbol (a top-level `const k =
 /// Symbol(desc)` of the program) as a key of a carried prototype layout;
 /// `string` is null, `hash` the compiler's hash of the binding (a key index
@@ -188,7 +224,7 @@ pub const AGENT_PTR_SLOTS: usize = 4 + INTRINSIC_FAMILIES;
 /// sealed every slot names `PERRY_PRISTINE_PROTO`, whose word is 0.
 pub const AGENT_PTR_INTRINSIC_PROTO: usize = 4;
 /// Number of builtin prototype families.
-pub const BUILTIN_PROTO_FAMILIES: usize = 16;
+pub const BUILTIN_PROTO_FAMILIES: usize = 17;
 /// The builtin namespace objects whose direct member calls lowering binds to
 /// intrinsics (`Math.max(..)`, `Object.keys(..)`, `console.log(..)`). Namespace
 /// `i` is intrinsic family `BUILTIN_PROTO_FAMILIES + i`: its agent slot
@@ -303,6 +339,59 @@ pub const CLASS_FIRST_EVALUATION_STATE: u64 = 0x7FFE_0000_0000_0001;
 pub const GC_TYPE_CLOSURE: u8 = 4;
 /// `gc::GC_TYPE_OBJECT`: an ordinary object, e.g. a byte cell's property bag.
 pub const GC_TYPE_OBJECT: u8 = 2;
+/// `gc::GC_TYPE_ARRAY`: an ordinary array head (`ArrayHeader`).
+pub const GC_TYPE_ARRAY: u8 = 1;
+/// `gc::GC_ARRAY_RAW_F64_LAYOUT`: a `GC_TYPE_ARRAY`'s `_reserved` bit saying
+/// its slots are canonical raw `f64` values.
+pub const GC_ARRAY_RAW_F64_LAYOUT: u16 = 0x80;
+/// `gc::GC_ARRAY_RAW_F64_HOLES`: a `GC_TYPE_ARRAY`'s `_reserved` bit saying
+/// every slot below the length is a canonical raw `f64` or a hole.
+pub const GC_ARRAY_RAW_F64_HOLES: u16 = 0x1000;
+/// `layout_slot::GC_ARRAY_I32_LAYOUT`: a `GC_TYPE_ARRAY`'s `_reserved` bit
+/// saying every element slot holds an I32 word (I32 at rest).
+pub const GC_ARRAY_I32_LAYOUT: u16 = 0x400;
+/// `array::MIN_ARRAY_CAPACITY`: the fewest slots a runtime array birth has.
+pub const MIN_ARRAY_CAPACITY: u32 = 4;
+
+/// The slots a fill birth `new Array(length).fill(v)` has: what
+/// `js_array_constructor_single` gives a dense `new Array(length)`, or the
+/// capacity an at-rest birth reserves (`reserve`, 0 for none) when that is
+/// more. The runtime's `js_array_fill_birth` and the inline birth codegen
+/// emits (`perry-codegen` `expr/fill_birth.rs`) both take it from here.
+pub const fn fill_birth_capacity(length: u32, reserve: u32) -> u32 {
+    let floor = if length > MIN_ARRAY_CAPACITY {
+        length
+    } else {
+        MIN_ARRAY_CAPACITY
+    };
+    if reserve > floor {
+        reserve
+    } else {
+        floor
+    }
+}
+
+/// The `GcHeader::_reserved` layout bits a non-empty fill birth is born with:
+/// the bits the two-step path leaves on `new Array(k).fill(<number>)`
+/// (pointer free, dense raw `f64`, and the raw-`f64`-or-holes bit `new
+/// Array(k)` set), or pointer free with the I32 layout bit when its elements
+/// are stored at rest (`js_array_rest_encode` clears both raw bits). The
+/// runtime asserts both against its own constants and against the two-step
+/// path (`perry-runtime` `array/fill_birth.rs`).
+pub const fn fill_birth_layout(rest: bool) -> u16 {
+    if rest {
+        GC_LAYOUT_POINTER_FREE | GC_ARRAY_I32_LAYOUT
+    } else {
+        GC_LAYOUT_POINTER_FREE | GC_ARRAY_RAW_F64_LAYOUT | GC_ARRAY_RAW_F64_HOLES
+    }
+}
+
+/// `gc::GC_ARRAY_CUSTOM_PROTO`: a `GC_TYPE_ARRAY`'s `_reserved` bit saying its
+/// `[[Prototype]]` was retargeted.
+pub const GC_ARRAY_CUSTOM_PROTO: u16 = 0x40;
+/// The largest capacity the packed-f64 counted loop admits
+/// (`typed_feedback::packed_f64_loop_admits_live_array`).
+pub const PACKED_F64_LOOP_MAX_CAPACITY: u32 = 16_000_000;
 /// `gc::GC_TYPE_BUFFER` and `gc::GC_TYPE_BUFFER_UINT8ARRAY`: the GcHeader type
 /// bytes of the two BYTE-VIEW buffer brands, a Node `Buffer` and a
 /// `BufferHeader`-backed `Uint8Array` (#10694: a buffer's flavor is its type
@@ -311,6 +400,15 @@ pub const GC_TYPE_BUFFER: u8 = 0x4c;
 pub const GC_TYPE_BUFFER_UINT8ARRAY: u8 = 0x40;
 /// Header-less symbols must be screened before trusting a buffer layout.
 pub const SYMBOL_HEADER_MAGIC: u32 = 0x5359_4D42;
+/// `SymbolHeader.registered` bits. `SYMBOL_GLOBAL_REGISTRY`: born by
+/// `Symbol.for` (the spec's GlobalSymbolRegistry; `Symbol.keyFor` answers it,
+/// WeakRef refuses it). `SYMBOL_NATIVE_TEXT`: a runtime-born immortal cell whose
+/// description is native text after the payload. `SYMBOL_WELL_KNOWN`: one of the
+/// spec's well-known symbols. A symbol's kind is read from its own payload;
+/// no registry is consulted to classify a word.
+pub const SYMBOL_GLOBAL_REGISTRY: u32 = 1;
+pub const SYMBOL_NATIVE_TEXT: u32 = 2;
+pub const SYMBOL_WELL_KNOWN: u32 = 4;
 /// `gc::GC_FLAG_FORWARDED` (GcHeader byte 1): an evacuated from-space stub.
 pub const GC_FLAG_FORWARDED: u8 = 0x80;
 /// `gc::GC_HEADER_SIZE`.
@@ -328,8 +426,8 @@ pub const GC_OBJECT_CALLABLE: u16 = 0x0020;
 /// Heap-birth facts shared by runtime allocation and realm-cell emission.
 /// These are existing meanings in GcHeader::_reserved, never image markers.
 pub const OBJ_FLAG_PLAIN_ORDINARY: u16 = 0x0200;
-/// An object has a null [[Prototype]].
-pub const OBJ_FLAG_NULL_PROTO: u16 = 0x40;
+// 0x40 was `OBJ_FLAG_NULL_PROTO`: a null [[Prototype]] is the shape's
+// identity (`PROTO_ID_NULL`), not a header bit. The bit is free.
 /// At least one own property carries non-default descriptor attributes.
 pub const OBJ_FLAG_HAS_DESCRIPTORS: u16 = 0x800;
 /// An array has one front-reserve pointer to its key-attribute array.
@@ -360,6 +458,14 @@ pub const GC_TYPE_STRING: u8 = 3;
 /// boxed binding. A declaring function's inline box read accepts exactly this
 /// kind, unforwarded, of exactly that size.
 pub const GC_TYPE_BOX: u8 = 22;
+/// `gc::GC_TYPE_RECORD_ARRAY`: a value-record array head
+/// (`record_array::RecordArrayHeader`). Never an ordinary array:
+/// `gc_type_is_array!` is false for it, and only the `js_record_array_*`
+/// entries read or write one.
+pub const GC_TYPE_RECORD_ARRAY: u8 = 42;
+/// `gc::GC_TYPE_RECORD_ELEMS`: a record array's element buffer,
+/// `capacity * words` pointer-free JSValue words.
+pub const GC_TYPE_RECORD_ELEMS: u8 = 43;
 
 /// Classify the first four GC-header bytes, loaded as a native-endian u32.
 /// No shape or target read is needed after the creation-time publication.
@@ -739,6 +845,45 @@ pub const FN_HAS_CONSTRUCTOR_LAYOUT: u32 = 1 << 23;
 /// an optional `{ i32 displacement, u32 offset, u32 length, u32 reserved }` tail.
 /// This is an immutable representation discriminator, not a validity bit.
 pub const FN_SOURCE_BLOCKS: u32 = 1 << 24;
+/// The compiled body is exactly `return <binding>` where the binding is one
+/// of the closure's captures: a call returns what these loads read, and
+/// nothing else happens. `trusted_captures` holds the capture index, and
+/// `trusted_boxed_mask` is 0 when the capture word is the value, else one plus
+/// the byte offset of the value in the cell the capture word names (a box or
+/// a scope object). Only codegen sets it, and only on an info with no trusted
+/// clone (`trusted_code` null), whose two words it licenses: an immutable
+/// representation discriminator like [`FN_SOURCE_BLOCKS`]. A read of an
+/// accessor whose getter carries it loads the binding instead of calling.
+pub const FN_RETURNS_CAPTURE: u32 = 1 << 27;
+const _: () = assert!(
+    FN_RETURNS_CAPTURE
+        & (FN_REST_MASK
+            | FN_RESOLVES_ARRAY_THIS
+            | FN_ARGUMENTS_OBJECT
+            | FN_ARGUMENTS_RESTRICTED
+            | FN_ARGUMENTS_MAPPED
+            | FN_NATIVE_EXPORT
+            | FN_HAS_LENGTH
+            | FN_ARROW
+            | FN_STRICT
+            | FN_ASYNC
+            | FN_GENERATOR
+            | FN_ASYNC_GENERATOR
+            | FN_NON_CONSTRUCTOR
+            | FN_BUILTIN
+            | FN_HAS_DECLARED
+            | FN_PERMANENT_IMAGE
+            | FN_COMPILED_BODY
+            | FN_HAS_SOURCE
+            | FN_NON_STRICT_ORDINARY
+            | FN_HAS_NAME
+            | FN_NAME_IMAGE
+            | FN_HAS_CONSTRUCTOR_LAYOUT
+            | FN_SOURCE_BLOCKS
+            | crate::function_metadata::FN_HAS_METADATA
+            | (0xF << FN_CALL_ENTRY_SHIFT))
+        == 0
+);
 /// Independent retained-source frames bound uncached small-range decoding.
 pub const RETAINED_SOURCE_BLOCK_BYTES: usize = 4096;
 /// A function whose own source is at most this long keeps a raw copy that its
@@ -1006,6 +1151,22 @@ pub const METHOD_SITE_BY_NAME_DIRECT: u64 = 0x7FFC_0000_0000_0012;
 const _: () = assert!(METHOD_SITE_BY_NAME | 2 == METHOD_SITE_BY_NAME_DIRECT);
 /// `object::ObjectMeta::spill` (the object-owned overflow buffer).
 pub const OBJECT_META_SPILL_OFFSET: usize = 32;
+/// `object::ObjectMeta::flags`.
+pub const OBJECT_META_FLAGS_OFFSET: usize = 24;
+/// `object::ObjectMeta::overflow` (the object's overflow table, 0 = none).
+pub const OBJECT_META_OVERFLOW_OFFSET: usize = 120;
+/// The one-bit state flags of `ObjectMeta::flags` (prototype role, exotic
+/// read receiver, native alias, sealed intrinsic, ...): an object with all of
+/// them clear is a plain holder of its own properties.
+pub const OBJECT_META_STATE_FLAGS: u64 = 0xFF;
+/// `object::overflow::Table::summary` (a `u32`): the OR of every entry's
+/// attribute summary ever recorded.
+pub const OVERFLOW_TABLE_SUMMARY_OFFSET: usize = 20;
+/// The summary bits (`key_attrs::SUMMARY_ACCESSOR | SUMMARY_NON_WRITABLE |
+/// SUMMARY_PRIVATE`) that must be clear for "every entry of this table is a
+/// plain writable data property": then an own key's present fixed slot may be
+/// overwritten in place.
+pub const OVERFLOW_SUMMARY_BLOCKS_PLAIN_STORE: u32 = 0x13;
 
 /// `closure::CAPTURES_THIS_FLAG` / `closure::NO_THIS_REBIND_FLAG`, the high
 /// bits of `ClosureHeader::capture_count`. A closure with the first and not

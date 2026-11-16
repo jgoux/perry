@@ -178,7 +178,7 @@ unsafe fn array_custom_array_prototype_from_bits(
         return None;
     }
     let hdr = (resolved as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
-    if (*hdr).obj_type == crate::gc::GC_TYPE_ARRAY {
+    if crate::gc_type_is_array!((*hdr).obj_type) {
         Some(resolved)
     } else {
         None
@@ -317,6 +317,7 @@ pub(super) unsafe fn array_miss_index_get(arr: *const ArrayHeader, index: u32) -
 /// A missing descriptor cannot collect; a getter returns before either caller
 /// uses the raw holder again and the invocation roots its original receiver.
 #[cold]
+#[optimize(size)]
 #[inline(never)]
 pub(super) unsafe fn array_index_accessor_get(
     arr: *const ArrayHeader,

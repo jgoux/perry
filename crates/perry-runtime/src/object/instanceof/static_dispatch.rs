@@ -148,8 +148,26 @@ fn instanceof_dispatch(
         if !hi_sym.is_null() {
             let hi_f64 = f64::from_bits(crate::value::JSValue::pointer(hi_sym as *const u8).bits());
             if let Some(vb) = crate::symbol::class_static_symbol_lookup_in_chain(class_id, hi_f64) {
-                let cb = f64::from_bits(vb);
-                if let HasInstanceOutcome::Result(r) = dispatch_own_has_instance(cb, value) {
+                let mut cb = f64::from_bits(vb);
+                // The hook's receiver is C. A static-id caller names C by
+                // its id; its function object is the class value, whose first
+                // read may allocate, so both operands are rooted across it.
+                let mut target = match constructor {
+                    Some(target) => target,
+                    None => {
+                        let scope = crate::gc::RuntimeHandleScope::new();
+                        let lhs = scope.root_nanbox_f64(value);
+                        let hook = scope.root_nanbox_f64(cb);
+                        let target =
+                            crate::object::native_module::class_constructor_ref_value(class_id);
+                        value = lhs.get_nanbox_f64();
+                        cb = hook.get_nanbox_f64();
+                        target
+                    }
+                };
+                if let HasInstanceOutcome::Result(r) =
+                    dispatch_own_has_instance(OwnHook::Value(cb), &mut target, &mut value)
+                {
                     return r;
                 }
             }
@@ -282,20 +300,25 @@ fn native_instanceof(
     // has `Function.prototype` in its prototype chain. Keep `CLASS_ID_FUNCTION`
     // in sync with perry-codegen/src/expr/instance_misc1.rs.
     if class_id == CLASS_ID_FUNCTION {
-        if value_is_callable(value) {
+        let addr = value_addr(value);
+        // A function whose prototype was reset (`Object.setPrototypeOf(fn,
+        // proto)`) answers by its actual chain, which need not reach
+        // `Function.prototype`.
+        let reset_callable = addr != 0 && crate::closure::closure_static_prototype(addr).is_some();
+        if value_is_callable(value) && !reset_callable {
             return true_val;
         }
         // An ordinary object whose recorded chain reaches a function
         // (`Object.create(fn)`) has `Function.prototype` on it too.
-        let addr = value_addr(value);
-        if addr != 0
-            && unsafe { crate::object::prototype_chain::meta_capable_object(addr) }.is_some()
-            && crate::object::prototype_chain::object_static_prototype(addr).is_some()
+        if reset_callable
+            || (addr != 0
+                && unsafe { crate::object::prototype_chain::meta_capable_object(addr) }.is_some()
+                && crate::object::prototype_chain::object_static_prototype(addr).is_some())
         {
             let function = constructor
                 .as_ref()
                 .map(|rhs| rhs.get_nanbox_f64())
-                .unwrap_or_else(|| js_get_global_this_builtin_value(b"Function".as_ptr(), 8));
+                .unwrap_or_else(|| crate::object::builtin_value_core("Function"));
             if ordinary_has_instance_prototype_walk(rooted_value.get_nanbox_f64(), function) {
                 return true_val;
             }
@@ -460,7 +483,7 @@ fn native_instanceof(
     // prototype side table instead. Honor that chain for user class ids.
     if is_class_id_registered(class_id) {
         let addr = value_addr(value);
-        if addr != 0 && super::prototype_chain::object_static_prototype(addr).is_some() {
+        if addr != 0 && super::prototype_chain::has_recorded_prototype(addr) {
             let constructor = super::class_constructor_ref_value(class_id);
             return if ordinary_has_instance_prototype_walk(
                 rooted_value.get_nanbox_f64(),
@@ -712,7 +735,7 @@ fn native_instanceof(
                 } else {
                     let scope = crate::gc::RuntimeHandleScope::new();
                     let object = scope
-                        .root_nanbox_f64(js_get_global_this_builtin_value(b"Object".as_ptr(), 6));
+                        .root_nanbox_f64(crate::object::builtin_value_core("Object"));
                     ordinary_has_instance_prototype_walk_rooted(rooted_value, &object)
                 };
                 return if matches { true_val } else { false_val };
@@ -744,18 +767,8 @@ fn native_instanceof(
             // `DateCell` pointer — #2089) and an Invalid Date.
             return true_val;
         }
-        let top16 = (bits >> 48) as u16;
-        if top16 == 0 && bits >= 0x1000 {
-            let addr = bits as usize;
-            // #10694: a raw word must be allocator-owned before the brand read.
-            if crate::buffer::buffer_family_type_owned(addr).is_some()
-                || crate::set::is_registered_set(addr)
-                || crate::map::is_registered_map(addr)
-                || crate::typedarray_hook_slots::lookup_typed_array_kind(addr).is_some()
-            {
-                return true_val;
-            }
-        }
+        // A word whose top 16 bits are clear is a Number (a denormal, or
+        // +0), not a raw object pointer.
         return false_val;
     }
 
@@ -771,7 +784,7 @@ fn native_instanceof(
         // byte below it.
         let is_array = unsafe { crate::value::addr_class::try_read_gc_header(value_addr(value)) }
             .is_some_and(|header| {
-                header.obj_type == crate::gc::GC_TYPE_ARRAY
+                crate::gc_type_is_array!(header.obj_type)
                     || header.obj_type == crate::gc::GC_TYPE_LAZY_ARRAY
             });
         return if is_array { true_val } else { false_val };

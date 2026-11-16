@@ -296,9 +296,12 @@ impl CopyingNurseryCollector {
                 // is rewritten to the current array and the stub, unmarked,
                 // is freed with its extent.
                 let forwarded = forwarding_address(ptr.header) as usize;
-                self.mark_addr::<DIAGNOSTICS>(forwarded).unwrap_or(forwarded)
+                self.mark_addr::<DIAGNOSTICS>(forwarded)
+                    .unwrap_or(forwarded)
             },
-            CopyingPointerKind::YoungLarge | CopyingPointerKind::Longlived | CopyingPointerKind::Malloc => {
+            CopyingPointerKind::YoungLarge
+            | CopyingPointerKind::Longlived
+            | CopyingPointerKind::Malloc => {
                 unsafe {
                     let flags = (*ptr.header).gc_flags;
                     if flags & GC_FLAG_MARKED == 0 && !super::pin::pinned_counts_as_marked(flags) {
@@ -353,6 +356,10 @@ impl CopyingNurseryCollector {
             (*header).gc_flags = flags | GC_FLAG_MARKED;
             let total = (*header).size as usize;
             self.queue_child_scan::<DIAGNOSTICS>(header);
+            #[cfg(perry_gc_instruments)]
+            if DIAGNOSTICS {
+                super::diagnostic_hooks::life_reached(user, user);
+            }
             if let Some(d) = self.survival.as_mut().filter(|_| DIAGNOSTICS) {
                 d.record((*header).obj_type, total, true);
             }
@@ -500,6 +507,10 @@ impl CopyingNurseryCollector {
         // GC_FLAG_MARKED past the end of the cycle and reads as live to the
         // next full sweep. Only the worklist push is skipped.
         self.queue_child_scan::<DIAGNOSTICS>(new_header);
+        #[cfg(perry_gc_instruments)]
+        if DIAGNOSTICS {
+            super::diagnostic_hooks::life_reached(old_user as usize, new_user as usize);
+        }
         if let Some(d) = self.survival.as_mut().filter(|_| DIAGNOSTICS) {
             d.record((*new_header).obj_type, total, promote);
         }
@@ -678,6 +689,12 @@ fn untraced_promotion_instrument_veto<const DIAGNOSTICS: bool>() -> Option<&'sta
     }
     if DIAGNOSTICS && crate::gc::gc_verify_mark_enabled() {
         return Some("verify_mark");
+    }
+    // The life claims (check mode, lifetime measurement) read the copy and
+    // promotion points of the trace: untraced, every claim reads as freed.
+    #[cfg(perry_gc_instruments)]
+    if DIAGNOSTICS && super::diagnostic_hooks::life_hooks_armed() {
+        return Some("life_claims");
     }
     if super::barrier::incremental_mark_in_progress_on_this_thread() {
         return Some("incremental_mark_in_progress");
@@ -926,6 +943,7 @@ pub(super) fn run_copied_minor_attempt<const DIAGNOSTICS: bool>(
     _trigger_kind: GcTriggerKind,
     may_speculate: bool,
 ) -> CopiedMinorAttempt {
+    crate::snap_funnel!(Gc);
     let _heap_change = crate::gc::heap_generation::HeapChange::begin(
         crate::gc::heap_generation::HeapChangeKind::CopyingMinor,
     );
@@ -1048,8 +1066,9 @@ pub(super) fn run_copied_minor_attempt<const DIAGNOSTICS: bool>(
     collector.stats.first_cycle_promotion_rolled_back = first_cycle_rollback;
     collector.stats.in_place_promoted_blocks = promotion.block_count();
     // See `CopyingNurseryCollector::skip_remembering` for the proof.
-    collector.skip_remembering =
-        promoting_in_place && young_large_bytes == 0 && collector.ptrs.malloc_registry_empty_at_start;
+    collector.skip_remembering = promoting_in_place
+        && young_large_bytes == 0
+        && collector.ptrs.malloc_registry_empty_at_start;
     if collector.skip_remembering {
         debug_assert_no_remembering_possible();
     }
@@ -1587,7 +1606,9 @@ pub(super) fn run_copied_minor_attempt<const DIAGNOSTICS: bool>(
     } else {
         let sticky = &mut collector.sticky;
         crate::arena::finish_copied_young_large(|header| unsafe {
-            super::leaf_service::remember_promoted_large_container_into::<DIAGNOSTICS>(sticky, header)
+            super::leaf_service::remember_promoted_large_container_into::<DIAGNOSTICS>(
+                sticky, header,
+            )
         })
     };
     let large_live_bytes = young_large_bytes.saturating_sub(large_reset.reusable_bytes);
@@ -1756,7 +1777,8 @@ pub(super) fn run_copied_minor_attempt<const DIAGNOSTICS: bool>(
     } else {
         from_space_bytes.saturating_sub(collector.live_from_bytes) as u64
     };
-    let freed_bytes = nursery_freed_bytes.saturating_add(malloc_freed_bytes)
+    let freed_bytes = nursery_freed_bytes
+        .saturating_add(malloc_freed_bytes)
         .saturating_add(large_reset.reusable_bytes as u64);
     collector.stats.malloc_validation_lookups = collector.ptrs.malloc_validation_lookups();
     collector.stats.malloc_registry_rebuilds = collector.ptrs.malloc_registry_rebuilds();
@@ -1812,7 +1834,12 @@ pub(super) fn run_copied_minor_attempt<const DIAGNOSTICS: bool>(
     // one line: the baseline is the base of a GROWTH measurement, not a
     // liveness claim, and withholding it pins that base at 0 on exactly the
     // workloads that reach this path.
-    credit_promoted_bytes_to_old_baseline(collector.stats.promoted_bytes.saturating_add(if untraced { 0 } else { large_live_bytes }));
+    credit_promoted_bytes_to_old_baseline(
+        collector
+            .stats
+            .promoted_bytes
+            .saturating_add(if untraced { 0 } else { large_live_bytes }),
+    );
     // #10241: the promoted cohort counts in-place promotions only; bytes this
     // minor tenured by copy survived a minor already (`promoted_cohort`).
     super::promoted_cohort::note_minor_promotion(
@@ -1885,15 +1912,23 @@ pub(super) fn run_copied_minor_attempt<const DIAGNOSTICS: bool>(
         collector.stats.survivor_first_round_live_bytes,
     );
     if from_space_bytes != 0 {
-    retune_after_scavenge(
-        collector.stats.eden_live_bytes,
-        collector.stats.eden_copied_bytes,
-        collector.stats.survivor_first_round_live_bytes,
-        eden_allocated_bytes >= entry_eden_budget,
-    );
+        retune_after_scavenge(
+            collector.stats.eden_live_bytes,
+            collector.stats.eden_copied_bytes,
+            collector.stats.survivor_first_round_live_bytes,
+            eden_allocated_bytes >= entry_eden_budget,
+        );
     }
     if let Some(d) = collector.survival.as_ref().filter(|_| DIAGNOSTICS) {
         d.report(super::survival_diag::next_minor_seq());
+    }
+    #[cfg(perry_gc_instruments)]
+    if DIAGNOSTICS && crate::arena::alloc_life::on() {
+        crate::arena::alloc_life::copied(
+            collector.stats.promoted_bytes,
+            collector.stats.copied_bytes,
+            collector.stats.in_place_promoted_bytes,
+        );
     }
     if DIAGNOSTICS {
         crate::arena::alloc_sample::report("minor")

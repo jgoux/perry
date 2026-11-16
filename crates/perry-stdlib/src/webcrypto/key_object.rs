@@ -9,8 +9,7 @@ use crate::crypto::util::{
 
 unsafe fn throw_type_error(message: &str) -> ! {
     let msg = perry_runtime::js_string_from_bytes(message.as_ptr(), message.len() as u32);
-    let err = perry_runtime::error::js_typeerror_new(msg);
-    perry_runtime::exception::js_throw(perry_runtime::value::js_nanbox_pointer(err as i64))
+    perry_runtime::exception::throw_core(perry_runtime::error::CoreError::type_error(msg))
 }
 
 unsafe fn throw_dom_exception(name: &str, message: &str) -> ! {
@@ -22,7 +21,7 @@ unsafe fn throw_dom_exception(name: &str, message: &str) -> ! {
     if err.is_null() {
         throw_type_error(message);
     }
-    perry_runtime::exception::js_throw(perry_runtime::value::js_nanbox_pointer(err as i64))
+    perry_runtime::exception::throw_open(perry_runtime::value::js_nanbox_pointer(err as i64))
 }
 
 unsafe fn require_hash(algo_bits: u64) -> HashAlgo {
@@ -85,6 +84,13 @@ unsafe fn key_material(value: &str, kind: KeyKind, asym_type: u8) -> Vec<u8> {
         }
         (4, KeyKind::Private) => parse_x25519_private_surrogate(value).map(|key| key.to_vec()),
         (4, KeyKind::Public) => parse_x25519_public_surrogate(value).map(|key| key.to_vec()),
+        // ML-KEM / ML-DSA: the PEM's DER is the CryptoKey material.
+        (7..=12, KeyKind::Private) => pq_private_key_from_pem(value)
+            .filter(|(algorithm, _)| algorithm.asym_type() == asym_type)
+            .map(|(_, der)| der),
+        (7..=12, KeyKind::Public) => pq_public_key_from_pem(value)
+            .filter(|(algorithm, _)| algorithm.asym_type() == asym_type)
+            .map(|(_, der)| der),
         _ => None,
     }
     .unwrap_or_else(|| throw_dom_exception("DataError", "The key data is invalid"))
@@ -112,6 +118,10 @@ unsafe fn select_key_algorithm(algo_bits: u64, asym_type: u8) -> (KeyAlgo, HashA
         }
         (3, "ED25519") => (KeyAlgo::Ed25519, HashAlgo::Sha256),
         (4, "X25519") => (KeyAlgo::X25519, HashAlgo::Sha256),
+        (7..=12, name) if akp_key_algo_for_key_object(name, asym_type).is_some() => (
+            akp_key_algo_for_key_object(name, asym_type).unwrap_or(KeyAlgo::MlKem512),
+            HashAlgo::Sha256,
+        ),
         _ => throw_dom_exception(
             "NotSupportedError",
             "The requested algorithm is not supported for this key",
@@ -179,8 +189,8 @@ unsafe fn crypto_key_bytes(addr: usize) -> Vec<u8> {
 /// for RSA, a SEC1 point / raw scalar for EC, raw 32-byte keys for Ed/X25519)
 /// into the PEM / internal-surrogate string form Perry's KeyObject surrogates
 /// use, plus the `asymmetric_key_meta` type id (1 rsa, 2 ec, 3 ed25519,
-/// 4 x25519). Returns `None` for key types Perry has no KeyObject surrogate for
-/// (Ed448 / X448 / ML-KEM) — the caller turns that into a throw, never a silent
+/// 4 x25519, 7-9 ML-KEM, 10-12 ML-DSA). Returns `None` for key types Perry has
+/// no KeyObject surrogate for (Ed448 / X448) — the caller turns that into a throw, never a silent
 /// `undefined`.
 fn asymmetric_key_surrogate(mat: CryptoKeyMaterial, bytes: &[u8]) -> Option<(String, u8)> {
     let ed_key: Option<[u8; 32]> = bytes.try_into().ok();
@@ -227,6 +237,7 @@ fn asymmetric_key_surrogate(mat: CryptoKeyMaterial, bytes: &[u8]) -> Option<(Str
         }
         (KeyAlgo::X25519, KeyKind::Public) => Some((x25519_public_surrogate(&ed_key?), 4)),
         (KeyAlgo::X25519, KeyKind::Private) => Some((x25519_private_surrogate(&ed_key?), 4)),
+        (algo, kind) if is_akp_key_algo(algo) => Some(akp_key_object_pem(algo, kind, bytes)),
         _ => None,
     }
 }

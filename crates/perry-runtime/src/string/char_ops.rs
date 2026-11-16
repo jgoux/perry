@@ -73,12 +73,7 @@ pub extern "C" fn js_string_end_index_to_i32(value: f64, len: i32) -> i32 {
 /// This entry cannot invoke user code. Rust supplies truncation and saturation.
 #[no_mangle]
 pub extern "C" fn js_string_number_index_to_i32(index: f64) -> i32 {
-    let value = crate::value::JSValue::from_bits(index.to_bits());
-    if value.is_int32() {
-        value.as_int32()
-    } else {
-        index as i32
-    }
+    index as i32
 }
 
 /// Already-coerced end index; undefined retains the method's default.
@@ -314,10 +309,6 @@ pub extern "C" fn js_string_index_get(s: *const StringHeader, key: f64) -> f64 {
 /// caller must continue to the ordinary property lookup.
 fn canonical_index_of(key: f64) -> Option<u64> {
     let jsval = crate::value::JSValue::from_bits(key.to_bits());
-    if jsval.is_int32() {
-        let i = jsval.as_int32();
-        return if i < 0 { None } else { Some(i as u64) };
-    }
     if jsval.is_number() {
         // Real double: only a finite, non-negative integer is an array index.
         if !key.is_finite() || key < 0.0 || key.fract() != 0.0 {
@@ -498,9 +489,7 @@ fn to_uint16(code: f64) -> u16 {
 /// `Number(bigint)`); a `Symbol` throws via `js_number_coerce`.
 fn fromcharcode_arg_to_uint16(code: f64) -> u16 {
     let jv = crate::value::JSValue::from_bits(code.to_bits());
-    let n = if jv.is_int32() {
-        jv.as_int32() as f64
-    } else if jv.is_number() {
+    let n = if jv.is_number() {
         code
     } else if jv.is_bigint() {
         crate::collection_iter::throw_type_error("Cannot convert a BigInt value to a number");
@@ -634,6 +623,11 @@ pub extern "C" fn js_string_from_char_code(code: f64) -> *mut StringHeader {
 /// `String.fromCharCode(...arrayLike)` / `String.fromCharCode.apply(_, bytes)`.
 #[no_mangle]
 pub extern "C" fn js_string_from_char_code_array(value: f64) -> *mut StringHeader {
+    // `.apply(_, undefined | null)` passes no arguments (CreateListFromArrayLike).
+    let jsv = crate::value::JSValue::from_bits(value.to_bits());
+    if jsv.is_null() || jsv.is_undefined() {
+        return js_string_from_bytes(std::ptr::null(), 0);
+    }
     let arr = crate::object::js_array_like_to_array(value);
     if arr.is_null() {
         return js_string_from_bytes(std::ptr::null(), 0);
@@ -667,9 +661,7 @@ pub extern "C" fn js_string_from_char_code_array(value: f64) -> *mut StringHeade
 fn throw_invalid_code_point(code: f64) -> ! {
     let msg = format!("Invalid code point {}", code);
     let msg_str = js_string_from_bytes(msg.as_ptr(), msg.len() as u32);
-    let err_ptr = crate::error::js_rangeerror_new(msg_str);
-    let err_value = crate::value::JSValue::pointer(err_ptr as *const u8).bits();
-    crate::exception::js_throw(f64::from_bits(err_value))
+    crate::exception::throw_core(crate::error::CoreError::range_error(msg_str))
 }
 
 /// Create a string from a Unicode code point (String.fromCodePoint).
@@ -709,6 +701,11 @@ pub extern "C" fn js_string_from_code_point(code: f64) -> *mut StringHeader {
 /// reified `String.fromCodePoint` constructor static so value reads / spread
 /// calls work. (#4627)
 pub fn js_string_from_code_point_array(value: f64) -> *mut StringHeader {
+    // `.apply(_, undefined | null)` passes no arguments (CreateListFromArrayLike).
+    let jsv = crate::value::JSValue::from_bits(value.to_bits());
+    if jsv.is_null() || jsv.is_undefined() {
+        return js_string_from_bytes(std::ptr::null(), 0);
+    }
     let arr = crate::object::js_array_like_to_array(value);
     if arr.is_null() {
         return js_string_from_bytes(std::ptr::null(), 0);

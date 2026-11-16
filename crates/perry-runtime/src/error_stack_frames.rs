@@ -270,10 +270,39 @@ mod walk {
     #[inline(always)]
     pub(crate) fn origin() -> Origin {}
 
+    /// The JS text section's bounds (x86_64 Linux). Codegen places every
+    /// body it publishes a named `JsFunctionInfo` for in `perry_js_text`
+    /// (`perry_codegen::codegen::helpers::js_text_section`), and the linker
+    /// defines these symbols around that output section. The anchor keeps the
+    /// section, and so the symbols, in every image that links the runtime,
+    /// one without compiled JS included; its own frame never appears (it is
+    /// never called).
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[link_section = "perry_js_text"]
+    #[inline(never)]
+    extern "C" fn js_text_anchor() {}
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    pub(super) fn js_text_bounds() -> (usize, usize) {
+        unsafe extern "C" {
+            static __start_perry_js_text: u8;
+            static __stop_perry_js_text: u8;
+        }
+        // Referencing the anchor keeps its section live under
+        // `--gc-sections` (the link passes `-z start-stop-gc`, so the bounds
+        // themselves retain nothing).
+        std::hint::black_box(js_text_anchor as extern "C" fn());
+        (
+            std::ptr::addr_of!(__start_perry_js_text) as usize,
+            std::ptr::addr_of!(__stop_perry_js_text) as usize,
+        )
+    }
+
     /// x86_64 Linux: the JS frames above `origin`, innermost first, at most
     /// `out.len()` of them. A frame is JS when its function (the covering
-    /// FDE's start) is one codegen registered a display name for: exactly
-    /// the frames `render_frames` can name, so the walk stops once it holds
+    /// FDE's start) lies in the JS text section: exactly the bodies
+    /// `render_frames` can name, decided by where the code lives (two
+    /// compares, no lookup), so the walk stops once it holds
     /// `Error.stackTraceLimit` of them and stores no runtime frame. A frame
     /// no table covers is kept for the resolver to judge.
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -287,17 +316,10 @@ mod walk {
         if top == 0 || out.is_empty() {
             return 0;
         }
-        crate::builtins::with_bundle_function_names(|names| {
-            crate::eh_walker::capture_js_return_addresses(origin, out, top, |pc, start| {
-                start == 0
-                    || (names.contains_key(&(start as usize))
-                        && (pc as usize)
-                            .saturating_sub(1)
-                            .saturating_sub(start as usize)
-                            <= super::MAX_FUNCTION_SPAN)
-            })
+        let (lo, hi) = js_text_bounds();
+        crate::eh_walker::capture_js_return_addresses(origin, out, top, |_pc, start| {
+            start == 0 || (lo..hi).contains(&(start as usize))
         })
-        .unwrap_or(0)
     }
 
     /// Elsewhere the chain walk is two loads per frame, so it keeps every
@@ -426,24 +448,51 @@ fn capture_encoded(
     origin: walk::Origin,
     want: usize,
 ) -> ([u8; MAX_CAPTURED_FRAMES * PC_CHARS], usize) {
-    let mut pcs = [0usize; MAX_CAPTURED_FRAMES];
-    let n = walk::capture_js(origin, &mut pcs, want);
-    if diag_enabled() {
-        eprintln!(
-            "[stackdiag] capture: frames={n} want={want} top={:#x} fp0={:#x} pcs={:x?}",
-            walk::diag_stack_top(),
-            walk::diag_frame_pointer(),
-            &pcs[..n]
-        );
+    #[cfg(all(perry_gc_instruments, target_os = "linux", target_arch = "x86_64"))]
+    {
+        return crate::snap_census::input_call("stack.capture", &format!("{:?}", (want,)), || {
+            let mut pcs = [0usize; MAX_CAPTURED_FRAMES];
+            let n = walk::capture_js(origin, &mut pcs, want);
+            crate::snap_census::pc_check(&pcs[..n], walk::js_text_bounds());
+            if diag_enabled() {
+                eprintln!(
+                    "[stackdiag] capture: frames={n} want={want} top={:#x} fp0={:#x} pcs={:x?}",
+                    walk::diag_stack_top(),
+                    walk::diag_frame_pointer(),
+                    &pcs[..n]
+                );
+            }
+            let mut blob = [0u8; MAX_CAPTURED_FRAMES * PC_CHARS];
+            if n == 0 {
+                return (blob, 0);
+            }
+            let len = encode_pcs(&pcs[..n], &mut blob);
+            (blob, len)
+        });
     }
-    let mut blob = [0u8; MAX_CAPTURED_FRAMES * PC_CHARS];
-    if n == 0 {
-        return (blob, 0);
+    #[cfg(not(all(perry_gc_instruments, target_os = "linux", target_arch = "x86_64")))]
+    {
+        #[cfg(not(all(perry_gc_instruments, target_os = "linux", target_arch = "x86_64")))]
+        {
+            let mut pcs = [0usize; MAX_CAPTURED_FRAMES];
+            let n = walk::capture_js(origin, &mut pcs, want);
+            if diag_enabled() {
+                eprintln!(
+                    "[stackdiag] capture: frames={n} want={want} top={:#x} fp0={:#x} pcs={:x?}",
+                    walk::diag_stack_top(),
+                    walk::diag_frame_pointer(),
+                    &pcs[..n]
+                );
+            }
+            let mut blob = [0u8; MAX_CAPTURED_FRAMES * PC_CHARS];
+            if n == 0 {
+                return (blob, 0);
+            }
+            let len = encode_pcs(&pcs[..n], &mut blob);
+            (blob, len)
+        }
     }
-    let len = encode_pcs(&pcs[..n], &mut blob);
-    (blob, len)
 }
-
 /// Raw return addresses of the current native stack, innermost first, for
 /// the GC's site-attribution diagnostics (`gc/diag_sites.rs`, the
 /// `PERRY_ALLOC_SITE_SAMPLE` sampler). Every native frame, runtime ones
@@ -638,7 +687,7 @@ fn load_static_symbol_index() -> Option<StaticSymbolIndex> {
     if raw_entries.is_empty() {
         return None;
     }
-    raw_entries.sort_unstable_by_key(|(address, _)| *address);
+    crate::cold_sort::sort_by_key(&mut raw_entries, |(address, _)| *address);
 
     // `dladdr` reports the loaded base. Mach-O and GNU-linked ELF images also
     // publish their preferred base as one of the marker symbols above. For an
@@ -671,7 +720,7 @@ fn load_static_symbol_index() -> Option<StaticSymbolIndex> {
             relocated_address(address, preferred_base, image_base).map(|address| (address, name))
         })
         .collect();
-    entries.sort_unstable_by_key(|(address, _)| *address);
+    crate::cold_sort::sort_by_key(&mut entries, |(address, _)| *address);
     entries.dedup_by(|right, left| right.0 == left.0);
     (!entries.is_empty()).then_some(StaticSymbolIndex {
         image_base,
@@ -825,10 +874,10 @@ pub(crate) fn render_frames(blob: &[u8], limit: usize) -> Option<String> {
                 out.push_str(&format!("{pc:#x}"));
                 out.push(']');
             }
-            // A module's top-level frame is registered with its own location
-            // (`Object.<anonymous> (<path>)`, node's spelling); the name
-            // already carries the position, so do not append an unknown one.
-            if !name.starts_with("Object.<anonymous> (") {
+            // Module labels carry their location: a bare ESM file URL or
+            // CommonJS's Object.<anonymous> (path). Neither needs an unknown
+            // location appended to it.
+            if !name.starts_with("Object.<anonymous> (") && !name.starts_with("file://") {
                 out.push_str(" (<anonymous>)");
             }
             rendered += 1;
@@ -879,10 +928,22 @@ fn stack_trace_limit() -> usize {
 /// it (see [`walk::origin`]).
 #[inline(always)]
 pub(crate) fn capture_frames_payload() -> Vec<u8> {
-    let origin = walk::origin();
-    capture_frames_payload_from(origin)
+    #[cfg(all(perry_gc_instruments, target_os = "linux", target_arch = "x86_64"))]
+    {
+        return crate::snap_census::input_call("stack.payload", &format!("{:?}", ()), || {
+            let origin = walk::origin();
+            capture_frames_payload_from(origin)
+        });
+    }
+    #[cfg(not(all(perry_gc_instruments, target_os = "linux", target_arch = "x86_64")))]
+    {
+        #[cfg(not(all(perry_gc_instruments, target_os = "linux", target_arch = "x86_64")))]
+        {
+            let origin = walk::origin();
+            capture_frames_payload_from(origin)
+        }
+    }
 }
-
 #[inline(never)]
 fn capture_frames_payload_from(origin: walk::Origin) -> Vec<u8> {
     let limit = stack_trace_limit();
@@ -924,30 +985,66 @@ pub(crate) fn join_stack(head: &str, lines: &str) -> String {
 /// ran under (an [`ALPHABET`] index); the frame lines stop there. An empty
 /// payload is a capture that found nothing.
 pub(crate) fn frames_payload_to_lines(payload: &[u8]) -> String {
-    let (limit, payload) = match payload.split_first() {
-        Some((c, rest)) => match decode_char(*c) {
-            Some(limit) => (limit as usize, rest),
-            None => (RENDER_LIMIT, payload),
-        },
-        None => (RENDER_LIMIT, payload),
-    };
-    if limit == 0 {
-        return String::new();
+    #[cfg(all(perry_gc_instruments, target_os = "linux", target_arch = "x86_64"))]
+    {
+        return crate::snap_census::input_call(
+            "stack.rendered",
+            &format!("{:?}", (payload,)),
+            || {
+                let (limit, payload) = match payload.split_first() {
+                    Some((c, rest)) => match decode_char(*c) {
+                        Some(limit) => (limit as usize, rest),
+                        None => (RENDER_LIMIT, payload),
+                    },
+                    None => (RENDER_LIMIT, payload),
+                };
+                if limit == 0 {
+                    return String::new();
+                }
+                let (blob, recorded) = match payload.iter().position(|b| *b == b'\n') {
+                    Some(at) => (&payload[..at], std::str::from_utf8(&payload[at + 1..]).ok()),
+                    None => (payload, None),
+                };
+                // The recorded #5247 line is the innermost frame and counts toward it.
+                let resolved = render_frames(blob, limit - usize::from(recorded.is_some()));
+                match (recorded, resolved) {
+                    (Some(line), Some(frames)) => format!("{line}\n{frames}"),
+                    (Some(line), None) => line.to_string(),
+                    (None, Some(frames)) => frames,
+                    (None, None) => "    at <anonymous>".to_string(),
+                }
+            },
+        );
     }
-    let (blob, recorded) = match payload.iter().position(|b| *b == b'\n') {
-        Some(at) => (&payload[..at], std::str::from_utf8(&payload[at + 1..]).ok()),
-        None => (payload, None),
-    };
-    // The recorded #5247 line is the innermost frame and counts toward it.
-    let resolved = render_frames(blob, limit - usize::from(recorded.is_some()));
-    match (recorded, resolved) {
-        (Some(line), Some(frames)) => format!("{line}\n{frames}"),
-        (Some(line), None) => line.to_string(),
-        (None, Some(frames)) => frames,
-        (None, None) => "    at <anonymous>".to_string(),
+    #[cfg(not(all(perry_gc_instruments, target_os = "linux", target_arch = "x86_64")))]
+    {
+        #[cfg(not(all(perry_gc_instruments, target_os = "linux", target_arch = "x86_64")))]
+        {
+            let (limit, payload) = match payload.split_first() {
+                Some((c, rest)) => match decode_char(*c) {
+                    Some(limit) => (limit as usize, rest),
+                    None => (RENDER_LIMIT, payload),
+                },
+                None => (RENDER_LIMIT, payload),
+            };
+            if limit == 0 {
+                return String::new();
+            }
+            let (blob, recorded) = match payload.iter().position(|b| *b == b'\n') {
+                Some(at) => (&payload[..at], std::str::from_utf8(&payload[at + 1..]).ok()),
+                None => (payload, None),
+            };
+            // The recorded #5247 line is the innermost frame and counts toward it.
+            let resolved = render_frames(blob, limit - usize::from(recorded.is_some()));
+            match (recorded, resolved) {
+                (Some(line), Some(frames)) => format!("{line}\n{frames}"),
+                (Some(line), None) => line.to_string(),
+                (None, Some(frames)) => frames,
+                (None, None) => "    at <anonymous>".to_string(),
+            }
+        }
     }
 }
-
 /// #9486: format-and-memoise half of [`js_error_get_stack`].
 pub(crate) unsafe fn materialize_error_stack(error: *mut ErrorHeader) -> *mut StringHeader {
     if !(*error).stack.is_null() {
@@ -1008,6 +1105,7 @@ mod tests {
             .wrapping_add(17)
     }
 
+    #[cfg(target_pointer_width = "64")]
     #[test]
     fn pcs_round_trip_through_the_ascii_blob() {
         let pcs = [0x1_0000_1234usize, 0x7fff_ffff_0000, 1, 0];
@@ -1035,9 +1133,22 @@ mod tests {
         any(target_vendor = "apple", target_os = "linux"),
         any(target_arch = "aarch64", target_arch = "x86_64")
     ))]
+    // Stands in for a compiled JS body: it publishes a bundle name below and,
+    // on x86_64 Linux, lives in the JS text section as codegen places every
+    // named body, the range the capture keeps frames of.
+    #[cfg_attr(
+        all(target_arch = "x86_64", target_os = "linux"),
+        link_section = "perry_js_text"
+    )]
+    // The probe's own frame must be on the stack while the constructor
+    // captures: the result passes through `black_box`, so the construction
+    // is a call that returns here, never a tail call that pops this frame
+    // first (an optimized build turns `js_error_new()` in tail position into
+    // a jump once it inlines it). Compiled JS calls the constructor and uses
+    // its result, so it always keeps its frame.
     #[inline(never)]
     fn unread_error_probe() -> *mut ErrorHeader {
-        crate::error::js_error_new()
+        std::hint::black_box(crate::error::js_error_new())
     }
 
     #[cfg(all(
@@ -1046,12 +1157,10 @@ mod tests {
     ))]
     #[test]
     fn constructing_an_error_does_not_resolve_its_captured_names() {
-        unsafe {
-            crate::builtins::test_publish_bundle_name(
-                unread_error_probe as *const u8 as usize,
-                b"unreadErrorProbe",
-            );
-        }
+        crate::builtins::test_publish_bundle_name(
+            unread_error_probe as *const u8 as usize,
+            b"unreadErrorProbe",
+        );
         let before = FRAME_RESOLUTION_ATTEMPTS.load(std::sync::atomic::Ordering::SeqCst);
         let error = unread_error_probe();
         let scope = crate::gc::RuntimeHandleScope::new();
@@ -1084,23 +1193,20 @@ mod tests {
         }
     }
 
+    #[cfg(target_pointer_width = "64")]
     #[test]
     fn new_image_replacement_is_visible_without_a_name_snapshot() {
         const START: usize = 0x0000_7d10_0010_0000;
         const BEFORE: &[u8] = b"bundleNameBefore";
         const AFTER: &[u8] = b"bundleNameAfter";
-        unsafe {
-            crate::builtins::test_publish_bundle_name(START as *const u8 as usize, BEFORE);
-        }
+        crate::builtins::test_publish_bundle_name(START as *const u8 as usize, BEFORE);
         let mut blob = [0u8; MAX_CAPTURED_FRAMES * PC_CHARS];
         let len = encode_pcs(&[START + 32], &mut blob);
         assert_eq!(
             render_frames(&blob[..len], RENDER_LIMIT).as_deref(),
             Some("    at bundleNameBefore (<anonymous>)")
         );
-        unsafe {
-            crate::builtins::test_publish_bundle_name(START as *const u8 as usize, AFTER);
-        }
+        crate::builtins::test_publish_bundle_name(START as *const u8 as usize, AFTER);
 
         assert_eq!(
             render_frames(&blob[..len], RENDER_LIMIT).as_deref(),
@@ -1138,6 +1244,7 @@ mod tests {
     /// stack index must use only codegen's image registry, or the lower-bound
     /// lookup gives every nearby runtime function the thunk's JS name.
     #[test]
+    #[cfg(target_pointer_width = "64")]
     fn describe_ip_does_not_name_runtime_code_after_a_builtin_thunk() {
         const THUNK_START: usize = 0x0000_7e00_0000_0000;
         const THUNK_NAME: &[u8] = b"get years";
@@ -1149,13 +1256,8 @@ mod tests {
             unsafe { crate::closure::JsFunctionInfo::from_code(THUNK_START as *const u8, 0) },
             &OWNER,
         );
-        unsafe {
-            crate::builtins::test_publish_bundle_name(
-                BUNDLE_START as *const u8 as usize,
-                BUNDLE_NAME,
-            );
-            crate::builtins::register_function_name(&native.info, THUNK_NAME);
-        }
+        crate::builtins::test_publish_bundle_name(BUNDLE_START as *const u8 as usize, BUNDLE_NAME);
+        crate::builtins::register_function_name(&native.info, THUNK_NAME);
         assert_eq!(
             crate::builtins::test_registered_name(&native.info).as_deref(),
             Some("get years"),

@@ -60,8 +60,21 @@ fn read_site<'a>(pf: &'a ProgramFacts, key: &str) -> &'a crate::SiteFacts {
 
 fn rank(v: &crate::Verdict) -> u8 {
     match v {
-        crate::Verdict::T0Mono | crate::Verdict::T0Set | crate::Verdict::StringLength => 2,
+        crate::Verdict::T0Mono
+        | crate::Verdict::T0Set
+        | crate::Verdict::OwnLength
+        | crate::Verdict::NativeMember
+        | crate::Verdict::Dead
+        | crate::Verdict::Throws
+        | crate::Verdict::OwnDataOrAbsent
+        | crate::Verdict::IntrinsicCall
+        | crate::Verdict::NsExport
+        | crate::Verdict::AccessorGet
+        | crate::Verdict::AccessorSet
+        | crate::Verdict::KnownObjectStore
+        | crate::Verdict::PerKind => 2,
         crate::Verdict::E0 => 1,
+        crate::Verdict::AddsKey => 0,
         crate::Verdict::No(_) => 0,
     }
 }

@@ -113,8 +113,8 @@ mod compare_value_eq;
 #[cfg(test)]
 pub(crate) use compare::test_key_byte_reads;
 pub(crate) mod concat;
-pub(crate) mod concat_parts;
 mod concat_boundary;
+pub(crate) mod concat_parts;
 pub(crate) mod concat_site;
 mod format;
 mod html;
@@ -125,6 +125,7 @@ mod locale;
 pub(crate) mod normalize_hooked;
 mod pad;
 mod provenance;
+pub(crate) mod short_pair;
 use provenance::{combine_string_flags, raw_string_metadata};
 pub(crate) mod literal_replace;
 #[cfg(test)]
@@ -210,7 +211,6 @@ pub use concat_parts::{
 };
 pub use concat_site::{js_string_concat_site_value, CONCAT_SITE_SLOTS};
 pub(crate) use format::ascii_char_string;
-pub(crate) use format::fix_exponent_format;
 pub(crate) use format::js_format_f64;
 
 /// The canonical `StringHeader` for a runtime-internal constant property name.
@@ -258,6 +258,7 @@ pub(crate) use intern::existing_property_atom;
 pub(crate) use intern::existing_property_atom_of_value;
 pub use intern::js_string_intern;
 pub use intern::js_string_pool_atom;
+pub(crate) use intern::property_atom_from_bytes;
 #[cfg(test)]
 pub(crate) use intern::test_evict_interned;
 pub(crate) use intern::IMAGE_ATOM_FLAGS;
@@ -544,7 +545,9 @@ pub struct StringHeader {
     pub byte_len: u32,
     /// Capacity in bytes (allocated space for data)
     pub capacity: u32,
-    /// Reference hint: 0=shared (never mutate in-place), 1=unique (in-place append OK)
+    /// Ownership hint: 0=shared (never mutate in-place), 1=unique (in-place append OK).
+    /// From `intern::KEY_WORD_MIN` up: shared, and the word is the key word of
+    /// this text (its folded FNV-1a hash, `intern::key_word_of_hash`).
     pub refcount: u32,
     /// Bit flags: STRING_FLAG_HAS_LONE_SURROGATES = 1
     pub flags: u32,
@@ -836,8 +839,7 @@ pub(crate) const MAX_STRING_LENGTH: usize = 536_870_888;
 pub(crate) fn throw_invalid_string_length() -> ! {
     let message = "Invalid string length";
     let msg = js_string_from_bytes(message.as_ptr(), message.len() as u32);
-    let err = crate::error::js_rangeerror_new(msg);
-    crate::exception::js_throw(crate::value::js_nanbox_pointer(err as i64))
+    crate::exception::throw_core(crate::error::CoreError::range_error(msg))
 }
 
 /// [`string_storage_alloc`] with **no collection point**: `Some` means the
@@ -1166,6 +1168,7 @@ pub(crate) fn string_copy_range(
 
 /// Only block exhaustion needs the source handle and post-allocation reload.
 #[cold]
+#[optimize(size)]
 #[inline(never)]
 fn string_copy_range_collecting(
     s: *const StringHeader,
@@ -1385,6 +1388,10 @@ pub(crate) use iter_object::dispatch_string_iterator_step;
 pub(crate) use intern::{
     is_program_atom, is_property_atom, property_atom, property_atom_from_value, property_atom_hash,
     prune_property_atoms, scan_property_atoms,
+};
+pub(crate) use intern::{
+    key_first_atom, key_word_atom, key_word_atom_indexed, short_key_atom, short_key_atom_indexed,
+    KEY_WORD_MIN,
 };
 
 pub(crate) mod byte_scan;

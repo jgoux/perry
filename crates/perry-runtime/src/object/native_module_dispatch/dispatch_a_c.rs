@@ -102,6 +102,11 @@ pub(crate) unsafe fn nm_dispatch_assert(ctx: &NmCtx, module_name: &str, method_n
             js_assert_does_not_reject(arg(0), arg(1), arg(2))
         }
         ("assert", "ifError") | ("assert/strict", "ifError") => js_assert_if_error(arg(0)),
+        ("assert", "AssertionError") | ("assert/strict", "AssertionError") => {
+            crate::collection_iter::throw_type_error(
+                "Class constructor AssertionError cannot be invoked without 'new'",
+            )
+        }
         ("assert", "Assert") | ("assert/strict", "Assert") => {
             crate::fs::validate::throw_type_error_with_code(
                 "Class constructor Assert cannot be invoked without 'new'",
@@ -162,9 +167,10 @@ pub(crate) unsafe fn nm_dispatch_async_hooks(
                 message.as_ptr(),
                 message.len() as u32,
             ));
-            let err = msg
-                .with_mut_ptr::<crate::StringHeader, _>(|msg| crate::error::js_typeerror_new(msg));
-            crate::exception::js_throw(crate::value::js_nanbox_pointer(err as i64))
+            let err = msg.with_mut_ptr::<crate::StringHeader, _>(|msg| {
+                crate::error::CoreError::type_error(msg)
+            });
+            crate::exception::throw_core(err)
         }
         ("async_hooks", "createHook") => {
             crate::async_hook_slots::js_async_hooks_create_hook(arg(0))

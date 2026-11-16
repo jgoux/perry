@@ -89,6 +89,7 @@ fn empty_class(name: &str) -> Class {
         is_exported: false,
         aliases: Vec::new(),
         is_nested: false,
+        decl_stmt: None,
         alloc_width_hint: 0,
         specialized_from: None,
     }
@@ -392,6 +393,7 @@ fn import(source: &str, imported: &str, local: &str) -> Import {
         type_only: false,
         runtime_erased: false,
         is_dynamic: false,
+        is_deferred: false,
         is_dynamic_target: false,
         is_deferred_require: false,
         is_adopted_require: false,

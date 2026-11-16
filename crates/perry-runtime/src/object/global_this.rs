@@ -13,7 +13,7 @@ pub(crate) use global_this_webassembly::{
 pub(crate) use global_this_webassembly::{
     register_extern_wrapper as register_wasm_extern_wrapper,
     register_module_wrapper as register_wasm_module_wrapper, registered_extern_handle,
-    registered_module_handle,
+    registered_module_handle, wrapper_prototype as wasm_wrapper_prototype,
 };
 
 // Topical sub-modules split out of the original monolithic `global_this.rs`
@@ -86,8 +86,7 @@ pub(crate) fn function_prototype_bind_thunk_for_test() -> *const crate::closure:
 pub(crate) use array_error::{
     function_apply_proxy, function_prototype_apply_thunk, function_prototype_call_thunk,
     generic_array_like_to_vec, global_this_rest_array_values, is_native_error_subclass_constructor,
-    object_prototype_has_own_property_thunk, object_prototype_is_prototype_of_thunk,
-    object_prototype_property_is_enumerable_thunk, object_prototype_to_string_thunk,
+    object_prototype_to_string_thunk, object_prototype_value_of_thunk,
 };
 pub(crate) use async_generator_state::is_async_generator_instance_value;
 pub use async_generator_state::js_async_generator_create;
@@ -104,21 +103,28 @@ pub(crate) use builtin_thunks::{
 };
 pub use ctor_thunks::js_webcrypto_illegal_constructor;
 pub(crate) use ctor_thunks::{
-    builtin_prototype_value, is_array_prototype_method_value, is_function_prototype_object_value,
-    normalize_eval_this_body, regexp_constructor_call_thunk, subtle_crypto_method_value,
-    typed_array_constructor_call_thunk, webcrypto_method_value,
+    builtin_constructor_value, builtin_prototype_value, is_array_prototype_method_value,
+    is_function_prototype_object_value, normalize_eval_this_body, regexp_constructor_call_thunk,
+    subtle_crypto_method_value, typed_array_constructor_call_thunk, webcrypto_method_value,
 };
 #[cfg(test)]
 pub(crate) use fetch_globals::collect_before_global_this_alloc_for_test;
+pub(crate) use fetch_globals::init_fetch_backed_receiver;
 #[cfg(feature = "temporal")]
 pub(crate) use fetch_globals::temporal_subclass_super;
+#[cfg(all(perry_gc_instruments, target_os = "linux", target_arch = "x86_64"))]
+pub(crate) use fetch_globals::thread_realm_global_addr;
 pub(crate) use fetch_globals::{
     global_this_blob_thunk, global_this_builtin_noop_thunk, global_this_file_thunk,
     global_this_headers_thunk, global_this_is_materialized, global_this_request_thunk,
+    realm_core, realm_family_phase, realm_is_complete,
     global_this_response_thunk, is_thread_realm_global,
 };
 pub use fetch_globals::{
-    js_fetch_or_value_super, js_get_global_this, js_global_or_console_property_by_name,
+    js_fetch_or_value_super, js_get_global_core, js_get_global_this, js_realm_complete,
+    js_realm_family_phase, perry_realm_complete, perry_realm_core_entry,
+    perry_realm_family_phase,
+    js_global_or_console_property_by_name,
     js_module_top_this, js_request_subclass_init, js_response_subclass_init,
 };
 #[cfg(test)]
@@ -132,8 +138,7 @@ pub(crate) use generator::{
 pub(crate) use generator::{intrinsic_sync_step_kind, resume_intrinsic_sync_step};
 pub use generator::{js_generator_attach_closure_prototype, js_generator_attach_prototype};
 pub(crate) use generator_state::{
-    call_generator_symbol_method, fixed_generator_state, install_class_symbol_method,
-    install_evaluation_generator_symbols, STEP_DONE, STEP_INNER_RESULT,
+    fixed_generator_state, install_class_symbol_method, STEP_DONE, STEP_INNER_RESULT,
 };
 pub(crate) use generator_state::{
     generator_observe_record_prototype, generator_original_prototype_key,
@@ -162,11 +167,13 @@ pub(crate) use object_intrinsic::{
     object_prototype_intrinsic_bits,
 };
 pub(crate) use populate::{
-    default_prepare_stack_trace_func_ptr, populate_global_this_builtins,
-    scan_error_constructor_root_mut, ERROR_CONSTRUCTOR_PTR,
+    birth_lazy_family, birth_unborn_family_of, default_prepare_stack_trace_func_ptr,
+    populate_global_this_builtins, populate_realm_core, populate_realm_rest, RealmPhases,
+    scan_error_constructor_root_mut, unborn_declared_statics_of, ERROR_CONSTRUCTOR_PTR,
 };
 pub(crate) use proto_methods::{
-    install_error_prototype_data_properties, populate_builtin_prototype_methods,
+    install_builtin_well_known_symbol_method, install_error_prototype_data_properties,
+    populate_builtin_prototype_methods,
 };
 pub(crate) use typed_array::{
     ensure_typed_array_intrinsic, install_function_has_instance_symbol,
@@ -184,8 +191,27 @@ pub(crate) use global_this_webassembly::owned_wrappers as test_wasm_wrapper_stat
 // Existing unit fixtures invoke these bodies directly; production installers
 // now name their owning module in the exported info declaration.
 #[cfg(test)]
-pub(crate) use array_error::{
-    object_prototype_to_locale_string_thunk, object_prototype_value_of_thunk,
-};
+pub(crate) use array_error::object_prototype_to_locale_string_thunk;
 #[cfg(test)]
 pub(crate) use typed_array::array_buffer_is_view_thunk;
+
+/// The key of the global object named `name`: the agent atom of that text
+/// (DEC 243(5)). A builtin global name is an image atom seeded with the
+/// program atoms, so this allocates nothing for it; every key of the global
+/// object is an atom, and a miss on it proves absence.
+pub(crate) fn global_name_key(name: impl AsRef<[u8]>) -> *mut crate::StringHeader {
+    let name = name.as_ref();
+    let hash = crate::object::key_bytes_hash(name.as_ptr(), name.len());
+    if let Some(atom) = crate::object::runtime_layouts::builtin_global_atom(name, hash) {
+        return atom as *mut crate::StringHeader;
+    }
+    crate::string::js_string_pool_atom(name.as_ptr(), name.len() as u32, hash, 0)
+}
+
+/// The code address of the realm's `Object.prototype.hasOwnProperty` body: a
+/// function value whose info names it is that builtin, whatever binding or
+/// property the program read it from.
+#[inline(always)]
+pub(crate) fn has_own_property_body() -> usize {
+    array_error::object_prototype_has_own_property_thunk as *const () as usize
+}

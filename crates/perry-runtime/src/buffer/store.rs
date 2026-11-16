@@ -27,9 +27,12 @@ pub(crate) const PROTOTYPE_KEY: &str = "#<perry:prototype>";
 
 const _: () = assert!(std::mem::size_of::<BufferHeader>() == crate::codegen_abi::BYTES_STORE);
 const _: () = assert!(std::mem::offset_of!(BufferHeader, link) == crate::codegen_abi::BYTES_LINK);
-const _: () =
-    assert!(crate::object::header::meta_form_alloc_bytes(0) == crate::codegen_abi::BYTES_VIEW_BAG_OWNER);
-const _: () = assert!(crate::gc_type_is_object!(crate::codegen_abi::GC_TYPE_OBJECT));
+const _: () = assert!(
+    crate::object::header::meta_form_alloc_bytes(0) == crate::codegen_abi::BYTES_VIEW_BAG_OWNER
+);
+const _: () = assert!(crate::gc_type_is_object!(
+    crate::codegen_abi::GC_TYPE_OBJECT
+));
 
 #[inline(always)]
 pub(crate) unsafe fn header(addr: usize) -> *mut crate::gc::GcHeader {
@@ -313,7 +316,7 @@ pub(crate) enum Init<'a> {
     Shared,
 }
 
-pub(crate) fn store_alloc(brand: u8, len: u32, init: Init<'_>) -> *mut BufferHeader {
+fn store_alloc_cell(brand: u8, len: u32, init: Init<'_>) -> *mut BufferHeader {
     use super::backing::Backing;
     use crate::gc::ByteStorePlacement;
     super::bytes::assert_allocation_allowed();
@@ -334,6 +337,8 @@ pub(crate) fn store_alloc(brand: u8, len: u32, init: Init<'_>) -> *mut BufferHea
         placement
     };
     let capacity = byte_len as u32;
+    #[cfg(perry_gc_instruments)]
+    crate::wpfacts_check::family::byte_cell_born(brand, len);
     let ptr = match init {
         Init::Shared => {
             assert_eq!(brand, crate::gc::GC_TYPE_BUFFER_SHARED_ARRAY_BUFFER);
@@ -450,4 +455,66 @@ pub(crate) unsafe fn sabotage_inline_copy(value: f64, input: &[u8]) {
         .as_pointer::<u8>()
         .cast_mut();
     std::ptr::copy_nonoverlapping(input.as_ptr(), cell.add(8), input.len());
+}
+
+/// The one birth of every byte cell that is a JavaScript value (typed arrays,
+/// Buffer, ArrayBuffer, SharedArrayBuffer, a DataView's backing), whoever asks
+/// for it. A program whose compile claimed that it never creates or observes
+/// a byte cell (`family_reach`: the typed-array group is then not installed)
+/// aborts here instead of running on with a value the rest of the group
+/// cannot serve (`family_never`); one load and one test per birth.
+/// `#[inline(never)]`: this symbol is the seed of the call-graph check that
+/// keeps the realm's declared births complete (perry-gc-effects `births`).
+///
+/// Declared at the end of the file, with the allocation itself kept in place
+/// as [`store_alloc_cell`], so that no line above moves.
+#[inline(never)]
+pub(crate) fn store_alloc(brand: u8, len: u32, init: Init<'_>) -> *mut BufferHeader {
+    crate::family_never::byte_cell_birth();
+    store_alloc_cell(brand, len, init)
+}
+
+/// A zeroed typed-array cell that is a private workspace of the runtime and
+/// is never handed to JavaScript: the two index cells of a comparator sort of
+/// more than 64 elements (`array::sort`, its only caller; the test below
+/// keeps it so). It is no birth of a value, so it is the one entry that does
+/// not test the family claim: any program sorts. `#[inline(never)]`: the
+/// births check cuts its walk at this symbol.
+#[inline(never)]
+pub(crate) fn store_alloc_scratch(kind: u8, len: u32) -> *mut BufferHeader {
+    store_alloc_cell(
+        crate::typedarray_hook_slots::type_for_kind(kind),
+        len,
+        Init::Zero,
+    )
+}
+
+#[cfg(test)]
+mod scratch_entry_tests {
+    /// `store_alloc_scratch` skips the family claim, so it must stay private
+    /// to the comparator sort's two workspaces.
+    #[test]
+    fn the_scratch_entry_has_one_caller() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<(String, usize)>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    let calls = text.matches(concat!("store_alloc_", "scratch(")).count();
+                    if calls != 0 {
+                        out.push((path.display().to_string(), calls));
+                    }
+                }
+            }
+        }
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut callers = Vec::new();
+        walk(&src, &mut callers);
+        callers.retain(|(path, _)| !path.ends_with("buffer/store.rs"));
+        assert_eq!(callers.len(), 1, "{callers:?}");
+        assert!(callers[0].0.ends_with("array/sort.rs"), "{callers:?}");
+        assert_eq!(callers[0].1, 2, "{callers:?}");
+    }
 }

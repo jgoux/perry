@@ -98,6 +98,7 @@ fn update_call_sites_in_stmt(
             body,
             catch,
             finally,
+            ..
         } => {
             update_call_sites_in_stmts(body, ctx, lookup);
             if let Some(c) = catch {
@@ -238,6 +239,7 @@ fn update_call_sites_in_expr(
             object,
             index,
             value,
+            ..
         } => {
             update_call_sites_in_expr(object, ctx, lookup);
             update_call_sites_in_expr(index, ctx, lookup);

@@ -118,6 +118,7 @@ fn closure_free_exprs_of_stmt(stmt: &Stmt, f: &mut dyn FnMut(&Expr)) {
             body,
             catch,
             finally,
+            ..
         } => {
             for s in body
                 .iter()
@@ -237,6 +238,7 @@ fn closure_capture_ids_stmt(stmt: &Stmt, out: &mut std::collections::HashSet<Loc
             body,
             catch,
             finally,
+            ..
         } => {
             for s in body
                 .iter()
@@ -398,10 +400,19 @@ pub fn synthesize_class_captures(
     // for every captured id (own + inherited). The fields themselves are
     // still deduplicated below — the child only declares the OWN-not-
     // inherited subset, so a single keys-array entry exists per capture.
+    //
+    // The capture table is keyed by class name, so `extends <name>` finds
+    // whatever class of that name was declared anywhere in the module. A
+    // capture is a local in scope at this declaration: a parent capture that
+    // is not in scope here belongs to a same-named class of another function
+    // (`const C = make(1); class Child extends C {}` at module scope finds
+    // the class `C` declared inside `make`), which this class cannot forward.
     if let Some(pname) = extends_name {
         if let Some(parent_caps) = ctx.lookup_class_captures(pname) {
             for id in parent_caps {
-                union_captures.insert(*id);
+                if outer_scope_ids.contains(id) {
+                    union_captures.insert(*id);
+                }
             }
         }
     }
@@ -457,7 +468,7 @@ pub fn synthesize_class_captures(
     if let Some(pname) = extends_name {
         if let Some(parent_fields) = ctx.lookup_class_field_names(pname) {
             for f in parent_fields {
-                if f.starts_with("__perry_cap_") {
+                if crate::cap_fields::is_cap_field_name(f) {
                     inherited_cap_field_names.insert(f.clone());
                 }
             }
@@ -479,7 +490,7 @@ pub fn synthesize_class_captures(
             continue;
         }
         fields.push(ClassField {
-            origin: crate::ClassFieldOrigin::Definition,
+            origin: crate::ClassFieldOrigin::Capture,
             name: crate::cap_fields::cap_field_name(cap_salt, cid),
             key_expr: None,
             ty: Type::Any,
@@ -985,6 +996,8 @@ pub fn synthesize_class_captures(
                 object: Box::new(Expr::This),
                 property: crate::cap_fields::cap_field_name(cap_salt, outer_id),
                 value: Box::new(Expr::LocalGet(fresh_param_id)),
+                byte_offset: 0,
+                byte_end: 0,
             }
         }));
     }
@@ -1193,6 +1206,7 @@ fn stmt_has_direct_super_call(stmt: &Stmt) -> bool {
             body,
             catch,
             finally,
+            ..
         } => {
             stmts_have_direct_super_call(body)
                 || catch
@@ -1267,6 +1281,7 @@ fn insert_stashes_before_returns(body: &mut Vec<Stmt>, stashes: &[Stmt]) {
                 body: tb,
                 catch,
                 finally,
+                ..
             } => {
                 insert_stashes_before_returns(tb, stashes);
                 if let Some(c) = catch {
@@ -1412,6 +1427,7 @@ pub(crate) fn append_new_args_stmt(
             body,
             catch,
             finally,
+            ..
         } => {
             for s in body {
                 append_new_args_stmt(s, class_name, cap_args, skip_if_present);
@@ -1546,6 +1562,7 @@ fn stamp_self_new_stmt(stmt: &mut Stmt, class_name: &str, eval_id: LocalId) {
             body,
             catch,
             finally,
+            ..
         } => {
             for s in body {
                 stamp_self_new_stmt(s, class_name, eval_id);

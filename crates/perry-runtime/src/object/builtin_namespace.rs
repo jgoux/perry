@@ -45,6 +45,26 @@ pub(crate) const FIRST: usize = crate::codegen_abi::BUILTIN_PROTO_FAMILIES;
 pub(crate) const COUNT: usize = crate::codegen_abi::BUILTIN_NAMESPACES.len();
 /// The realm global's sealed family: its writes are attributed to namespaces.
 pub(crate) const GLOBAL_FAMILY: usize = FIRST + COUNT;
+/// `console`'s intrinsic family: the one sealed namespace holder the program
+/// may still patch (DEC 250: it leaves the lock set, keeps its shadow bit).
+/// It is also the one builtin namespace that is a native-module namespace
+/// object: its member writes land in the override table
+/// (`native_module::native_namespace_prop_override_store`), which reports them
+/// here by this family.
+pub(crate) const CONSOLE_FAMILY: usize = FIRST + console_index();
+const fn console_index() -> usize {
+    let mut i = 0;
+    while i < COUNT {
+        if matches!(
+            crate::codegen_abi::BUILTIN_NAMESPACES[i].as_bytes(),
+            b"console"
+        ) {
+            return i;
+        }
+        i += 1;
+    }
+    panic!("console is a builtin namespace");
+}
 const _: () = assert!(GLOBAL_FAMILY as u64 <= super::meta_flags::OBJECT_META_SEALED_FAMILY_MASK);
 const _: () = assert!(FIRST + COUNT == crate::codegen_abi::INTRINSIC_FAMILIES);
 
@@ -126,7 +146,9 @@ unsafe fn global_data_binding(global: *const ObjectHeader, name: &str) -> Option
 
 /// Seal every namespace holder of THIS thread's realm and the realm global
 /// (`builtin_proto::seal_realm`, under its builtin-definition scope). A `vm`
-/// realm's namespaces are its own and are never published.
+/// realm's namespaces are its own and are never published. A namespace the
+/// global does not bind yet (a phase-B name of a two-phase realm) is sealed
+/// when its phase binds it ([`seal_namespace_value`]).
 pub(crate) fn seal_namespaces(global: *mut ObjectHeader) {
     if !super::global_this::is_thread_realm_global(global) {
         return;
@@ -137,31 +159,59 @@ pub(crate) fn seal_namespaces(global: *mut ObjectHeader) {
             let Some(bits) = global_data_binding(global, name) else {
                 continue;
             };
-            // A constructor without statics has no bag yet: give it one, so
-            // a later write lands in a sealed holder.
-            let addr = (bits & crate::value::POINTER_MASK) as usize;
-            if bits & !crate::value::POINTER_MASK == crate::value::POINTER_TAG
-                && crate::closure::is_closure_ptr(addr)
-            {
-                crate::closure::props::bag_ensure(addr);
-            }
-            let obj = holder_of_value(bits);
-            if obj.is_null() {
-                continue;
-            }
-            super::builtin_proto::seal_object_family(obj, FIRST + i);
-            if contract_mode() {
-                snapshot_members(i, obj);
-            }
-            trace(name, "sealed", (*obj).parent_class_id);
-            if super::shapes::is_site_matchable_layout_word((*obj).parent_class_id) {
-                crate::agent_ptrs::publish_intrinsic_proto(FIRST + i, obj);
-            } else {
-                // Its word cannot carry the bit: never pristine.
-                crate::agent_ptrs::publish_patched_intrinsic(FIRST + i);
-            }
+            seal_namespace(i, bits);
         }
         super::builtin_proto::seal_object_family(global, GLOBAL_FAMILY);
+    }
+}
+
+/// Seal the holder of namespace `i`, whose value is `bits`, and publish it.
+///
+/// # Safety
+/// `bits` is the namespace's live value (or no pointer), under the caller's
+/// no-move scope.
+#[inline(always)]
+unsafe fn seal_namespace(i: usize, bits: u64) {
+    let name = crate::codegen_abi::BUILTIN_NAMESPACES[i];
+    // A constructor without statics has no bag yet: give it one, so
+    // a later write lands in a sealed holder.
+    let addr = (bits & crate::value::POINTER_MASK) as usize;
+    if bits & !crate::value::POINTER_MASK == crate::value::POINTER_TAG
+        && crate::closure::is_closure_ptr(addr)
+    {
+        crate::closure::props::bag_ensure(addr);
+    }
+    let obj = holder_of_value(bits);
+    if obj.is_null() {
+        return;
+    }
+    super::builtin_proto::seal_object_family(obj, FIRST + i);
+    if contract_mode() {
+        snapshot_members(i, obj);
+    }
+    trace(name, "sealed", (*obj).parent_class_id);
+    if super::shapes::is_site_matchable_layout_word((*obj).parent_class_id) {
+        crate::agent_ptrs::publish_intrinsic_proto(FIRST + i, obj);
+    } else {
+        // Its word cannot carry the bit: never pristine.
+        crate::agent_ptrs::publish_patched_intrinsic(FIRST + i);
+    }
+}
+
+/// Seal the holder of the builtin namespace `name` of THIS thread's realm,
+/// whose value is `bits`, before the realm global binds it: phase B of a
+/// two-phase realm, whose namespaces the realm seal (phase A) did not see.
+/// No-op for a name that is no builtin namespace. The caller is the
+/// population (a builtin definition, in its no-move window).
+#[cold]
+#[inline(never)]
+pub(crate) fn seal_namespace_value(name: &str, bits: u64) {
+    if let Some(i) = crate::codegen_abi::BUILTIN_NAMESPACES
+        .iter()
+        .position(|listed| *listed == name)
+    {
+        // SAFETY: the just-built namespace value, in the population's window.
+        unsafe { seal_namespace(i, bits) };
     }
 }
 
@@ -357,6 +407,9 @@ fn violated(i: usize, member: &[u8], why: &str) -> ! {
 /// function-valued member, so a guarded site's check can compare the member
 /// it is about to bypass with the one the realm installed. Never consulted
 /// by anything but [`js_builtin_namespace_contract_check`].
+// Inlined into each seal (the realm seal's loop and phase B's one-namespace
+// seal), so that the realm seal stays the one function it was.
+#[inline(always)]
 fn contract_mode() -> bool {
     // SAFETY: a NUL-terminated literal; `getenv` only reads the environment.
     let v = unsafe { libc::getenv(c"PERRY_CHECK_CONTRACTS".as_ptr()) };
@@ -388,6 +441,9 @@ fn function_identity(bits: u64) -> Option<usize> {
 }
 
 /// Record namespace `i`'s function members (contract runs).
+// Inlined into the population (its one-pass copy and its phase copy), as it was
+// when the population was its only caller.
+#[inline(always)]
 unsafe fn snapshot_members(i: usize, holder: *mut ObjectHeader) {
     let names =
         super::js_object_get_own_property_names(crate::value::js_nanbox_pointer(holder as i64));

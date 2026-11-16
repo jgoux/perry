@@ -10,7 +10,6 @@
 //! object.
 use super::*;
 use crate::codegen_abi::LayoutWord;
-use crate::object::ObjectHeader;
 use crate::value::JSValue;
 
 /// The export declaration owns its constructor and prototype decoration.
@@ -98,10 +97,12 @@ pub(crate) fn own_prototype_by_bag(ctor: f64) -> Option<f64> {
         // The shape assigns the slot's canonical storage.
         let slot = (encoded & !SPILL) as usize;
         let bits = if encoded & SPILL == 0 {
-            let fields = crate::meta_slots_of!(crate::meta_obj_runtime_born!(bag as *mut _)) as *const u64;
+            let fields =
+                crate::meta_slots_of!(crate::meta_obj_runtime_born!(bag as *mut _)) as *const u64;
             *fields.add(slot)
         } else {
-            let spill = (*crate::meta_read!(crate::meta_obj_runtime_born!(bag as *mut _))).spill as *const crate::array::ArrayHeader;
+            let spill = (*crate::meta_read!(crate::meta_obj_runtime_born!(bag as *mut _))).spill
+                as *const crate::array::ArrayHeader;
             *crate::array::array_elements_ptr(spill).add(slot)
         };
         (bits != crate::value::TAG_HOLE).then_some(f64::from_bits(bits))
@@ -144,7 +145,8 @@ fn emitter_birth(
     // order: each fill is the newest key, so in place.
     unsafe {
         let obj = crate::object::layout_desc::perry_alloc_layout(layout);
-        let fields = crate::meta_slots_of!(crate::meta_obj_runtime_born!(obj as *mut _)) as *mut u64;
+        let fields =
+            crate::meta_slots_of!(crate::meta_obj_runtime_born!(obj as *mut _)) as *mut u64;
         crate::gc::runtime_store_jsvalue_slot_layout_deferred(
             obj as usize,
             fields.add(emitter_slot::EVENTS as usize) as usize,
@@ -190,7 +192,7 @@ pub extern "C" fn js_event_emitter_object_new(options: f64) -> f64 {
     emitter_new(
         proto,
         options.get_nanbox_f64(),
-        &raw const crate::object::runtime_layouts::EVENT_EMITTER,
+        crate::object::runtime_layouts::EVENT_EMITTER::desc(),
     )
 }
 /// `new EventEmitterAsyncResource(opts)`.
@@ -232,6 +234,5 @@ fn validate_async_resource_name(options: f64) {
 pub extern "C" fn js_event_emitter_async_resource_call(_options: f64) -> f64 {
     let message = b"Class constructor EventEmitterAsyncResource cannot be invoked without 'new'";
     let msg = crate::string::js_string_from_bytes(message.as_ptr(), message.len() as u32);
-    let err = crate::error::js_typeerror_new(msg);
-    crate::exception::js_throw(crate::value::js_nanbox_pointer(err as i64))
+    crate::exception::throw_core(crate::error::CoreError::type_error(msg))
 }

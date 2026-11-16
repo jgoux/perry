@@ -205,9 +205,7 @@ impl StrKey {
         if entry_bits >> 48 == STRING_UPPER {
             let header =
                 (entry_bits & crate::value::POINTER_MASK) as *const crate::string::StringHeader;
-            let data = header
-                .cast::<u8>()
-                .add(std::mem::size_of::<crate::string::StringHeader>());
+            let data = crate::string::string_data(header);
             let stored_len = (*header).byte_len;
             let query_len = match self {
                 StrKey::Short { len, .. } | StrKey::Heap { len, .. } => len,
@@ -481,7 +479,7 @@ mod tests {
             f64::from_bits(TAG_TRUE),
             f64::from_bits(TAG_UNDEFINED),
             f64::from_bits(MAP_HOLE_KEY_BITS),
-            f64::from_bits(crate::value::INT32_TAG | 5),
+            f64::from_bits(crate::value::INTERNAL_WORD_TAG | 5),
         ];
         for &key in &values {
             let Some(skey) = StrKey::decode(key.to_bits()) else {

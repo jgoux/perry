@@ -246,6 +246,9 @@ impl Plan {
                         object: target.clone(),
                         index: key.clone(),
                         value: value.clone(),
+                        element_offset: 0,
+                        byte_offset: 0,
+                        byte_end: 0,
                     },
                 )
             }
@@ -259,12 +262,16 @@ impl Plan {
                     object: array.clone(),
                     index: index.clone(),
                     value: value.clone(),
+                    element_offset: 0,
+                    byte_offset: 0,
+                    byte_end: 0,
                 },
             ),
             Expr::IndexSet {
                 object,
                 index,
                 value,
+                ..
             } => {
                 let Some(root) = self.receiver(ctx, object) else {
                     return false;
@@ -472,7 +479,15 @@ fn numeric_function<'a>(
         }
         _ => return None,
     };
-    ctx.wpfacts.numeric_functions.get(&id)
+    let f = ctx.wpfacts.numeric_functions.get(&id);
+    if f.is_some() {
+        crate::verify_facts::consumed(
+            crate::verify_facts::Fact::NumericBody,
+            || serde_json::json!({"body":id}),
+        );
+        crate::facts_consumed::used();
+    }
+    f
 }
 
 fn owner_proof<'a>(
@@ -483,10 +498,33 @@ fn owner_proof<'a>(
     if ctx.wpfacts_off || ctx.wpfacts.interp_guard {
         return None;
     }
-    ctx.wpfacts
+    let p = ctx
+        .wpfacts
         .indexed_owners
         .get(&id)
-        .filter(|p| p.kind == kind)
+        .filter(|p| p.kind == kind);
+    if let Some(p) = p {
+        crate::verify_facts::consumed(
+            crate::verify_facts::Fact::OwnerBrand,
+            || serde_json::json!({"local":id,"kind":p.kind}),
+        );
+        crate::verify_facts::consumed(
+            crate::verify_facts::Fact::MinimumExtent,
+            || serde_json::json!({"local":id,"length":p.min_len}),
+        );
+        if let Some(n) = p.exact_len {
+            crate::verify_facts::consumed(
+                crate::verify_facts::Fact::ExactExtent,
+                || serde_json::json!({"local":id,"length":n}),
+            );
+        }
+        crate::verify_facts::consumed(
+            crate::verify_facts::Fact::Separation,
+            || serde_json::json!({"local":id,"allocations":p.allocations}),
+        );
+        crate::facts_consumed::used();
+    }
+    p
 }
 
 fn static_interval(ctx: &FnCtx<'_>, p: &Plan, e: &Expr, bound: i64) -> Option<(i64, i64)> {
@@ -607,6 +645,33 @@ fn boxed_binding(ctx: &mut FnCtx<'_>, id: u32) -> String {
         .cloned()
         .unwrap_or_else(|| format!("@{}", ctx.module_globals[&id]));
     ctx.block().load(DOUBLE, &slot)
+}
+
+/// A facts-verification build (`verify_facts`): the input the facts prove a
+/// Number is one, or the witness reports the site.
+pub(crate) fn verify_number_input(ctx: &mut FnCtx<'_>, number: &str, value: &str, id: u32) {
+    crate::verify_facts::tick(ctx);
+    let miss = ctx.new_block("indexed.owner.verify_miss");
+    let miss_l = ctx.block_label(miss);
+    branch_guard(ctx, number, &miss_l);
+    let ok = ctx.current_block;
+    ctx.current_block = miss;
+    crate::verify_facts::number_checked(id);
+    let site = crate::verify_facts::site_arg(
+        ctx,
+        &format!("number input local {id}"),
+        crate::verify_facts::Fact::NumberInput,
+        &[],
+    );
+    let _ = crate::verify_facts::check(
+        ctx,
+        crate::types::I32,
+        "perry_wpfacts_check_miss",
+        &[(DOUBLE, value)],
+        &site,
+    );
+    ctx.block().unreachable();
+    ctx.current_block = ok;
 }
 
 fn branch_guard(ctx: &mut FnCtx<'_>, pass: &str, slow: &str) {
@@ -1148,6 +1213,9 @@ fn expression(
                 object: target.clone(),
                 index: key.clone(),
                 value: value.clone(),
+                element_offset: 0,
+                byte_offset: 0,
+                byte_end: 0,
             },
             values,
             storage,
@@ -1163,6 +1231,9 @@ fn expression(
                 object: array.clone(),
                 index: index.clone(),
                 value: value.clone(),
+                element_offset: 0,
+                byte_offset: 0,
+                byte_end: 0,
             },
             values,
             storage,
@@ -1171,6 +1242,7 @@ fn expression(
             object,
             index,
             value,
+            ..
         } => {
             let Expr::LocalGet(id) = object.as_ref() else {
                 unreachable!()
@@ -1513,6 +1585,15 @@ pub(super) fn lower(
         ) || ctx.numeric_accumulator_f64_slots.contains_key(id);
         if !native_number && (ctx.wpfacts_off || !ctx.wpfacts.number_inputs.contains(id)) {
             branch_guard(ctx, &number, &slow_l);
+        } else if !native_number {
+            crate::verify_facts::consumed(
+                crate::verify_facts::Fact::NumberInput,
+                || serde_json::json!({"local":id}),
+            );
+            crate::facts_consumed::used();
+            if crate::verify_facts::enabled() {
+                verify_number_input(ctx, &number, &v, *id);
+            }
         }
         values.insert(*id, Number::F(v));
     }
@@ -1533,6 +1614,12 @@ pub(super) fn lower(
     // identities can prove separation before falling back to live spans.
     if !p.stores.is_empty() {
         disjoint_storage(ctx, &mut storage, &slow_l);
+    }
+    if ctx.wpfacts.indexed_metadata_pristine {
+        crate::verify_facts::consumed(
+            crate::verify_facts::Fact::IndexedMetadata,
+            || serde_json::json!({"local":length_receiver}),
+        );
     }
     if let Some(id) = length_receiver.filter(|id| {
         storage[id].kind != STRING_KIND

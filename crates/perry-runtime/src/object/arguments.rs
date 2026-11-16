@@ -1,36 +1,22 @@
 //! ECMAScript Arguments objects with ordinary property slots.
 //!
-//! A private allocation tail carries the birth layout and mapped aliases.
-//! It moves and dies with the object; birth needs no metadata allocation.
+//! The object's meta record carries its birth word (length and birth
+//! layout) and its exotic state (mapped aliases): `ObjectMeta::arguments_birth`
+//! and `ObjectMeta::arguments`. Birth allocates that record. The cell holds
+//! property slots only, so `object_inline_capacity` stays the cell-size
+//! formula every ordinary object uses and pays nothing for arguments objects.
 
 use super::descriptors::{build_accessor_descriptor, build_data_descriptor};
 use super::header::meta_form_alloc_bytes;
 use super::*;
 use crate::codegen_abi::LayoutWord;
 
-#[repr(C)]
-struct ArgumentsTail {
-    len: u32,
-    /// Immutable birth layout; the live shape must still equal this identity.
-    birth_shape: LayoutWord,
-    /// TAG_TRUE / TAG_FALSE for unmapped objects; a boxed alias array otherwise.
-    state: u64,
-}
-
-/// Only called on an allocation born by unstamped_arguments_object.
-unsafe fn arguments_tail(obj: *const ObjectHeader) -> *mut ArgumentsTail {
-    let header = crate::gc::header_from_trusted_user_ptr(obj.cast());
-    (header as *mut u8)
-        .add((*header).size as usize - std::mem::size_of::<ArgumentsTail>())
-        .cast()
-}
-
-/// Explicit child edge outside the ordinary property-slot range. The GC
-/// enumerates it even when a property mutation changes the receiver's shape.
-pub(crate) unsafe fn arguments_mapping_slot(obj: *mut ObjectHeader) -> Option<*mut u64> {
-    let header = crate::gc::header_from_trusted_user_ptr(obj.cast());
-    ((*header)._reserved & crate::gc::OBJ_FLAG_ARGUMENTS != 0)
-        .then(|| &mut (*arguments_tail(obj)).state as *mut u64)
+/// The record holding an arguments object's birth word and state. Only
+/// called on an object that carries `OBJ_FLAG_ARGUMENTS`: the flag is set
+/// after the record is installed, and a meta record is never removed.
+#[inline]
+unsafe fn arguments_record(obj: *const ObjectHeader) -> *mut ObjectMeta {
+    (*obj).meta
 }
 
 const ARGUMENTS_RESTRICTED: u64 = crate::value::TAG_TRUE;
@@ -152,7 +138,7 @@ unsafe fn arguments_state(obj: *const ObjectHeader) -> Option<ArgumentsState> {
     if header._reserved & crate::gc::OBJ_FLAG_ARGUMENTS == 0 {
         return None;
     }
-    match (*arguments_tail(obj)).state {
+    match (*arguments_record(obj)).arguments {
         0 => None,
         ARGUMENTS_RESTRICTED => Some(ArgumentsState::Restricted),
         ARGUMENTS_UNMAPPED => Some(ArgumentsState::Unmapped),
@@ -255,7 +241,7 @@ pub(super) const THROWER_FROZEN_FLAGS: u16 =
 
 pub(super) fn thrower_closure_value() -> f64 {
     let closure = crate::closure::js_closure_alloc_singleton(
-        crate::fn_info!(#[realm("Function.prototype.arguments.<get>", integrity = frozen, spec = {name = ""}, emit = metadata(realm_thrower_public))] export crate::object::arguments::arguments_throw_type_error, 0; with_declared(0)),
+        crate::fn_info!(#[realm("Function.prototype.arguments.<get>", integrity = frozen, spec = {name = ""}, emit = metadata(realm_thrower_public))] export crate::object::arguments::arguments_throw_type_error, 0; with_name("get arguments"), with_declared(0)),
     );
     // #10509: configure the per-thread singleton once, not per strict call.
     // The frozen bits are the last step below and live in the closure's own
@@ -389,7 +375,7 @@ pub extern "C" fn js_arguments_object_alloc_mapped(
 fn unstamped_arguments_object(slots: u32) -> *mut ObjectHeader {
     let alloc_slots = std::cmp::max(slots as usize, crate::object::INLINE_SLOT_FLOOR);
     let obj = crate::arena::arena_alloc_gc(
-        meta_form_alloc_bytes(alloc_slots) + std::mem::size_of::<ArgumentsTail>(),
+        meta_form_alloc_bytes(alloc_slots),
         8,
         crate::gc::GC_TYPE_OBJECT,
     ) as *mut ObjectHeader;
@@ -397,14 +383,6 @@ fn unstamped_arguments_object(slots: u32) -> *mut ObjectHeader {
         // Arm the existing probe latch before publishing the arguments identity.
         ARGUMENTS_OBJECTS_EVER_USED.store(true, std::sync::atomic::Ordering::Relaxed);
         (*obj).class_id = 0;
-        let header = crate::gc::header_from_trusted_user_ptr(obj.cast()).cast_mut();
-        (*header)._reserved |= crate::gc::OBJ_FLAG_ARGUMENTS;
-        // GC_STORE_AUDIT(INIT): private tail starts pointer-free, before any mint.
-        arguments_tail(obj).write(ArgumentsTail {
-            len: slots - 2,
-            birth_shape: LayoutWord(0),
-            state: ARGUMENTS_UNMAPPED,
-        });
         (*obj).parent_class_id = 0;
         // GC_STORE_AUDIT(INIT): fresh object starts with no per-object meta record.
         *crate::meta_slot_of!(crate::meta_obj_runtime_born!(obj)) = std::ptr::null_mut();
@@ -477,6 +455,21 @@ pub(crate) fn arguments_object_alloc_rooted(
     let pair = restricted_callee.then(|| scope.root_raw_mut_ptr(restricted_callee_pair()));
     let slots = len.saturating_add(2);
     let obj = scope.root_raw_mut_ptr(unstamped_arguments_object(slots));
+    // The record is installed before the arguments identity is published and
+    // before the birth stamp (nothing may allocate between the stamp and the
+    // field initialization). `object_meta_ensure` roots the owner itself.
+    unsafe {
+        let meta = crate::object::object_meta_ensure(
+            crate::meta_obj_runtime_born!(obj.get_raw_mut_ptr::<ObjectHeader>()),
+            crate::object::MetaReason::Arguments,
+        );
+        // GC_STORE_AUDIT(INIT): scalar state words of a fresh record.
+        (*meta).arguments = ARGUMENTS_UNMAPPED;
+        (*meta).arguments_birth = 0;
+        let live = obj.get_raw_mut_ptr::<ObjectHeader>();
+        let header = crate::gc::header_from_trusted_user_ptr(live.cast()).cast_mut();
+        (*header)._reserved |= crate::gc::OBJ_FLAG_ARGUMENTS;
+    }
     let cache_index = if len <= 64 {
         Some(len as usize + if restricted_callee { 65 } else { 0 })
     } else {
@@ -532,8 +525,9 @@ pub(crate) fn arguments_object_alloc_rooted(
                         .to_bits()
                 },
             ));
-        (*arguments_tail(obj)).birth_shape =
-            LayoutWord(crate::object::shapes::object_shape_stamp(obj).0);
+        // GC_STORE_AUDIT(INIT): POD birth word (length low, LayoutWord high).
+        (*arguments_record(obj)).arguments_birth = u64::from(slots - 2)
+            | u64::from(crate::object::shapes::object_shape_stamp(obj).0) << 32;
         // Attributes are already in the birth shape. No empty descriptor edit.
         let header = (obj as *mut u8)
             .sub(crate::gc::GC_HEADER_SIZE)
@@ -563,10 +557,11 @@ pub(crate) fn arguments_object_alloc_rooted(
         crate::value::js_nanbox_pointer(map.get_raw_mut_ptr::<ArrayHeader>() as i64).to_bits()
     };
     unsafe {
-        let slot = &mut (*arguments_tail(obj)).state as *mut u64;
-        // GC_STORE_AUDIT(BARRIERED): explicit mapped-alias child edge.
+        let meta = arguments_record(obj);
+        let slot = &mut (*meta).arguments as *mut u64;
+        // GC_STORE_AUDIT(BARRIERED): the meta record's mapped-alias child edge.
         slot.write(state);
-        crate::gc::runtime_write_barrier_slot(obj as usize, slot as usize, state);
+        crate::gc::runtime_write_barrier_slot(meta as usize, slot as usize, state);
     }
     obj
 }
@@ -602,7 +597,7 @@ pub extern "C" fn js_arguments_bundle_index_get(raw_args: f64, key: f64) -> f64 
     // Forwarded or descriptor-bearing inputs keep the complete getter below.
     unsafe {
         if let Some(header) = crate::value::addr_class::try_read_gc_header(raw as usize) {
-            if header.obj_type == crate::gc::GC_TYPE_ARRAY
+            if crate::gc_type_is_array!(header.obj_type)
                 && header.gc_flags & crate::gc::GC_FLAG_FORWARDED == 0
                 && !crate::array::array_has_element_descriptors_resolved(raw)
                 && (*raw).length <= (*raw).capacity
@@ -747,12 +742,23 @@ pub(crate) fn test_arguments_registry_probe_count() -> u64 {
     TEST_ARGUMENTS_REGISTRY_PROBES.with(|c| c.get())
 }
 
+/// The birth word of an arguments object's meta record as (length, birth
+/// LayoutWord), or `None` when the object has no record.
+#[cfg(test)]
+pub(crate) unsafe fn test_arguments_birth_word(obj: *const ObjectHeader) -> Option<(u32, u32)> {
+    let meta = arguments_record(obj);
+    (!meta.is_null()).then(|| {
+        let word = (*meta).arguments_birth;
+        (word as u32, (word >> 32) as u32)
+    })
+}
+
 /// Exact birth shape proves all indexed properties remain own data slots.
 /// Value stores do not weaken it; deletes, descriptors and prototype edits do.
 unsafe fn born_arguments_len(obj: *const ObjectHeader) -> Option<u32> {
-    let tail = &*arguments_tail(obj);
-    let born = tail.birth_shape;
-    (born != LayoutWord(0) && LayoutWord((*obj).shape_word()) == born).then_some(tail.len)
+    let word = (*arguments_record(obj)).arguments_birth;
+    let born = LayoutWord((word >> 32) as u32);
+    (born != LayoutWord(0) && LayoutWord((*obj).shape_word()) == born).then_some(word as u32)
 }
 
 unsafe fn born_arguments_index(obj: *const ObjectHeader, index: u32) -> f64 {
@@ -1248,58 +1254,24 @@ pub(crate) unsafe fn arguments_object_to_array(
     Some(out.with_mut_ptr(|arr: *mut ArrayHeader| arr))
 }
 
+/// The call-argument drain of `f(...x)`: the one spread path
+/// ([`crate::array::spread_values`], GetIterator semantics: a non-iterable
+/// operand throws). A proven dense array is returned as is (its readers copy
+/// the elements).
 #[no_mangle]
 pub extern "C" fn js_array_like_to_array(value: f64) -> *mut ArrayHeader {
     let jsv = JSValue::from_bits(value.to_bits());
-    if !jsv.is_pointer() {
-        return std::ptr::null_mut();
+    if jsv.is_pointer()
+        && crate::array::js_array_is_array(value).to_bits() == crate::value::TAG_TRUE
+    {
+        if let Some(arr) = crate::array::plain_call_spread_source(value) {
+            return arr as *mut ArrayHeader;
+        }
+        if let Some(arr) = crate::array::dense_spread_source(value) {
+            return arr as *mut ArrayHeader;
+        }
     }
-    let raw = jsv.as_pointer::<u8>();
-    unsafe {
-        if let Some(arr) = arguments_object_to_array(raw as *const ObjectHeader) {
-            return arr;
-        }
-        let addr = raw as usize;
-        if crate::typedarray_hook_slots::lookup_typed_array_kind(addr).is_some() {
-            return crate::typedarray_hook_slots::typed_array_to_array(
-                raw as *const crate::typedarray_hook_slots::TypedArrayHeader,
-            );
-        }
-        if crate::buffer::is_registered_buffer(addr) {
-            return crate::buffer::buffer_to_array(raw as *const crate::buffer::BufferHeader);
-        }
-        // A real Array → the dominant plain shape needs only the sticky
-        // iterator-protocol check and one receiver-shape compare. An own key
-        // (including Symbol.iterator) or a custom prototype leaves that shape;
-        // only then pay the complete dense-spread proof (#11772).
-        if crate::array::js_array_is_array(value).to_bits() == crate::value::TAG_TRUE {
-            if let Some(arr) = crate::array::plain_call_spread_source(value) {
-                return arr as *mut ArrayHeader;
-            }
-            if let Some(arr) = crate::array::dense_spread_source(value) {
-                return arr as *mut ArrayHeader;
-            }
-            return crate::array::js_array_clone_for_spread(value);
-        }
-        // Generic iterable with a user `[Symbol.iterator]` (Map/Set, generator
-        // objects, hand-rolled iterables, …): spread uses the ITERATOR protocol
-        // (GetIterator → IteratorStep → IteratorValue), NOT array-like
-        // length/index access. Drive `.next()` to collect the yielded values so
-        // `f(...iterable)` / `new C(...iterable)` / `[...iterable]` spread see
-        // them, and so errors thrown by `[Symbol.iterator]` / `.next()` /
-        // accessing `value`/`done` propagate (test262 spread-err-*). Plain
-        // array-like objects (a `{length, 0, 1}` bag with no `@@iterator`) keep
-        // the legacy reinterpret fallback below.
-        if crate::collection_iter::is_iterable(value) {
-            let iter = crate::symbol::js_get_iterator(value);
-            let mut out = crate::array::js_array_alloc(0);
-            while let Some(v) = crate::collection_iter::iterator_next_value(iter) {
-                out = crate::array::js_array_push_f64(out, f64::from_bits(v.to_bits()));
-            }
-            return out;
-        }
-        crate::array::clean_arr_ptr(raw as *const ArrayHeader) as *mut ArrayHeader
-    }
+    crate::array::spread_values(value)
 }
 
 unsafe fn read_ordinary_own_value(
@@ -1309,10 +1281,7 @@ unsafe fn read_ordinary_own_value(
     let keys_view = crate::object::object_keys(obj);
     let keys = keys_view.arr();
     let key_count = keys_view.count() as usize;
-    let alloc_limit = std::cmp::max(
-        crate::object::object_live_slot_count(obj),
-        crate::object::INLINE_SLOT_FLOOR as u32,
-    ) as usize;
+    let alloc_limit = crate::object::object_inline_capacity(obj) as usize;
     for i in 0..key_count {
         let key_val = crate::array::js_array_get(keys, i as u32);
         if crate::string::js_string_key_matches(key_val, key) {
@@ -1336,10 +1305,7 @@ unsafe fn write_ordinary_own_value(
     let keys_view = crate::object::object_keys(obj);
     let keys = keys_view.arr();
     let key_count = keys_view.count() as usize;
-    let alloc_limit = std::cmp::max(
-        crate::object::object_live_slot_count(obj),
-        crate::object::INLINE_SLOT_FLOOR as u32,
-    ) as usize;
+    let alloc_limit = crate::object::object_inline_capacity(obj) as usize;
     for i in 0..key_count {
         let key_val = crate::array::js_array_get(keys, i as u32);
         if crate::string::js_string_key_matches(key_val, key) {

@@ -139,10 +139,13 @@ pub(crate) fn emit_private_site_guard(
     let in_range = recv.is_object_pointer;
     let inert = emit_private_template_inert(blk, class_id);
     let ready = blk.and(crate::types::I1, &in_range, &inert);
+    // An unprimed site word is 0. Without a static id it gates the probe;
+    // with one, the probe is reachable unprimed, so the compare below carries
+    // the same term.
+    let primed = blk.icmp_ne(I64, &word, "0");
     let ready = if static_id.is_some() {
         ready
     } else {
-        let primed = blk.icmp_ne(I64, &word, "0");
         blk.and(crate::types::I1, &ready, &primed)
     };
     blk.cond_br(&ready, &probe_l, &miss_l);
@@ -154,11 +157,15 @@ pub(crate) fn emit_private_site_guard(
     let shape_ptr = crate::expr::receiver_range::emit_field_ptr(blk, &biased, 4);
     let shape = blk.load(crate::types::I32, &shape_ptr);
     let shape = blk.zext(crate::types::I32, &shape, I64);
-    // A site word is never 0 once primed, and no ShapeId is 0, so an
-    // unprimed word never matches here.
+    // A zero shape word names no shape (a Proxy cell, a Date), so it never
+    // matches anything: the receiver's word is compared with the site word
+    // only when the site is primed (word != 0), or with the class's final
+    // ShapeId. The static-id path reaches this block unprimed, so the term is
+    // required there.
     let hit = blk.icmp_eq(I64, &shape, &word);
     let hit = match static_id {
         Some(id) => {
+            let hit = blk.and(crate::types::I1, &hit, &primed);
             let is_final = blk.icmp_eq(I64, &shape, &id.to_string());
             blk.or(crate::types::I1, &is_final, &hit)
         }
@@ -269,7 +276,7 @@ fn lower_captureless_some_inline(
             let type_addr = blk.sub(I64, &raw, "8");
             let type_ptr = blk.inttoptr(I64, &type_addr);
             let obj_type = blk.load(I8, &type_ptr);
-            let is_array = blk.icmp_eq(I8, &obj_type, "1"); // GC_TYPE_ARRAY
+            let is_array = crate::target_layout::emit_gc_type_is_array(blk, I8, &obj_type);
             let flags_addr = blk.sub(I64, &raw, "7");
             let flags_ptr = blk.inttoptr(I64, &flags_addr);
             let gc_flags = blk.load(I8, &flags_ptr);
@@ -567,7 +574,37 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 .block()
                 .call(DOUBLE, "js_private_lexical_brand_pop", &[]))
         }
-        Expr::Logical { op, left, right } => lower_logical(ctx, *op, left, right),
+        // The `this.F` hoist's version test: a compile-time answer. True only
+        // in a body lowered with a proven `this` of exactly this class.
+        Expr::ThisProvenClass(class) => {
+            let proven = !crate::stmt::this_field_fast_off()
+                && ctx
+                    .ptr_shape_region_class(&Expr::This)
+                    .is_some_and(|c| c == *class);
+            let bits = if proven {
+                crate::nanbox::TAG_TRUE_I64
+            } else {
+                crate::nanbox::TAG_FALSE_I64
+            };
+            Ok(ctx.block().bitcast_i64_to_double(bits))
+        }
+        Expr::Logical { op, left, right } => {
+            // I32 at rest: `a[k] ?? <int32>` is the slot's word or the literal.
+            if matches!(op, perry_hir::LogicalOp::Coalesce) {
+                if let Some(v) = super::rest_elems::try_lower_default_i32(ctx, left, right)? {
+                    return Ok(ctx
+                        .block()
+                        .sitofp(crate::types::I32, &v, crate::types::DOUBLE));
+                }
+                // An Array of Numbers: the nullish test is on the read's
+                // miss arm only (`index_get::rep_default`).
+                if let Some(v) = super::index_get::rep_default::try_lower(ctx, left, right, false)?
+                {
+                    return Ok(v);
+                }
+            }
+            lower_logical(ctx, *op, left, right)
+        }
 
         // -------- arr.filter(callback) --------
         // Mirrors ArrayMap: takes a closure header pointer, returns
@@ -1154,50 +1191,9 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
         // -------- Math.min(...args) --------
         // Two HIR shapes: variadic (Vec<Expr>) and spread-from-array
         // (single Expr that is an array). Both build/use an array and
-        // call js_math_min_array. The variadic form materializes a
-        // temporary fixed-size array via js_array_alloc + push.
+        // call js_math_min_array. The variadic form (no spread) folds inline.
         Expr::MathMin(values) => {
-            if values.len() == 2 {
-                return rooting::with_operands_rooted(
-                    ctx,
-                    &[&values[0], &values[1]],
-                    |ctx, vals| {
-                        Ok(lower_math_minmax2(
-                            ctx,
-                            [&values[0], &values[1]],
-                            [&vals[0], &vals[1]],
-                            "llvm.minimum.f64",
-                            "js_math_min2",
-                        ))
-                    },
-                );
-            }
-            let cap = (values.len() as u32).to_string();
-            let arr_handle_v = ctx.block().call(I64, "js_array_alloc", &[(I32, &cap)]);
-            // Push each value. push_f64 may realloc, so the returned pointer is
-            // threaded through — and #7615 slice 2: it was threaded through a
-            // RAW SSA register that stayed live across the NEXT argument's
-            // lowering, so `Math.min(f(), g(), h())` pushed into a pre-move
-            // address. The accumulator is the fix; being an `i64` derived above
-            // the window is exactly what #7280 cannot repair.
-            let protect = rooting::any_operand_may_collect(ctx, values.iter());
-            rooting::with_rooted_accumulator(
-                ctx,
-                Repr::Ptr,
-                &arr_handle_v,
-                protect,
-                |ctx, acc| {
-                    for v_expr in values {
-                        let v_box = lower_expr(ctx, v_expr)?;
-                        acc.advance(ctx, "js_array_push_f64", &[Arg::Plain(DOUBLE, &v_box)]);
-                    }
-                    Ok(())
-                },
-                |ctx, current| {
-                    let blk = ctx.block();
-                    Ok(blk.call(DOUBLE, "js_math_min_array", &[(I64, current)]))
-                },
-            )
+            lower_math_minmax_n(ctx, values, "llvm.minimum.f64", f64::INFINITY)
         }
         Expr::MathMinSpread(arr_expr) => {
             let arr_box = lower_expr(ctx, arr_expr)?;
@@ -1208,42 +1204,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
 
         // -------- Math.max(...args) — same shape as Math.min --------
         Expr::MathMax(values) => {
-            if values.len() == 2 {
-                return rooting::with_operands_rooted(
-                    ctx,
-                    &[&values[0], &values[1]],
-                    |ctx, vals| {
-                        Ok(lower_math_minmax2(
-                            ctx,
-                            [&values[0], &values[1]],
-                            [&vals[0], &vals[1]],
-                            "llvm.maximum.f64",
-                            "js_math_max2",
-                        ))
-                    },
-                );
-            }
-            let cap = (values.len() as u32).to_string();
-            let arr_handle_v = ctx.block().call(I64, "js_array_alloc", &[(I32, &cap)]);
-            // Same raw-accumulator window as `MathMin` above (#7615 slice 2).
-            let protect = rooting::any_operand_may_collect(ctx, values.iter());
-            rooting::with_rooted_accumulator(
-                ctx,
-                Repr::Ptr,
-                &arr_handle_v,
-                protect,
-                |ctx, acc| {
-                    for v_expr in values {
-                        let v_box = lower_expr(ctx, v_expr)?;
-                        acc.advance(ctx, "js_array_push_f64", &[Arg::Plain(DOUBLE, &v_box)]);
-                    }
-                    Ok(())
-                },
-                |ctx, current| {
-                    let blk = ctx.block();
-                    Ok(blk.call(DOUBLE, "js_math_max_array", &[(I64, current)]))
-                },
-            )
+            lower_math_minmax_n(ctx, values, "llvm.maximum.f64", f64::NEG_INFINITY)
         }
         Expr::MathMaxSpread(arr_expr) => {
             let arr_box = lower_expr(ctx, arr_expr)?;
@@ -1508,8 +1469,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             rooting::with_operands_rooted(ctx, &operands, |ctx, vals| {
                 let r_d = vals.get(1).cloned().unwrap_or_else(|| "0.0".to_string());
                 let blk = ctx.block();
-                let s_handle = blk.call(I64, "js_string_coerce", &[(DOUBLE, &vals[0])]);
-                Ok(blk.call(DOUBLE, "js_parse_int", &[(I64, &s_handle), (DOUBLE, &r_d)]))
+                Ok(blk.call(DOUBLE, "js_parse_int_value", &[(DOUBLE, &vals[0]), (DOUBLE, &r_d)]))
             })
         }
         Expr::ParseFloat(string) => {
@@ -1610,6 +1570,13 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                         } else {
                             // The helper returns the current (possibly new or
                             // evacuated) accumulator; publish it in the root.
+                            // It is born with room for the keys the literal
+                            // defines after this part.
+                            let tail = parts[index + 1..]
+                                .iter()
+                                .filter(|(key, _)| key.is_some())
+                                .count()
+                                .to_string();
                             acc.advance(
                                 ctx,
                                 if index == 0 {
@@ -1617,7 +1584,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                                 } else {
                                     "js_object_spread_fresh"
                                 },
-                                &[Arg::Plain(DOUBLE, &value)],
+                                &[Arg::Plain(DOUBLE, &value), Arg::Plain(I32, &tail)],
                             );
                         }
                     }
@@ -1640,12 +1607,41 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             if let Some(site) = crate::layout_desc::create_families::site(ctx, expr) {
                 return crate::layout_desc::create_families::lower_assign(ctx, &site, expr);
             }
-            let target_box = lower_expr(ctx, target)?;
-            let acc = ctx.block().call(
-                DOUBLE,
-                "js_object_assign_validate_target",
-                &[(DOUBLE, &target_box)],
-            );
+            // `Object.assign({}, s, ...)`: the empty literal (`Expr::Object`,
+            // or the keyless literal-shape class it lowers to) is visible to
+            // nothing until the first copy, so it is created after `s` is
+            // evaluated, born with room for `s`'s own keys.
+            let empty_literal = match &**target {
+                Expr::Object(props) => props.is_empty(),
+                Expr::New {
+                    class_name, args, ..
+                } => {
+                    args.is_empty()
+                        && ctx
+                            .classes
+                            .get(class_name)
+                            .is_some_and(|c| c.is_literal_shape() && c.fields.is_empty())
+                }
+                _ => false,
+            };
+            let (acc, sources) = match sources.split_first() {
+                Some((first, rest)) if empty_literal => {
+                    let first_box = lower_expr(ctx, first)?;
+                    let acc =
+                        ctx.block()
+                            .call(DOUBLE, "js_object_assign_fresh", &[(DOUBLE, &first_box)]);
+                    (acc, rest)
+                }
+                _ => {
+                    let target_box = lower_expr(ctx, target)?;
+                    let acc = ctx.block().call(
+                        DOUBLE,
+                        "js_object_assign_validate_target",
+                        &[(DOUBLE, &target_box)],
+                    );
+                    (acc, sources.as_slice())
+                }
+            };
             // Stash target in a temp slot if there are multiple sources, so
             // each helper call uses the same SSA value (defensive: helper
             // returns target_f64 unchanged, but the chain is clearer when we
@@ -1709,49 +1705,96 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
     }
 }
 
-/// Two-argument `Math.max` / `Math.min`. When both operands are plain doubles
-/// (proven by construction, or by one signed compare per unproven operand),
-/// the answer is `llvm.maximum` / `llvm.minimum`: both propagate NaN and order
-/// `-0` below `+0`, which is exactly the JS definition. Anything else (int32
-/// boxes, strings, objects, BigInt, Symbol) keeps the coercing runtime helper.
-fn lower_math_minmax2(
+/// `Math.min/max(a1..an)` without spread. All arguments are evaluated first,
+/// in order (and rooted); then ToNumber runs on each in order (so `valueOf`
+/// side effects and a BigInt/Symbol TypeError keep their order, and a NaN does
+/// not stop later coercions); then the coerced values are folded left with
+/// `llvm.minimum/maximum.f64`, which propagate NaN and order -0 < +0 exactly
+/// as the spec does. Arguments proven to be plain doubles skip the coercion
+/// and the call is just the fold. Otherwise a plain-number test on the rest picks
+/// the inline fold, or one out-of-line `js_math_{min,max}_n` call that coerces
+/// and reduces the values (no array, no per-argument calls, no second fold).
+fn lower_math_minmax_n(
     ctx: &mut FnCtx<'_>,
-    exprs: [&Expr; 2],
-    vals: [&str; 2],
+    values: &[Expr],
     intrinsic: &str,
-    helper: &str,
-) -> String {
-    let mut plain: Option<String> = None;
-    for (expr, val) in exprs.iter().zip(vals.iter()) {
-        if super::dispatch::math_operand_is_proven_number(ctx, expr) {
-            continue;
-        }
-        let test = crate::codegen::emit_plain_number_test(ctx.block(), val);
-        plain = Some(match plain {
-            Some(prev) => ctx.block().and(crate::types::I1, &prev, &test),
-            None => test,
-        });
+    empty: f64,
+) -> Result<String> {
+    if values.is_empty() {
+        return Ok(crate::nanbox::double_literal(empty));
     }
-    let args = [(DOUBLE, vals[0]), (DOUBLE, vals[1])];
-    let Some(plain) = plain else {
-        return ctx.block().call(DOUBLE, intrinsic, &args);
-    };
-    let fast_idx = ctx.new_block("math.minmax.fast");
-    let slow_idx = ctx.new_block("math.minmax.slow");
-    let merge_idx = ctx.new_block("math.minmax.merge");
-    let fast_label = ctx.block_label(fast_idx);
-    let slow_label = ctx.block_label(slow_idx);
-    let merge_label = ctx.block_label(merge_idx);
-    ctx.block().cond_br(&plain, &fast_label, &slow_label);
-    ctx.current_block = fast_idx;
-    let fast = ctx.block().call(DOUBLE, intrinsic, &args);
-    let fast_end = ctx.block().label.clone();
-    ctx.block().br(&merge_label);
-    ctx.current_block = slow_idx;
-    let slow = ctx.block().call(DOUBLE, helper, &args);
-    let slow_end = ctx.block().label.clone();
-    ctx.block().br(&merge_label);
-    ctx.current_block = merge_idx;
-    ctx.block()
-        .phi(DOUBLE, &[(&fast, &fast_end), (&slow, &slow_end)])
+    let exprs: Vec<&Expr> = values.iter().collect();
+    rooting::with_operands_rooted(ctx, &exprs, |ctx, vals| {
+        let mut plain: Option<String> = None;
+        for (expr, val) in exprs.iter().zip(vals.iter()) {
+            if super::dispatch::math_operand_is_proven_number(ctx, expr) {
+                continue;
+            }
+            let test = crate::codegen::emit_plain_number_test(ctx.block(), val);
+            plain = Some(match plain {
+                Some(prev) => ctx.block().and(crate::types::I1, &prev, &test),
+                None => test,
+            });
+        }
+        // The fold: n-1 intrinsics, emitted once.
+        fn fold(ctx: &mut FnCtx<'_>, intrinsic: &str, vals: &[String]) -> String {
+            let mut acc = vals[0].clone();
+            for v in &vals[1..] {
+                acc = ctx
+                    .block()
+                    .call(DOUBLE, intrinsic, &[(DOUBLE, &acc), (DOUBLE, v)]);
+            }
+            acc
+        }
+        let Some(plain) = plain else {
+            return Ok(fold(ctx, intrinsic, vals));
+        };
+        let fast_idx = ctx.new_block("math.minmax.fast");
+        let slow_idx = ctx.new_block("math.minmax.slow");
+        let merge_idx = ctx.new_block("math.minmax.merge");
+        let fast_label = ctx.block_label(fast_idx);
+        let slow_label = ctx.block_label(slow_idx);
+        let merge_label = ctx.block_label(merge_idx);
+        ctx.block().cond_br(&plain, &fast_label, &slow_label);
+        ctx.current_block = fast_idx;
+        let fast = fold(ctx, intrinsic, vals);
+        let fast_end = ctx.block().label.clone();
+        ctx.block().br(&merge_label);
+        // Some argument is not a plain number: one out-of-line call does the
+        // ordered ToNumber and the reduction over the values on the stack.
+        ctx.current_block = slow_idx;
+        let is_min = intrinsic == "llvm.minimum.f64";
+        let slow = if (2..=4).contains(&vals.len()) {
+            // Up to four operands travel in registers to a fixed-arity helper:
+            // no stack buffer, no stores at the site.
+            let helper = format!(
+                "js_math_{}_{}",
+                if is_min { "min" } else { "max" },
+                vals.len()
+            );
+            let call_args: Vec<_> = vals.iter().map(|v| (DOUBLE, v.as_str())).collect();
+            ctx.block().call(DOUBLE, &helper, &call_args)
+        } else {
+            let buffer = ctx.func.alloca_entry_array(DOUBLE, vals.len());
+            let blk = ctx.block();
+            for (i, v) in vals.iter().enumerate() {
+                let slot = blk.gep(DOUBLE, &buffer, &[(I64, &i.to_string())]);
+                blk.store(DOUBLE, v, &slot);
+            }
+            let helper = if is_min {
+                "js_math_min_n"
+            } else {
+                "js_math_max_n"
+            };
+            let n = vals.len().to_string();
+            blk.call(DOUBLE, helper, &[(PTR, &buffer), (I32, &n)])
+        };
+        let blk = ctx.block();
+        let slow_end = blk.label.clone();
+        blk.br(&merge_label);
+        ctx.current_block = merge_idx;
+        Ok(ctx
+            .block()
+            .phi(DOUBLE, &[(&fast, &fast_end), (&slow, &slow_end)]))
+    })
 }

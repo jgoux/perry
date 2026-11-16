@@ -307,13 +307,11 @@ fn parse_json_source_tree(input: &[u8]) -> Option<JsonSourceNode> {
     JsonSourceParser::new(input).parse()
 }
 
-/// Force-materialize a lazy-tape array (`PERRY_JSON_TAPE`) into a real
-/// `ArrayHeader` tree and return a JSValue pointing at it. The reviver walk
-/// below reads `length`/`capacity`/element f64s directly off the pointer — a
-/// `LazyArrayHeader` has a different layout, so without this the walk reads
-/// garbage and SIGSEGVs. Unlike `redirect_lazy_to_materialized` (stringify),
-/// this forces materialization even when nothing has indexed the array yet.
-/// No-op for non-lazy values. Refs #1424.
+/// Force-materialize a lazy-tape array (`PERRY_JSON_TAPE`) before the
+/// reviver walk, which reads `length`/`capacity`/element f64s directly off
+/// the pointer: materialization fills every element slot and turns the
+/// value into the ordinary array in place, so the returned JSValue is the
+/// same object. No-op for non-lazy values. Refs #1424.
 unsafe fn force_materialize_if_lazy(value: JSValue) -> JSValue {
     let bits = value.bits();
     if (bits >> 48) != 0x7FFD {
@@ -434,9 +432,7 @@ unsafe fn string_header_bytes<'a>(ptr: *const StringHeader) -> Option<&'a [u8]> 
 }
 
 fn number_matches_source(value: JSValue, source_number: f64) -> bool {
-    let current = if value.is_int32() {
-        value.as_int32() as f64
-    } else if value.is_number() {
+    let current = if value.is_number() {
         value.as_number()
     } else {
         return false;
@@ -520,7 +516,7 @@ unsafe fn annotate_source_tree(node: &mut JsonSourceNode, value: JSValue) {
                 elements,
                 original_bits,
             },
-            crate::gc::GC_TYPE_ARRAY,
+            crate::gc_array_type_pat!(),
         ) => {
             *original_bits = value.bits();
             let arr = ptr as *const crate::ArrayHeader;
@@ -838,6 +834,13 @@ pub unsafe extern "C" fn js_json_parse_with_reviver(
 ) -> JSValue {
     let scope = crate::gc::RuntimeHandleScope::new();
     let text_handle = scope.root_string_ptr(text_ptr);
+    // A reviver that is not callable is ignored (JSON.parse step 3): only an
+    // allocator-owned closure is kept (and rooted), as on the thunk path.
+    let reviver_ptr = if reviver_ptr != 0 && crate::closure::is_closure_ptr(reviver_ptr as usize) {
+        reviver_ptr
+    } else {
+        0
+    };
     let reviver = reviver_ptr as *const crate::closure::ClosureHeader;
     let reviver_handle = scope.root_raw_const_ptr(reviver);
 

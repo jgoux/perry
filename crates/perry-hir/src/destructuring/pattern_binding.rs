@@ -390,6 +390,7 @@ pub(crate) fn lower_array_pattern_binding(
             ],
         }),
         finally: None,
+        forof_completion: None,
     });
     result.push(close_stmt);
     result.extend(source.release(&[iter_id, next_id]));
@@ -750,6 +751,7 @@ pub(crate) fn lower_pattern_binding_into(
                                 });
                                 computed_key_temps.push(key_id);
                                 Expr::IndexGet {
+                                    element_offset: 0,
                                     byte_offset: 0,
                                     byte_end: 0,
                                     object: Box::new(Expr::LocalGet(tmp_id)),
@@ -914,6 +916,7 @@ pub(crate) fn lower_pattern_binding_into(
                             });
                             for key_id in &computed_key_temps {
                                 result.push(Stmt::Expr(Expr::Delete(Box::new(Expr::IndexGet {
+                                    element_offset: 0,
                                     byte_offset: 0,
                                     byte_end: 0,
                                     object: Box::new(Expr::LocalGet(rest_id)),

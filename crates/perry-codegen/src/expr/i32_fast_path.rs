@@ -21,6 +21,7 @@ use crate::types::{DOUBLE, F32, I16, I32, I64, I8};
 #[cfg(test)]
 mod bits_tests;
 mod native_narrow;
+pub(crate) mod temps;
 
 use native_narrow::{
     lower_expr_native_i16, lower_expr_native_i8, lower_expr_native_isize, lower_expr_native_u16,
@@ -65,15 +66,20 @@ fn is_int32_bitwise_result(ctx: &FnCtx<'_>, e: &Expr) -> bool {
         || crate::type_analysis::is_provably_not_bigint(ctx, right))
 }
 
-/// (Issue #50) If `IndexGet { object, index }` is a flat-const access
-/// (inline `X[i][j]` or aliased `krow[j]`), lower it directly against
-/// the `[N x i32]` global and return the NaN-boxed-double form of the
-/// element. Returns `Ok(None)` when the pattern doesn't apply.
-pub(crate) fn try_lower_flat_const_index_get(
-    ctx: &mut FnCtx<'_>,
+/// The flat-const table, row and column an `IndexGet { object, index }`
+/// reads when [`try_lower_flat_const_index_get`] lowers it: an inline
+/// `X[i][j]` or an aliased `krow[j]` (`krow = X[i]`) over a folded flat-const
+/// 2D int array `X`, at keys that are not strings. `None` means that lowering
+/// does not take the read.
+///
+/// This is the single admission for that lowering and for the Number proof
+/// `type_analysis` gives the same read (the lowering always yields
+/// `sitofp i32 -> double`, a raw Number), so the two cannot disagree.
+pub(crate) fn flat_const_index_get_target(
+    ctx: &FnCtx<'_>,
     object: &Expr,
     index: &Expr,
-) -> Result<Option<String>> {
+) -> Option<(FlatConstInfo, Box<Expr>, Box<Expr>)> {
     let (info, row_expr, col_expr): (FlatConstInfo, Box<Expr>, Box<Expr>) = match object {
         // Inline: IndexGet(IndexGet(LocalGet(X), i), j)
         Expr::IndexGet {
@@ -81,30 +87,20 @@ pub(crate) fn try_lower_flat_const_index_get(
             index: outer_idx,
             ..
         } => {
-            if let Expr::LocalGet(id) = outer_obj.as_ref() {
-                if let Some(info) = ctx.flat_const_arrays.get(id).cloned() {
-                    (info, outer_idx.clone(), Box::new(index.clone()))
-                } else {
-                    return Ok(None);
-                }
-            } else {
-                return Ok(None);
-            }
+            let Expr::LocalGet(id) = outer_obj.as_ref() else {
+                return None;
+            };
+            let info = ctx.flat_const_arrays.get(id).cloned()?;
+            (info, outer_idx.clone(), Box::new(index.clone()))
         }
         // Aliased: IndexGet(LocalGet(krow), j) where krow was init'd
         // as `IndexGet(LocalGet(X), i)` for a flat-const X.
         Expr::LocalGet(alias_id) => {
-            if let Some((const_id, row_expr)) = ctx.array_row_aliases.get(alias_id).cloned() {
-                if let Some(info) = ctx.flat_const_arrays.get(&const_id).cloned() {
-                    (info, row_expr, Box::new(index.clone()))
-                } else {
-                    return Ok(None);
-                }
-            } else {
-                return Ok(None);
-            }
+            let (const_id, row_expr) = ctx.array_row_aliases.get(alias_id).cloned()?;
+            let info = ctx.flat_const_arrays.get(&const_id).cloned()?;
+            (info, row_expr, Box::new(index.clone()))
         }
-        _ => return Ok(None),
+        _ => return None,
     };
 
     // A string-keyed access (`m["1"]["0"]`) must NOT take the integer flat
@@ -119,8 +115,23 @@ pub(crate) fn try_lower_flat_const_index_get(
     let col_is_string = matches!(col_expr.as_ref(), Expr::String(_))
         || crate::type_analysis::is_string_expr(ctx, &col_expr);
     if row_is_string || col_is_string {
-        return Ok(None);
+        return None;
     }
+    Some((info, row_expr, col_expr))
+}
+
+/// (Issue #50) If `IndexGet { object, index }` is a flat-const access
+/// (inline `X[i][j]` or aliased `krow[j]`), lower it directly against
+/// the `[N x i32]` global and return the NaN-boxed-double form of the
+/// element. Returns `Ok(None)` when the pattern doesn't apply.
+pub(crate) fn try_lower_flat_const_index_get(
+    ctx: &mut FnCtx<'_>,
+    object: &Expr,
+    index: &Expr,
+) -> Result<Option<String>> {
+    let Some((info, row_expr, col_expr)) = flat_const_index_get_target(ctx, object, index) else {
+        return Ok(None);
+    };
 
     // Compute `row_i32` and `col_i32` as i32 SSA values. Use the existing
     // integer lowering when possible (both operands are likely small
@@ -474,6 +485,10 @@ fn i32_chain_magnitude_bits(e: &Expr, env: I32ChainEnv<'_>) -> Option<u32> {
             args.iter()
                 .all(|a| i32_chain_magnitude_bits(a, env).is_some())
                 .then_some(I32_CHAIN_LEAF_BITS)
+        }
+        // N1: conditionals and `Math.min`/`max`/`abs` of chains (`temps`).
+        Expr::Conditional { .. } | Expr::MathMin(_) | Expr::MathMax(_) | Expr::MathAbs(_) => {
+            temps::selection_bits(e, env, i32_chain_magnitude_bits)
         }
         // Issue #50 bridge: element of a flat-const 2D int table.
         Expr::IndexGet { object, .. } => match object.as_ref() {
@@ -876,6 +891,7 @@ pub(crate) fn lower_expr_native(
     expected: ExpectedNativeRep,
 ) -> Result<LoweredValue> {
     let _fallback = crate::fallback_diag::enter_expr(ctx, e);
+    let _consumed = crate::facts_consumed::enter(e, &ctx.func.name);
     match expected {
         ExpectedNativeRep::JsValueBits => lower_expr_native_js_value_bits(ctx, e),
         ExpectedNativeRep::I8 => lower_expr_native_i8(ctx, e),
@@ -1001,6 +1017,9 @@ fn lower_expr_native_string_ref(ctx: &mut FnCtx<'_>, e: &Expr) -> Result<Lowered
 }
 
 fn try_lower_expr_native_i32_structural(ctx: &mut FnCtx<'_>, e: &Expr) -> Result<Option<String>> {
+    if let Some(v) = temps::lower_selection(ctx, e)? {
+        return Ok(Some(v));
+    }
     let value = match e {
         Expr::Integer(n) => Some((*n as i32).to_string()),
         Expr::LocalGet(id) => ctx
@@ -1035,8 +1054,11 @@ fn try_lower_expr_native_i32_structural(ctx: &mut FnCtx<'_>, e: &Expr) -> Result
             ) =>
         {
             let l = lower_expr_native_i32(ctx, left)?.value;
-            let r = lower_expr_native_i32(ctx, right)?.value;
+            let mut r = lower_expr_native_i32(ctx, right)?.value;
             let blk = ctx.block();
+            if matches!(op, BinaryOp::Shl | BinaryOp::Shr | BinaryOp::UShr) {
+                r = blk.js_shift_count(&r);
+            }
             Some(match op {
                 BinaryOp::Add => blk.add(I32, &l, &r),
                 BinaryOp::Sub => blk.sub(I32, &l, &r),
@@ -1348,6 +1370,26 @@ fn lower_expr_native_i32(ctx: &mut FnCtx<'_>, e: &Expr) -> Result<LoweredValue> 
         );
         return Ok(lowered);
     }
+    // I32 at rest: `a[k] ?? <int32>` is the slot's word or the literal.
+    if let Expr::Logical {
+        op: perry_hir::LogicalOp::Coalesce,
+        left,
+        right,
+    } = e
+    {
+        if let Some(value) = super::rest_elems::try_lower_default_i32(ctx, left, right)? {
+            return Ok(i32_lowered(value));
+        }
+    }
+    if let Some(floor) = super::rest_elems::read_floor(ctx, e) {
+        let want = super::rest_elems::Want::I32;
+        let value = super::rest_elems::lower_read(ctx, e, floor, want)?;
+        return Ok(i32_lowered(value));
+    }
+    // I32 at rest (PR C): an I32 lane's read is the i32 in the slot.
+    if let Some(value) = super::rest_fields::try_lower_i32(ctx, e)? {
+        return Ok(i32_lowered(value));
+    }
     if let Some(lowered) = lower_packed_i32_loop_index_get(ctx, e)? {
         return Ok(lowered);
     }
@@ -1454,8 +1496,11 @@ fn lower_expr_native_i32(ctx: &mut FnCtx<'_>, e: &Expr) -> Result<LoweredValue> 
         }
         Expr::Binary { op, left, right } if is_i32_chain_op(*op) => {
             let l = lower_expr_native_i32(ctx, left)?.value;
-            let r = lower_expr_native_i32(ctx, right)?.value;
+            let mut r = lower_expr_native_i32(ctx, right)?.value;
             let blk = ctx.block();
+            if matches!(op, BinaryOp::Shl | BinaryOp::Shr | BinaryOp::UShr) {
+                r = blk.js_shift_count(&r);
+            }
             match op {
                 BinaryOp::Add => blk.add(I32, &l, &r),
                 BinaryOp::Sub => blk.sub(I32, &l, &r),
@@ -1654,6 +1699,7 @@ fn lower_expr_native_u32(ctx: &mut FnCtx<'_>, e: &Expr) -> Result<LoweredValue> 
         } => {
             let l = lower_expr_native_u32(ctx, left)?.value;
             let r = lower_expr_native_u32(ctx, right)?.value;
+            let r = ctx.block().js_shift_count(&r);
             ctx.block().lshr(I32, &l, &r)
         }
         _ => {
@@ -1763,6 +1809,10 @@ fn lower_expr_native_f64(ctx: &mut FnCtx<'_>, e: &Expr) -> Result<LoweredValue> 
         );
         return Ok(lowered);
     }
+    // I32 at rest (PR C): an I32 lane's read is its i32 as a double.
+    if let Some(value) = super::rest_fields::try_lower_number(ctx, e)? {
+        return Ok(f64_lowered(value));
+    }
     if let Some(value) =
         crate::expr::property_get::lower_raw_f64_class_field_get_for_number_context(ctx, e)?
     {
@@ -1781,7 +1831,8 @@ fn lower_expr_native_f64(ctx: &mut FnCtx<'_>, e: &Expr) -> Result<LoweredValue> 
         );
         return Ok(lowered);
     }
-    let stable_numeric_index = crate::stmt::stable_packed_loop::has_numeric_index_fact(ctx, e);
+    let stable_numeric_index = crate::stmt::stable_packed_loop::has_numeric_index_fact(ctx, e)
+        || super::rest_elems::number_read(ctx, e);
     let needs_raw_f64_fallback_coercion = !stable_numeric_index
         && (expr_may_return_boxed_value_from_raw_f64_fallback(ctx, e)
             || matches!(e, Expr::IndexGet { .. }) && is_numeric_expr(ctx, e));
@@ -1809,7 +1860,8 @@ fn lower_expr_native_f64(ctx: &mut FnCtx<'_>, e: &Expr) -> Result<LoweredValue> 
 }
 
 fn lower_expr_native_f32(ctx: &mut FnCtx<'_>, e: &Expr) -> Result<LoweredValue> {
-    let stable_numeric_index = crate::stmt::stable_packed_loop::has_numeric_index_fact(ctx, e);
+    let stable_numeric_index = crate::stmt::stable_packed_loop::has_numeric_index_fact(ctx, e)
+        || super::rest_elems::number_read(ctx, e);
     let needs_raw_f64_fallback_coercion = !stable_numeric_index
         && (expr_may_return_boxed_value_from_raw_f64_fallback(ctx, e)
             || matches!(e, Expr::IndexGet { .. }) && is_numeric_expr(ctx, e));

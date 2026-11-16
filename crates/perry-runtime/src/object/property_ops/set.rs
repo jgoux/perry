@@ -1,17 +1,14 @@
 //! Ordinary receiver-aware property assignment.
 use super::*;
 
-/// Extract a raw heap pointer (48-bit) from either a NaN-boxed value
-/// (POINTER_TAG / STRING_TAG) or a raw i64/f64-reinterpreted pointer
-/// (module-level globals store Arrays/Objects as raw I64s, not NaN-boxed).
+/// Extract the heap pointer (48-bit) of a NaN-boxed value (POINTER_TAG /
+/// STRING_TAG / a native id). Every other value answers 0: a word whose top
+/// 16 bits are clear is a Number (a denormal, or +0), not a raw pointer.
 pub(crate) fn extract_pointer(bits: u64) -> u64 {
     let top = bits >> 48;
     // A native id reaches the by-name/handle dispatch as its raw id.
     if top == 0x7FFD || top == 0x7FFF || top == (crate::value::HANDLE_TAG >> 48) {
         bits & POINTER_MASK
-    } else if top == 0 {
-        // Raw untagged pointer (module-level I64 global).
-        bits
     } else {
         0
     }
@@ -162,13 +159,12 @@ pub(crate) fn target_set(target: f64, key: f64, value: f64) {
 pub(crate) fn raw_ptr_from_value(value: f64) -> Option<usize> {
     let bits = value.to_bits();
     let top16 = bits >> 48;
-    let raw = if top16 == (POINTER_TAG >> 48) {
-        bits & POINTER_MASK
-    } else if top16 == 0 && crate::value::addr_class::is_above_handle_band(bits as usize) {
-        bits
-    } else {
+    // A value names an object by its tag alone: a word with clear top 16 bits
+    // is a Number (a denormal), never an address.
+    if top16 != (POINTER_TAG >> 48) {
         return None;
-    } as usize;
+    }
+    let raw = (bits & POINTER_MASK) as usize;
     // #7531: `value` is a Proxy `target`/`key` candidate -- caller-supplied,
     // so it can be a fetch/zlib/proxy/common-registry handle id. The old
     // floor (`GC_HEADER_SIZE + 0x1000`) sits below every handle band; the
@@ -195,7 +191,7 @@ pub(crate) fn array_ptr_from_value(value: f64) -> Option<*mut crate::array::Arra
     }
     unsafe {
         let gc = crate::value::addr_class::try_read_gc_header(raw)?;
-        if (*gc).obj_type == crate::gc::GC_TYPE_ARRAY
+        if crate::gc_type_is_array!((*gc).obj_type)
             || (*gc).obj_type == crate::gc::GC_TYPE_LAZY_ARRAY
         {
             Some(raw as *mut crate::array::ArrayHeader)
@@ -264,11 +260,6 @@ pub(crate) fn parse_canonical_nonnegative_i32(bytes: &[u8]) -> Option<i32> {
 }
 
 pub(crate) fn integer_index_key(key: f64) -> Option<i32> {
-    let jsval = crate::value::JSValue::from_bits(key.to_bits());
-    if jsval.is_int32() {
-        let index = jsval.as_int32();
-        return (index >= 0).then_some(index);
-    }
     if !key.is_nan() {
         return (key.is_finite() && key >= 0.0 && key.fract() == 0.0 && key <= i32::MAX as f64)
             .then_some(key as i32);
@@ -303,7 +294,7 @@ pub(crate) fn set_integer_indexed_exotic(target: f64, key: f64, value: f64) -> b
         return true;
     }
     if crate::buffer::is_registered_buffer(raw) {
-        crate::buffer::js_buffer_set(raw as *mut crate::buffer::BufferHeader, index, value as i32);
+        crate::buffer::js_buffer_set_value(raw as *mut crate::buffer::BufferHeader, index, value);
         return true;
     }
     if crate::typedarray_hook_slots::lookup_typed_array_kind(raw).is_some() {
@@ -381,12 +372,27 @@ pub(crate) fn own_set_descriptor(target: f64, key: f64) -> Option<OwnSetDescript
                     && (*meta).overflow == 0)
                     .then_some(addr)
             }
-            Some(header) if header.obj_type == crate::gc::GC_TYPE_ARRAY => {
-                crate::object::shape_store::named_bag(
+            Some(header) if crate::gc_type_is_array!(header.obj_type) => {
+                let bag = crate::object::shape_store::named_bag(
                     addr as *const crate::ObjectHeader,
                     key.to_bits(),
-                )
-                .map(|bag| bag as usize)
+                );
+                // The array's named layout key whose slot holds the hole is
+                // absent (`key_view`, object model §3.2): the walk goes on to
+                // the prototype chain.
+                if bag.is_some_and(|bag| {
+                    crate::object::key_view::own_key_is_hole(
+                        bag,
+                        crate::JSValue::from_bits(key.to_bits()),
+                    )
+                }) {
+                    return None;
+                }
+                // As for a prototype above: a bag with an overflow keeps its
+                // keys and attributes in its entries (a delete, then a
+                // re-definition), which the complete lookup below reads.
+                bag.filter(|&bag| !crate::object::overflow::has_overflow(bag))
+                    .map(|bag| bag as usize)
             }
             _ => None,
         }
@@ -516,10 +522,7 @@ pub(crate) fn own_set_descriptor(target: f64, key: f64) -> Option<OwnSetDescript
     let target = f64::from_bits(target_handle.get_nanbox_u64());
     // Class constructors have an immutable own prototype even though their
     // ClassRef representation has no heap address or descriptor side table.
-    if key_name == "prototype"
-        && crate::object::class_ref_id(target).is_some()
-        && crate::object::class_prototype_ref_id(target).is_none()
-    {
+    if key_name == "prototype" && crate::object::class_ref_id(target).is_some() {
         return Some(OwnSetDescriptor::Data { writable: false });
     }
     let obj_ptr = extract_pointer(target.to_bits()) as usize;
@@ -599,6 +602,15 @@ pub(crate) fn own_set_descriptor(target: f64, key: f64) -> Option<OwnSetDescript
             // property. Preserve its attributes when the first operation is
             // an assignment, before any read materializes the default object.
             if key_name == "prototype" && crate::object::function_would_have_own_prototype(target) {
+                // An unborn lazy builtin family's constructor: its birth gives
+                // `prototype` the builtin's attributes.
+                if unsafe { crate::object::birth_unborn_family_of(obj_ptr) } {
+                    if let Some(attrs) = crate::object::get_property_attrs(obj_ptr, &key_name) {
+                        return Some(OwnSetDescriptor::Data {
+                            writable: attrs.writable(),
+                        });
+                    }
+                }
                 crate::object::set_builtin_property_attrs(
                     obj_ptr,
                     key_name.clone(),
@@ -798,18 +810,25 @@ pub(crate) unsafe fn build_create_data_descriptor(value: f64) -> f64 {
 /// receiver's `[[DefineOwnProperty]]`. This is the operation used by public
 /// class fields: it bypasses inherited setters on ordinary objects and still
 /// drives a Proxy's `defineProperty` trap.
+///
+/// The descriptor is a Property Descriptor record, not a JS object: no
+/// descriptor object is allocated, and nothing is read back through
+/// `%Object.prototype%` (an inherited `get` cannot turn it into an accessor).
 pub(crate) fn create_data_property(receiver: f64, key: f64, value: f64) -> bool {
-    let scope = crate::gc::RuntimeHandleScope::new();
-    let receiver = scope.root_nanbox_f64(receiver);
-    let key = scope.root_nanbox_f64(key);
-    let value = scope.root_nanbox_f64(value);
-    let descriptor = unsafe { build_create_data_descriptor(value.get_nanbox_f64()) };
-    let descriptor = scope.root_nanbox_f64(descriptor);
-    crate::value::js_is_truthy(js_reflect_define_property(
-        receiver.get_nanbox_f64(),
-        key.get_nanbox_f64(),
-        descriptor.get_nanbox_f64(),
-    )) != 0
+    unsafe {
+        if !crate::object::object_ops::definition_target_is_object(receiver) {
+            reflect_non_object_typeerror("defineProperty");
+        }
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let receiver = scope.root_nanbox_f64(
+            crate::object::object_ops::normalize_descriptor_operand(receiver),
+        );
+        let value = scope.root_nanbox_f64(value);
+        let key = scope.root_nanbox_f64(crate::object::js_to_property_key(key));
+        let descriptor =
+            crate::object::object_ops::DescView::create_data(&scope, value.get_nanbox_f64());
+        crate::object::object_ops::define_own_property_decoded(&scope, &receiver, &key, &descriptor)
+    }
 }
 
 /// #5129: build a `{ value }`-only property descriptor — the `valueDesc` of
@@ -834,6 +853,10 @@ pub(crate) unsafe fn build_value_only_descriptor(value: f64) -> f64 {
 }
 
 pub(crate) fn create_or_update_receiver_property(receiver: f64, key: f64, value: f64) -> bool {
+    if crate::object::deferred_namespace::with_key_target(receiver, key, |_, _| ()).is_some() {
+        return false;
+    }
+
     if !reflect_value_is_object(receiver) {
         return false;
     }
@@ -925,6 +948,9 @@ pub(crate) fn create_or_update_receiver_property(receiver: f64, key: f64, value:
 }
 
 pub(crate) fn ordinary_set_with_receiver(target: f64, key: f64, value: f64, receiver: f64) -> bool {
+    if crate::object::deferred_namespace::is_deferred(target) {
+        return false;
+    }
     if let Some(ok) = set_handle_property(target, key, value) {
         return ok;
     }
@@ -941,11 +967,11 @@ pub(crate) fn ordinary_set_with_receiver(target: f64, key: f64, value: f64, rece
     //   - no recorded setPrototypeOf target (prototype chain is exactly
     //     Object.prototype) and no descriptor on Object.prototype,
     //   - string key.
+    // The target names an object by its tag alone: a word with clear top 16
+    // bits is a Number (a denormal), never a heap address.
     let target_top16 = target.to_bits() >> 48;
     if target.to_bits() == receiver.to_bits()
-        // POINTER_TAG'd heap object, or a module-level slot's raw I64 pointer
-        // (top 16 bits zero).
-        && (target_top16 == 0x7FFD || target_top16 == 0)
+        && target_top16 == 0x7FFD
         && unsafe { crate::symbol::js_is_symbol(key) } == 0
     {
         let addr = extract_pointer(target.to_bits()) as usize;
@@ -1036,13 +1062,11 @@ pub(crate) fn ordinary_set_with_receiver(target: f64, key: f64, value: f64, rece
                             // builds O(n²)). #10287: a RECORDED prototype (a
                             // function-constructed receiver, `Object.create`,
                             // `setPrototypeOf`) is walked per key rather than rejected.
-                            // A born-null receiver whose shape proves it ordinary
-                            // with no chain has nothing to intercept the key.
+                            // A receiver whose shape proves it ordinary with
+                            // no chain has nothing to intercept the key.
                             use crate::object::shapes::store_kind;
                             let obj = cur_addr() as *const crate::ObjectHeader;
-                            if header._reserved & crate::gc::OBJ_FLAG_NULL_PROTO != 0
-                                && store_kind::born_null_shape_proven(obj, header._reserved)
-                            {
+                            if store_kind::null_shape_proven(obj, header._reserved) {
                                 true
                             } else {
                                 match crate::object::prototype_chain::object_static_prototype(
@@ -1051,6 +1075,8 @@ pub(crate) fn ordinary_set_with_receiver(target: f64, key: f64, value: f64, rece
                                     None => {
                                         !crate::object::object_proto_may_intercept_key(cur_key())
                                     }
+                                    // A null chain: nothing intercepts.
+                                    Some(crate::value::TAG_NULL) => true,
                                     Some(_) => {
                                         !crate::object::plain_custom_prototype_may_intercept(
                                             cur_addr(),
@@ -1131,12 +1157,6 @@ pub(crate) fn ordinary_set_with_receiver(target: f64, key: f64, value: f64, rece
                                 // "is an ObjectHeader" test.
                                 && crate::object::object_is_regular(
                                     addr as *const crate::ObjectHeader,
-                                )
-                                // A born-null receiver's plan is keyed on a
-                                // shape that proves it ordinary with no chain.
-                                && crate::object::shapes::store_kind::born_null_admits_lane(
-                                    addr as *const crate::ObjectHeader,
-                                    header._reserved,
                                 )
                                 && interned != 0;
                             let verdict = if plan_eligible
@@ -1280,17 +1300,6 @@ pub(crate) fn receiver_super_parent_class_id(receiver: f64) -> Option<u32> {
     crate::object::get_parent_class_id(class_id)
 }
 
-pub(crate) fn normalize_accessor_receiver(receiver: f64) -> f64 {
-    let bits = receiver.to_bits();
-    if bits != 0 && (bits >> 48) == 0 {
-        crate::value::js_nanbox_pointer(bits as i64)
-    } else if receiver.is_finite() && receiver > 65_536.0 && receiver.fract() == 0.0 {
-        crate::value::js_nanbox_pointer(receiver as i64)
-    } else {
-        receiver
-    }
-}
-
 /// `super[key] = value` for class methods. The property lookup starts at the
 /// parent prototype, but writes use the current `this` as Receiver.
 #[no_mangle]
@@ -1301,7 +1310,6 @@ pub extern "C" fn js_super_put_value_set(
     receiver: f64,
     strict: i32,
 ) -> f64 {
-    let receiver = normalize_accessor_receiver(receiver);
     // Static-context super uses the parent CONSTRUCTOR as the lookup target,
     // while retaining the child constructor as Receiver. A statically-known
     // class parent is represented by a ClassRef; a function-valued parent is
@@ -1371,5 +1379,23 @@ pub extern "C" fn js_super_put_value_set(
     // for a missing key + no inherited setter creates an own data property on
     // the receiver. Do that ordinary set instead of throwing. (Test262
     // syntax/class-body-method-definition-super-property.)
+    if crate::object::deferred_namespace::is_deferred(receiver) {
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let receiver = scope.root_nanbox_f64(receiver);
+        let key = scope.root_nanbox_f64(key);
+        let value = scope.root_nanbox_f64(value);
+        crate::object::deferred_namespace::with_key_target(
+            receiver.get_nanbox_f64(),
+            key.get_nanbox_f64(),
+            |_, _| (),
+        );
+        return js_put_value_set(
+            receiver.get_nanbox_f64(),
+            key.get_nanbox_f64(),
+            value.get_nanbox_f64(),
+            receiver.get_nanbox_f64(),
+            strict,
+        );
+    }
     js_put_value_set(receiver, key, value, receiver, strict)
 }

@@ -24,19 +24,16 @@ fn large_leaf_has_dedicated_young_storage_and_no_payload_scan() {
         let p = leaf(LARGE_OBJECT_THRESHOLD_BYTES + 8);
         (p as *mut u64).write(string_bits(small));
         let header = header_from_user_ptr(p as *const u8);
-        let total = (*header).size as usize;
         assert_eq!(
             crate::arena::classify_heap_generation(p),
             HeapGeneration::Nursery
         );
         assert_eq!((*header).gc_flags & GC_FLAG_TENURED, 0);
         assert!(crate::arena::is_large_storage(p));
-        assert_eq!(
-            crate::arena::copying_from_space_in_use_bytes(),
-            before
-        );
+        assert_eq!(crate::arena::copying_from_space_in_use_bytes(), before);
         assert_eq!(crate::arena::moving_from_space_in_use_bytes(), moving);
-        let mut collector = CopyingNurseryCollector::new::<{ cfg!(test) }>(CopyingPointerSet::new());
+        let mut collector =
+            CopyingNurseryCollector::new::<{ cfg!(test) }>(CopyingPointerSet::new());
         let classified = collector.ptrs.classify(p).unwrap();
         assert_eq!(classified.kind, CopyingPointerKind::YoungLarge);
         assert_eq!(collector.mark_addr::<{ cfg!(test) }>(p), Some(p));
@@ -224,7 +221,7 @@ fn large_leaf_pressure_does_not_pretenure_the_special_json_output() {
 
 #[test]
 fn old_legacy_large_backing_still_classifies_secondary_objects() {
-    std::thread::spawn(|| unsafe {
+    std::thread::spawn(|| {
         let _guard = CopyingNurseryTestGuard::new(0);
         let _triggers = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
         let first =

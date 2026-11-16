@@ -22,19 +22,48 @@ pub extern "C" fn js_get_global_this_builtin_value(name_ptr: *const u8, name_len
     // Invariant: callers pass the bytes of a Rust `&str` (codegen's interned
     // builtin name with its `len()`, or a runtime literal/static name), so
     // they are UTF-8 by construction.
-    debug_assert!(std::str::from_utf8(name_bytes).is_ok(), "builtin name is not UTF-8");
+    debug_assert!(
+        std::str::from_utf8(name_bytes).is_ok(),
+        "builtin name is not UTF-8"
+    );
     let name = unsafe { std::str::from_utf8_unchecked(name_bytes) };
     // The singleton's shape owns the installed key. Borrow its spelling for
     // an ordinary data read instead of rematerializing a weak intern after
     // every collection. This shared lookup consults the live shape; stores,
     // deletions, accessors and prototype changes keep their ordinary semantics.
-    let global = js_get_global_this();
+    builtin_value_in(js_get_global_this(), name)
+}
+
+/// [`js_get_global_this_builtin_value`] for a caller that names a declared
+/// phase-A data global (`perry_abi::REALM_CORE_GLOBALS`) by a literal: the
+/// realm's core is enough for it, so a two-phase realm is not completed for
+/// the read. The entry is chosen at link time (`realm_core`); nothing looks
+/// at the name per call. Any other name (phase B's, the global itself, an
+/// accessor, a name the realm does not declare, a name that is not a
+/// literal) goes to [`js_get_global_this_builtin_value`], the full entry: an
+/// undeclared name's read can reach a getter on `Object.prototype`, which
+/// must never see an incomplete global as `this`.
+pub fn builtin_value_core(name: &'static str) -> f64 {
+    debug_assert!(
+        crate::codegen_abi::realm_core_global(name),
+        "{name} is not a declared phase-A global"
+    );
+    builtin_value_in(super::super::global_this::realm_core(), name)
+}
+
+/// `global[name]`, the body of both by-name readers.
+#[inline(always)]
+fn builtin_value_in(global: f64, name: &str) -> f64 {
     if let Some(value) = unsafe {
         super::super::native_get::try_data_get_bytes(
             crate::value::JSValue::from_bits(global.to_bits()),
             name.as_bytes(),
         )
     } {
+        // A by-name read gets the realm its name needs (the full entry, or
+        // the core for a declared phase-A name), so it cannot see a slot
+        // phase B has not bound.
+        debug_assert_ne!(value.bits(), crate::codegen_abi::REALM_UNBOUND_POISON);
         return f64::from_bits(value.bits());
     }
 
@@ -197,7 +226,13 @@ pub extern "C" fn js_object_get_prototype_of(obj_value: f64) -> f64 {
 /// `getPrototypeOf(socket)` can run before user code has ever read
 /// `net.Socket.prototype`.
 fn net_socket_prototype_value() -> f64 {
-    let ctor = crate::object::bound_native_callable_export_value("net", "Socket");
+    native_export_prototype_value("net", "Socket")
+}
+
+/// `<module>.<export>.prototype`, read the same way as
+/// [`net_socket_prototype_value`] so it is the object user code sees.
+pub(crate) fn native_export_prototype_value(module: &str, export: &str) -> f64 {
+    let ctor = crate::object::bound_native_callable_export_value(module, export);
     if !crate::value::JSValue::from_bits(ctor.to_bits()).is_pointer() {
         return f64::from_bits(crate::value::TAG_UNDEFINED);
     }
@@ -246,7 +281,11 @@ unsafe fn shape_link_prototype(obj: *const ObjectHeader, default_only: bool) -> 
     }
     if pid != s::PROTO_ID_DEFAULT {
         if pid >= s::PROTO_ID_CLASS {
-            return None;
+            return if pid < s::PROTO_ID_MIXED {
+                class_link_prototype(obj, record)
+            } else {
+                None
+            };
         }
         let word = s::object_prototype_word(obj);
         return (word != 0).then_some(f64::from_bits(word));
@@ -256,10 +295,45 @@ unsafe fn shape_link_prototype(obj: *const ObjectHeader, default_only: bool) -> 
         .then(|| f64::from_bits(crate::value::js_nanbox_pointer(proto as i64).to_bits()))
 }
 
+/// [`shape_link_prototype`] of a CLASS identity `pid`: a recorded prototype
+/// first, else the identity's word, which names the class's prototype holder
+/// once it is built (the prototype funnel publishes it before any shape names
+/// the identity), the rule the layout probe's `link_of` reads. The record
+/// already holds that word's cell (`prototype_word`). A declared but unbuilt
+/// holder (`undefined`) keeps the lazy resolution. Out of line, so the other
+/// identities' answers stay as they were.
+///
+/// # Safety
+/// As [`shape_link_prototype`]; `record` is `obj`'s live record, of a CLASS
+/// identity.
+#[inline(never)]
+unsafe fn class_link_prototype(
+    obj: *const ObjectHeader,
+    record: crate::object::shapes::ShapeRecordRef,
+) -> Option<f64> {
+    let holder = record.prototype_word();
+    if !crate::value::JSValue::from_bits(holder).is_pointer() {
+        // Unbuilt: the lazy resolution builds it (and reads any recorded
+        // prototype itself).
+        return None;
+    }
+    let word = crate::object::shapes::object_prototype_word(obj);
+    Some(f64::from_bits(if word != 0 { word } else { holder }))
+}
+
 // Only the realm default may bypass js_object_get_prototype_of's exposure
 // publication. Serial links (notably iterator prototypes) use its full exit.
 unsafe fn default_link_prototype(obj: *const ObjectHeader) -> Option<f64> {
     shape_link_prototype(obj, true)
+}
+
+/// `%Promise.prototype%` of this realm, the [[Prototype]] of every
+/// unrelinked `GC_TYPE_PROMISE` cell.
+fn promise_intrinsic_prototype() -> Option<f64> {
+    let proto = crate::object::builtin_prototype_value("Promise");
+    crate::value::JSValue::from_bits(proto.to_bits())
+        .is_pointer()
+        .then_some(proto)
 }
 
 pub(crate) fn get_prototype_of_resolved(obj_value: f64) -> f64 {
@@ -322,12 +396,7 @@ pub(crate) fn get_prototype_of_resolved(obj_value: f64) -> f64 {
     // null (15.2.3.2-1*).
     {
         let jv = crate::value::JSValue::from_bits(obj_value.to_bits());
-        // An INT32-tagged value may be a class ref (same 0x7FFE tag as small
-        // integers) — those must keep flowing to the class resolution below.
-        let is_class_ref = super::super::class_ref_id(obj_value).is_some();
-        let wrapper = if is_class_ref {
-            None
-        } else if jv.is_number() {
+        let wrapper = if jv.is_number() {
             Some("Number")
         } else if jv.is_any_string() {
             Some("String")
@@ -391,6 +460,12 @@ pub(crate) fn get_prototype_of_resolved(obj_value: f64) -> f64 {
                 if crate::value::JSValue::from_bits(proto.to_bits()).is_pointer() {
                     return proto;
                 }
+            }
+            // Registry-backed HTTP messages inherit their Node prototype unless
+            // user code recorded a replacement (including null).
+            if let Some(proto) = crate::object::http_handle_prototype::of_handle(raw_addr as usize)
+            {
+                return proto;
             }
             if let Some(dispatch) = super::super::class_registry::handle_prototype_dispatch() {
                 let proto = unsafe { dispatch(raw_addr as i64) };
@@ -536,67 +611,6 @@ pub(crate) fn get_prototype_of_resolved(obj_value: f64) -> f64 {
             crate::value::js_nanbox_pointer(parent as i64)
         };
     }
-    if let Some(class_id) = crate::object::class_value::legacy_class_value_word(bits) {
-        // An explicit `Object.setPrototypeOf(Ctor, obj)` wins over every
-        // derived answer below — it IS the constructor's [[Prototype]].
-        if super::super::class_prototype_ref_id(obj_value).is_none() {
-            let static_proto = super::super::class_registry::class_static_prototype(class_id);
-            if !static_proto.is_null() {
-                return f64::from_bits(
-                    crate::value::js_nanbox_pointer(static_proto as i64).to_bits(),
-                );
-            }
-            if super::super::class_registry::class_static_prototype_is_nulled(class_id) {
-                return f64::from_bits(TAG_NULL);
-            }
-        }
-        if super::super::class_prototype_ref_id(obj_value).is_none() {
-            // A class whose heritage is a runtime function value has no Perry
-            // parent class id. Its constructor's [[Prototype]] is that exact
-            // function object (not Function.prototype), as observed by
-            // Object.getPrototypeOf(D) and static `super` lookup.
-            let dynamic_parent = super::super::js_get_dynamic_parent_value(class_id);
-            let parent_value = crate::value::JSValue::from_bits(dynamic_parent.to_bits());
-            if !parent_value.is_undefined() && !parent_value.is_null() {
-                return dynamic_parent;
-            }
-        }
-        if let Some(parent_id) = get_parent_class_id(class_id) {
-            // #8343 followup: `NATIVE_MODULE_CLASS_ID` (0xFFFFFFFE) is a
-            // sentinel, not a real class. A prior `Object.create(proto)` whose
-            // `proto` was a native-module namespace object registered it as a
-            // synthetic class's parent. Returning the raw sentinel as an
-            // INT32-tagged class ref (`-2`) trips `Object.create` with
-            // `TypeError: Object prototype may only be an Object or null: -2`.
-            // Treat it as a root: a native-module namespace's [[Prototype]] is
-            // %Object.prototype%, so the synthetic class whose proto was that
-            // namespace inherits Object.prototype too.
-            // A builtin parent id (`extends Error`) is not a compiled class
-            // and never gets a class function object: its constructor is the
-            // dynamic parent value above, and without one this is a root.
-            if parent_id != 0
-                && parent_id != super::super::native_module::NATIVE_MODULE_CLASS_ID
-                && crate::object::is_class_id_registered(parent_id)
-            {
-                return crate::object::class_value::class_value(parent_id);
-            }
-        }
-        // Root of the class hierarchy. In JS `Object.getPrototypeOf` of a base
-        // class *constructor* is `Function.prototype`, and of a base class's
-        // `.prototype` object is `Object.prototype` — NOT null. class-transformer
-        // walks `Object.getPrototypeOf(target.prototype.constructor)` and then
-        // dereferences `.prototype` on the result; the old `null` made that
-        // `null.prototype` throw, blocking class-transformer/class-validator on
-        // any flat (no-`extends`) DTO. (#420 followup)
-        if super::super::class_prototype_ref_id(obj_value).is_some() {
-            let proto = crate::object::builtin_prototype_value("Object");
-            if proto.to_bits() != crate::value::TAG_UNDEFINED {
-                return proto;
-            }
-            return f64::from_bits(TAG_NULL);
-        }
-        return function_prototype_or_null();
-    }
     // Heap-pointer receiver — return the input value itself. For
     // class-id-tagged instances, `.constructor` then returns the class
     // ref (via the constructor intercept in js_object_get_field_by_name,
@@ -652,9 +666,11 @@ pub(crate) fn get_prototype_of_resolved(obj_value: f64) -> f64 {
             unsafe {
                 let obj = raw_addr as *const ObjectHeader;
                 let gc = gc_header_for(obj);
-                // #1175: objects allocated with a null prototype
-                // (Object.create(null), querystring.parse) report null here.
-                if (*gc)._reserved & crate::gc::OBJ_FLAG_NULL_PROTO != 0 {
+                // #1175: objects with a null prototype (Object.create(null),
+                // querystring.parse, linked to null): their shape says so.
+                if (*gc).obj_type == crate::gc::GC_TYPE_OBJECT
+                    && crate::object::shapes::object_prototype_is_null(obj)
+                {
                     return f64::from_bits(TAG_NULL);
                 }
                 // A RegExp's internal prototype does not depend on its
@@ -681,7 +697,15 @@ pub(crate) fn get_prototype_of_resolved(obj_value: f64) -> f64 {
                         return proto;
                     }
                 }
-                if (*gc).obj_type == crate::gc::GC_TYPE_ARRAY {
+                // A promise cell inherits from the realm's `%Promise.prototype%`
+                // (a relinked one returned above), never from whatever the
+                // `constructor` probe below finds under `globalThis.Promise`.
+                if (*gc).obj_type == crate::gc::GC_TYPE_PROMISE {
+                    if let Some(proto) = promise_intrinsic_prototype() {
+                        return proto;
+                    }
+                }
+                if crate::gc_type_is_array!((*gc).obj_type) {
                     if let Some(proto) =
                         super::super::array_get_prototype_of_addr(raw_addr as usize)
                     {
@@ -916,7 +940,9 @@ pub(crate) fn get_prototype_of_resolved(obj_value: f64) -> f64 {
         unsafe {
             let obj = bits as *const ObjectHeader;
             let gc = gc_header_for(obj);
-            if (*gc)._reserved & crate::gc::OBJ_FLAG_NULL_PROTO != 0 {
+            if (*gc).obj_type == crate::gc::GC_TYPE_OBJECT
+                && crate::object::shapes::object_prototype_is_null(obj)
+            {
                 return f64::from_bits(TAG_NULL);
             }
 
@@ -936,7 +962,12 @@ pub(crate) fn get_prototype_of_resolved(obj_value: f64) -> f64 {
                     return proto;
                 }
             }
-            if (*gc).obj_type == crate::gc::GC_TYPE_ARRAY {
+            if (*gc).obj_type == crate::gc::GC_TYPE_PROMISE {
+                if let Some(proto) = promise_intrinsic_prototype() {
+                    return proto;
+                }
+            }
+            if crate::gc_type_is_array!((*gc).obj_type) {
                 if let Some(proto) = super::super::array_get_prototype_of_addr(bits as usize) {
                     return proto;
                 }

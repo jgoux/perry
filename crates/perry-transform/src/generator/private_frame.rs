@@ -547,6 +547,7 @@ fn lower_list(
                         body,
                         catch,
                         finally,
+                        ..
                     } => {
                         ids(body, out);
                         if let Some(c) = catch {
@@ -569,6 +570,11 @@ fn lower_list(
         if let Expr::Closure { body, .. } = obj.as_ref() {
             ids(body, &mut locals);
         }
+        // Fresh ids are handed out in ascending original-id order: the set is
+        // hash-ordered, and the ids it assigns reach slot offsets and register
+        // allocation of the emitted code.
+        let mut locals: Vec<u32> = locals.into_iter().collect();
+        locals.sort_unstable();
         let map: HashMap<_, _> = locals
             .into_iter()
             .map(|id| {

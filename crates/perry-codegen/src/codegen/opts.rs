@@ -32,6 +32,8 @@ pub struct AppMetadata {
     /// `process.argv[1]` with the script path, matching Node/Bun's argv shape.
     /// It is compiler metadata rather than a user-configurable manifest field.
     pub entry_source_path: Option<String>,
+    /// Canonical source path of this module, used by its static stack frame.
+    pub module_source_path: Option<String>,
     /// The module format Node declares for the entry before looking at its
     /// syntax: `Some(true)` for `.mjs`/`.mts` or a nearest package.json with
     /// `"type": "module"`, `Some(false)` for `.cjs`/`.cts` or
@@ -57,6 +59,7 @@ impl Default for AppMetadata {
             app_group: None,
             update_config: None,
             entry_source_path: None,
+            module_source_path: None,
             entry_declared_esm: None,
             native_provider_installs: Vec::new(),
         }
@@ -125,77 +128,6 @@ pub fn namespace_member_class_key(namespace: &str, member: &str) -> String {
 /// checks)` look like a rest function in every module that imports both.
 pub fn namespace_member_func_key(namespace: &str, member: &str) -> String {
     format!("\0perry_namespace_func\0{namespace}\0{member}")
-}
-
-/// Accessor names known to benefit from the emitted guarded arm. Computed
-/// literal choices extend the existing name sets without evaluating a key or
-/// widening every string read. Unresolved keys retain the runtime path; name
-/// admission never authenticates an answer (the shape/pair/lane guards do).
-#[derive(Debug, Clone, Default)]
-pub struct ClassAccessorNames {
-    getters: std::collections::HashSet<String>,
-    setters: std::collections::HashSet<String>,
-    /// Getter names an object literal or a literal-keyed
-    /// `Object.defineProperty` declares. They never widen [`Self::may_get`];
-    /// they only give a read of that name its shape/slot memo.
-    literal_getters: std::collections::HashSet<String>,
-}
-
-mod computed_names;
-
-impl ClassAccessorNames {
-    /// The accessor names declared by the classes of `modules` (instance and
-    /// static alike: a superset only costs an arm).
-    pub fn collect<'m>(modules: impl IntoIterator<Item = &'m perry_hir::Module>) -> Self {
-        computed_names::collect(modules)
-    }
-
-    /// The names given, for a caller that already knows them.
-    pub fn from_names<G, S>(getters: G, setters: S) -> Self
-    where
-        G: IntoIterator<Item = String>,
-        S: IntoIterator<Item = String>,
-    {
-        Self {
-            getters: getters.into_iter().collect(),
-            setters: setters.into_iter().collect(),
-            ..Self::default()
-        }
-    }
-
-    /// May a compiled class declare a getter named `name`?
-    pub fn may_get(&self, name: &str) -> bool {
-        self.getters.contains(name)
-    }
-
-    /// May any getter of the program be declared under `name` (a class, an
-    /// object literal or a literal-keyed `Object.defineProperty`)? Only such
-    /// a fixed-name read owns a shape/slot memo; every other read keeps the
-    /// stateless probe and complete read.
-    pub fn may_read_through_getter(&self, name: &str) -> bool {
-        self.getters.contains(name) || self.literal_getters.contains(name)
-    }
-
-    /// May a compiled class declare a setter named `name`?
-    pub fn may_set(&self, name: &str) -> bool {
-        self.setters.contains(name)
-    }
-
-    /// A stable rendering for the object-cache key.
-    pub fn cache_key(&self) -> String {
-        let mut getters: Vec<&str> = self.getters.iter().map(String::as_str).collect();
-        let mut setters: Vec<&str> = self.setters.iter().map(String::as_str).collect();
-        let mut literal: Vec<&str> = self.literal_getters.iter().map(String::as_str).collect();
-        getters.sort_unstable();
-        setters.sort_unstable();
-        literal.sort_unstable();
-        format!(
-            "get:{}|set:{}|lit:{}",
-            getters.join(","),
-            setters.join(","),
-            literal.join(",")
-        )
-    }
 }
 
 /// Options controlling code generation for a single module.
@@ -340,9 +272,18 @@ pub struct CompileOptions {
     /// Locals that are namespace imports (`import * as X from "./mod"`).
     /// Codegen uses this to know that `X.foo()` should be dispatched as
     /// a cross-module call rather than an object method call.
+    /// A module that namespace-imports ITSELF (`import * as Mod from
+    /// "./this-module.js"`). Its `@__perry_ns_<prefix>` populator must run
+    /// BEFORE the top-level body, because the body is itself a namespace
+    /// consumer: trails' activesupport does `import * as C from
+    /// "./calculations.js"` and then, at top level, `include(RubyTime, C)`,
+    /// which reads `Object.getOwnPropertyNames(C)`. Populating at the tail left
+    /// that read seeing the global's initial NaN-boxed `undefined`.
+    pub namespace_self_import: bool,
     pub namespace_imports: Vec<String>,
     /// Namespace local -> owning compiled module prefix, before following re-exports.
     pub namespace_source_prefixes: std::collections::HashMap<String, String>,
+    pub deferred_namespace_imports: std::collections::HashSet<String>,
     /// #7189: `(namespace local, member)` pairs whose member is itself a MODULE
     /// NAMESPACE, from `export * as ns from "./m.ts"` in the imported module.
     ///
@@ -366,26 +307,11 @@ pub struct CompileOptions {
     /// source graph before cache lookup. Shared with all import declarations.
     /// Empty for standalone codegen, which uses its local ancestor walk.
     pub constructor_param_counts: std::collections::BTreeMap<String, usize>,
-    /// Whole-program concrete method implementations eligible for the short
-    /// trailing-spread direct-call lowering (#8772). Unlike `imported_classes`,
-    /// this capability also flows from a consumer module back to a generic
-    /// library module: perform-ecs owns the hot `component.reset(...args)`
-    /// call, while benchmark adapters define the concrete Position/Velocity
-    /// classes. The producer publishes the exact class id, immutable ShapeId
-    /// global and public method ABI; the caller still guards every arm and
-    /// retains the generic apply fallback.
-    pub short_spread_method_candidates:
-        std::sync::Arc<std::collections::HashMap<String, Vec<ShortSpreadMethodCandidate>>>,
     /// Whole-program stable exported object-literal methods eligible for an
     /// exact guarded call from an otherwise dynamic receiver (#8775). This is
     /// reverse-flow metadata: the calling module need not import the producer.
     pub object_literal_method_candidates:
         std::sync::Arc<std::collections::HashMap<String, Vec<ObjectLiteralMethodCandidate>>>,
-    /// The whole program's class accessor names ([`ClassAccessorNames`]),
-    /// which decide where the class-accessor arms are emitted. `None` (a
-    /// standalone or test compile that did not collect them) emits the arms
-    /// at every site.
-    pub program_class_accessor_names: Option<std::sync::Arc<ClassAccessorNames>>,
     /// Imported enum member lists, keyed by the local name under which
     /// the enum is visible in this module.
     pub imported_enums: Vec<(String, Vec<(String, perry_hir::EnumValue)>)>,
@@ -572,6 +498,12 @@ pub struct CompileOptions {
     /// module globals. For Eager modules the redundant calls
     /// short-circuit on the guard's first-write check.
     pub module_init_deps: Vec<String>,
+    pub module_deferred_init_deps: Vec<String>,
+    pub module_deferred_readiness: Vec<String>,
+    /// Selects async module evaluation only for a program containing TLA.
+    pub program_has_tla: bool,
+    /// A synchronous require cannot evaluate this module's async graph.
+    pub module_graph_has_tla: bool,
 
     /// Issue #842: true iff this module is the target of at least one
     /// `await import("./this_module.ts")` site anywhere in the program.
@@ -662,8 +594,8 @@ pub enum NamespaceEntryKind {
     /// Local user function exported as a value. Codegen calls
     /// `js_closure_alloc_singleton(@__perry_wrap_<scoped>)`.
     LocalFunction { wrap_symbol: String },
-    /// Local class exported as a value. Codegen emits the
-    /// INT32-tagged class-id NaN-box that matches `Expr::ClassRef`.
+    /// Local class exported as a value. Codegen fetches the constructor
+    /// function object that matches `Expr::ClassRef`.
     LocalClass { class_id: u32 },
     /// Re-exported variable from another module. Codegen calls
     /// `perry_fn_<source_prefix>__<source_local>()` as a 0-arg getter
@@ -685,6 +617,8 @@ pub enum NamespaceEntryKind {
     /// nested value IS the target module's `@__perry_ns_<source_prefix>`
     /// global, populated by the target's own `__init`.
     NestedNamespace { source_prefix: String },
+    /// A namespace value exported from an import-defer binding.
+    DeferredNamespace { source_prefix: String },
     /// `export * as Name from "node:..."` (or another Perry-native module).
     /// Native modules have no compiled `@__perry_ns_*` global, so codegen asks
     /// the runtime to materialize their namespace directly.
@@ -868,18 +802,6 @@ impl ImportedClass {
     }
 }
 
-/// Producer-authored capability for one concrete class method that can be
-/// called by the guarded short trailing-spread lowering (#8772).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ShortSpreadMethodCandidate {
-    pub class_id: u32,
-    pub method_name: String,
-    pub source_prefix: String,
-    pub target: String,
-    pub shape_id_global: String,
-    pub declared_count: usize,
-}
-
 /// One concise own method published by an exported object-literal capability.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportedObjectLiteralMethod {
@@ -986,8 +908,11 @@ pub(crate) struct CrossModuleCtx<'a> {
     /// The class and method tables inverted (`class_hierarchy`). Set once
     /// both tables are final, before any function body is lowered.
     pub class_hierarchy: super::class_hierarchy::ClassHierarchy,
+    /// See `CompileOptions::namespace_self_import`.
+    pub namespace_self_import: bool,
     pub namespace_imports: std::collections::HashSet<String>,
     pub namespace_source_prefixes: std::collections::HashMap<String, String>,
+    pub deferred_namespace_imports: std::collections::HashSet<String>,
     /// #7189: `(namespace local, member)` pairs whose member is itself a MODULE
     /// NAMESPACE, from `export * as ns from "./m.ts"` in the imported module.
     ///
@@ -1006,12 +931,8 @@ pub(crate) struct CrossModuleCtx<'a> {
     /// `CompileOptions::namespace_member_origin_names`.
     pub namespace_member_origin_names: std::collections::HashMap<(String, String), String>,
     pub imported_async_funcs: std::collections::HashSet<String>,
-    pub short_spread_method_candidates:
-        std::sync::Arc<std::collections::HashMap<String, Vec<ShortSpreadMethodCandidate>>>,
     pub object_literal_method_candidates:
         std::sync::Arc<std::collections::HashMap<String, Vec<ObjectLiteralMethodCandidate>>>,
-    /// The whole program class accessor names, carried from the compile options.
-    pub program_class_accessor_names: Option<std::sync::Arc<ClassAccessorNames>>,
     /// FuncIds of locally-defined async functions in this module. Populated
     /// from `hir.functions.is_async`. Used by `is_promise_expr` to refine
     /// `let p = asyncFn();` to `Promise(_)` so subsequent `p.then(cb)`
@@ -1241,6 +1162,9 @@ pub(crate) struct CrossModuleCtx<'a> {
     /// entry (internal linkage, named by `spec_function_name`). Mutually
     /// exclusive with the typed_abi clone families.
     pub spec_abi_functions: std::collections::HashMap<u32, super::spec_abi::SpecFnPlan>,
+    /// P2 (DESIGN-p2 §3.2): typed class methods by HIR function id
+    /// (`signature_entry::select_methods`).
+    pub typed_methods: std::collections::HashMap<u32, super::signature_entry::TypedMethod>,
     /// Declared return types independently verified from the specialized
     /// body's guarded inputs and runtime-derived constructions. A direct call
     /// result may become a local proof only when its arguments also route to
@@ -1379,16 +1303,18 @@ pub(crate) struct CrossModuleCtx<'a> {
     /// Untyped string accumulators, module-wide
     /// (`collectors::string_accumulator_locals`).
     pub string_accumulator_locals: std::collections::HashSet<u32>,
+    /// Bindings whose object no code writes for their whole life
+    /// (`collectors::contents_stable_bindings`), module-wide.
+    pub contents_stable_bindings: std::collections::HashSet<u32>,
+    /// Empty-literal bindings a later loop pushes into
+    /// (`collectors::loop_pushed_arrays`), module-wide.
+    pub loop_pushed_arrays: crate::collectors::PushedArrays,
     /// Bindings assigned before any reader can run
     /// (`collectors::definite_init`), module-wide.
     pub definite_init: crate::collectors::DefiniteInit,
     /// Debug/benchmark switch that forces Buffer/Uint8Array accesses through
     /// the generic helper path.
     pub disable_buffer_fast_path: bool,
-    /// #6405: set when this module assigns a Buffer numeric read-method name as
-    /// an own property (`buf.readUInt8 = fn`). Threaded into every FnCtx so the
-    /// inline read intrinsic deopts to own-prop-aware runtime dispatch.
-    pub program_shadows_buffer_read_method: bool,
     /// (Issue #50) Module-level `const` 2D int arrays folded into flat
     /// `[N x i32]` LLVM constants. Maps local_id → info. Populated by
     /// scanning `hir.init`; threaded through every FnCtx so the IndexGet
@@ -1471,6 +1397,12 @@ pub(crate) struct CrossModuleCtx<'a> {
     /// fires before the body — transitively pulls in any Deferred dep
     /// chain reached only through this module's re-exports.
     pub module_init_deps: Vec<String>,
+    pub module_deferred_init_deps: Vec<String>,
+    pub module_deferred_readiness: Vec<String>,
+    /// Selects async module evaluation only for a program containing TLA.
+    pub program_has_tla: bool,
+    /// A synchronous require cannot evaluate this module's async graph.
+    pub module_graph_has_tla: bool,
     /// Issue #842: true iff this module is the target of at least one
     /// dynamic `import()` site in the program. Forces emission of
     /// `@__perry_ns_<prefix>` + populator even when `namespace_entries`

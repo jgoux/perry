@@ -174,10 +174,10 @@ pub use formatting::{
 pub(crate) use formatting::test_boxed_primitive_allocation_count;
 pub(crate) use formatting::{
     boxed_primitive_json_value, boxed_primitive_payload, boxed_primitive_to_string_tag,
-    boxed_string_wrapper_utf16_len, format_finite_number_js, format_jsvalue, int32_or_class_repr,
-    is_array_hole, is_negative_zero, jsvalue_string_content, InspectCompactGuard,
-    InspectCustomInspectGuard, InspectDepthLimitGuard, InspectGettersGuard, InspectShowHiddenGuard,
-    InspectSortedGuard, INT_EXACT_FASTPATH_LIMIT,
+    boxed_string_wrapper_utf16_len, format_finite_number_js, format_jsvalue, is_array_hole,
+    is_negative_zero, jsvalue_string_content, InspectCompactGuard, InspectCustomInspectGuard,
+    InspectDepthLimitGuard, InspectGettersGuard, InspectShowHiddenGuard, InspectSortedGuard,
+    INT_EXACT_FASTPATH_LIMIT,
 };
 
 pub use globals::{
@@ -188,6 +188,14 @@ pub use globals::{
     scan_queued_microtask_roots_mut,
 };
 
+#[cfg(perry_gc_instruments)]
+#[cfg_attr(
+    not(all(perry_gc_instruments, target_os = "linux", target_arch = "x86_64")),
+    allow(unused_imports)
+)]
+pub(crate) use globals::snap_pending_ticks;
+#[cfg(all(test, perry_gc_instruments))]
+pub(crate) use globals::test_push_tick;
 pub(crate) use globals::{
     discard_cancelled_microtasks, drain_queued_microtasks_count, queued_microtasks_pending,
 };

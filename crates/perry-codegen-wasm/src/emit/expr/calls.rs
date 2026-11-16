@@ -41,6 +41,7 @@ impl<'a> FuncEmitCtx<'a> {
                                 }
                             }
                             func.instruction(&Instruction::Call(idx));
+                            self.emit_exception_guard(func);
                             if self.emitter.void_funcs.contains(&idx) {
                                 func.instruction(&Instruction::I64Const(TAG_UNDEFINED as i64));
                             }
@@ -51,27 +52,15 @@ impl<'a> FuncEmitCtx<'a> {
                     if let Expr::GlobalGet(_) = object.as_ref() {
                         match property.as_str() {
                             "log" => {
-                                for arg in args {
-                                    self.emit_frame_begin(func, 1);
-                                    self.emit_store_arg(func, 0, arg);
-                                    self.emit_memcall_void(func, "console_log", 1);
-                                }
+                                self.emit_console_call(func, "console_log", args);
                                 return true;
                             }
                             "warn" => {
-                                for arg in args {
-                                    self.emit_frame_begin(func, 1);
-                                    self.emit_store_arg(func, 0, arg);
-                                    self.emit_memcall_void(func, "console_warn", 1);
-                                }
+                                self.emit_console_call(func, "console_warn", args);
                                 return true;
                             }
                             "error" => {
-                                for arg in args {
-                                    self.emit_frame_begin(func, 1);
-                                    self.emit_store_arg(func, 0, arg);
-                                    self.emit_memcall_void(func, "console_error", 1);
-                                }
+                                self.emit_console_call(func, "console_error", args);
                                 return true;
                             }
                             _ => {}
@@ -85,9 +74,26 @@ impl<'a> FuncEmitCtx<'a> {
                     // Fallback: class/UI method dispatch via mem_call with stack-based buffer.
                     {
                         let method_name = property.as_str();
-                        // Slot 0 = object, slots 1..N = args
+                        let global_receiver = matches!(object.as_ref(), Expr::GlobalGet(id)
+                            if !self.emitter.global_map.contains_key(id));
+                        if global_receiver {
+                            // The host global is independent of its mutable globalThis property.
+                            self.emit_frame_begin(func, 0);
+                            self.emit_memcall(func, "global_receiver", 0);
+                            func.instruction(&Instruction::LocalSet(self.temp_store_local));
+                        }
                         self.emit_frame_begin(func, (args.len() + 1) as u32);
-                        self.emit_store_arg(func, 0, object);
+                        if global_receiver {
+                            self.emit_slot_addr(func, 0);
+                            func.instruction(&Instruction::LocalGet(self.temp_store_local));
+                            func.instruction(&Instruction::I64Store(wasm_encoder::MemArg {
+                                offset: 0,
+                                align: 3,
+                                memory_index: 0,
+                            }));
+                        } else {
+                            self.emit_store_arg(func, 0, object);
+                        }
                         for (i, arg) in args.iter().enumerate() {
                             self.emit_store_arg(func, (i + 1) as u32, arg);
                         }
@@ -180,6 +186,7 @@ impl<'a> FuncEmitCtx<'a> {
                                 }
                             }
                             func.instruction(&Instruction::Call(idx));
+                            self.emit_exception_guard(func);
                             // Void functions don't push a return value; push undefined
                             // so the caller always has a value on the stack.
                             if self.emitter.void_funcs.contains(&idx) {
@@ -218,6 +225,7 @@ impl<'a> FuncEmitCtx<'a> {
                                 }
                             }
                             func.instruction(&Instruction::Call(idx));
+                            self.emit_exception_guard(func);
                             // Void functions don't push a return value, but call
                             // expressions always need a value on the stack. Push undefined.
                             if matches!(return_type, perry_hir::types::Type::Void)

@@ -212,7 +212,7 @@ pub(super) unsafe fn scan_dirty_object_slots<const DIAGNOSTICS: bool>(
     };
     super::ephemeron::discover(header);
     let mut complete = true;
-    visit_gc_rewrite_slot_descriptors::<DIAGNOSTICS>(header, |descriptor| unsafe {
+    visit_gc_rewrite_slot_descriptors_shared::<DIAGNOSTICS>(header, &mut |descriptor| unsafe {
         match descriptor {
             GcMutableSlotDescriptor::Slot(slot) => {
                 if crate::weakref::is_weak_target_trace_slot(header, slot.slot) {
@@ -1420,7 +1420,7 @@ pub(super) fn decode_heap_addr(bits: u64) -> usize {
         }
         decode_raw_pointer_candidate(addr)
     } else {
-        // SHORT_STRING_TAG (0x7FF9), INT32_TAG (0x7FFE),
+        // SHORT_STRING_TAG (0x7FF9), INTERNAL_WORD_TAG (0x7FFE),
         // primitive (0x7FFC), JS_HANDLE (0x7FFB) — none are
         // young-gen pointers.
         0
@@ -1632,6 +1632,7 @@ fn precise_root_write_barrier(root: super::PreciseRoot) {
 }
 
 #[cold]
+#[optimize(size)]
 #[inline(never)]
 fn precise_root_write_barrier_active(root: super::PreciseRoot) {
     let ptr = hot_incremental_mark_valid_ptrs().get();

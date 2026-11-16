@@ -95,6 +95,11 @@ pub(super) fn stronger(u: &ProgramFacts, w: &ProgramFacts) -> Vec<String> {
     out
 }
 
+/// Whole-program facts (the product mode) of a multi-module program.
+pub(super) fn whole(mods: &[(&str, &str)]) -> ProgramFacts {
+    run(mods, false, &FactsConfig::default())
+}
+
 fn both(mods: &[(&str, &str)]) -> (ProgramFacts, ProgramFacts) {
     let cfg = FactsConfig::default();
     (run(mods, true, &cfg), run(mods, false, &cfg))
@@ -640,6 +645,8 @@ fn a_layout_met_again_in_its_own_description_is_named_once() {
         literal_shape: true,
         facts: facts.clone(),
         methods: Vec::new(),
+        getters: Vec::new(),
+        own_getters: Vec::new(),
         native_parent: None,
         parent: None,
         field_fns: Vec::new(),
@@ -657,7 +664,9 @@ fn a_layout_met_again_in_its_own_description_is_named_once() {
         ctor_fn: None,
         birth_keys: Vec::new(),
         definite: Vec::new(),
+        reserved: Vec::new(),
         ctor_leaks: true,
+        ctor_returns: false,
         binding_prim: 0,
         fn_inst: false,
     };

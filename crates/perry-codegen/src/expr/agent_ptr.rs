@@ -5,15 +5,16 @@
 //! `PERRY_AGENT_PTRS` (a `#[thread_local]` array of [`AGENT_PTR_SLOTS`]
 //! pointers). How emitted code reaches it depends on the target:
 //!
-//! * [`AgentPtrAccess::ExecutableTls`] — ELF executables (Linux, Android;
-//!   x86-64 and aarch64): the block is an `external thread_local` global in
+//! * [`AgentPtrAccess::ExecutableTls`] — ELF executables (Linux; x86-64 and
+//!   aarch64): the block is an `external thread_local` global in
 //!   the static TLS block of the executable the runtime archive is linked
 //!   into, which the module addresses local-exec
 //!   ([`crate::module::LlModule::use_local_exec_tls`]): the access is one
 //!   thread-pointer-relative load (`mov %fs:PERRY_AGENT_PTRS@TPOFF+off` on
 //!   x86-64, which folds into a consuming compare; `mrs tpidr_el0` + a
-//!   `:tprel:` offset on aarch64). Not used for dylib/staticlib outputs: an
-//!   image that can be `dlopen`ed has no fixed offset in the static TLS
+//!   `:tprel:` offset on aarch64). Not used for dylib/staticlib outputs, nor
+//!   for Android and OpenHarmony programs, which are always shared objects:
+//!   an image that can be `dlopen`ed has no fixed offset in the static TLS
 //!   block.
 //! * [`AgentPtrAccess::AppleTsd`] — Apple aarch64: Mach-O has no initial-exec
 //!   model (every thread-local access is a TLV thunk call), so the block's
@@ -28,7 +29,8 @@
 //!   the runtime emits for its own static) inside it. Emitted code and the
 //!   runtime are linked into ONE image, so `_tls_index` is theirs.
 //! * [`AgentPtrAccess::Call`] — everything else (wasm, arm64_32, Windows
-//!   aarch64, x86-64 Darwin, ELF dylib/staticlib outputs): the runtime
+//!   aarch64, x86-64 Darwin, ELF dylib/staticlib outputs, Android and
+//!   OpenHarmony): the runtime
 //!   accessor. x86-64 Darwin has no call-free thread-local model (every
 //!   Mach-O thread-local access is a TLV thunk call) and the runtime's
 //!   pthread-TSD fast path (`HotTls`, the Apple aarch64 route) is built for
@@ -82,18 +84,28 @@ pub(crate) fn set_output_is_executable(executable: bool) {
 /// (`LlModule::use_local_exec_tls`), so the object emitters, which run on
 /// other threads, read the model from the IR rather than from shared state.
 pub(crate) fn program_tls_is_local_exec(triple: &str, output_type: &str) -> bool {
-    elf_triple(triple) && output_type == "executable"
+    elf_executable_target(triple) && output_type == "executable"
 }
 
-fn elf_triple(triple: &str) -> bool {
-    (triple.contains("linux") || triple.contains("android"))
+/// An ELF target whose `executable` output is linked as an executable. An
+/// Android or OpenHarmony program is a shared object the platform's app
+/// process loads (`perry`'s `link/platform_cmd.rs` links it `-shared`)
+/// whatever the output kind, so its thread-locals have no fixed offset from
+/// the thread pointer, and local-exec relocations (`R_X86_64_TPOFF32`,
+/// `R_AARCH64_TLSLE_*`) cannot be linked `-shared`. Their runtime archives
+/// also use emulated TLS (`inprocess::optimize_emit::emulated_tls`), whose
+/// blocks only the runtime's accessors reach.
+fn elf_executable_target(triple: &str) -> bool {
+    triple.contains("linux")
+        && !triple.contains("android")
+        && !triple.contains("ohos")
         && (triple.starts_with("x86_64") || triple.starts_with("aarch64"))
 }
 
 /// The image can address runtime TLS without a resolver call. Shared images
 /// keep the generic accessor; each executable invocation stays on one thread.
 pub(crate) fn executable_tls(triple: &str) -> bool {
-    elf_triple(triple) && OUTPUT_IS_EXECUTABLE.with(|c| c.get())
+    elf_executable_target(triple) && OUTPUT_IS_EXECUTABLE.with(|c| c.get())
 }
 
 /// How this compile reaches the block. `PERRY_AGENT_PTR_ACCESS=call` forces
@@ -103,7 +115,7 @@ pub(crate) fn agent_ptr_access(ctx: &FnCtx<'_>) -> AgentPtrAccess {
         return AgentPtrAccess::Call;
     }
     let triple = ctx.target_triple;
-    if elf_triple(triple) && OUTPUT_IS_EXECUTABLE.with(|c| c.get()) {
+    if elf_executable_target(triple) && OUTPUT_IS_EXECUTABLE.with(|c| c.get()) {
         return AgentPtrAccess::ExecutableTls;
     }
     if triple.starts_with("x86_64") && triple.contains("windows") {
@@ -162,12 +174,58 @@ pub(crate) fn emit_agent_ptr_or(ctx: &mut FnCtx<'_>, slot: usize, absent: &str) 
     }
 }
 
+/// May a compiled site use the agent slot of intrinsic `family` AS the
+/// intrinsic object (dereference it beyond its layout word)? Only for a
+/// family the realm's phase A binds (`perry_abi::realm_phase`): until phase B
+/// has sealed a phase-B family or namespace its slot names the pristine
+/// stand-in, which is good for the shadow word and for nothing else (DESIGN
+/// startup-realm, section 7 rule 7).
+pub(crate) fn intrinsic_slot_is_the_object(family: usize) -> bool {
+    let name = match perry_abi::BuiltinProto::ALL.get(family) {
+        Some((_, constructor)) => constructor,
+        None => match perry_abi::BUILTIN_NAMESPACES.get(family - perry_abi::BUILTIN_PROTO_FAMILIES)
+        {
+            Some(namespace) => namespace,
+            None => return false,
+        },
+    };
+    !perry_abi::realm_rest_global(name)
+}
+
+/// [`emit_intrinsic_proto`] for a site that goes on to read the object
+/// itself (its meta, its slots), not only its layout word: refused at
+/// compile time for a phase-B family.
+pub(crate) fn emit_intrinsic_proto_object(ctx: &mut FnCtx<'_>, family: usize) -> String {
+    assert!(
+        intrinsic_slot_is_the_object(family),
+        "intrinsic family {family} is bound in phase B: its agent slot is the stand-in until then"
+    );
+    emit_intrinsic_proto(ctx, family)
+}
+
+/// The layout word of this agent's intrinsic prototype of builtin family
+/// `family` (the word whose shadow bit is `Pristine(family)`): the one read
+/// that is good for every family in every phase of the realm, the pristine
+/// stand-in's word included.
+pub(crate) fn emit_intrinsic_shadow_word(ctx: &mut FnCtx<'_>, family: usize) -> String {
+    let proto = emit_intrinsic_proto(ctx, family);
+    let at = ctx
+        .block()
+        .gep(crate::types::I8, &proto, &[(crate::types::I64, "4")]);
+    ctx.block().load(crate::types::I32, &at)
+}
+
 /// This agent's intrinsic prototype of builtin family `family` (object model
 /// step 3: the object whose layout word's shadow bit is `Pristine(family)`).
 /// The slot is never null (`PERRY_PRISTINE_PROTO` until the realm is sealed),
 /// so the inline forms are one load; Apple's TSD path answers the stand-in
 /// when unavailable; every other target calls the leaf accessor.
-pub(crate) fn emit_intrinsic_proto(ctx: &mut FnCtx<'_>, family: usize) -> String {
+///
+/// Private: the two doors out of this module are
+/// [`emit_intrinsic_shadow_word`] (the layout word, any family) and
+/// [`emit_intrinsic_proto_object`] (the object, phase-A families only), so
+/// the compiler enforces DESIGN startup-realm rule 7.
+fn emit_intrinsic_proto(ctx: &mut FnCtx<'_>, family: usize) -> String {
     let slot = crate::runtime_abi::AGENT_PTR_INTRINSIC_PROTO + family;
     debug_assert!(slot < AGENT_PTR_SLOTS);
     let slot_off = (slot * 8).to_string();
@@ -320,4 +378,112 @@ pub(crate) fn emit_agent_ptr(ctx: &mut FnCtx<'_>, slot: usize, fallback_fn: &str
     ctx.current_block = join_idx;
     ctx.block()
         .phi(PTR, &[(&fast_val, &fast_pred), (&called, &slow_pred)])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    /// DESIGN startup-realm, rule 7: before phase B a phase-B family's agent
+    /// slot may be read for its layout word only. The raw slot loader is
+    /// private to this module (the compiler enforces that); its two doors
+    /// are the shadow-word reader (any family) and
+    /// `emit_intrinsic_proto_object`, which refuses a phase-B family.
+    #[test]
+    fn a_phase_b_intrinsic_slot_is_never_used_as_the_object() {
+        use perry_abi::{BuiltinProto, BUILTIN_PROTO_FAMILIES};
+        // The families the generic dispatcher dereferences are phase A: this
+        // fails the day one of them moves to phase B.
+        assert!(intrinsic_slot_is_the_object(BuiltinProto::Map as usize));
+        assert!(intrinsic_slot_is_the_object(BuiltinProto::Set as usize));
+        assert!(intrinsic_slot_is_the_object(BuiltinProto::Array as usize));
+        // Phase-B families and namespaces with a slot, by name (stage 2's
+        // set; a later stage only adds to it): refused.
+        assert!(!intrinsic_slot_is_the_object(
+            BuiltinProto::WeakMap as usize
+        ));
+        assert!(!intrinsic_slot_is_the_object(
+            BuiltinProto::WeakSet as usize
+        ));
+        for namespace in ["Intl", "Atomics"] {
+            let family = perry_abi::builtin_namespace_family(namespace).expect(namespace);
+            assert!(family >= BUILTIN_PROTO_FAMILIES);
+            assert!(!intrinsic_slot_is_the_object(family), "{namespace}");
+        }
+        // No slot, no object.
+        assert!(!intrinsic_slot_is_the_object(usize::MAX / 2));
+        // Every phase-B name that has a slot is one of the refused: the
+        // predicate follows the phase lists, whatever they hold.
+        let mut refused = 0;
+        for name in perry_abi::REALM_REST_GLOBALS {
+            if let Some((family, _)) = BuiltinProto::ALL.iter().find(|(_, n)| n == name) {
+                assert!(!intrinsic_slot_is_the_object(*family as usize), "{name}");
+                refused += 1;
+            }
+            if let Some(family) = perry_abi::builtin_namespace_family(name) {
+                assert!(!intrinsic_slot_is_the_object(family), "{name}");
+                refused += 1;
+            }
+        }
+        assert!(refused >= 4, "the phase-B list lost its slotted families");
+        // The raw loader stays private, with exactly its two callers here.
+        let source = include_str!("agent_ptr.rs");
+        let raw = ["fn emit_intrinsic", "_proto("].concat();
+        assert!(source.contains(&format!("\n{raw}")), "the raw loader is not private");
+        let calls = ["= emit_intrinsic", "_proto(ctx, family)"].concat();
+        let tail = ["    emit_intrinsic", "_proto(ctx, family)\n}"].concat();
+        assert_eq!(
+            source.matches(&calls).count() + source.matches(&tail).count(),
+            2,
+            "the raw loader has a caller besides the shadow-word reader and the object door"
+        );
+    }
+
+    /// Local-exec only where the program is an ELF executable: Linux
+    /// `executable` outputs. Android and OpenHarmony programs are shared
+    /// objects whatever the output kind (`link/platform_cmd.rs` links them
+    /// `-shared`), where a local-exec relocation does not link.
+    #[test]
+    fn local_exec_tls_only_for_elf_executables() {
+        for triple in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+            assert!(program_tls_is_local_exec(triple, "executable"), "{triple}");
+            for kind in ["dylib", "staticlib"] {
+                assert!(!program_tls_is_local_exec(triple, kind), "{triple} {kind}");
+            }
+        }
+        for triple in [
+            "aarch64-linux-android",
+            "x86_64-linux-android",
+            "aarch64-unknown-linux-ohos",
+            "x86_64-unknown-linux-ohos",
+            "arm64-apple-macosx",
+            "x86_64-pc-windows-msvc",
+        ] {
+            assert!(!program_tls_is_local_exec(triple, "executable"), "{triple}");
+        }
+    }
+
+    /// The agent block's direct thread-pointer access follows the same image
+    /// kind: an Android or OpenHarmony compile reaches it through the
+    /// accessor even when its output kind says `executable`.
+    #[test]
+    fn shared_object_targets_take_the_accessor() {
+        set_output_is_executable(true);
+        assert!(executable_tls("x86_64-unknown-linux-gnu"));
+        assert!(executable_tls("aarch64-unknown-linux-gnu"));
+        for triple in [
+            "aarch64-linux-android",
+            "x86_64-linux-android",
+            "aarch64-unknown-linux-ohos",
+            "x86_64-unknown-linux-ohos",
+        ] {
+            assert!(!executable_tls(triple), "{triple}");
+        }
+        set_output_is_executable(false);
+        assert!(!executable_tls("x86_64-unknown-linux-gnu"));
+        set_output_is_executable(true);
+    }
+}
+
+pub(crate) fn output_is_executable() -> bool {
+    OUTPUT_IS_EXECUTABLE.with(|s| s.get())
 }

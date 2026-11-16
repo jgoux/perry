@@ -30,10 +30,7 @@ use super::unwrap_call_callee_ts_wrappers;
 /// An identifier that still names the global built-in (no local, function,
 /// class or import binding shadows it).
 fn is_unshadowed_global(ctx: &LoweringContext, name: &str) -> bool {
-    ctx.lookup_local(name).is_none()
-        && ctx.lookup_func(name).is_none()
-        && ctx.lookup_class(name).is_none()
-        && ctx.lookup_imported_func(name).is_none()
+    !ctx.shadows_unqualified_global(name)
 }
 
 /// `N` / `globalThis.N` for an unshadowed builtin namespace `N`.
@@ -103,7 +100,7 @@ fn live_namespace(ns: &str) -> Expr {
 /// Can the lowered arguments appear in both arms of the guard? Each arm runs
 /// alone, so nothing is evaluated twice; but a definition (a closure or class
 /// body, with its function id) or a suspension point must exist once.
-fn duplicable(args: &[Expr]) -> bool {
+pub(super) fn duplicable(args: &[Expr]) -> bool {
     fn ok(e: &Expr) -> bool {
         if matches!(
             e,

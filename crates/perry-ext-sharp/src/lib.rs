@@ -42,9 +42,7 @@ unsafe fn opts_number_field(opts: f64, name: &str) -> Option<f64> {
     let key = js_string_from_bytes(name.as_ptr(), name.len() as u32);
     let field =
         JsValue::from_bits(js_object_get_field_by_name_boxed(rooted_opts.get(), key).to_bits());
-    if field.is_int32() {
-        Some(((field.bits() & 0xFFFF_FFFF) as u32 as i32) as f64)
-    } else if field.is_number() {
+    if field.is_number() {
         Some(f64::from_bits(field.bits()))
     } else {
         None
@@ -782,7 +780,7 @@ pub unsafe extern "C" fn js_sharp_to_file(
                         let obj = _record_roots.root_addr(
                             (unsafe {
                                 perry_ffi::runtime_layouts::alloc_runtime_record(
-                                    std::ptr::addr_of!(perry_ffi::runtime_layouts::RECORD_F30_0),
+                                    perry_ffi::runtime_layouts::RECORD_F30_0::desc(),
                                 )
                             }) as i64,
                         );
@@ -878,9 +876,9 @@ pub extern "C" fn js_sharp_metadata(handle: Handle) -> *mut Promise {
                 let _record_roots = perry_ffi::TransientRootScope::enter();
                 let obj = _record_roots.root_addr(
                     (unsafe {
-                        perry_ffi::runtime_layouts::alloc_runtime_record(std::ptr::addr_of!(
-                            perry_ffi::runtime_layouts::RECORD_F31_0
-                        ))
+                        perry_ffi::runtime_layouts::alloc_runtime_record(
+                            perry_ffi::runtime_layouts::RECORD_F31_0::desc(),
+                        )
                     }) as i64,
                 );
                 unsafe {
@@ -1188,9 +1186,9 @@ mod static_record_layout_tests {
         perry_ffi::initialize_runtime_fixture();
         let roots = perry_ffi::TransientRootScope::enter();
         let record = roots.root_addr(unsafe {
-            perry_ffi::runtime_layouts::alloc_runtime_record(std::ptr::addr_of!(
-                perry_ffi::runtime_layouts::RECORD_F30_0
-            ))
+            perry_ffi::runtime_layouts::alloc_runtime_record(
+                perry_ffi::runtime_layouts::RECORD_F30_0::desc(),
+            )
         } as i64);
         for slot in 0..5 {
             assert_eq!(
@@ -1205,9 +1203,9 @@ mod static_record_layout_tests {
             );
         }
         let record = roots.root_addr(unsafe {
-            perry_ffi::runtime_layouts::alloc_runtime_record(std::ptr::addr_of!(
-                perry_ffi::runtime_layouts::RECORD_F31_0
-            ))
+            perry_ffi::runtime_layouts::alloc_runtime_record(
+                perry_ffi::runtime_layouts::RECORD_F31_0::desc(),
+            )
         } as i64);
         for slot in 0..6 {
             assert_eq!(
