@@ -5,7 +5,7 @@ mod buffer_species;
 pub(crate) use buffer_constructor::{
     buffer_constructor_value, buffer_intrinsic_prototype_parent, buffer_intrinsic_prototype_value,
     buffer_original_prototype_value, cached_buffer_intrinsic_prototype_value,
-    is_buffer_constructor_value,
+    install_buffer_prototype_members, is_buffer_constructor_value,
 };
 mod builtin_closure_metadata;
 mod module_cjs;
@@ -37,8 +37,7 @@ pub(crate) fn minted_native_callable_export(canonical_key: &str) -> Option<f64> 
 }
 
 pub fn bound_native_callable_export_value(module_name: &str, property_name: &str) -> f64 {
-    if crate::process::worker_restrictions::worker_process_member_hidden(module_name, property_name)
-    {
+    if super::native_namespace_member_absent(module_name, property_name) {
         return f64::from_bits(crate::value::TAG_UNDEFINED);
     }
     // Bound-native closures carry (module, method) metadata that the
@@ -87,11 +86,12 @@ pub fn bound_native_callable_export_value(module_name: &str, property_name: &str
     if module_name == "inspector/promises" && property_name != "Session" {
         return bound_native_callable_export_value("inspector", property_name);
     }
-    let export_module_name = if property_name == "Assert" && module_name == "assert/strict" {
-        "assert"
-    } else {
-        module_name
-    };
+    let export_module_name =
+        if matches!(property_name, "Assert" | "AssertionError") && module_name == "assert/strict" {
+            "assert"
+        } else {
+            module_name
+        };
     let callable_module_name = if export_module_name == "util.types" {
         "util/types"
     } else {
@@ -110,6 +110,9 @@ pub fn bound_native_callable_export_value(module_name: &str, property_name: &str
     if let Some(bits) = NATIVE_CALLABLE_EXPORTS.with(|c| c.borrow().get(&key).copied()) {
         return f64::from_bits(bits);
     }
+    // The export's one callable, minted on its first read whichever init
+    // reads it first: the SNAP census counts it as the runtime's.
+    let _census = crate::snap_census::first_use();
 
     let method_bytes: &'static [u8] = property_name.as_bytes().to_vec().leak();
     let scope = crate::gc::RuntimeHandleScope::new();
@@ -162,7 +165,7 @@ pub fn bound_native_callable_export_value(module_name: &str, property_name: &str
             crate::gc::gc_collect_minor();
         }
     });
-    let exposed_name = if export_module_name == "fs" {
+    let exposed_name = if export_module_name == "fs" || export_module_name == "sqlite" {
         native_callable_export_display_name(export_module_name, property_name)
     } else if export_module_name == "url" && property_name == "resolveObject" {
         realm_native_url_resolveObject_metadata!(name)
@@ -413,6 +416,14 @@ pub(super) fn native_callable_export_display_name<'a>(module: &str, prop: &'a st
             "Stats" => realm_native_fs_Stats_metadata!(name),
             _ => prop,
         }
+    } else if module == "sqlite" {
+        // node 26: the classes are `Database` / `Statement`; `DatabaseSync`
+        // and `StatementSync` are aliases of them.
+        match prop {
+            "DatabaseSync" => "Database",
+            "StatementSync" => "Statement",
+            _ => prop,
+        }
     } else {
         prop
     }
@@ -428,12 +439,8 @@ extern "C" fn buffer_constructor_thunk(
     let value_js = crate::value::JSValue::from_bits(value.to_bits());
     let buf = if value_js.is_undefined() || value_js.is_null() {
         crate::buffer::js_buffer_alloc(0, 0)
-    } else if value_js.is_int32() || value_js.is_number() {
-        let size = if value_js.is_int32() {
-            value_js.as_int32()
-        } else {
-            value as i32
-        };
+    } else if value_js.is_number() {
+        let size = value as i32;
         crate::buffer::js_buffer_alloc_unsafe(size)
     } else {
         let second = crate::value::JSValue::from_bits(encoding_or_offset.to_bits());
@@ -443,16 +450,10 @@ extern "C" fn buffer_constructor_thunk(
         if !third.is_undefined() || second_is_offset {
             let len = if third.is_undefined() {
                 -1
-            } else if third.is_int32() {
-                third.as_int32()
             } else {
                 length as i32
             };
-            let offset = if second.is_int32() {
-                second.as_int32()
-            } else {
-                encoding_or_offset as i32
-            };
+            let offset = encoding_or_offset as i32;
             crate::buffer::js_buffer_from_arraybuffer_slice(value.to_bits() as i64, offset, len)
         } else {
             let enc = if second.is_undefined() {
@@ -466,11 +467,70 @@ extern "C" fn buffer_constructor_thunk(
     crate::value::js_nanbox_pointer(buf as i64)
 }
 
-extern "C" fn buffer_prototype_method_thunk(
+/// `Buffer.prototype.toString(encoding, start, end)` as a value
+/// (`Buffer.prototype.toString.call(buf, ..)`): the decode `buf.toString(..)`
+/// runs, on a Buffer or a plain `Uint8Array` (Node decodes any Uint8Array
+/// receiver's bytes). Any other receiver throws Node's TypeError
+/// (`argument must be a buffer`). Node also decodes the other typed arrays
+/// and (without arguments) a DataView; perry throws there.
+pub(crate) extern "C" fn buffer_prototype_to_string(
     _closure: *const crate::closure::ClosureHeader,
-    _this: crate::closure::JsThis,
+    this: crate::closure::JsThis,
+    args: *const f64,
+    argc: usize,
 ) -> f64 {
-    f64::from_bits(crate::value::TAG_UNDEFINED)
+    let this_bits = this.bits();
+    let addr = (this_bits & crate::value::POINTER_MASK) as usize;
+    if !(crate::value::JSValue::from_bits(this_bits).is_pointer()
+        && addr != 0
+        && crate::buffer::is_uint8_view_buffer(addr))
+    {
+        crate::collection_iter::throw_type_error("argument must be a buffer");
+    }
+    let args = if args.is_null() || argc == 0 {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(args, argc) }
+    };
+    unsafe {
+        crate::object::buffer_dispatch::buffer_to_string_call(
+            addr as *mut crate::buffer::BufferHeader,
+            args,
+        )
+    }
+}
+
+/// A builtin `Buffer.prototype` member called with an explicit `this`
+/// (`Buffer.prototype.copy.call(src, dst)`, `.apply`, `.bind`,
+/// `Reflect.apply`): the member's name is its closure's capture 0 (its index
+/// in `BUFFER_PROTOTYPE_METHODS`), the receiver must be a `Uint8Array` view
+/// (a Buffer, a plain `Uint8Array` or a subclass instance; anything else is
+/// Node's TypeError), and the body is the builtin method of that name. The
+/// member was chosen by the caller, so the receiver's prototype chain is not
+/// consulted again.
+extern "C" fn buffer_prototype_method_thunk(
+    closure: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
+    args: *const f64,
+    argc: usize,
+) -> f64 {
+    let index = crate::closure::js_closure_get_capture_f64(closure, 0) as usize;
+    let Some(method) = BUFFER_PROTOTYPE_METHODS.get(index) else {
+        return f64::from_bits(crate::value::TAG_UNDEFINED);
+    };
+    let this_bits = this.bits();
+    let addr = (this_bits & crate::value::POINTER_MASK) as usize;
+    if !(crate::value::JSValue::from_bits(this_bits).is_pointer()
+        && addr != 0
+        && crate::buffer::is_uint8_view_buffer(addr))
+    {
+        crate::collection_iter::throw_type_error(
+            "The \"this\" argument must be an instance of Buffer or Uint8Array.",
+        );
+    }
+    unsafe {
+        crate::object::buffer_dispatch::dispatch_builtin_buffer_method(addr, method, args, argc)
+    }
 }
 
 /// `this` for a `Buffer.prototype.offset`/`.parent` accessor read, resolved
@@ -694,6 +754,29 @@ const BUFFER_PROTOTYPE_METHODS: &[&str] = &[
     "utf8Write",
 ];
 
+/// Is `name` an own builtin member of `Buffer.prototype`
+/// (`BUFFER_PROTOTYPE_METHODS`)?
+pub(crate) fn is_buffer_prototype_member(name: &str) -> bool {
+    BUFFER_PROTOTYPE_METHODS.contains(&name)
+}
+
+/// Is `value` a builtin method member of `Buffer.prototype` that shares
+/// [`buffer_prototype_method_thunk`]? That thunk has no behaviour of its own:
+/// the member's body is the receiver's name dispatch
+/// (`buffer_dispatch::dispatch_buffer_method`). Decided by the closure's body.
+pub(crate) fn is_buffer_prototype_method_thunk(value: crate::value::JSValue) -> bool {
+    if !value.is_pointer() {
+        return false;
+    }
+    let addr = value.as_pointer::<u8>() as usize;
+    let Some(header) = (unsafe { crate::value::addr_class::try_read_gc_header(addr) }) else {
+        return false;
+    };
+    header.obj_type == crate::gc::GC_TYPE_CLOSURE
+        && crate::closure::js_closure_get_func(addr as *const crate::closure::ClosureHeader)
+            == buffer_prototype_method_thunk as *const u8
+}
+
 const ASSERT_PROTOTYPE_METHODS: &[&str] = &[
     "fail",
     "ok",
@@ -744,7 +827,104 @@ pub(crate) fn assert_cjs_export_value(module_name: &str) -> f64 {
         .as_pointer::<crate::closure::ClosureHeader>() as usize;
     crate::closure::closure_set_dynamic_prop(closure, "strict", strict);
     crate::closure::closure_set_dynamic_prop(closure, "default", callable.get_nanbox_f64());
+    // The constructors are the `assert` module's own, shared by `assert/strict`.
+    let constructors: [(&str, extern "C" fn(i32) -> f64); 2] = [
+        ("AssertionError", super::assert_assertion_error_export),
+        ("Assert", super::assert_assert_export),
+    ];
+    for (constructor, export) in constructors {
+        let value = export(0);
+        let closure = crate::value::JSValue::from_bits(callable.get_nanbox_f64().to_bits())
+            .as_pointer::<crate::closure::ClosureHeader>() as usize;
+        crate::closure::closure_set_dynamic_prop(closure, constructor, value);
+    }
     callable.get_nanbox_f64()
+}
+
+/// `assert.AssertionError.prototype`: `constructor`, and `Error.prototype` as
+/// its [[Prototype]] (node: `class AssertionError extends Error`). Every
+/// AssertionError, thrown by an assert helper or constructed, is born linked
+/// to this object, so `instanceof Error` / `instanceof AssertionError` are
+/// answered by the prototype chain.
+fn attach_assertion_error_prototype(constructor_value: f64) {
+    let constructor_js = JSValue::from_bits(constructor_value.to_bits());
+    if !constructor_js.is_pointer() {
+        return;
+    }
+    let closure = constructor_js.as_pointer::<crate::closure::ClosureHeader>() as usize;
+    if closure == 0 {
+        return;
+    }
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let constructor = scope.root_nanbox_f64(constructor_value);
+    let error = {
+        let name = "Error";
+        scope.root_nanbox_f64(crate::object::js_get_global_this_builtin_value(
+            name.as_ptr(),
+            name.len(),
+        ))
+    };
+    let error_prototype = {
+        scope.root_nanbox_f64(unsafe {
+            crate::value::js_dynamic_object_get_property(
+                error.get_nanbox_f64(),
+                b"prototype".as_ptr().cast(),
+                9,
+            )
+        })
+    };
+    let proto = scope.root_raw_mut_ptr(crate::realm_decl! { birth js_object_alloc(0, 0); realm { "node:assert.AssertionError.prototype", members = { constructor; toString; }; } });
+    if proto.get_raw_mut_ptr::<ObjectHeader>().is_null() {
+        return;
+    }
+    if JSValue::from_bits(error_prototype.get_nanbox_f64().to_bits()).is_pointer() {
+        crate::object::prototype_chain::object_set_static_prototype(
+            proto.get_raw_mut_ptr::<ObjectHeader>() as usize,
+            error_prototype.get_nanbox_u64(),
+        );
+    }
+    let key = "constructor";
+    let constructor_key = crate::string::js_string_from_bytes(key.as_ptr(), key.len() as u32);
+    super::define_builtin_data_property(
+        proto.get_raw_mut_ptr::<ObjectHeader>(),
+        constructor_key,
+        constructor.get_nanbox_f64(),
+        key.to_string(),
+        super::PropertyAttrs::new(true, false, true),
+    );
+    // node: `AssertionError.prototype.toString()` is
+    // `${this.name} [${this.code}]: ${this.message}`.
+    let to_string = scope.root_nanbox_f64(async_hooks_static_method_value(
+        crate::fn_info!(#[realm("node:assert.AssertionError.prototype.toString")] export crate::object::assert::js_assert_assertion_error_to_string, 0),
+        "toString",
+        0,
+    ));
+    let key = "toString";
+    let to_string_key = crate::string::js_string_from_bytes(key.as_ptr(), key.len() as u32);
+    super::define_builtin_data_property(
+        proto.get_raw_mut_ptr::<ObjectHeader>(),
+        to_string_key,
+        to_string.get_nanbox_f64(),
+        key.to_string(),
+        super::PropertyAttrs::new(true, false, true),
+    );
+    let proto_value =
+        crate::value::js_nanbox_pointer(proto.get_raw_mut_ptr::<ObjectHeader>() as i64);
+    let closure = JSValue::from_bits(constructor.get_nanbox_f64().to_bits())
+        .as_pointer::<crate::closure::ClosureHeader>() as usize;
+    crate::closure::closure_set_dynamic_prop(closure, "prototype", proto_value);
+    super::set_builtin_property_attrs(
+        closure,
+        "prototype".to_string(),
+        super::PropertyAttrs::new(false, false, false),
+    );
+    // The constructor's own [[Prototype]] is `Error` (statics and
+    // `Object.getPrototypeOf(AssertionError) === Error`).
+    if JSValue::from_bits(error.get_nanbox_f64().to_bits()).is_pointer() {
+        let closure = JSValue::from_bits(constructor.get_nanbox_f64().to_bits())
+            .as_pointer::<crate::closure::ClosureHeader>() as usize;
+        crate::closure::closure_set_static_prototype(closure, error.get_nanbox_u64());
+    }
 }
 
 fn attach_assert_prototype(constructor_value: f64) {
@@ -852,7 +1032,7 @@ fn attach_crypto_x509_certificate_shape(closure_addr: usize, constructor_value: 
 
     unsafe {
         let getter = crate::closure::js_closure_alloc(
-            crate::fn_info!(#[realm("node:crypto.X509Certificate.prototype.issuerCertificate.<get>", provider = intrinsic_closure, constructible = true)] export crate::object::native_module::callable_exports::x509_issuer_certificate_getter_thunk, 0; with_declared(0)),
+            crate::fn_info!(#[realm("node:crypto.X509Certificate.prototype.issuerCertificate.<get>", provider = intrinsic_closure, constructible = true)] export crate::object::native_module::callable_exports::x509_issuer_certificate_getter_thunk, 0; with_name("get issuerCertificate"), with_declared(0)),
             0,
         );
         if !getter.is_null() {
@@ -1280,6 +1460,15 @@ unsafe fn bound_native_callable_closure(
     // heap floor lets a `0xf0000`-band id through on Linux — the #5592 sweep
     // host) before probing `CLOSURE_MAGIC`. Refs test262
     // class/subclass/superclass-{arrow,async,generator,async-generator}-function.
+    // Every closure user code can reach carries an info record; only a heap
+    // walker can see a header whose info is not written yet.
+    #[cfg(debug_assertions)]
+    if crate::closure::is_closure_ptr(closure as usize) {
+        assert!(
+            !(*closure).info.is_null(),
+            "a reachable closure carries an info record"
+        );
+    }
     if !crate::closure::is_closure_ptr(closure as usize)
         || ((*closure).code() != crate::closure::BOUND_METHOD_FUNC_PTR
             && (*(*closure).info).flags & crate::codegen_abi::FN_NATIVE_EXPORT == 0)
@@ -1557,6 +1746,9 @@ pub(crate) unsafe fn nm_attach_assert(
     if property_name == "Assert" {
         attach_assert_prototype(value);
     }
+    if property_name == "AssertionError" {
+        attach_assertion_error_prototype(value);
+    }
     value
 }
 
@@ -1709,3 +1901,7 @@ pub(crate) unsafe fn nm_attach_util(
     }
     value
 }
+
+#[cfg(test)]
+#[path = "buffer_proto_call_tests.rs"]
+mod buffer_proto_call_tests;

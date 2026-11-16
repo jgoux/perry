@@ -18,6 +18,9 @@ mod collapse;
 mod dispatch_receiver_class;
 #[path = "dynamic_dispatch_select.rs"]
 mod select;
+#[path = "dynamic_dispatch_spread.rs"]
+mod spread;
+pub(crate) use spread::emit_function as lower_function_spread_call;
 #[path = "dynamic_dispatch_tower.rs"]
 mod tower;
 use collapse::method_dispatch_collapse_enabled;
@@ -51,6 +54,9 @@ struct TowerPshapeRoute {
     /// layout; `delete` swaps in a freshly cloned array, which is exactly what
     /// the inline compare catches.
     keys_global: String,
+    /// The index argument positions and clone parameter ids when the case's
+    /// index arguments are proven Numbers (`lower_call::index_split`).
+    number_index: Option<(Vec<crate::lower_call::index_split::IndexArg>, Vec<u32>)>,
 }
 
 /// Build the exact direct-call ABI for one concrete method implementation.
@@ -130,6 +136,100 @@ fn build_direct_method_args(
     direct_args
 }
 
+/// ONCHANGE2: `object.property( args )` the facts prove runs one class
+/// method body (`wpfacts_access::proven_method_fn`): the receiver is
+/// evaluated first, then the arguments (13.3.6.1: the member's value is
+/// read before the arguments; the proof makes that read the fixed body, so
+/// reading it later is unobservable), and the body's public entry is called
+/// with the receiver as `this`, its arguments adapted to the body's declared
+/// parameters, rest and `arguments` slots exactly as the tower's case arm
+/// does (`build_direct_method_args`). No guard and no by-name fallback.
+/// NULLCALL1: a receiver that may also be `undefined` / `null` is tested
+/// once right after it is evaluated: the nullish edge is the complete member
+/// read, which throws before any argument is evaluated (13.3.6.1: GetValue
+/// of the member reference precedes ArgumentListEvaluation).
+pub(crate) fn try_lower_proven_method_call(
+    ctx: &mut FnCtx<'_>,
+    callee: &Expr,
+    args: &[Expr],
+) -> Result<Option<String>> {
+    let Expr::PropertyGet {
+        object,
+        property,
+        byte_offset,
+        ..
+    } = callee
+    else {
+        return Ok(None);
+    };
+    let offset = if *byte_offset != 0 {
+        *byte_offset
+    } else {
+        crate::codegen::signature_entry::direct_call_offset()
+    };
+    let Some((class, fname, abi, nullable)) =
+        crate::expr::wpfacts_access::proven_method_fn(ctx, object, property, offset)
+    else {
+        return Ok(None);
+    };
+    // A holder named here: this module's registration of it; else the
+    // holder module's own (the facts' `DirectAbi`).
+    let (has_rest, has_synthetic_arguments, has_user_rest, decl) = match &class {
+        Some(class) => {
+            let key = (class.clone(), property.to_string());
+            (
+                matches!(ctx.method_has_rest.get(&key), Some(&true)),
+                matches!(ctx.method_has_synthetic_arguments.get(&key), Some(&true)),
+                crate::codegen::arguments::method_has_user_rest(ctx, class, property),
+                ctx.method_param_counts.get(&key).copied().unwrap_or(0),
+            )
+        }
+        None => (abi.rest, abi.synthetic_arguments, abi.user_rest, abi.params as usize),
+    };
+    crate::facts_consumed::used();
+    let mut roots = crate::rooting::open_rooted_group(1 + args.len());
+    let bundles = has_rest || has_synthetic_arguments;
+    let recv_collects = bundles || crate::rooting::any_operand_may_collect(ctx, args.iter());
+    let recv_idx = roots.lower(ctx, object, recv_collects)?;
+    if nullable {
+        let recv_box = roots.reread(ctx, recv_idx)?;
+        crate::expr::wpfacts_access::emit_nullish_throw_test(
+            ctx, object, &recv_box, property, *byte_offset, None,
+        );
+    }
+    let mut arg_idxs = Vec::with_capacity(args.len());
+    for (i, a) in args.iter().enumerate() {
+        let collects = bundles || crate::rooting::any_operand_may_collect(ctx, args[i + 1..].iter());
+        arg_idxs.push(roots.lower(ctx, a, collects)?);
+    }
+    let recv_box = roots.reread(ctx, recv_idx)?;
+    let mut user_args: Vec<String> = Vec::with_capacity(args.len());
+    for &idx in &arg_idxs {
+        user_args.push(roots.reread(ctx, idx)?);
+    }
+    let undefined_lit = double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED));
+    let direct_args = build_direct_method_args(
+        ctx,
+        &recv_box,
+        &user_args,
+        has_rest,
+        has_synthetic_arguments,
+        has_user_rest,
+        false,
+        decl,
+        &undefined_lit,
+    );
+    let slices: Vec<(crate::types::LlvmType, &str)> =
+        direct_args.iter().map(|s| (DOUBLE, s.as_str())).collect();
+    let value = ctx.block().call(DOUBLE, &fname, &slices);
+    super::super::method_override::publish_constructive_method_truthy(ctx, &fname, &value);
+    roots.release(ctx);
+    if std::env::var_os("PERRY_FACTS_REPORT").is_some() {
+        eprintln!("# proven_method_call offset={offset} callee={fname} nullable={}", nullable as u8);
+    }
+    Ok(Some(value))
+}
+
 /// Is implementor `class`'s `property` (body `function`) a prototype constant
 /// a proven site may call directly? (`select::cased`.)
 pub(crate) fn method_target_is_cased(
@@ -169,6 +269,30 @@ pub(crate) fn try_lower_instance_method_call(
     object: &Expr,
     property: &str,
     args: &[Expr],
+    call_byte_offset: u32,
+) -> Result<Option<String>> {
+    lower_instance_method_call(ctx, object, property, args, None, call_byte_offset)
+}
+
+/// `recv.m(...args)`: the plain call's tower with the spread argument
+/// producer (`dynamic_dispatch_spread.rs`). `None`: the caller's generic
+/// spread path (a receiver the tower does not claim).
+pub(crate) fn try_lower_instance_method_spread_call(
+    ctx: &mut FnCtx<'_>,
+    object: &Expr,
+    property: &str,
+    args: &[perry_hir::CallArg],
+    call_byte_offset: u32,
+) -> Result<Option<String>> {
+    lower_instance_method_call(ctx, object, property, &[], Some(args), call_byte_offset)
+}
+
+fn lower_instance_method_call(
+    ctx: &mut FnCtx<'_>,
+    object: &Expr,
+    property: &str,
+    args: &[Expr],
+    spread: Option<&[perry_hir::CallArg]>,
     call_byte_offset: u32,
 ) -> Result<Option<String>> {
     // Runtime-derived evidence may identify the receiver directly. A declared
@@ -226,6 +350,9 @@ pub(crate) fn try_lower_instance_method_call(
         && !is_builtin_receiver
         && generator_receiver_candidate(ctx, receiver_class.as_deref(), property)
     {
+        if spread.is_some() {
+            return Ok(None);
+        }
         return crate::lower_call::lower_split_method_call(
             ctx,
             object,
@@ -251,8 +378,16 @@ pub(crate) fn try_lower_instance_method_call(
     // prototype guards names its body); every other receiver must have its
     // method read before the arguments, through the split method site.
     let split = (needs_dynamic_dispatch || typed_candidate)
-        && crate::expr::method_site::args_may_observe_lookup(ctx, args)
-        && crate::expr::method_site::method_site_enabled(ctx, property, args.len());
+        && match spread {
+            Some(list) => {
+                crate::lower_call::lookup_first::spread_args_may_observe_lookup(ctx, list)
+                    && crate::expr::method_site::method_site_enabled(ctx, property, list.len())
+            }
+            None => {
+                crate::expr::method_site::args_may_observe_lookup(ctx, args)
+                    && crate::expr::method_site::method_site_enabled(ctx, property, args.len())
+            }
+        };
     if needs_dynamic_dispatch || typed_candidate {
         // Find all (class_id → fn_name) for `property` — including
         // INHERITED methods. Per JS spec, `subInstance.method()` for a
@@ -419,6 +554,24 @@ pub(crate) fn try_lower_instance_method_call(
             }
             let closed = proven.as_ref().is_some_and(|(_, nullable)| !nullable);
             let split = split && !closed;
+            if let Some(list) = spread {
+                return spread::emit(
+                    ctx,
+                    spread::Site {
+                        object,
+                        property,
+                        args: list,
+                        implementors: &implementors,
+                        impl_meta: &impl_meta,
+                        impl_owner: &impl_owner,
+                        cased: &cased,
+                        proven: proven.as_ref(),
+                        split,
+                        call_byte_offset,
+                    },
+                )
+                .map(Some);
+            }
             let post_args_may_collect = ctx.strings.call_location_for(call_byte_offset).is_some()
                 || impl_meta
                     .iter()
@@ -437,12 +590,18 @@ pub(crate) fn try_lower_instance_method_call(
             // Object model step 3: the receiver's class id selects the
             // constant body, a branch over the compile-time set of cased
             // classes. 0 = no compiled body: the site's generic arm.
-            let selected = if let Some((_, nullable)) = &proven {
-                crate::expr::wpfacts_access::emit_class_id(ctx, &recv, *nullable)
+            // `arms`: the implementors a selection names (one per switch arm);
+            // `None` for a proven site, whose switch lists every class.
+            let (selected, arms) = if let Some((_, nullable)) = &proven {
+                (
+                    crate::expr::wpfacts_access::emit_class_id(ctx, &recv, *nullable),
+                    None,
+                )
             } else if cased.contains(&true) {
-                select::select(ctx, &recv, property, &implementors, &cased)
+                let (selected, arms) = select::select(ctx, &recv, property, &implementors, &cased);
+                (selected, Some(arms))
             } else {
-                "0".to_string()
+                ("0".to_string(), Some(Vec::new()))
             };
             // #11910: a receiver no compiled body claims reads its method
             // through the split method site before the arguments.
@@ -482,15 +641,17 @@ pub(crate) fn try_lower_instance_method_call(
             let case_idxs: Vec<(usize, usize)> = implementors
                 .iter()
                 .enumerate()
-                .filter(|&(i, _)| cased[i])
+                .filter(|&(i, _)| cased[i] && arms.as_ref().map_or(true, |a| a.contains(&i)))
                 .map(|(i, _)| (i, ctx.new_block(&format!("idispatch.case{i}"))))
                 .collect();
             let switch = match &proven {
                 // The proven classes' ids select their implementors. The last
                 // class is the default arm (the receiver is one of them), as
-                // the read shape's last slot is; a contract build lists every
-                // class and its default is the witness.
+                // the read shape's last slot is; a contract or
+                // facts-verification build lists every class and its default
+                // is the witness.
                 Some((map, nullable)) => {
+                    crate::verify_facts::tick(ctx);
                     let label_of = |i: usize| {
                         case_idxs
                             .iter()
@@ -498,7 +659,7 @@ pub(crate) fn try_lower_instance_method_call(
                             .map(|&(_, idx)| ctx.block_label(idx))
                             .expect("a proven class's implementor is cased")
                     };
-                    let contracts = crate::codegen::helpers::check_contracts();
+                    let contracts = crate::verify_facts::witnesses();
                     let (listed, default) = if *nullable || contracts {
                         (&map[..], generic_label.clone())
                     } else {
@@ -556,6 +717,13 @@ pub(crate) fn try_lower_instance_method_call(
                 );
                 let case_arg_slices: Vec<(crate::types::LlvmType, &str)> =
                     case_args.iter().map(|s| (DOUBLE, s.as_str())).collect();
+                // The facts prove the receiver is this arm's class (`proven`)
+                // and that class's layout never changes (`fixed_layout`): the
+                // arm needs no recheck.
+                let layout_proven = proven.is_some()
+                    && impl_owner[i]
+                        .as_deref()
+                        .is_some_and(|owner| tower_layout_proven(ctx, owner, implementors[i].0));
                 let v = match tower_pshape_route(
                     ctx,
                     impl_owner[i].as_deref(),
@@ -565,11 +733,7 @@ pub(crate) fn try_lower_instance_method_call(
                 ) {
                     Some(route) => {
                         let recv_handle = unbox_to_i64(ctx.block(), &recv_box);
-                        // The facts prove the receiver is this arm's class
-                        // (`proven`) and that class's layout never changes
-                        // (`fixed_layout`): the arm needs no recheck.
-                        let layout_proven = proven.is_some()
-                            && tower_layout_proven(ctx, implementors[i].0);
+                        let owner = impl_owner[i].as_deref().unwrap_or_default();
                         emit_tower_pshape_call(
                             ctx,
                             i,
@@ -577,6 +741,8 @@ pub(crate) fn try_lower_instance_method_call(
                             &recv_handle,
                             &case_arg_slices,
                             layout_proven,
+                            owner,
+                            implementors[i].0,
                         )
                     }
                     None => {
@@ -586,7 +752,29 @@ pub(crate) fn try_lower_instance_method_call(
                                 closed_bodies.len(),
                             );
                         }
-                        ctx.block().call(DOUBLE, fname, &case_arg_slices)
+                        // An index the site proves a Number takes the
+                        // clone split instead of the public dispatcher.
+                        let split = impl_owner[i].as_deref().and_then(|owner| {
+                            crate::lower_call::index_split::number_index_positions(
+                                ctx,
+                                owner,
+                                property,
+                                args,
+                                call_byte_offset,
+                            )
+                        });
+                        match split {
+                            Some((positions, params)) => {
+                                crate::lower_call::index_split::emit_number_index_split(
+                                    ctx,
+                                    fname,
+                                    &positions,
+                                    &params,
+                                    &case_arg_slices,
+                                )
+                            }
+                            None => ctx.block().call(DOUBLE, fname, &case_arg_slices),
+                        }
                     }
                 };
                 let after = ctx.block().label.clone();
@@ -600,13 +788,24 @@ pub(crate) fn try_lower_instance_method_call(
             // has none: its block is the contract build's witness, or dead.
             ctx.current_block = generic_idx;
             if closed {
-                if crate::codegen::helpers::check_contracts() {
-                    let site = ctx.wpfacts_sites as i64;
-                    ctx.wpfacts_sites += 1;
-                    let _ = ctx.block().call(
+                if crate::verify_facts::witnesses() {
+                    let ids: Vec<u32> = proven
+                        .as_ref()
+                        .map(|(map, _)| map.iter().map(|&(cid, _)| cid).collect())
+                        .unwrap_or_default();
+                    crate::expr::wpfacts_access::receiver_checked(ctx, object);
+                    let site = crate::verify_facts::site_arg(
+                        ctx,
+                        &format!("method .{property} receiver class_ids={ids:?}"),
+                        crate::verify_facts::Fact::Receiver,
+                        &ids,
+                    );
+                    let _ = crate::verify_facts::check(
+                        ctx,
                         I32,
-                        "perry_wpfacts_check_call_miss",
-                        &[(crate::types::PTR, "null"), (I64, &site.to_string())],
+                        "perry_wpfacts_check_miss",
+                        &[(DOUBLE, &recv_box)],
+                        &site,
                     );
                 }
                 ctx.block().unreachable();
@@ -652,6 +851,10 @@ pub(crate) fn try_lower_instance_method_call(
         }
     }
 
+    // A spread call the tower does not claim keeps the caller's generic path.
+    if spread.is_some() {
+        return Ok(None);
+    }
     if let Some(class_name) = receiver_class {
         // Step 1: walk parent chain for the static method name.
         let mut static_method: Option<(String, (String, String))> = None;
@@ -1125,7 +1328,7 @@ pub(crate) fn try_lower_instance_method_call(
                 let key = ctx.strings.intern(property);
                 let dispatch = ctx.strings.static_dispatch_global(key);
                 let method_id = crate::strings::emit_static_dispatch_id(ctx.block(), &dispatch);
-                let selected = select::select_with_word(
+                let (selected, arms) = select::select_with_word(
                     ctx,
                     &recv,
                     property,
@@ -1151,7 +1354,7 @@ pub(crate) fn try_lower_instance_method_call(
                 } else {
                     None
                 };
-                Some((selected, word, lookup))
+                Some((selected, word, lookup, arms))
             } else {
                 None
             };
@@ -1636,7 +1839,33 @@ pub(crate) fn try_lower_instance_method_call(
                     // already proven here — no guard is emitted on this path at
                     // all. Same ABI, so the call is unchanged apart from the
                     // callee name.
-                    let direct = ctx.block().call(DOUBLE, generic_target, &arg_slices);
+                    // An index the site proves a Number takes the clone
+                    // split here instead of the public dispatcher's guard.
+                    let split = (nonnegative_index_direct_name.is_none()
+                        && (Some(generic_target) == pshape_target.as_deref()
+                            || generic_target == fallback_fn.as_str()))
+                    .then(|| {
+                        crate::lower_call::index_split::number_index_positions(
+                            ctx,
+                            &class_name,
+                            property,
+                            args,
+                            call_byte_offset,
+                        )
+                    })
+                    .flatten();
+                    let direct = match split {
+                        Some((positions, params)) => {
+                            crate::lower_call::index_split::emit_number_index_split(
+                                ctx,
+                                generic_target,
+                                &positions,
+                                &params,
+                                &arg_slices,
+                            )
+                        }
+                        None => ctx.block().call(DOUBLE, generic_target, &arg_slices),
+                    };
                     super::super::method_override::publish_constructive_method_truthy(
                         ctx,
                         &fallback_fn,
@@ -1647,11 +1876,12 @@ pub(crate) fn try_lower_instance_method_call(
                 }
                 let selected_value = selection
                     .as_ref()
-                    .and_then(|(_, _, lookup)| lookup.as_ref())
+                    .and_then(|(_, _, lookup, _)| lookup.as_ref())
                     .map(|(_, root)| roots.reread_emitted(ctx, *root));
-                let certificate = selection.as_ref().map(|(selected, word, lookup)| {
+                let certificate = selection.as_ref().map(|(selected, word, lookup, arms)| {
                     crate::lower_call::method_override::ConstantMethodSelection {
                         selected,
+                        arms,
                         receiver_word: (!static_split).then_some(word.as_str()),
                         lookup: lookup
                             .as_ref()
@@ -1703,6 +1933,7 @@ pub(crate) fn try_lower_instance_method_call(
                     shape_only_guard,
                     &subclass_arms,
                     certificate.as_ref(),
+                    call_byte_offset,
                 ) {
                     roots.release(ctx);
                     return Ok(Some(guarded));

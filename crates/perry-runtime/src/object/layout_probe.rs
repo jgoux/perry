@@ -33,8 +33,14 @@
 //!
 //! An own data property; an overflow entry; a data property of the first
 //! prototype that holds the key, when every object before it proves the key
-//! absent. Everything else (an accessor, an exotic or per-object receiver, a
-//! chain that ends without the key, a builtin prototype that misses) is
+//! absent. An accessor found the same way (key list or overflow, own or on
+//! that prototype) is an answer of the shape too: [`pair_answer`] gives
+//! what [[Get]] returns without running user code (the getter's binding when
+//! its body is exactly `return <captured binding>`, `undefined` for a pair
+//! with no getter), and otherwise `TAG_HOLE`, whose decline edge
+//! (`js_object_get_field_slow`) reads the same pair and calls the getter with
+//! the receiver as `this`. Everything else (an exotic or per-object receiver,
+//! a chain that ends without the key, a builtin prototype that misses) is
 //! `TAG_HOLE`, and the site takes its complete slow operation.
 #[path = "layout_probe_indexed.rs"]
 mod indexed;
@@ -45,7 +51,8 @@ mod store_target;
 #[path = "layout_probe_unloaded.rs"]
 mod unloaded;
 
-use super::shapes_store::{ShapeRecord, FLAT_BASE_OFFSET};
+pub(crate) use super::shapes_store::ShapeRecord;
+use super::shapes_store::FLAT_BASE_OFFSET;
 use crate::codegen_abi::LayoutWord;
 use crate::object::layout_desc::note_run;
 use crate::object::ObjectHeader;
@@ -87,16 +94,29 @@ const DIRECT_ENTRY: u32 = 1 << 29;
 /// slot is the position's index word, and the hit is one load. Never with
 /// [`TEXT_ENTRY`] or [`ALIAS_ENTRY`], whose index words hold a hash or atom.
 const SLOT_ENTRY: u32 = 1 << 28;
-/// A bucket entry whose key is a public accessor stored at an inline slot of
-/// every receiver of the record: the slot is the position's index word, and
-/// the accessor pair is one load (`accessor_at` would read exactly that
-/// slot). A fact of the immutable list, its attributes and the inline slot
-/// count, like [`SLOT_ENTRY`]; never with [`TEXT_ENTRY`] or [`ALIAS_ENTRY`].
-/// The hit path reads such a key as it reads any accessor: it declines, and
-/// the site slow entry (`js_object_get_field_slow`) calls the getter.
+/// A bucket entry whose key is a public accessor stored at the same storage
+/// slot of every receiver of the record: the position's index word names
+/// that slot, with [`PAIR_SPILLED`] when it lies past the record's inline
+/// slots (the receiver's spill holds the pair at that field index). The pair
+/// is one load, inline or from the spill ([`index_pair_bits`]). A fact of
+/// the immutable list, its attributes and the inline slot count, like
+/// [`SLOT_ENTRY`]; never with [`TEXT_ENTRY`] or [`ALIAS_ENTRY`].
 const ACCESSOR_ENTRY: u32 = 1 << 27;
+/// The flag of an [`ACCESSOR_ENTRY`] index word whose slot is no inline slot
+/// of the record (`slot >= live_inline_slot_count`, the rule `value_at`
+/// applies per read, decided once when the index is derived).
+const PAIR_SPILLED: u64 = 1 << 32;
+/// [`own_entry`]'s pair word when the index names no accessor slot.
+const NO_PAIR: u64 = u64::MAX;
+/// A bucket entry whose key is a plain writable data property (no accessor,
+/// not private, writable) at an inline slot of every receiver of the record
+/// ([`DIRECT_ENTRY`] or [`SLOT_ENTRY`]): a store hit writes that slot with no
+/// further lookup of the key's attributes or storage (DESIGN_R §3, the
+/// entry word carries slot and attribute class). A fact of the immutable
+/// list and its attributes, derived with the index.
+const WRITE_ENTRY: u32 = 1 << 26;
 /// The position bits of a bucket entry.
-const POS_BITS: u32 = ACCESSOR_ENTRY - 1;
+const POS_BITS: u32 = WRITE_ENTRY - 1;
 /// [`hit_value`]'s slot when the hit is no single load.
 const NO_LOAD: u32 = u32::MAX;
 /// The bits of a probe word that are not the position table's address.
@@ -167,6 +187,96 @@ fn hole() -> f64 {
     f64::from_bits(TAG_HOLE)
 }
 
+/// What a read of the accessor whose pair is `pair_bits` returns, when that
+/// needs no user code: the getter's binding when the getter's body is
+/// exactly `return <captured binding>` (`FN_RETURNS_CAPTURE`, read with the
+/// loads the body executes) and the half carries no class getter entry;
+/// `undefined` for a pair with no getter; else `TAG_HOLE`, and the site's
+/// decline edge calls the getter (`get_slow::call_getter`). A slot that holds
+/// no pair declines: the complete read decides. The pair is the shape's own
+/// answer for the key, so no site asks by name whether a getter may be
+/// reached. A GC leaf.
+///
+/// One straight path, ordered for the common decline (a getter that runs
+/// user code): pair -> getter word -> its info flags -> hole. The class
+/// entry word is read only on the two answering paths.
+#[inline(always)]
+unsafe fn pair_answer(pair_bits: u64) -> f64 {
+    use crate::object::accessor_pair::{get_word_is_closure, raw_get_is_class_entry};
+    let Some((get, raw)) = crate::object::accessor_pair::pair_getter_words(pair_bits) else {
+        return hole();
+    };
+    if !get_word_is_closure(get) {
+        // No getter: [[Get]] is `undefined`, unless the half is a class entry.
+        return if raw_get_is_class_entry(raw) {
+            hole()
+        } else {
+            f64::from_bits(crate::value::TAG_UNDEFINED)
+        };
+    }
+    match crate::closure::returned_capture_bits(get) {
+        Some(v) if !raw_get_is_class_entry(raw) => f64::from_bits(v),
+        _ => hole(),
+    }
+}
+
+/// The accessor pair `obj` stores where the index's [`ACCESSOR_ENTRY`] word
+/// `word` names it: one inline load, or with [`PAIR_SPILLED`] the spill's
+/// word at that field index (`None` when this receiver's spill holds none,
+/// as [`accessor_slot_bits`] answers).
+#[inline(always)]
+unsafe fn index_pair_bits(obj: *const ObjectHeader, word: u64) -> Option<u64> {
+    let slot = word as u32 as usize;
+    if word & PAIR_SPILLED != 0 {
+        return crate::object::spill::spill_get_present(obj as usize, slot);
+    }
+    Some(*((obj as *const u8).add(std::mem::size_of::<ObjectHeader>() + slot * 8) as *const u64))
+}
+
+/// [`pair_answer`] for the public accessor whose pair the index's
+/// [`ACCESSOR_ENTRY`] word `word` names: one load, getter half only. Out of
+/// line and cold, so the indexed data path keeps its registers.
+#[cold]
+#[inline(never)]
+unsafe fn accessor_answer_slot(obj: *const ObjectHeader, word: u64) -> f64 {
+    match index_pair_bits(obj, word) {
+        Some(bits) => pair_answer(bits),
+        None => hole(),
+    }
+}
+
+/// [`pair_answer`] for the overflow entry `entry` of `table` (an accessor
+/// entry: its value is the pair). Cold: an overflow data read never enters.
+#[cold]
+#[inline(never)]
+unsafe fn overflow_accessor_answer(
+    table: *const crate::object::overflow::Table,
+    obj: *const ObjectHeader,
+    entry: u32,
+) -> f64 {
+    crate::object::overflow::get_from(table, obj, entry).map_or_else(hole, |pair| pair_answer(pair))
+}
+
+/// [`pair_answer`] for the public accessor at key position `pos` of `obj`
+/// (record `r`) when the index names no slot for it. A private entry, or a
+/// position that holds no accessor, declines.
+#[cold]
+#[inline(never)]
+unsafe fn accessor_answer_at(obj: *const ObjectHeader, r: *const ShapeRecord, pos: u32) -> f64 {
+    if crate::object::key_attrs::keys_entry(
+        (*r).keys as usize as *const crate::array::ArrayHeader,
+        pos,
+    ) & crate::object::key_attrs::ENTRY_PRIVATE
+        != 0
+    {
+        return hole();
+    }
+    match accessor_slot_bits(obj, r, pos) {
+        Some(bits) => pair_answer(bits),
+        None => hole(),
+    }
+}
+
 /// Release the position table a probe word owns (record removal).
 pub(crate) fn release_probe(word: u64) {
     let table = (word & !PROBE_FLAGS) as usize;
@@ -216,7 +326,15 @@ unsafe fn key_word_hash(bits: u64) -> Option<u64> {
 #[cold]
 #[inline(never)]
 unsafe fn derive(r: *mut ShapeRecord) -> u64 {
-    let mut word = derive_word(&*r);
+    // I32 at rest (PR C): the probe returns slot words as JS values and its
+    // site memos keep shape/slot pairs, so it declines every key of a record
+    // with an I32 lane; the complete read decodes through the layout
+    // accessor (`layout_slot::slot_get`).
+    let mut word = if (*r).i32_lanes() != 0 {
+        PROBE_READY | PROBE_DECLINE
+    } else {
+        derive_word(&*r)
+    };
     // Verify mode sends every probe of the record through the cold path,
     // where its answer is held for the slow entry's check.
     if verify::on() {
@@ -324,7 +442,7 @@ pub(crate) unsafe fn mint_colour_masks(rec: &mut ShapeRecord) {
         && !keys.is_null()
         && !crate::object::overflow::is_table(keys)
         && crate::value::addr_class::try_read_gc_header(keys as usize)
-            .is_some_and(|gc| gc.obj_type == crate::gc::GC_TYPE_ARRAY)
+            .is_some_and(|gc| crate::gc_type_is_array!(gc.obj_type))
     {
         colour_masks(rec)
     } else {
@@ -394,12 +512,16 @@ unsafe fn colour_masks(rec: &ShapeRecord) -> ([u64; 2], [u64; 2]) {
         {
             continue;
         }
+        // An I32 lane's word is no JS value: a 2c arm never reads it.
+        if (rec.lane(storage) == crate::object::field_rep::REP_SPECIAL)
+            && !rec.lane_is_constfn(storage)
+        {
+            continue;
+        }
         mask[(bit / 64) as usize] |= 1u64 << (bit % 64);
         if store_layout
             && entry & crate::object::key_attrs::ENTRY_NON_WRITABLE == 0
-            && (storage >= crate::object::field_rep::REP_SLOTS
-                || crate::object::field_rep::slot_rep(rec.rep, storage)
-                    != crate::object::field_rep::REP_SPECIAL)
+            && rec.lane(storage) != crate::object::field_rep::REP_SPECIAL
         {
             store[(bit / 64) as usize] |= 1u64 << (bit % 64);
         }
@@ -473,18 +595,6 @@ unsafe fn inline_slot(
     }
     let slot = key_storage_slot(keys, pos);
     (slot != pos && slot < rec.live_inline_slot_count && slot != NO_LOAD).then_some(slot)
-}
-
-/// May a TEXT entry of `rec`'s list prove absence (see `derive_word`)?
-unsafe fn text_proves_absence(rec: &ShapeRecord) -> bool {
-    if rec.object_kind() == super::ShapeObjectKind::Ordinary {
-        return true;
-    }
-    let dir = super::ordinary_dir_addr();
-    match object_prototype(dir) {
-        Some(p) => std::ptr::eq(record_of(dir, LayoutWord((*p).parent_class_id)), rec),
-        None => false,
-    }
 }
 
 /// A TEXT entry's word (a short or plain string no program atom named when
@@ -562,10 +672,10 @@ unsafe fn own_position(r: *mut ShapeRecord, key_bits: u64, hash: u64) -> Result<
     own_entry(r, key_bits, hash).map(|(pos, _)| pos)
 }
 
-/// [`own_position`] and the inline slot of the accessor pair there when the
-/// index names one ([`ACCESSOR_ENTRY`]), else [`NO_LOAD`].
+/// [`own_position`] and the index word naming the accessor pair's slot
+/// there when the index names one ([`ACCESSOR_ENTRY`]), else [`NO_PAIR`].
 #[inline(always)]
-unsafe fn own_entry(r: *mut ShapeRecord, key_bits: u64, hash: u64) -> Result<(u32, u32), bool> {
+unsafe fn own_entry(r: *mut ShapeRecord, key_bits: u64, hash: u64) -> Result<(u32, u64), bool> {
     let word = probe_word(r);
     if word == 0 || word & PROBE_DECLINE != 0 {
         return Err(false);
@@ -581,7 +691,7 @@ unsafe fn own_entry(r: *mut ShapeRecord, key_bits: u64, hash: u64) -> Result<(u3
         let mut i = 0;
         while i < count {
             if *words.add(i as usize) == key_bits {
-                return Ok((i, NO_LOAD));
+                return Ok((i, NO_PAIR));
             }
             i += 1;
         }
@@ -598,9 +708,9 @@ unsafe fn own_entry(r: *mut ShapeRecord, key_bits: u64, hash: u64) -> Result<(u3
         }
         if let Some(p) = bucket_matches(table, list, pos, key_bits, hash) {
             let pair = if pos & ACCESSOR_ENTRY != 0 {
-                KeyIndex::word(table, p) as u32
+                KeyIndex::word(table, p)
             } else {
-                NO_LOAD
+                NO_PAIR
             };
             return Ok((p, pair));
         }
@@ -682,6 +792,15 @@ pub unsafe extern "C" fn perry_probe_get(
     key_bits: u64,
     hash: u64,
 ) -> f64 {
+    // Census builds: a keyed read of a global property names its key
+    // (§2.10.13), like the binding read below.
+    #[cfg(perry_gc_instruments)]
+    let mut scratch = [0; crate::value::SHORT_STRING_MAX_LEN];
+    #[cfg(perry_gc_instruments)]
+    let _gkey = crate::snap_census::global_key(
+        (obj_biased as usize).wrapping_add(perry_abi::RECEIVER_HANDLE_FLOOR),
+        || crate::string::js_string_key_bytes(crate::JSValue::from_bits(key_bits), &mut scratch),
+    );
     probe_get::<true>(dir, obj_biased, key_bits, hash)
 }
 
@@ -698,6 +817,14 @@ pub unsafe extern "C" fn perry_probe_get_binding(
     key_bits: u64,
     hash: u64,
 ) -> f64 {
+    // Census builds: a global binding's read names its key (§2.10.13).
+    #[cfg(perry_gc_instruments)]
+    let mut scratch = [0; crate::value::SHORT_STRING_MAX_LEN];
+    #[cfg(perry_gc_instruments)]
+    let _gkey = crate::snap_census::global_key(
+        (obj_biased as usize).wrapping_add(perry_abi::RECEIVER_HANDLE_FLOOR),
+        || crate::string::js_string_key_bytes(crate::JSValue::from_bits(key_bits), &mut scratch),
+    );
     probe_get::<false>(dir, obj_biased, key_bits, hash)
 }
 
@@ -758,9 +885,33 @@ unsafe fn site_key_hash<const LAZY_HASH: bool>(key_bits: u64, hash: u64) -> u64 
     }
 }
 
-/// Actual table ownership was proved by the front on this NoCollect path.
-/// Keep the operation's inherited-call/verify register needs out of receivers
-/// whose ordinary record already answers without an owned table.
+/// [`owned_get`]'s accessor arm, its tail: the checked entry read of the
+/// pair, its answer and (with `ABSENT`) the verify hook the data arm runs.
+/// Cold, so the data arm keeps its code and registers.
+#[cold]
+#[inline(never)]
+unsafe fn owned_accessor_answer<const ABSENT: bool>(
+    table: *const crate::object::overflow::Table,
+    obj: *const ObjectHeader,
+    entry: u32,
+    r: *mut ShapeRecord,
+    key_bits: u64,
+) -> f64 {
+    let record = super::ShapeRecordRef(std::ptr::NonNull::new_unchecked(r));
+    let value = crate::object::overflow::get_found_from_record(table, obj, entry, record)
+        .map_or_else(hole, |pair| pair_answer(pair));
+    if ABSENT {
+        verify::answer(obj as usize, key_bits, value)
+    } else {
+        value
+    }
+}
+
+/// The read of a receiver with a table, a tail of the front (which proved
+/// the current ordinary record and the actual table): one lookup of the
+/// table decides it. An entry that holds its own data value is the answer
+/// here, in a leaf with no frame, and so is a reference to a fixed inline
+/// slot; an accessor pair, a spilled fixed slot and a miss are tails.
 #[inline(never)]
 unsafe fn owned_get<const ABSENT: bool, const LAZY_HASH: bool>(
     dir: *const u8,
@@ -772,8 +923,11 @@ unsafe fn owned_get<const ABSENT: bool, const LAZY_HASH: bool>(
 ) -> f64 {
     // A1_UNPROVEN: record-first: probe receiver before its record (kind-A/B question for S0f).
     let meta = crate::meta_read!(crate::meta_obj_runtime_born!(obj as *mut _));
-    if (*obj).class_id == crate::object::NATIVE_MODULE_CLASS_ID
-        || (*meta).elements != 0
+    // A native namespace has its own record kind
+    // (`shapes_store_kind::receiver_ordinary_kind`), so the front's kind
+    // test excludes it.
+    debug_assert!((*obj).class_id != crate::object::NATIVE_MODULE_CLASS_ID);
+    if (*meta).elements != 0
         || (*meta).flags
             & (crate::object::OBJECT_META_FLAG_EXOTIC_READ_RECEIVER
                 | crate::object::OBJECT_META_FLAG_NATIVE_ALIAS)
@@ -781,34 +935,77 @@ unsafe fn owned_get<const ABSENT: bool, const LAZY_HASH: bool>(
     {
         return hole();
     }
-    let hash = site_key_hash::<LAZY_HASH>(key_bits, hash);
-    let value = match crate::object::overflow::find_hashed(table, key_bits, hash) {
-        Some(entry) => {
-            if *crate::object::overflow::attrs_at(table, entry) as u8
-                & crate::object::key_attrs::ENTRY_ACCESSOR_MASK
-                != 0
-            {
-                hole()
-            } else {
-                // The front proved this current ordinary record and actual
-                // table; find_hashed just proved the live entry. Consume those
-                // same facts through the shared checked entry reader.
-                let record = super::ShapeRecordRef(std::ptr::NonNull::new_unchecked(r));
-                crate::object::overflow::get_found_from_record(table, obj, entry, record)
-                    .map(f64::from_bits)
-                    .unwrap_or_else(hole)
-            }
-        }
-        // The actual table has proved own absence. Continue through
-        // the existing current-shape prototype walk, without deriving
-        // a redundant receiver-key index or learning an overflow memo.
-        None => inherited_get::<ABSENT>(dir, obj, r, key_bits, hash),
+    // One lookup of the table decides the read. A data entry is the answer
+    // here, with no frame: its own value word, or the word of the fixed
+    // inline slot it refers to. An accessor pair, a spilled fixed slot and
+    // a miss are tails.
+    let Some(entry) = crate::object::overflow::find_hashed_with(table, key_bits, || {
+        site_key_hash::<LAZY_HASH>(key_bits, hash)
+    }) else {
+        return owned_miss::<ABSENT, LAZY_HASH>(dir, obj, r, key_bits, hash);
     };
+    let Some(word) =
+        crate::object::overflow::found_data_word(table, obj, entry, (*r).live_inline_slot_count)
+    else {
+        return owned_found::<ABSENT>(table, obj, entry, r, key_bits);
+    };
+    let value = f64::from_bits(word);
     if ABSENT {
         verify::answer(obj as usize, key_bits, value)
     } else {
         value
     }
+}
+
+/// The table front's found entry that one load does not answer
+/// (`overflow::found_data_word`): an accessor pair, or a reference to a fixed
+/// slot that is spilled or holds a lane word. Out of line, a tail of the
+/// front: the front proved this current ordinary record and actual table and
+/// its lookup proved the live entry; the shared checked entry reader consumes
+/// those same facts.
+#[inline(never)]
+unsafe fn owned_found<const ABSENT: bool>(
+    table: *const crate::object::overflow::Table,
+    obj: *const ObjectHeader,
+    entry: u32,
+    r: *mut ShapeRecord,
+    key_bits: u64,
+) -> f64 {
+    if *crate::object::overflow::attrs_at(table, entry) as u8
+        & crate::object::key_attrs::ENTRY_ACCESSOR_MASK
+        != 0
+    {
+        // The entry's value is its accessor pair: one tail call, so
+        // nothing of the data arm stays live across it.
+        return owned_accessor_answer::<ABSENT>(table, obj, entry, r, key_bits);
+    }
+    let record = super::ShapeRecordRef(std::ptr::NonNull::new_unchecked(r));
+    let value = crate::object::overflow::get_found_from_record(table, obj, entry, record)
+        .map(f64::from_bits)
+        .unwrap_or_else(hole);
+    if ABSENT {
+        verify::answer(obj as usize, key_bits, value)
+    } else {
+        value
+    }
+}
+
+/// The table front's miss: the actual table has proved own absence. Continue
+/// through the existing current-shape prototype walk, without deriving a
+/// redundant receiver-key index or learning an overflow memo. Out of line, a
+/// tail of the front, and itself only the hash and a tail call: the chain's
+/// answer is returned as the front of a receiver with no table returns it
+/// (`probe_get_absent`), so the miss keeps no frame for the verify hook.
+#[inline(never)]
+unsafe fn owned_miss<const ABSENT: bool, const LAZY_HASH: bool>(
+    dir: *const u8,
+    obj: *const ObjectHeader,
+    r: *mut ShapeRecord,
+    key_bits: u64,
+    hash: u64,
+) -> f64 {
+    let hash = site_key_hash::<LAZY_HASH>(key_bits, hash);
+    inherited_get::<ABSENT>(dir, obj, r, key_bits, hash)
 }
 
 /// The own-data front. With `SITE` (a compile-time choice) every own miss
@@ -826,10 +1023,17 @@ unsafe fn probe_get_at<const ABSENT: bool, const SITE: bool, const LAZY_HASH: bo
     // tail call, so the leaf saves nothing on a hit.
     let obj =
         (obj_biased as usize).wrapping_add(perry_abi::RECEIVER_HANDLE_FLOOR) as *const ObjectHeader;
+    if (*obj).class_id == crate::object::deferred_namespace::DEFERRED_NAMESPACE_CLASS_ID {
+        return hole();
+    }
     let word = (*obj).parent_class_id;
     let r = record_of(dir, LayoutWord(word));
     if r.is_null() {
-        return array_named_get::<ABSENT>(
+        // An exotic receiver whose named own keys live in an ordinary bag
+        // answers an own key from that bag first, by the ordinary own arm.
+        // Out of line and cold like the exotic continuation it replaces, so
+        // the ordinary front keeps its layout and caller-saved registers.
+        return bag_first_get::<ABSENT>(
             dir,
             obj,
             key_bits,
@@ -927,6 +1131,7 @@ unsafe fn plain_data_at(r: *const ShapeRecord, pos: u32) -> bool {
 /// Is position `pos` of record `r` an accessor or a private name (not
 /// [`plain_data_at`])? Out of line: the chain walk asks it only for a hole.
 #[cold]
+#[optimize(size)]
 #[inline(never)]
 unsafe fn attributed_at(r: *const ShapeRecord, pos: u32) -> bool {
     !plain_data_at(r, pos)
@@ -946,7 +1151,7 @@ unsafe fn own_hole<const ABSENT: bool>(
     hash: u64,
 ) -> f64 {
     if !plain_data_at(r, pos) {
-        return hole();
+        return accessor_answer_at(obj, r, pos);
     }
     own_absent::<ABSENT>(dir, obj, r, key_bits, hash)
 }
@@ -964,8 +1169,11 @@ unsafe fn own_value<const ABSENT: bool>(
     hash: u64,
 ) -> f64 {
     let v = value_at(obj, r, pos);
-    if v.to_bits() != TAG_HOLE || !plain_data_at(r, pos) {
+    if v.to_bits() != TAG_HOLE {
         return v;
+    }
+    if !plain_data_at(r, pos) {
+        return accessor_answer_at(obj, r, pos);
     }
     own_absent::<ABSENT>(dir, obj, r, key_bits, hash)
 }
@@ -1017,7 +1225,7 @@ unsafe fn array_named_get<const ABSENT: bool>(
     key_bits: u64,
     hash: u64,
 ) -> f64 {
-    let v = exotic_get::<ABSENT>(dir, obj, key_bits, hash);
+    let v = exotic_get::<ABSENT, true>(dir, obj, key_bits, hash);
     if ABSENT {
         verify::answer(obj as usize, key_bits, v)
     } else {
@@ -1025,8 +1233,98 @@ unsafe fn array_named_get<const ABSENT: bool>(
     }
 }
 
+/// The read of an exotic receiver (no ordinary record): its bag's own key
+/// by the ordinary own arm ([`bag_own`]), else the exotic continuation.
+#[cold]
+#[inline(never)]
+unsafe fn bag_first_get<const ABSENT: bool>(
+    dir: *const u8,
+    obj: *const ObjectHeader,
+    key_bits: u64,
+    hash: u64,
+) -> f64 {
+    match bag_own(dir, obj, key_bits, hash) {
+        Ok(v) if ABSENT => verify::answer(obj as usize, key_bits, v),
+        Ok(v) => v,
+        Err(true) => array_named_get_past_bag::<ABSENT>(dir, obj, key_bits, hash),
+        Err(false) => array_named_get::<ABSENT>(dir, obj, key_bits, hash),
+    }
+}
+
+/// [`array_named_get`] after [`bag_own`] proved the key absent from the
+/// receiver's bag (or found no bag): the exotic own keys, then the chain.
+#[cold]
+#[inline(never)]
+unsafe fn array_named_get_past_bag<const ABSENT: bool>(
+    dir: *const u8,
+    obj: *const ObjectHeader,
+    key_bits: u64,
+    hash: u64,
+) -> f64 {
+    let v = exotic_get::<ABSENT, false>(dir, obj, key_bits, hash);
+    if ABSENT {
+        verify::answer(obj as usize, key_bits, v)
+    } else {
+        v
+    }
+}
+
+/// `atom_hash(b"length")`: an array's `length` is its header's, never a
+/// key of its bag.
+const LENGTH_HASH: u64 = crate::object::runtime_layouts::atom_hash(b"length");
+
+/// The own key `key_bits` (hash `hash`) of an exotic receiver whose named
+/// own properties live in an ordinary bag object (a function's `props`, an
+/// array's `named`), read by the ordinary own arm on that bag: `Ok(value)`
+/// for a hit (a hole when the entry is no plain data slot, which the site
+/// treats as a decline, as for any receiver), `Err(true)` when the bag's
+/// record proves the key absent or there is no bag, `Err(false)` when the
+/// bag cannot answer here (no ordinary or derived record, an owned table, a
+/// forwarded cell, another receiver kind, an array's `length`).
 #[inline(always)]
-unsafe fn exotic_get<const ABSENT: bool>(
+pub(super) unsafe fn bag_own(
+    dir: *const u8,
+    obj: *const ObjectHeader,
+    key_bits: u64,
+    hash: u64,
+) -> Result<f64, bool> {
+    let header = crate::gc::header_from_trusted_user_ptr(obj.cast());
+    if (*header).gc_flags & crate::gc::GC_FLAG_FORWARDED != 0 {
+        return Err(false);
+    }
+    let bag = match (*header).obj_type {
+        crate::gc_array_type_pat!() => {
+            if hash == LENGTH_HASH {
+                return Err(false);
+            }
+            (*(obj as *const crate::array::ArrayHeader)).named as *const ObjectHeader
+        }
+        crate::gc::GC_TYPE_CLOSURE => {
+            (*(obj as *const crate::closure::ClosureHeader)).props as *const ObjectHeader
+        }
+        _ => return Err(false),
+    };
+    if bag.is_null() {
+        return Err(true);
+    }
+    let word = (*bag).parent_class_id;
+    if word & crate::object::overflow::SHADOW_BIT != 0 {
+        return Err(false);
+    }
+    let r = record_of(dir, LayoutWord(word));
+    if r.is_null() {
+        return Err(false);
+    }
+    let pw = (*r).probe;
+    if pw & (PROBE_READY | PROBE_DECLINE | PROBE_CHECKED | PROBE_ATOMS) != PROBE_READY | PROBE_ATOMS
+    {
+        return Err(false);
+    }
+    list_position(r, pw, key_bits, hash).map(|(pos, load)| hit_value(bag, r, pos, load))
+}
+
+#[inline(always)]
+unsafe fn exotic_get<const ABSENT: bool, const BAG: bool>(
     dir: *const u8,
     obj: *const ObjectHeader,
     key_bits: u64,
@@ -1037,7 +1335,7 @@ unsafe fn exotic_get<const ABSENT: bool>(
         return hole();
     }
     let (named, proto, function) = match (*header).obj_type {
-        crate::gc::GC_TYPE_ARRAY => {
+        crate::gc_array_type_pat!() => {
             // Array length is an intrinsic own property, stored in the array
             // header rather than its named bag. Never prove it absent by
             // walking the bag and prototypes (including for computed keys
@@ -1065,15 +1363,21 @@ unsafe fn exotic_get<const ABSENT: bool>(
         crate::gc::GC_TYPE_CLOSURE => {
             let c = obj as *const crate::closure::ClosureHeader;
             let plain = crate::closure::shape::closure_on_plain_function_shape(c);
+            // A plain or bound function's [[Prototype]] is its shape's
+            // identity (`%Function.prototype%` until a link moves it).
+            // A bound function's intrinsic `name` and `length` are its
+            // target's, not static data of a body: those keys decline.
             (
                 (*c).props as *const ObjectHeader,
-                plain.then_some(crate::closure::shape::INTRINSIC_SERIAL_FUNCTION),
+                plain
+                    .then(|| crate::object::shapes::shape_proto_id((*c).shape_id))
+                    .flatten(),
                 plain,
             )
         }
         _ => return hole(),
     };
-    if !named.is_null() {
+    if BAG && !named.is_null() {
         let word = (*named).parent_class_id;
         let r = record_of(dir, LayoutWord(word));
         if r.is_null() {
@@ -1091,6 +1395,18 @@ unsafe fn exotic_get<const ABSENT: bool>(
             Err(false) => return hole(),
         }
     }
+    // A bound function is asked only after its bag missed (an own key is
+    // the common read).
+    let proto = match proto {
+        None if (*header).obj_type == crate::gc::GC_TYPE_CLOSURE
+            && bound_on_described_shape(obj.cast(), hash) =>
+        {
+            crate::object::shapes::shape_proto_id(
+                (*obj.cast::<crate::closure::ClosureHeader>()).shape_id,
+            )
+        }
+        proto => proto,
+    };
     let Some(serial) = proto else {
         return hole();
     };
@@ -1131,6 +1447,26 @@ unsafe fn exotic_get<const ABSENT: bool>(
         };
     }
     exotic_chain::<ABSENT>(dir, p, key_bits, hash)
+}
+
+/// Is `c` a bound function on a described Function shape (its own keys are
+/// its bag's, its [[Prototype]] its shape's identity), read for a key other
+/// than the intrinsic `name`, `length` and `prototype`, which a bound
+/// function answers from its target or not at all?
+///
+/// # Safety
+/// `c` is a live closure cell.
+#[inline(never)]
+unsafe fn bound_on_described_shape(c: *const crate::closure::ClosureHeader, hash: u64) -> bool {
+    use crate::object::runtime_layouts::atom_hash as h;
+    const NAME: u64 = h(b"name");
+    const LENGTH: u64 = h(b"length");
+    const PROTOTYPE: u64 = h(b"prototype");
+    let info = (*c).info;
+    !info.is_null()
+        && (*info).code == crate::closure::BOUND_FUNCTION_FUNC_PTR
+        && (*c).shape_id != crate::closure::shape::function_dictionary_shape()
+        && !matches!(hash, NAME | LENGTH | PROTOTYPE)
 }
 
 /// [`chain_from`] from an exotic receiver's builtin prototype `next`: there
@@ -1304,9 +1640,11 @@ unsafe fn overflow_then_inherited<const ABSENT: bool>(
     }
 }
 
-/// The overflow entry for `key_bits`: `Some(value)` (`TAG_HOLE` for an
-/// accessor, which the slow operation calls), `None` when the overflow
-/// proves the key absent.
+/// The overflow entry for `key_bits`: `Some(value)` (for an accessor, its
+/// [`pair_answer`]), `None` when the overflow proves the key absent.
+/// Inlined at its callers as before the accessor arm existed: that arm is
+/// one cold call.
+#[inline(always)]
 unsafe fn overflow_get(obj: *const ObjectHeader, key_bits: u64, hash: u64) -> Option<f64> {
     // A1_UNPROVEN: record-first: probe receiver before its record (kind-A/B question for S0f).
     let meta = crate::meta_read!(crate::meta_obj_runtime_born!(obj as *mut _));
@@ -1322,7 +1660,7 @@ unsafe fn overflow_get(obj: *const ObjectHeader, key_bits: u64, hash: u64) -> Op
         & crate::object::key_attrs::ENTRY_ACCESSOR_MASK
         != 0
     {
-        return Some(hole());
+        return Some(overflow_accessor_answer(t, obj, i));
     }
     Some(
         crate::object::overflow::get_from(t, obj, i)
@@ -1377,11 +1715,28 @@ pub(crate) unsafe fn probe_accessor(
 ///
 /// # Safety
 /// `obj` is a live object above the handle band.
+#[inline]
 pub(crate) unsafe fn probe_accessor_word(
     obj: *const ObjectHeader,
     key_bits: u64,
     hash: u64,
 ) -> Option<crate::object::accessor_pair::Accessor> {
+    probe_accessor_slot(obj, key_bits, hash)
+        .map(|bits| crate::object::accessor_pair::pair_of_value(bits).unwrap_or_default())
+}
+
+/// The layout walk of [`probe_accessor_word`], answering the holder's
+/// accessor slot word (the pair value; a word that is no pair reads as the
+/// accessor with neither half). A read decodes only the getter half
+/// (`accessor_pair::getter_half_of_value`).
+///
+/// # Safety
+/// `obj` is a live object above the handle band.
+pub(crate) unsafe fn probe_accessor_slot(
+    obj: *const ObjectHeader,
+    key_bits: u64,
+    hash: u64,
+) -> Option<u64> {
     if (obj as usize) < perry_abi::RECEIVER_HANDLE_FLOOR {
         return None;
     }
@@ -1405,10 +1760,12 @@ pub(crate) unsafe fn probe_accessor_word(
                 Err(false) => return None,
                 Err(true) => {}
             }
-            if (*cur).parent_class_id & crate::object::overflow::SHADOW_BIT != 0
-                && !matches!(overflow_get(cur, key_bits, hash), None)
-            {
-                return None;
+            if (*cur).parent_class_id & crate::object::overflow::SHADOW_BIT != 0 {
+                match overflow_accessor(cur, key_bits, hash) {
+                    OverflowKey::Absent => {}
+                    OverflowKey::Accessor(bits) => return Some(bits),
+                    OverflowKey::Data => return None,
+                }
             }
         } else {
             return None;
@@ -1442,32 +1799,61 @@ pub(crate) unsafe fn probe_accessor_word(
     None
 }
 
-/// The accessor at key position `pos` of `obj` (record `r`): one load of
-/// inline slot `pair` when the record's index names it ([`ACCESSOR_ENTRY`]),
-/// else ([`NO_LOAD`]) [`accessor_at`].
+/// What `obj`'s overflow holds for `key_bits` (atom hash `hash`).
+enum OverflowKey {
+    /// No overflow, or the overflow proves the key absent.
+    Absent,
+    /// An accessor entry: its slot word (the pair; 0 when unreadable).
+    Accessor(u64),
+    /// A data entry.
+    Data,
+}
+
+/// The overflow's entry for `key_bits`, as [`probe_accessor_word`] needs it:
+/// an accessor entry is the walk's answer exactly as a key-list accessor is.
+unsafe fn overflow_accessor(obj: *const ObjectHeader, key_bits: u64, hash: u64) -> OverflowKey {
+    // A1_UNPROVEN: record-first: probe receiver before its record (kind-A/B question for S0f).
+    let meta = crate::meta_read!(crate::meta_obj_runtime_born!(obj as *mut _));
+    if meta.is_null() || (*meta).overflow == 0 {
+        return OverflowKey::Absent;
+    }
+    let t = (*meta).overflow as usize as *const crate::object::overflow::Table;
+    let Some(i) = crate::object::overflow::find_hashed(t, key_bits, hash) else {
+        return OverflowKey::Absent;
+    };
+    if *crate::object::overflow::attrs_at(t, i) as u8
+        & crate::object::key_attrs::ENTRY_ACCESSOR_MASK
+        == 0
+    {
+        return OverflowKey::Data;
+    }
+    OverflowKey::Accessor(crate::object::overflow::get_from(t, obj, i).unwrap_or(0))
+}
+
+/// The accessor slot word at key position `pos` of `obj` (record `r`): one
+/// load where the record's index names the slot ([`ACCESSOR_ENTRY`] word
+/// `pair`, [`index_pair_bits`]), else ([`NO_PAIR`]) [`accessor_slot_bits`].
 #[inline(always)]
 unsafe fn accessor_in(
     obj: *const ObjectHeader,
     r: *const ShapeRecord,
     pos: u32,
-    pair: u32,
-) -> Option<crate::object::accessor_pair::Accessor> {
-    if pair == NO_LOAD {
-        return accessor_at(obj, r, pos);
+    pair: u64,
+) -> Option<u64> {
+    if pair == NO_PAIR {
+        return accessor_slot_bits(obj, r, pos);
     }
-    let bits = *((obj as *const u8).add(std::mem::size_of::<ObjectHeader>() + pair as usize * 8)
-        as *const u64);
-    Some(crate::object::accessor_pair::pair_of_value(bits).unwrap_or_default())
+    index_pair_bits(obj, pair)
 }
 
-/// The accessor at key position `pos` of `obj` (record `r`), if that key is
-/// an accessor.
-#[inline(never)]
-unsafe fn accessor_at(
+/// The slot value of the accessor at key position `pos` of `obj` (record
+/// `r`), if that key is an accessor of a positional layout.
+#[inline(always)]
+unsafe fn accessor_slot_bits(
     obj: *const ObjectHeader,
     r: *const ShapeRecord,
     pos: u32,
-) -> Option<crate::object::accessor_pair::Accessor> {
+) -> Option<u64> {
     if !positional_layout(&*r) || (*r).summary() & crate::object::key_attrs::SUMMARY_ACCESSOR == 0 {
         return None;
     }
@@ -1485,7 +1871,7 @@ unsafe fn accessor_at(
     } else {
         crate::object::spill::spill_get_present(obj as usize, slot as usize)?
     };
-    Some(crate::object::accessor_pair::pair_of_value(bits).unwrap_or_default())
+    Some(bits)
 }
 
 /// The value of `obj`'s own PRIVATE entry `key_bits` (a property atom,
@@ -1552,6 +1938,7 @@ pub unsafe extern "C" fn perry_probe_own_method(
         if crate::gc_type_is_object!((*h).obj_type)
             && (*h).gc_flags & crate::gc::GC_FLAG_FORWARDED == 0
             && (*obj).parent_class_id & crate::object::overflow::SHADOW_BIT == 0
+            && (*obj).class_id != crate::object::deferred_namespace::DEFERRED_NAMESPACE_CLASS_ID
         {
             let r = record_of(dir, LayoutWord((*obj).parent_class_id));
             if !r.is_null() && (*r).present() {
@@ -1575,6 +1962,7 @@ pub unsafe extern "C" fn perry_probe_own_method(
 
 /// [`perry_probe_own_method`]'s by-bytes scan of the key's text.
 #[cold]
+#[optimize(size)]
 #[inline(never)]
 unsafe fn own_method_by_bytes(recv: f64, key_bits: u64) -> f64 {
     let key = (key_bits & POINTER_MASK) as *const crate::StringHeader;
@@ -1586,6 +1974,19 @@ unsafe fn own_method_by_bytes(recv: f64, key_bits: u64) -> f64 {
         crate::string::string_data(key),
         (*key).byte_len as usize,
     )
+}
+
+/// Whether `probe_has` must leave a layout accessor entry of `cur` to the
+/// overflow probe: only an object with an overflow keeps its attributes (and
+/// a deleted accessor's tombstone) there. The shadow bit's absence proves no
+/// overflow (`LAYOUT_SHADOW_BIT`); a shadowed object without a table still
+/// answers from the layout. Out of line so the data-entry path of
+/// `probe_has` keeps its register shape.
+#[cold]
+#[inline(never)]
+unsafe fn accessor_defers_to_overflow(cur: *const ObjectHeader) -> bool {
+    (*cur).parent_class_id & crate::object::overflow::SHADOW_BIT != 0
+        && crate::object::overflow::has_overflow(cur)
 }
 
 /// The probe's presence mode (`in`, `Object.hasOwn`,
@@ -1626,10 +2027,34 @@ pub(crate) unsafe fn probe_has(obj_bits: u64, key_bits: u64, own_only: bool) -> 
         }
         None => return -1,
     };
-    let absent = if exact { 0 } else { -1 };
     let dir = super::ordinary_dir_addr();
+    // The keyed read's own-slot arm, asked for presence.
+    if exact && computed::own_slot_holds(dir, payload as *const ObjectHeader, key) {
+        return 1;
+    }
+    probe_has_walk(dir, payload, key, hash, exact, own_only)
+}
+
+/// [`probe_has`]'s presence walk for the resolved key `key` (its hash
+/// `hash`; `exact` when it is the key's atom or symbol, so that a miss
+/// proves absence) from the object at `payload`. Inlined into its two
+/// callers ([`probe_has`] and the `in` operator's miss arm), so a miss pays
+/// one frame, not two.
+#[inline(always)]
+pub(crate) unsafe fn probe_has_walk(
+    dir: *const u8,
+    payload: usize,
+    key: u64,
+    hash: u64,
+    exact: bool,
+    own_only: bool,
+) -> i32 {
+    let absent = if exact { 0 } else { -1 };
     let mut cur = payload as *const ObjectHeader;
     for _ in 0..MAX_HOPS {
+        if (*cur).class_id == crate::object::deferred_namespace::DEFERRED_NAMESPACE_CLASS_ID {
+            return -1;
+        }
         let w = (*cur).parent_class_id;
         let r = record_of(dir, LayoutWord(w));
         if r.is_null() {
@@ -1644,20 +2069,28 @@ pub(crate) unsafe fn probe_has(obj_bits: u64, key_bits: u64, own_only: bool) -> 
                 if entry & crate::object::key_attrs::ENTRY_PRIVATE != 0 {
                     return -1;
                 }
+                // The attributes of an object with an overflow live in its
+                // entries, not in its layout (`overflow::set_entry_attrs`),
+                // and a deleted accessor leaves only its tombstone there: the
+                // layout's accessor entry answers only when there is no
+                // overflow, else the overflow probe below does.
                 if entry & crate::object::key_attrs::ENTRY_ACCESSOR_MASK != 0 {
-                    return 1;
-                }
-                let slot = crate::object::key_attrs::key_storage_slot(keys, pos);
-                let v = if slot < (*r).live_inline_slot_count {
-                    *((cur as *const u8)
-                        .add(std::mem::size_of::<ObjectHeader>() + slot as usize * 8)
-                        as *const u64)
+                    if !accessor_defers_to_overflow(cur) {
+                        return 1;
+                    }
                 } else {
-                    crate::object::spill::spill_get_present(cur as usize, slot as usize)
-                        .unwrap_or(TAG_HOLE)
-                };
-                if v != TAG_HOLE {
-                    return 1;
+                    let slot = crate::object::key_attrs::key_storage_slot(keys, pos);
+                    let v = if slot < (*r).live_inline_slot_count {
+                        *((cur as *const u8)
+                            .add(std::mem::size_of::<ObjectHeader>() + slot as usize * 8)
+                            as *const u64)
+                    } else {
+                        crate::object::spill::spill_get_present(cur as usize, slot as usize)
+                            .unwrap_or(TAG_HOLE)
+                    };
+                    if v != TAG_HOLE {
+                        return 1;
+                    }
                 }
                 // A hole slot: the key is absent here; a re-add lives in the
                 // overflow.
@@ -1719,13 +2152,16 @@ pub(crate) unsafe fn probe_has(obj_bits: u64, key_bits: u64, own_only: bool) -> 
 /// Is `obj` (class id nonzero) a class declaration's or a class
 /// evaluation's prototype object?
 #[cold]
+#[optimize(size)]
 #[inline(never)]
 unsafe fn class_prototype_object(obj: *const ObjectHeader) -> bool {
     crate::object::class_value::class_decl_prototype_link((*obj).class_id) as usize == obj as usize
         || crate::object::field_get_set::class_evaluation_prototype_class_id(obj as usize).is_some()
 }
 
-/// The store twin of [`perry_probe_get`] (§3.7, the stores' probe path):
+/// The store twin of [`perry_probe_get`] (§3.7, the stores' probe path;
+/// DESIGN_R §3, frame-free: the hit is [`own_set`]'s inline store, every
+/// other case one tail call):
 /// `obj.key = value` when the receiver's own layout holds `key` as a plain
 /// writable data property in an inline slot, or its overflow holds it as a
 /// plain writable entry of its own: one barriered store. Returns 1 when it
@@ -1748,22 +2184,468 @@ pub unsafe extern "C" fn perry_probe_set(
     hash: u64,
     value: f64,
 ) -> i32 {
-    if obj_bits & TAG_MASK != POINTER_TAG {
+    match own_set(dir, obj_bits, key_bits, hash, value) {
+        OwnSet::Stored => 1,
+        OwnSet::Slot(obj, address, slot) => {
+            probe_set_slot_any(obj, address, slot, store_bits(value))
+        }
+        OwnSet::Table(t, address) => probe_set_table_barrier(t, address, store_bits(value)),
+        OwnSet::Hole(r, at) => probe_set_hole(dir, obj_bits, r, key_bits, hash, at, value),
+        OwnSet::Absent(r) => probe_set_add(dir, obj_bits, r, key_bits, hash, value),
+        // The overflow owns every own key: the complete probe declines too
+        // (store_target::overflow), so the [[Set]] decides the add at once.
+        OwnSet::OverflowMiss(_) => 0,
+        OwnSet::Rest => probe_set_rest(dir, obj_bits, key_bits, hash, value),
+    }
+}
+
+/// [`perry_probe_set`] for every case [`own_set`] hands back
+/// ([`OwnSet::Rest`]): the complete store probe, which re-derives what it
+/// needs (a hole fill, a spilled slot, a prototype's store note, a TEXT
+/// entry's text, an underived probe word, an attributed slot).
+#[inline(never)]
+unsafe fn probe_set_rest(
+    dir: *const u8,
+    obj_bits: u64,
+    key_bits: u64,
+    hash: u64,
+    value: f64,
+) -> i32 {
+    match set_plan(dir, obj_bits, key_bits, hash, value) {
+        SetPlan::Stored(stored) => stored,
+        SetPlan::Add(obj, r, bits) => i32::from(probe_add(dir, obj, r, key_bits, hash, bits)),
+    }
+}
+
+/// [`perry_probe_set`]'s fill of a hole slot its receiver's own list names
+/// ([`OwnSet::Hole`]): the key is absent, and the static record admits the
+/// fill or the complete `[[Set]]` decides (the complete probe's record arm).
+/// `at` is the key's list position (low half) and its slot (high half).
+#[inline(never)]
+unsafe fn probe_set_hole(
+    dir: *const u8,
+    obj_bits: u64,
+    r: *const ShapeRecord,
+    key_bits: u64,
+    hash: u64,
+    at: u64,
+    value: f64,
+) -> i32 {
+    let obj = (obj_bits & POINTER_MASK) as usize as *mut ObjectHeader;
+    let keys = (*r).keys as usize as *const crate::array::ArrayHeader;
+    if !hole_fill_admitted(dir, obj, r, keys, at as u32, key_bits, hash) {
         return 0;
+    }
+    store_target::checked_slot(obj, r, (at >> 32) as u32, store_bits(value))
+}
+
+/// [`perry_probe_set`]'s add of a key its receiver's own list does not hold
+/// ([`OwnSet::Absent`]): absent when the list is complete
+/// ([`own_list_complete`]), else the complete store probe.
+#[inline(never)]
+unsafe fn probe_set_add(
+    dir: *const u8,
+    obj_bits: u64,
+    r: *const ShapeRecord,
+    key_bits: u64,
+    hash: u64,
+    value: f64,
+) -> i32 {
+    if !own_list_complete(r) {
+        return probe_set_rest(dir, obj_bits, key_bits, hash, value);
+    }
+    let obj = (obj_bits & POINTER_MASK) as usize as *mut ObjectHeader;
+    i32::from(probe_add(dir, obj, r, key_bits, hash, store_bits(value)))
+}
+
+/// Does record `r`'s own list name every own key of its receivers by atom
+/// (its probe word's `PROBE_ATOMS`), so that a key it does not hold is
+/// absent? Asked by the add arms, after the leaf's index loop.
+///
+/// # Safety
+/// `r` is a live record.
+#[inline(always)]
+pub(crate) unsafe fn own_list_complete(r: *const ShapeRecord) -> bool {
+    (*r).probe & PROBE_ATOMS != 0
+}
+
+/// [`perry_probe_set`]'s barriered store of a value other than a finite
+/// Number into an own slot of lane ANY ([`OwnSet::Slot`]).
+#[inline(never)]
+unsafe fn probe_set_slot_any(
+    obj: *mut ObjectHeader,
+    address: *mut u64,
+    slot: u32,
+    bits: u64,
+) -> i32 {
+    own_slot_store_any(obj, address, slot, bits);
+    // Opaque: a known constant return lets IPO take the call out of tail position.
+    core::hint::black_box(1)
+}
+
+/// [`perry_probe_set`]'s barrier for an overflow value word [`own_set`]
+/// wrote ([`OwnSet::Table`]).
+#[inline(never)]
+unsafe fn probe_set_table_barrier(
+    t: *mut crate::object::overflow::Table,
+    address: *mut u64,
+    bits: u64,
+) -> i32 {
+    crate::gc::runtime_write_barrier_slot(t as usize, address as usize, bits);
+    // Opaque: a known constant return lets IPO take the call out of tail position.
+    core::hint::black_box(1)
+}
+
+/// The barriered store [`OwnSet::Slot`] leaves to its caller.
+///
+/// # Safety
+/// `address` is slot `slot` of live ordinary `obj`, of lane ANY.
+#[inline(always)]
+pub(crate) unsafe fn own_slot_store_any(
+    obj: *mut ObjectHeader,
+    address: *mut u64,
+    slot: u32,
+    bits: u64,
+) {
+    crate::gc::runtime_store_jsvalue_slot_layout_deferred(
+        obj as usize,
+        address as usize,
+        slot as usize,
+        bits,
+    );
+}
+
+/// What the frame-free store probe [`own_set`] found (DESIGN_R §3). Its
+/// callers act on a hit and leave by one tail call for everything else.
+pub(crate) enum OwnSet {
+    /// Stored: a finite Number in an own slot whose lane takes it.
+    Stored,
+    /// An own plain writable slot of lane ANY for a value that is no finite
+    /// Number: the caller makes the barriered store ([`own_slot_store_any`]).
+    Slot(*mut ObjectHeader, *mut u64, u32),
+    /// An overflow-owned plain value word, written: its barrier remains.
+    Table(*mut crate::object::overflow::Table, *mut u64),
+    /// A hole in an own inline slot the record's list names by a plain
+    /// writable entry (the key is absent): the caller asks whether the
+    /// record admits the fill. The key's list position (low half) and slot
+    /// (high half).
+    Hole(*const ShapeRecord, u64),
+    /// The record of the receiver (ordinary, unfrozen, no overflow, no
+    /// prototype role) whose own list does not hold the key: absent when the
+    /// list is complete ([`own_list_complete`], which the arm asks): the add.
+    Absent(*const ShapeRecord),
+    /// The record of an overflowed receiver (ordinary, unfrozen, no
+    /// prototype role) whose overflow does not hold the key. The overflow
+    /// owns every current own key, so the key is absent unless the layout
+    /// names it (a deleted layout key); the arm asks the layout, then the add.
+    OverflowMiss(*const ShapeRecord),
+    /// Everything else: the complete store decides.
+    Rest,
+}
+
+/// A store's value word: the hole-free spelling of `value`.
+#[inline(always)]
+pub(crate) fn store_bits(value: f64) -> u64 {
+    if value.to_bits() == POINTER_TAG {
+        crate::value::TAG_UNDEFINED
+    } else {
+        value.to_bits()
+    }
+}
+
+/// The store probe's frame-free common path, shared by `o.k = v` and
+/// `o[k] = v`: no call. A hit is an own plain writable data property at an
+/// inline slot named by its index entry ([`WRITE_ENTRY`], or a position
+/// below the bound of an unindexed list no entry of which blocks a store),
+/// or an overflow entry of the same kind. GC leaf.
+///
+/// # Safety
+/// As for [`perry_probe_set`].
+#[inline(always)]
+pub(crate) unsafe fn own_set(
+    dir: *const u8,
+    obj_bits: u64,
+    key_bits: u64,
+    hash: u64,
+    value: f64,
+) -> OwnSet {
+    if obj_bits & TAG_MASK != POINTER_TAG {
+        return OwnSet::Rest;
     }
     let payload = (obj_bits & POINTER_MASK) as usize;
     if payload < perry_abi::RECEIVER_HANDLE_FLOOR {
-        return 0;
+        return OwnSet::Rest;
     }
     let obj = payload as *mut ObjectHeader;
     let word = (*obj).parent_class_id;
     let r = record_of(dir, LayoutWord(word));
     if r.is_null() || (*r).object_kind() != super::ShapeObjectKind::Ordinary {
-        return 0;
+        return OwnSet::Rest;
     }
     let gc = crate::value::addr_class::honest_header(payload);
     if gc._reserved & crate::gc::OBJ_FLAG_FROZEN != 0 {
-        return 0;
+        return OwnSet::Rest;
+    }
+    // A1_UNPROVEN: record-first: probe receiver before its record (kind-A/B question for S0f).
+    let meta = crate::meta_read!(crate::meta_obj_runtime_born!(obj as *mut _));
+    if !meta.is_null() {
+        // A prototype's store is noted (`note_value_store`): the role bit.
+        if (*meta).flags & crate::object::OBJECT_META_FLAG_IS_PROTOTYPE != 0 {
+            return OwnSet::Rest;
+        }
+        // A clear shadow bit proves there is no overflow. Otherwise its
+        // entries, when present, own every current key and attribute.
+        if word & crate::object::overflow::SHADOW_BIT != 0 && (*meta).overflow != 0 {
+            let t = (*meta).overflow as usize as *mut crate::object::overflow::Table;
+            let Some(i) = crate::object::overflow::find_hashed_with(t, key_bits, || hash) else {
+                return OwnSet::OverflowMiss(r);
+            };
+            // As store_target::overflow: an entry's kind is asked first, and a
+            // value no barrier looks at into an entry holding its own plain
+            // writable value is one store.
+            let bits = store_bits(value);
+            if crate::object::overflow::holds_own_value(t, i)
+                && crate::gc::barrier_scalar_child_skips(bits)
+            {
+                if let Some(address) = crate::object::overflow::own_writable_value(t, i) {
+                    // GC_STORE_AUDIT(POINTER_FREE): a scalar word the barrier skips; the table owns this value word.
+                    *address = bits;
+                    return OwnSet::Stored;
+                }
+            }
+            if let Some(slot) = crate::object::overflow::fixed_slot_of(t, i) {
+                if !crate::object::key_attrs::entry_is_plain_writable_data(
+                    crate::object::overflow::entry_attrs(t.cast(), i),
+                ) {
+                    return OwnSet::Rest;
+                }
+                return own_slot_hit(obj, r, slot, None, value);
+            }
+            if !crate::object::overflow::plain_writable_value(t, i) {
+                return OwnSet::Rest;
+            }
+            let address = crate::object::overflow::value_at(t, i);
+            // GC_STORE_AUDIT(BARRIERED): the table owns this value word; the
+            // caller's tail call is its barrier.
+            *address = bits;
+            return OwnSet::Table(t, address);
+        }
+    }
+    // The hit takes the receiver from its value bits and computes the
+    // stored word itself, so the index loop holds neither.
+    match own_store_slot(r, key_bits, hash) {
+        Ok((pos, slot)) => own_slot_hit(
+            (obj_bits & POINTER_MASK) as usize as *mut ObjectHeader,
+            r,
+            slot,
+            Some(pos),
+            value,
+        ),
+        Err(true) => OwnSet::Absent(r),
+        Err(false) => OwnSet::Rest,
+    }
+}
+
+/// [`own_set`]'s write of own inline slot `slot` (a plain writable data
+/// property): a finite Number in a lane that takes it is stored here; a
+/// hole (an absent key) at list position `pos` is the fill
+/// ([`OwnSet::Hole`]; an overflow's fixed-slot reference, `None`, declines
+/// it), a spilled slot or a tail lane is the rest.
+#[inline(always)]
+unsafe fn own_slot_hit(
+    obj: *mut ObjectHeader,
+    r: *const ShapeRecord,
+    slot: u32,
+    pos: Option<u32>,
+    value: f64,
+) -> OwnSet {
+    if slot >= (*r).live_inline_slot_count || slot >= crate::object::field_rep::REP_SLOTS {
+        return OwnSet::Rest;
+    }
+    let address = (obj as *mut u8)
+        .add(std::mem::size_of::<ObjectHeader>() + slot as usize * 8)
+        .cast::<u64>();
+    if *address == TAG_HOLE {
+        return match pos {
+            Some(pos) => OwnSet::Hole(r, u64::from(pos) | (u64::from(slot) << 32)),
+            None => OwnSet::Rest,
+        };
+    }
+    let bits = store_bits(value);
+    let rep = (*r).word0_lane(slot);
+    if bits & 0x7ff0_0000_0000_0000 != 0x7ff0_0000_0000_0000
+        && rep != crate::object::field_rep::REP_SPECIAL
+    {
+        // GC_STORE_AUDIT(POINTER_FREE): a canonical finite Number.
+        address.write(bits);
+        return OwnSet::Stored;
+    }
+    if rep == crate::object::field_rep::REP_ANY {
+        return OwnSet::Slot(obj, address, slot);
+    }
+    OwnSet::Rest
+}
+
+/// The inline slot a store of `key_bits` writes in record `r`'s receivers,
+/// from the index entry alone (no call): `Ok((position, slot))` for a [`WRITE_ENTRY`]
+/// (or an unindexed position below the bound, no entry blocking a store),
+/// `Err(true)` when the list does not hold the key (absent when the list is
+/// complete: [`own_list_complete`], asked by the caller), `Err(false)` for the
+/// rest (an underived or declining probe word, a TEXT entry of the key's
+/// hash that is not its word, an entry that is no plain writable slot).
+#[inline(always)]
+unsafe fn own_store_slot(
+    r: *mut ShapeRecord,
+    key_bits: u64,
+    hash: u64,
+) -> Result<(u32, u32), bool> {
+    let word = (*r).probe;
+    if word == 0 || word & PROBE_DECLINE != 0 {
+        return Err(false);
+    }
+    let count = (*r).logical_key_count;
+    // The probe word is not held past here: the caller asks whether the
+    // list is complete ([`own_list_complete`]).
+    let absent = Err(true);
+    if count == 0 {
+        return absent;
+    }
+    let table = (word & !PROBE_FLAGS) as *const KeyIndex;
+    if table.is_null() {
+        let list = crate::array::array_elements_ptr((*r).keys as usize as *const _) as *const u64;
+        let mut i = 0;
+        while i < count {
+            if *list.add(i as usize) == key_bits {
+                // An unindexed list reads position `i` below its bound with
+                // one load (`probe_get_at`); a store writes it when no entry
+                // of the list blocks one.
+                return if (*r).summary()
+                    & (crate::object::key_attrs::SUMMARY_BLOCKS_STORE
+                        | crate::object::key_attrs::SUMMARY_PRIVATE)
+                    == 0
+                    && i < (*r).position_bound_raw()
+                {
+                    Ok((i, i))
+                } else {
+                    Err(false)
+                };
+            }
+            i += 1;
+        }
+        return absent;
+    }
+    let mask = (*table).mask as usize;
+    let slots = KeyIndex::buckets(table);
+    let mut b = hash as usize & mask;
+    loop {
+        let e = *slots.add(b);
+        if e == u32::MAX {
+            return absent;
+        }
+        let p = e & POS_BITS;
+        if e & TEXT_ENTRY == 0 || KeyIndex::word(table, p) == hash {
+            let w = if e & ALIAS_ENTRY != 0 {
+                KeyIndex::word(table, p)
+            } else {
+                // The list is read at the entry, not held across the loop.
+                *(crate::array::array_elements_ptr((*r).keys as usize as *const _) as *const u64)
+                    .add(p as usize)
+            };
+            if w == key_bits {
+                return if e & WRITE_ENTRY != 0 {
+                    Ok((p, entry_load(table, e, p)))
+                } else {
+                    Err(false)
+                };
+            }
+            // Equal texts are one key: the complete probe compares them.
+            if e & TEXT_ENTRY != 0 {
+                return Err(false);
+            }
+        }
+        b = (b + 1) & mask;
+    }
+}
+
+/// The static-key store site's out-of-line path
+/// (`expr/put_value_store_ic.rs`): the store probe ([`perry_probe_set`]),
+/// and when it declines, the complete strict-aware `[[Set]]`
+/// (`js_put_value_set`, the receiver being the target). Returns the
+/// assignment's value: `value` after a probe store, else the `[[Set]]`'s
+/// re-read of it from its own root. May collect (the `[[Set]]` runs
+/// setters and adds keys), so it is the site's one statepoint.
+///
+/// # Safety
+/// As for [`perry_probe_set`].
+#[no_mangle]
+pub unsafe extern "C" fn perry_store_or_put(
+    dir: *const u8,
+    obj_bits: u64,
+    key_bits: u64,
+    hash: u64,
+    value: f64,
+    strict: i32,
+) -> f64 {
+    if perry_probe_set(dir, obj_bits, key_bits, hash, value) != 0 {
+        return value;
+    }
+    let obj = f64::from_bits(obj_bits);
+    crate::object::property_ops::put_value::js_put_value_set(
+        obj,
+        f64::from_bits(key_bits),
+        value,
+        obj,
+        strict,
+    )
+}
+
+/// What the store probe found: the store it made (1) or its decline (0),
+/// or a key its receiver's complete own list proves absent (an ordinary,
+/// unfrozen object with no overflow), with the value word to add.
+enum SetPlan {
+    Stored(i32),
+    Add(*mut ObjectHeader, *const ShapeRecord, u64),
+}
+
+/// [`perry_probe_set`] up to the key add: the own store, or the receiver
+/// and record an add starts from. GC leaf.
+#[inline(always)]
+unsafe fn set_plan(dir: *const u8, obj_bits: u64, key_bits: u64, hash: u64, value: f64) -> SetPlan {
+    match set_front(dir, obj_bits, key_bits, hash, value) {
+        Ok(stored) => SetPlan::Stored(stored),
+        Err((obj, r, bits)) => record_plan(dir, obj, r, key_bits, hash, bits),
+    }
+}
+
+/// [`set_plan`]'s guards and its table arm: `Ok` is the store made (1) or
+/// the decline (0); `Err` the receiver, its record and the value word of a
+/// receiver with no table, which its record answers ([`record_plan`]).
+#[inline(always)]
+unsafe fn set_front(
+    dir: *const u8,
+    obj_bits: u64,
+    key_bits: u64,
+    hash: u64,
+    value: f64,
+) -> Result<i32, (*mut ObjectHeader, *mut ShapeRecord, u64)> {
+    #[allow(non_snake_case)]
+    let Stored = |stored: i32| Ok(stored);
+    if obj_bits & TAG_MASK != POINTER_TAG {
+        return Stored(0);
+    }
+    let payload = (obj_bits & POINTER_MASK) as usize;
+    if payload < perry_abi::RECEIVER_HANDLE_FLOOR {
+        return Stored(0);
+    }
+    let obj = payload as *mut ObjectHeader;
+    let word = (*obj).parent_class_id;
+    let r = record_of(dir, LayoutWord(word));
+    if r.is_null() || (*r).object_kind() != super::ShapeObjectKind::Ordinary {
+        return Stored(0);
+    }
+    let gc = crate::value::addr_class::honest_header(payload);
+    if gc._reserved & crate::gc::OBJ_FLAG_FROZEN != 0 {
+        return Stored(0);
     }
     let bits = if value.to_bits() == POINTER_TAG {
         crate::value::TAG_UNDEFINED
@@ -1776,16 +2658,31 @@ pub unsafe extern "C" fn perry_probe_set(
         // A1_UNPROVEN: record-first: probe receiver before its record (kind-A/B question for S0f).
         let meta = crate::meta_read!(crate::meta_obj_runtime_born!(obj as *mut _));
         if !meta.is_null() && (*meta).overflow != 0 {
-            return store_target::overflow(
+            return Stored(store_target::overflow(
                 obj,
                 r,
                 (*meta).overflow as usize as *mut _,
                 key_bits,
                 hash,
                 bits,
-            );
+            ));
         }
     }
+    Err((obj, r, bits))
+}
+
+/// [`set_plan`] for a receiver with no table: its record's own store, or the
+/// receiver and record an add starts from.
+#[inline(always)]
+unsafe fn record_plan(
+    dir: *const u8,
+    obj: *mut ObjectHeader,
+    r: *mut ShapeRecord,
+    key_bits: u64,
+    hash: u64,
+    bits: u64,
+) -> SetPlan {
+    use SetPlan::Stored;
     match own_position(r, key_bits, hash) {
         Ok(pos) => {
             let keys = (*r).keys as usize as *const crate::array::ArrayHeader;
@@ -1797,7 +2694,7 @@ pub unsafe extern "C" fn perry_probe_set(
                     crate::object::key_attrs::keys_entry(keys, pos),
                 )
             {
-                return 0;
+                return Stored(0);
             }
             let slot = crate::object::key_attrs::key_storage_slot(keys, pos);
             if slot < (*r).live_inline_slot_count {
@@ -1808,13 +2705,44 @@ pub unsafe extern "C" fn perry_probe_set(
                 if *address == TAG_HOLE
                     && !hole_fill_admitted(dir, obj, r, keys, pos, key_bits, hash)
                 {
-                    return 0;
+                    return Stored(0);
                 }
             }
-            store_target::checked_slot(obj, r, slot, bits)
+            Stored(store_target::checked_slot(obj, r, slot, bits))
         }
-        Err(true) => i32::from(probe_add(dir, obj, r, key_bits, hash, bits)),
-        Err(false) => 0,
+        Err(true) => SetPlan::Add(obj, r, bits),
+        Err(false) => Stored(0),
+    }
+}
+
+/// A symbol-keyed `[[Set]]` on an ordinary receiver through the store probe
+/// (DEC 243(3)): an own plain writable entry takes the value in place; a key
+/// the receiver's complete own list proves absent, whose add nothing on the
+/// chain intercepts, is the canonical key-add transition, as a string key's
+/// is. `false`, having changed nothing, for everything else: the full
+/// symbol `[[Set]]` runs.
+///
+/// # Safety
+/// `obj_bits` any value bits; `sym_bits` a symbol value.
+pub(crate) unsafe fn symbol_store(obj_bits: u64, sym_bits: u64, value: f64) -> bool {
+    let symbol = (sym_bits & POINTER_MASK) as *const crate::symbol::SymbolHeader;
+    // Only a well-known symbol can be one the runtime watches stores of
+    // (`@@isConcatSpreadable`, a collection's `@@iterator`).
+    if (*symbol).registered & perry_abi::SYMBOL_WELL_KNOWN != 0 {
+        crate::symbol::note_symbol_key_installed(symbol as usize);
+        crate::object::map_set_subclass::note_iterator_symbol_write(
+            (obj_bits & POINTER_MASK) as usize,
+            symbol as usize,
+        );
+    }
+    let hash = (*symbol).id;
+    let dir = super::ordinary_dir_addr();
+    match set_plan(dir, obj_bits, sym_bits, hash, value) {
+        SetPlan::Stored(stored) => stored != 0,
+        SetPlan::Add(obj, r, bits) => {
+            write::add_admitted(dir, obj, r, sym_bits, hash)
+                && crate::object::shaped_symbols::append(obj, symbol as usize, bits)
+        }
     }
 }
 
@@ -1823,13 +2751,22 @@ mod write;
 use write::hole_fill_admitted;
 pub(crate) use write::layouts_admit_add;
 use write::probe_add;
+pub(crate) use write::{function_link_admits_add, function_put_plan, FunctionPut};
 
 #[path = "layout_probe/computed.rs"]
 mod computed;
+#[path = "layout_probe/keyed_delete.rs"]
+mod keyed_delete;
 use computed::computed_key;
-#[cfg(test)]
 pub use computed::perry_probe_get_keyed;
 pub use computed::perry_probe_get_value;
+pub(crate) use computed::probe_set_keyed;
+pub(crate) use computed::{in_keyed_leaf, in_keyed_miss};
+pub(crate) use computed::{
+    keyed_add_admitted, keyed_leaf, keyed_overflow_append, probe_store_atom, probe_store_keyed,
+    probe_store_keyed_complete, store_key_mintable, KeyedStore,
+};
+pub(crate) use keyed_delete::probe_delete_keyed;
 
 #[path = "layout_probe/diagnostics.rs"]
 mod diagnostics;
@@ -1882,3 +2819,15 @@ mod builtin_layout_probe_tests;
 #[cfg(test)]
 #[path = "layout_probe_overflow_tests.rs"]
 mod overflow_tests;
+
+#[cfg(test)]
+#[path = "layout_probe_accessor_tests.rs"]
+mod accessor_tests;
+
+#[cfg(test)]
+#[path = "layout_probe_global_tests.rs"]
+mod global_tests;
+
+#[cfg(test)]
+#[path = "layout_probe_symbol_store_tests.rs"]
+mod symbol_store_tests;

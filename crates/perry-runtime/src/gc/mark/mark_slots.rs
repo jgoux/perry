@@ -80,7 +80,7 @@ unsafe fn remember_malloc_mark_slots<const DIAGNOSTICS: bool>(
         return;
     }
     let weak_holder = crate::weakref::is_weak_holder_header(header);
-    visit_gc_rewrite_slots::<DIAGNOSTICS>(header, |slot| {
+    visit_gc_rewrite_slots_shared::<DIAGNOSTICS>(header, |slot| {
         if weak_holder && crate::weakref::is_weak_target_trace_slot(header, slot.slot) {
             return;
         }
@@ -200,11 +200,30 @@ unsafe fn trace_heap_rewrite_slots_impl<
                             break 'visit;
                         }
                     }
-                    remember_mutable_old_to_young_slot(
-                        sticky.as_deref_mut().unwrap(),
-                        header,
-                        slot,
-                    );
+                    // An observer may rewrite the word, so remember the
+                    // post-mark reread. Custody follows the caller's parent
+                    // kind, as on the observer-free paths: a young large
+                    // container (OLD_PARENT, promoted in place by the sweep)
+                    // keeps bare old pages, which array growth from it
+                    // inherits; deciding by generation here would record
+                    // owner-qualified entries growth cannot carry.
+                    if OLD_PARENT {
+                        if let Some(word) = FieldWord::decode(slot.read()) {
+                            remember_decoded_full_mark_slot(
+                                sticky.as_deref_mut().unwrap(),
+                                header,
+                                slot,
+                                word,
+                                true,
+                            );
+                        }
+                    } else {
+                        remember_mutable_old_to_young_slot(
+                            sticky.as_deref_mut().unwrap(),
+                            header,
+                            slot,
+                        );
+                    }
                 }
             }
         }};

@@ -77,7 +77,7 @@ pub(crate) fn set_field_by_name_object_tail(
         let gc_header =
             (obj as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
         let gc_type = (*gc_header).obj_type;
-        if gc_type == crate::gc::GC_TYPE_ARRAY {
+        if crate::gc_type_is_array!(gc_type) {
             if key.is_null() {
                 return;
             }
@@ -272,10 +272,6 @@ pub(crate) fn set_field_by_name_object_tail(
         let plan_eligible = !key.is_null()
             && obj_class_id != NATIVE_MODULE_CLASS_ID
             && crate::object::object_is_regular(obj)
-            && super::shapes::store_kind::born_null_admits_lane(
-                obj,
-                (*gc_header)._reserved,
-            )
             // Per-key, not per-receiver: a descriptor on some OTHER key cannot
             // intercept this one, and a plan hit skips the own-accessor
             // short-circuit below, so the key must be provably uncovered.
@@ -573,7 +569,6 @@ pub(crate) fn set_field_by_name_object_tail(
             // freshly read `obj_flags`, not the pre-vet read.
             let record_plan_eligible = obj_class_id != NATIVE_MODULE_CLASS_ID
                 && crate::object::object_is_regular(obj)
-                && super::shapes::store_kind::born_null_admits_lane(obj, obj_flags)
                 // `desc_gate_ok` above already proved this key is uncovered on
                 // this receiver, which is the per-key half of the old flag.
                 && desc_gate_ok;
@@ -740,7 +735,7 @@ pub(crate) fn set_field_by_name_object_tail(
                 && !super::shapes::shape_descriptor_of_receiver(
                     (super::shapes::object_shape_stamp(obj)).0,
                 )
-                .is_some_and(|d| d.special_constfn_mask != 0)
+                .is_some_and(|d| d.has_constfn_lane())
             {
                 // `publish_key_add_edge` already minted the exact ConstFn
                 // successor after writing the closure. The legacy redundant

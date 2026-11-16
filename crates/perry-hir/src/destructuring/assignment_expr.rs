@@ -34,6 +34,7 @@ pub(crate) fn lower_destructuring_assignment(
             for (idx, elem) in arr_pat.elems.iter().enumerate() {
                 if let Some(elem_pat) = elem {
                     let index_expr = Expr::IndexGet {
+                        element_offset: 0,
                         byte_offset: 0,
                         byte_end: 0,
                         object: value.clone(),
@@ -64,6 +65,8 @@ pub(crate) fn lower_destructuring_assignment(
                                                 object,
                                                 property,
                                                 value: Box::new(index_expr),
+                                                byte_offset: 0,
+                                                byte_end: 0,
                                             });
                                         }
                                         ast::MemberProp::Computed(computed) => {
@@ -72,6 +75,9 @@ pub(crate) fn lower_destructuring_assignment(
                                                 object,
                                                 index,
                                                 value: Box::new(index_expr),
+                                                element_offset: 0,
+                                                byte_offset: 0,
+                                                byte_end: 0,
                                             });
                                         }
                                         // `[this.#field] = arr` — brand-guard the
@@ -92,6 +98,8 @@ pub(crate) fn lower_destructuring_assignment(
                                                 object,
                                                 property,
                                                 value: Box::new(index_expr),
+                                                byte_offset: 0,
+                                                byte_end: 0,
                                             });
                                         }
                                     }
@@ -186,6 +194,7 @@ pub(crate) fn lower_destructuring_assignment(
                                 // the key so `...rest` can exclude it below.
                                 computed_excl_keys.push(lower_expr(ctx, &computed.expr)?);
                                 Expr::IndexGet {
+                                    element_offset: 0,
                                     byte_offset: 0,
                                     byte_end: 0,
                                     object: value.clone(),
@@ -275,6 +284,7 @@ pub(crate) fn lower_destructuring_assignment(
                                     // untouched).
                                     for key in computed_excl_keys.drain(..) {
                                         exprs.push(Expr::Delete(Box::new(Expr::IndexGet {
+                                            element_offset: 0,
                                             byte_offset: 0,
                                             byte_end: 0,
                                             object: Box::new(Expr::LocalGet(id)),

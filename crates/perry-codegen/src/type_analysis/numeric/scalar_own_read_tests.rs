@@ -15,6 +15,8 @@ fn store(object: Expr, name: &str, value: Expr) -> Stmt {
         object: Box::new(object),
         property: name.into(),
         value: Box::new(value),
+        byte_offset: 0,
+        byte_end: 0,
     })
 }
 
@@ -79,6 +81,7 @@ fn scalar_loop(poison: Option<Expr>) -> String {
         is_exported: false,
         aliases: Vec::new(),
         is_nested: false,
+        decl_stmt: None,
         alloc_width_hint: 0,
         specialized_from: None,
         static_accessor_names: Vec::new(),

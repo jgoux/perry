@@ -361,15 +361,27 @@ fn emit_yield_star_loop(
         }),
     )));
     // Initial pull: `received` starts as `NormalCompletion(undefined)`, so the
-    // first inner `next()` gets an explicit `undefined` argument.
-    current.push(Stmt::Expr(Expr::LocalSet(
-        del_result_id,
-        Box::new(delegate_await(delegate_next_call(
-            del_next_id,
-            del_iter_id,
-            Expr::Undefined,
-        ))),
-    )));
+    // first inner `next()` gets an explicit `undefined` argument. In an async
+    // generator the pull is awaited: linearize it so the await is a suspend
+    // point (a state of its own), not an inline await.
+    linearize_body(
+        &[Stmt::Expr(Expr::LocalSet(
+            del_result_id,
+            Box::new(delegate_await(delegate_next_call(
+                del_next_id,
+                del_iter_id,
+                Expr::Undefined,
+            ))),
+        ))],
+        states,
+        current,
+        state_num,
+        state_id,
+        next_local_id,
+        sent_id,
+        catches,
+        finallys,
+    );
     current.extend(del_kind_id.map(|kind| delegate_kind_set(kind, del_next_id, del_iter_id)));
     // Async `yield *`: the awaited iter-result must be an Object or `next()`
     // throws a TypeError (test262 yield-star-next-non-object-ignores-then).
@@ -589,6 +601,12 @@ pub struct FinallyRoute {
     pub completion_check_state: Option<u32>,
     /// Shared handler order with [`CatchRoute::seq`]: smaller is inner.
     pub seq: u32,
+    /// The completion local of the synchronous `for...of` whose close this
+    /// finally is (carried from the HIR `Try`). A `.return()` injected while
+    /// suspended inside the loop is a return completion: it sets the local to
+    /// 1 before this finally runs, so the loop closes its iterator
+    /// (ECMA-262 27.5.3.4 GeneratorResumeAbrupt, 14.7.5.7 IteratorClose).
+    pub forof_completion: Option<LocalId>,
 }
 
 /// The next handler sequence number. `catches` and `finallys` only ever grow
@@ -708,6 +726,33 @@ pub fn linearize_body(
                     },
                 });
                 // Bare `await x;` — result discarded, no continuation binding.
+            }
+            // `x = await e;` — the shape the `yield *` desugar emits for each
+            // awaited delegated pull (`__del_result = await next.call(..)`).
+            // Generated after the await-hoisting pass, so it must split here
+            // too; left inline it lowered to the busy-wait await, which never
+            // settles under an embedder's event loop.
+            Stmt::Expr(Expr::LocalSet(id, value))
+                if linearize_async_generator() && matches!(value.as_ref(), Expr::Await(_)) =>
+            {
+                let Expr::Await(inner) = value.as_ref() else {
+                    unreachable!()
+                };
+                let await_val = (**inner).clone();
+                let this_state = *state_num;
+                *state_num += 1;
+                states.push(State {
+                    num: this_state,
+                    body: std::mem::take(current),
+                    exit: StateExit::Await {
+                        value: await_val,
+                        next_state: *state_num,
+                    },
+                });
+                current.push(Stmt::Expr(Expr::LocalSet(
+                    *id,
+                    Box::new(Expr::LocalGet(sent_id)),
+                )));
             }
             Stmt::Let {
                 id,
@@ -1364,6 +1409,7 @@ pub fn linearize_body(
                 body,
                 catch,
                 finally,
+                forof_completion,
             } if body_contains_yield(body)
                 || finally.as_ref().is_some_and(|f| body_contains_yield(f))
                 || catch.as_ref().is_some_and(|c| body_contains_yield(&c.body)) =>
@@ -1567,6 +1613,7 @@ pub fn linearize_body(
                             finally_entry_state: Some(finally_entry_state),
                             protected_end_state: finally_protected_end,
                             completion_check_state: Some(completion_state),
+                            forof_completion: *forof_completion,
                         });
                     } else {
                         // #4374: a non-yielding finally is inlined into the
@@ -1582,6 +1629,7 @@ pub fn linearize_body(
                             finally_entry_state: None,
                             protected_end_state: post_catch_state,
                             completion_check_state: None,
+                            forof_completion: *forof_completion,
                         });
                         for s in fin {
                             current.push(s.clone());

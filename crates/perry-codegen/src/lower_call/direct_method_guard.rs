@@ -141,6 +141,27 @@ pub(crate) fn family_method_word(
     property: &str,
     direct_fn: &str,
 ) -> Option<String> {
+    match family_method_word_holed(ctx, class_id, property, direct_fn, false)? {
+        (id, None) => Some(id),
+        (_, Some(_)) => None,
+    }
+}
+
+/// [`family_method_word`], and with `late_ok` also for a family whose LATE
+/// key spells `property` (a data method's own slot, `RawFamily::late_blocked`;
+/// owner decision 2026-11-16): then the second value is that slot, and the
+/// word proves "no own `property`" only together with the slot holding the
+/// hole ([`emit_late_slot_holds_hole`]). Under the exact family word the
+/// object has no overflow (its install sets the shadow bit), so the slot is
+/// the only place an own `property` can be. A constructor key spelling
+/// `property` gives `None`.
+pub(crate) fn family_method_word_holed(
+    ctx: &mut FnCtx<'_>,
+    class_id: u32,
+    property: &str,
+    direct_fn: &str,
+    late_ok: bool,
+) -> Option<(String, Option<u32>)> {
     if direct_fn.starts_with("perry_static_") {
         return None;
     }
@@ -151,14 +172,54 @@ pub(crate) fn family_method_word(
         return None;
     }
     let fam = ctx.program_layouts.families.get(&class_id)?;
-    if fam.keys.iter().any(|(k, _)| k == property) {
+    let hole = match fam.keys.iter().position(|(k, _)| k == property) {
+        None => None,
+        Some(pos) if late_ok && pos >= fam.own_count as usize => Some(fam.keys[pos].1),
+        Some(_) => return None,
+    };
+    Some((family_layout_id(ctx, class_id)?, hole))
+}
+
+/// `i1`: the family slot `slot` of the object `recv_box` (whose exact family
+/// word the caller has compared) holds the hole: the one compare the owner
+/// decision 2026-11-16 accepts at an unproven, already guarded site of a key
+/// that has a late slot.
+pub(crate) fn emit_late_slot_holds_hole(ctx: &mut FnCtx<'_>, recv_box: &str, slot: u32) -> String {
+    let header =
+        crate::target_layout::object_slot_base_bytes(ctx.target_triple, ctx.program_layouts.form())
+            as i64;
+    let blk = ctx.block();
+    let bits = blk.bitcast_double_to_i64(recv_box);
+    let handle = blk.and(I64, &bits, crate::nanbox::POINTER_MASK_I64);
+    let obj = blk.inttoptr(I64, &handle);
+    let ptr = blk.gep(I8, &obj, &[(I64, &(header + 8 * i64::from(slot)).to_string())]);
+    let value = blk.load(I64, &ptr);
+    blk.icmp_eq(I64, &value, crate::nanbox::TAG_HOLE_I64)
+}
+
+/// The i32 layout id of class `class_id`'s family descriptor, loaded from the
+/// descriptor's `layout_id` word (written once at startup, before user code);
+/// `None` without layouts or a family. 0 when the runtime could not register
+/// the layout (then no birth uses it): compare it against 0 before use.
+pub(crate) fn family_layout_id(ctx: &mut FnCtx<'_>, class_id: u32) -> Option<String> {
+    if !crate::layout_desc::layouts_enabled("executable", ctx.target_triple) {
         return None;
     }
+    ctx.program_layouts.families.get(&class_id)?;
     let desc = crate::layout_desc::note_family_desc_use(class_id);
     let offset = crate::layout_desc::DESC_LAYOUT_ID_OFFSET.to_string();
     let blk = ctx.block();
     let id_ptr = blk.gep(I8, &desc, &[(I64, &offset)]);
     Some(blk.load(I32, &id_ptr))
+}
+
+/// Is every instance of class `class_id` at the layout its birth pair
+/// describes once it can be observed? A class with no family is born on the
+/// pair itself; one with a family is born on the family layout, which then
+/// has to hold the pair's instance ([`family_holds_birth_layout`]).
+pub(crate) fn births_match_clone_layout(ctx: &FnCtx<'_>, class_name: &str, class_id: u32) -> bool {
+    !ctx.program_layouts.families.contains_key(&class_id)
+        || family_holds_birth_layout(ctx, class_name, class_id)
 }
 
 /// Does class `class_name`'s family layout hold exactly the instance its
@@ -187,7 +248,8 @@ pub(crate) fn family_holds_birth_layout(ctx: &FnCtx<'_>, class_name: &str, class
                 return false;
             }
             match fam.keys.get(slot) {
-                Some((k, s)) if k.name() == Some(f.name.as_str()) && *s as usize == slot => {}
+                Some((k, s))
+                    if k.plain() && k.name() == Some(f.name.as_str()) && *s as usize == slot => {}
                 _ => return false,
             }
             slot += 1;

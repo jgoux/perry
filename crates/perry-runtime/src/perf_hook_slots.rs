@@ -18,6 +18,27 @@ pub(crate) unsafe fn histogram_property(namespace_obj: f64, property: &str) -> O
         .get()
         .map_or_else(|| None, |run| unsafe { run(namespace_obj, property) })
 }
+// perf_hooks.monitorEventLoopDelay(options?) / createHistogram(options?) for
+// calls that reach the namespace dispatch (a namespace import's member call,
+// a detached export) rather than codegen's static lowering.
+static JS_PERF_MONITOR_EVENT_LOOP_DELAY: Hook<extern "C" fn(f64) -> f64> = Hook::empty();
+pub(crate) fn js_perf_monitor_event_loop_delay(options: f64) -> f64 {
+    match JS_PERF_MONITOR_EVENT_LOOP_DELAY.get() {
+        Some(run) => run(options),
+        None => crate::collection_iter::throw_type_error(
+            "perf_hooks.monitorEventLoopDelay: the performance subsystem is not installed",
+        ),
+    }
+}
+static JS_PERF_CREATE_HISTOGRAM: Hook<extern "C" fn(f64) -> f64> = Hook::empty();
+pub(crate) fn js_perf_create_histogram(options: f64) -> f64 {
+    match JS_PERF_CREATE_HISTOGRAM.get() {
+        Some(run) => run(options),
+        None => crate::collection_iter::throw_type_error(
+            "perf_hooks.createHistogram: the performance subsystem is not installed",
+        ),
+    }
+}
 static ATTACH_PERF_HOOKS_CONSTRUCTOR: Hook<unsafe fn(&str, f64, usize) -> ()> = Hook::empty();
 pub(crate) unsafe fn attach_perf_hooks_constructor(
     class_name: &str,
@@ -96,12 +117,6 @@ pub(crate) fn is_perf_hooks_shape_instance_of(value: f64, class_id: u32) -> Opti
 static IS_PERF_OBSERVER_LIST_VALUE: Hook<fn(f64) -> bool> = Hook::empty();
 pub(crate) fn is_perf_observer_list_value(value: f64) -> bool {
     IS_PERF_OBSERVER_LIST_VALUE
-        .get()
-        .map_or_else(|| false, |run| run(value))
-}
-static IS_PERFORMANCE_NAMESPACE_VALUE: Hook<fn(f64) -> bool> = Hook::empty();
-pub(crate) fn is_performance_namespace_value(value: f64) -> bool {
-    IS_PERFORMANCE_NAMESPACE_VALUE
         .get()
         .map_or_else(|| false, |run| run(value))
 }
@@ -277,12 +292,6 @@ pub(crate) fn performance_namespace() -> f64 {
         .get()
         .map_or_else(|| f64::from_bits(crate::value::TAG_UNDEFINED), |run| run())
 }
-static PERFORMANCE_PROTOTYPE_METHOD_VALUE: Hook<fn(&str) -> Option<f64>> = Hook::empty();
-pub(crate) fn performance_prototype_method_value(name: &str) -> Option<f64> {
-    PERFORMANCE_PROTOTYPE_METHOD_VALUE
-        .get()
-        .map_or_else(|| None, |run| run(name))
-}
 static VALIDATE_PERF_LIST_FILTER_ARG: Hook<fn(f64, &str, bool) -> ()> = Hook::empty();
 pub(crate) fn validate_perf_list_filter_arg(value: f64, name: &str, missing: bool) -> () {
     VALIDATE_PERF_LIST_FILTER_ARG
@@ -311,6 +320,9 @@ pub(crate) fn install() {
         crate::perf_histogram::install_tls_resolver();
         HISTOGRAM_METHOD.set(crate::perf_histogram::histogram_method);
         HISTOGRAM_PROPERTY.set(crate::perf_histogram::histogram_property);
+        JS_PERF_MONITOR_EVENT_LOOP_DELAY
+            .set(crate::perf_histogram::js_perf_monitor_event_loop_delay);
+        JS_PERF_CREATE_HISTOGRAM.set(crate::perf_histogram::js_perf_create_histogram);
         ATTACH_PERF_HOOKS_CONSTRUCTOR.set(crate::perf_hooks::attach_perf_hooks_constructor);
         CONSTRUCT_PERF_HOOKS_CLASS.set(crate::perf_hooks::construct_perf_hooks_class);
         CURRENT_LIST_GET_BY_NAME.set(crate::perf_hooks::current_list_get_by_name);
@@ -321,7 +333,6 @@ pub(crate) fn install() {
         IS_PERF_ENTRY_OBJECT_INSTANCE_OF.set(crate::perf_hooks::is_perf_entry_object_instance_of);
         IS_PERF_HOOKS_SHAPE_INSTANCE_OF.set(crate::perf_hooks::is_perf_hooks_shape_instance_of);
         IS_PERF_OBSERVER_LIST_VALUE.set(crate::perf_hooks::is_perf_observer_list_value);
-        IS_PERFORMANCE_NAMESPACE_VALUE.set(crate::perf_hooks::is_performance_namespace_value);
         JS_PERF_CLEAR_MARKS.set(crate::perf_hooks::js_perf_clear_marks);
         JS_PERF_CLEAR_MEASURES.set(crate::perf_hooks::js_perf_clear_measures);
         JS_PERF_CLEAR_RESOURCE_TIMINGS.set(crate::perf_hooks::js_perf_clear_resource_timings);
@@ -346,8 +357,6 @@ pub(crate) fn install() {
         PERF_ENTRY_TO_JSON.set(crate::perf_hooks::perf_entry_to_json);
         PERF_SUPPORTED_ENTRY_TYPES_VALUE.set(crate::perf_hooks::perf_supported_entry_types_value);
         PERFORMANCE_NAMESPACE.set(crate::perf_hooks::performance_namespace);
-        PERFORMANCE_PROTOTYPE_METHOD_VALUE
-            .set(crate::perf_hooks::performance_prototype_method_value);
         VALIDATE_PERF_LIST_FILTER_ARG.set(crate::perf_hooks::validate_perf_list_filter_arg);
         REGISTER_ROOTS.set(register_roots);
     });

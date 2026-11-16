@@ -27,6 +27,7 @@ impl WasmModuleEmitter {
             "jsvalue_to_template_string",
             "is_truthy",
             "js_strict_eq",
+            "js_loose_eq",
             "math_floor",
             "math_ceil",
             "math_round",
@@ -124,6 +125,7 @@ impl WasmModuleEmitter {
             "closure_call_1",
             "closure_call_2",
             "closure_call_3",
+            "new_dynamic",
             "closure_call_spread",
             "array_map",
             "array_filter",
@@ -139,6 +141,10 @@ impl WasmModuleEmitter {
             "class_call_method",
             "class_get_field",
             "class_set_field",
+            "generator_new",
+            "box_new",
+            "box_get",
+            "box_set",
             "class_set_static",
             "class_get_static",
             "class_instanceof",
@@ -173,13 +179,49 @@ impl WasmModuleEmitter {
             "date_get_minutes",
             "date_get_seconds",
             "date_get_milliseconds",
+            "date_parse",
+            "date_utc",
+            "date_value_of",
+            "date_get_timezone_offset",
+            "date_get_utc_full_year",
+            "date_get_utc_month",
+            "date_get_utc_date",
+            "date_get_utc_day",
+            "date_get_utc_hours",
+            "date_get_utc_minutes",
+            "date_get_utc_seconds",
+            "date_get_utc_milliseconds",
+            "date_set_utc_full_year",
+            "date_set_utc_month",
+            "date_set_utc_date",
+            "date_set_utc_hours",
+            "date_set_utc_minutes",
+            "date_set_utc_seconds",
+            "date_set_utc_milliseconds",
+            "date_to_date_string",
+            "date_to_time_string",
+            "date_to_locale_string",
+            "date_to_locale_date_string",
+            "date_to_locale_time_string",
+            "date_to_json",
             "error_new",
             "error_message",
+            "global_property",
+            "global_receiver",
+            "propagate_exception",
             "regexp_new",
             "regexp_test",
             "number_coerce",
             "is_nan",
             "is_finite",
+            "number_is_integer",
+            "number_is_safe_integer",
+            "global_is_nan",
+            "global_is_finite",
+            "encode_uri",
+            "decode_uri",
+            "encode_uri_component",
+            "decode_uri_component",
             "console_log_multi",
             "class_set_parent",
             "try_start",
@@ -251,7 +293,10 @@ impl WasmModuleEmitter {
             "promise_then",
             "await_promise",
         ];
-        for name in &bridge_names {
+        for name in bridge_names
+            .iter()
+            .chain(super::expr::ITERATOR_RECORD_BRIDGES)
+        {
             self.intern_string(name);
         }
 
@@ -424,6 +469,7 @@ impl WasmModuleEmitter {
                 body,
                 catch,
                 finally,
+                ..
             } => {
                 self.collect_strings_in_stmts(body);
                 if let Some(c) = catch {
@@ -561,6 +607,7 @@ impl WasmModuleEmitter {
                 object,
                 index,
                 value,
+                ..
             } => {
                 self.collect_strings_in_expr(object);
                 self.collect_strings_in_expr(index);
@@ -963,11 +1010,24 @@ impl WasmModuleEmitter {
             Expr::JsonParse(e) | Expr::JsonStringify(e) => {
                 self.collect_strings_in_expr(e);
             }
+            Expr::JsonStringifyFull(val, replacer, space) => {
+                self.collect_strings_in_expr(val);
+                self.collect_strings_in_expr(replacer);
+                self.collect_strings_in_expr(space);
+            }
             Expr::NumberCoerce(e)
             | Expr::IsNaN(e)
             | Expr::IsUndefinedOrBareNan(e)
             | Expr::IsFinite(e)
-            | Expr::BigIntCoerce(e) => {
+            | Expr::NumberIsNaN(e)
+            | Expr::NumberIsFinite(e)
+            | Expr::NumberIsInteger(e)
+            | Expr::NumberIsSafeInteger(e)
+            | Expr::BigIntCoerce(e)
+            | Expr::EncodeURI(e)
+            | Expr::DecodeURI(e)
+            | Expr::EncodeURIComponent(e)
+            | Expr::DecodeURIComponent(e) => {
                 self.collect_strings_in_expr(e);
             }
             Expr::ParseInt { string, radix } => {
@@ -1045,7 +1105,11 @@ impl WasmModuleEmitter {
                 self.collect_strings_in_expr(auth_header);
                 self.collect_strings_in_expr(body);
             }
-            _ => {}
+            // Every other variant interns the strings under its children, so a
+            // literal under a node without its own arm still has an id.
+            _ => perry_hir::walker::walk_expr_children(expr, &mut |child| {
+                self.collect_strings_in_expr(child)
+            }),
         }
     }
 }

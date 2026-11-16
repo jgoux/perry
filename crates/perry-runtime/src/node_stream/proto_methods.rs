@@ -42,10 +42,10 @@ pub(crate) enum StreamProto {
 impl StreamProto {
     fn layout(self) -> *const crate::object::layout_desc::PerryLayoutDesc {
         match self {
-            StreamProto::Readable => std::ptr::addr_of!(layouts::READABLE_PROTOTYPE),
-            StreamProto::Writable => std::ptr::addr_of!(layouts::WRITABLE_PROTOTYPE),
-            StreamProto::Duplex => std::ptr::addr_of!(layouts::DUPLEX_PROTOTYPE),
-            StreamProto::Transform => std::ptr::addr_of!(layouts::TRANSFORM_PROTOTYPE),
+            StreamProto::Readable => layouts::READABLE_PROTOTYPE::desc(),
+            StreamProto::Writable => layouts::WRITABLE_PROTOTYPE::desc(),
+            StreamProto::Duplex => layouts::DUPLEX_PROTOTYPE::desc(),
+            StreamProto::Transform => layouts::TRANSFORM_PROTOTYPE::desc(),
         }
     }
 
@@ -140,6 +140,29 @@ pub(crate) fn is_builtin_hook(value: f64) -> bool {
     NODE_PROTOTYPE_HOOKS
         .iter()
         .any(|hook| std::ptr::eq(*hook, info))
+}
+
+/// The writable table's rows from here on are not readable rows.
+const WRITABLE_OWN_ROWS: usize = 15;
+
+/// Identify the exact stream/emitter body, not its mutable name property.
+pub(crate) fn is_builtin_stream_method(value: f64, name: &str) -> bool {
+    if !is_callable_value(value) {
+        return false;
+    }
+    let raw = raw_ptr_from_value(value);
+    if !crate::closure::is_closure_ptr(raw) {
+        return false;
+    }
+    let info = unsafe { (*(raw as *const ClosureHeader)).info };
+    // The union of the readable, emitter and writable rows: every emitter row
+    // and the writable rows before `WRITABLE_OWN_ROWS` are readable rows
+    // (`stream_method_rows_cover_the_three_tables`), so 46 rows are compared,
+    // the identity first.
+    super::readwrite::readable_methods()
+        .into_iter()
+        .chain(super::readwrite::writable_methods().into_iter().skip(WRITABLE_OWN_ROWS))
+        .any(|(key, intrinsic)| std::ptr::eq(intrinsic, info) && key == name)
 }
 
 /// `value` when it is a callable that is not one of node's prototype hooks.
@@ -382,7 +405,7 @@ pub(crate) fn build_passthrough_prototype(constructor: f64) -> f64 {
         return crate::value::js_nanbox_pointer(proto as i64);
     }
     // SAFETY: a node prototype descriptor of this runtime.
-    let layout = unsafe { layouts::NodePrototype::of(&raw const layouts::PASSTHROUGH_PROTOTYPE) };
+    let layout = unsafe { layouts::NodePrototype::of(layouts::PASSTHROUGH_PROTOTYPE::desc()) };
     let proto = scope.root_raw_mut_ptr(unsafe { layout.birth() });
     let p = || proto.get_raw_mut_ptr::<ObjectHeader>();
     let transform = proto_closure(&scope, &NS_PASSTHROUGH_TRANSFORM_INFO);
@@ -980,8 +1003,7 @@ pub(crate) fn build_legacy_stream_prototype(constructor: f64) -> f64 {
     let scope = crate::gc::RuntimeHandleScope::new();
     let constructor = scope.root_nanbox_f64(constructor);
     // SAFETY: a node prototype descriptor of this runtime.
-    let layout =
-        unsafe { layouts::NodePrototype::of(std::ptr::addr_of!(layouts::STREAM_PROTOTYPE)) };
+    let layout = unsafe { layouts::NodePrototype::of(layouts::STREAM_PROTOTYPE::desc()) };
     let proto = scope.root_raw_mut_ptr(unsafe { layout.birth() });
     let p = || proto.get_raw_mut_ptr::<ObjectHeader>();
     let pipe = proto_closure(&scope, &NS_LEGACY_PIPE_INFO);
@@ -1288,4 +1310,26 @@ extern "C" fn ns_legacy_pipe2(
         &[pipe.get_nanbox_f64(), source.get_nanbox_f64()],
     );
     dest.get_nanbox_f64()
+}
+
+#[cfg(test)]
+mod stream_method_rows_tests {
+    /// `is_builtin_stream_method` compares the readable rows and the writable
+    /// rows from `WRITABLE_OWN_ROWS` on: that is the union of the readable,
+    /// emitter and writable tables.
+    #[test]
+    fn stream_method_rows_cover_the_three_tables() {
+        use super::super::readwrite::{emitter_methods, readable_methods, writable_methods};
+        let scanned: Vec<_> = readable_methods()
+            .into_iter()
+            .chain(writable_methods().into_iter().skip(super::WRITABLE_OWN_ROWS))
+            .collect();
+        for row in readable_methods()
+            .into_iter()
+            .chain(emitter_methods())
+            .chain(writable_methods())
+        {
+            assert!(scanned.contains(&row), "row {} is not compared", row.0);
+        }
+    }
 }

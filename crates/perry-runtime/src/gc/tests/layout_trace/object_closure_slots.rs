@@ -78,7 +78,7 @@ fn test_int32_store_without_typed_descriptor_is_left_verbatim() {
     unsafe {
         *fields = 0.0f64.to_bits();
     }
-    let int32_bits = crate::value::INT32_TAG | 5u64;
+    let int32_bits = crate::value::INTERNAL_WORD_TAG | 5u64;
     runtime_store_jsvalue_slot(obj as usize, fields as usize, 0, int32_bits);
 
     assert_eq!(
@@ -93,7 +93,13 @@ fn test_raw_capture_word_keeps_closure_pointer_free_at_any_alignment() {
     // An 8-aligned word is what `layout_pointer_bearing_bits` calls a pointer.
     // Stored through the plain-word setter it must not demote the layout, so a
     // link-placed address or a counter value cannot change runtime work.
-    for word in [0x1000_i64, 0x2008, 0x40_0000, 0x5555_1234_5670, 0x5555_1234_5674] {
+    for word in [
+        0x1000_i64,
+        0x2008,
+        0x40_0000,
+        0x5555_1234_5670,
+        0x5555_1234_5674,
+    ] {
         let closure =
             crate::closure::js_closure_alloc(crate::fn_info!(layout_mask_test_closure, 0), 3);
         crate::closure::js_closure_set_capture_f64(closure, 0, 1.0);

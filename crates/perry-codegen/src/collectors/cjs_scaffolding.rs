@@ -615,6 +615,7 @@ fn for_each_stmt(stmts: &[Stmt], f: &mut dyn FnMut(&Stmt)) {
                 body,
                 catch,
                 finally,
+                ..
             } => {
                 for_each_stmt(body, f);
                 if let Some(catch) = catch {
@@ -987,6 +988,7 @@ mod tests {
             is_exported: false,
             aliases: Vec::new(),
             is_nested: false,
+            decl_stmt: None,
             alloc_width_hint: 0,
             specialized_from: None,
             static_accessor_names: Vec::new(),
@@ -1003,6 +1005,8 @@ mod tests {
                 object: Box::new(Expr::LocalGet(POINT_ID)),
                 property: "x".to_string(),
                 value: Box::new(Expr::Number(1.0)),
+                byte_offset: 0,
+                byte_end: 0,
             }),
             Stmt::Return(Some(Expr::PropertyGet {
                 byte_end: 0,
@@ -1089,6 +1093,9 @@ mod tests {
             value: Box::new(value),
             receiver: Box::new(Expr::LocalGet(REQUIRE_ID)),
             strict: true,
+            element_offset: 0,
+            byte_offset: 0,
+            byte_end: 0,
         })
     }
 
@@ -1370,6 +1377,9 @@ mod tests {
                 value: Box::new(anon_shape("__AnonShape_user", Vec::new())),
                 receiver: Box::new(Expr::LocalGet(77)),
                 strict: true,
+                element_offset: 0,
+                byte_offset: 0,
+                byte_end: 0,
             }),
             // A user `let` of an object literal — a real rule-1 candidate.
             let_const(55, "row", anon_shape("__AnonShape_row", Vec::new())),

@@ -54,6 +54,7 @@ fn class_with_fields(name: &str, fields: &[&str]) -> Class {
         is_exported: false,
         aliases: Vec::new(),
         is_nested: false,
+        decl_stmt: None,
         alloc_width_hint: 0,
         specialized_from: None,
         static_accessor_names: Vec::new(),
@@ -88,6 +89,8 @@ fn store_x(id: u32) -> Stmt {
         object: Box::new(Expr::LocalGet(id)),
         property: "x".to_string(),
         value: Box::new(Expr::Number(1.0)),
+        byte_offset: 0,
+        byte_end: 0,
     })
 }
 

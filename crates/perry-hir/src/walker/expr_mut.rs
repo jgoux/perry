@@ -7,6 +7,15 @@ pub fn walk_expr_children_mut<F>(expr: &mut Expr, f: &mut F)
 where
     F: FnMut(&mut Expr),
 {
+    stacker::maybe_grow(WALK_STACK_RED_ZONE, WALK_STACK_SEGMENT, || {
+        walk_expr_children_mut_level(expr, f)
+    })
+}
+
+fn walk_expr_children_mut_level<F>(expr: &mut Expr, f: &mut F)
+where
+    F: FnMut(&mut Expr),
+{
     match expr {
         Expr::ScopedTemp { value, body, .. } => {
             f(value);
@@ -707,7 +716,7 @@ where
             f(property);
             f(object);
         }
-        Expr::PrivateLexicalBrandPop => {}
+        Expr::PrivateLexicalBrandPop | Expr::ThisProvenClass(_) => {}
         Expr::PrivateLexicalBrand(object) | Expr::PrivateLexicalBrandPush(object) => {
             f(object);
         }
@@ -813,6 +822,7 @@ where
             object,
             index,
             value,
+            ..
         } => {
             f(object);
             f(index);

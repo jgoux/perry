@@ -110,6 +110,7 @@ pub fn absorb_writes_into_index_used(stmts: &[perry_hir::Stmt], out: &mut HashSe
                 body,
                 catch,
                 finally,
+                ..
             } => {
                 absorb_writes_into_index_used(body, out);
                 if let Some(c) = catch {
@@ -205,6 +206,7 @@ pub fn collect_localsets_in_expr_for_propagate<'a>(
             object,
             index,
             value,
+            ..
         } => {
             collect_localsets_in_expr_for_propagate(object, out);
             collect_localsets_in_expr_for_propagate(index, out);
@@ -273,6 +275,7 @@ pub fn walk_index_uses_in_stmts(stmts: &[perry_hir::Stmt], out: &mut HashSet<u32
                 body,
                 catch,
                 finally,
+                ..
             } => {
                 walk_index_uses_in_stmts(body, out);
                 if let Some(c) = catch {
@@ -323,6 +326,7 @@ pub fn walk_index_uses_in_expr(e: &perry_hir::Expr, out: &mut HashSet<u32>) {
             object,
             index,
             value,
+            ..
         } => {
             collect_index_refs(index, out);
             walk_index_uses_in_expr(object, out);

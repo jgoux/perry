@@ -75,6 +75,7 @@ fn collect_flat_const_row_aliases(
                 body,
                 catch,
                 finally,
+                ..
             } => {
                 collect_flat_const_row_aliases(body, id, out);
                 if let Some(catch) = catch {
@@ -156,6 +157,7 @@ fn flat_const_stmts_are_safe(
                 body,
                 catch,
                 finally,
+                ..
             } => {
                 flat_const_stmts_are_safe(body, id, row_aliases)
                     && catch
@@ -354,6 +356,7 @@ fn any_top_level_expr(
                 body,
                 catch,
                 finally,
+                ..
             } => {
                 if any_top_level_expr(body, pred) {
                     return true;
@@ -498,6 +501,7 @@ pub fn expr_has_mutation(e: &perry_hir::Expr, id: u32) -> bool {
             object,
             index,
             value,
+            ..
         } => {
             is_local_get_chain(object, id)
                 || expr_has_mutation(object, id)
@@ -617,6 +621,7 @@ mod tests {
 
     fn index(object: Expr, index: i64) -> Expr {
         Expr::IndexGet {
+            element_offset: 0,
             byte_offset: 0,
             byte_end: 0,
             object: Box::new(object),
@@ -662,6 +667,9 @@ mod tests {
             object: Box::new(index(Expr::LocalGet(7), 0)),
             index: Box::new(Expr::Integer(1)),
             value: Box::new(Expr::Integer(99)),
+            element_offset: 0,
+            byte_offset: 0,
+            byte_end: 0,
         };
         assert!(!flat_const_array_uses_are_read_only(
             &[perry_hir::Stmt::Expr(write)],
@@ -675,6 +683,8 @@ mod tests {
             object: Box::new(Expr::LocalGet(7)),
             property: "count".to_string(),
             value: Box::new(Expr::String("lie".to_string())),
+            byte_offset: 0,
+            byte_end: 0,
         };
         let update = Expr::PropertyUpdate {
             object: Box::new(Expr::LocalGet(7)),
@@ -682,6 +692,8 @@ mod tests {
             op: BinaryOp::Add,
             prefix: false,
             strict: true,
+            byte_offset: 0,
+            byte_end: 0,
         };
         assert!(expr_has_mutation(&set, 7));
         assert!(expr_has_mutation(&update, 7));
@@ -696,6 +708,9 @@ mod tests {
             value: Box::new(Expr::String("changed".to_string())),
             receiver: Box::new(Expr::LocalGet(8)),
             strict: true,
+            element_offset: 0,
+            byte_offset: 0,
+            byte_end: 0,
         };
         assert!(expr_has_mutation(&set, 7));
         assert!(expr_has_mutation(&set, 8));

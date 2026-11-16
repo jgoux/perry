@@ -216,7 +216,7 @@ pub(super) unsafe fn visit_gc_layout_slot_descriptors_generic<const DIAGNOSTICS:
         // uninitialised padding into the address and hide the edge.
         let descriptor = if matches!(
             (*header).obj_type,
-            crate::gc_object_type_pat!() | GC_TYPE_CLOSURE | GC_TYPE_ARRAY
+            crate::gc_object_type_pat!() | GC_TYPE_CLOSURE | crate::gc_array_type_pat!()
         ) {
             pointer_slot(slot.cast())
         } else {
@@ -496,39 +496,14 @@ unsafe fn visit_gc_rewrite_slot_descriptors_with<
                 return;
             }
             visit(pointer_slot(&mut (*lazy).blob_str as *mut _ as *mut usize));
-            visit(pointer_slot(
-                &mut (*lazy).materialized as *mut _ as *mut usize,
-            ));
-            visit(pointer_slot(
-                &mut (*lazy).materialized_elements as *mut _ as *mut usize,
-            ));
-            visit(pointer_slot(
-                &mut (*lazy).materialized_bitmap as *mut _ as *mut usize,
-            ));
-
+            // The element slots the materialized array keeps: TAG_HOLE until an
+            // element is materialized, which is a non-pointer to the visitor.
             let cached_length = (*lazy).cached_length as usize;
-            let cache = (*lazy).materialized_elements;
-            let bitmap = (*lazy).materialized_bitmap;
-            if cache.is_null() || bitmap.is_null() || cached_length == 0 {
-                return;
-            }
-            let bitmap_words = cached_length.div_ceil(64);
-            for w in 0..bitmap_words {
-                let word = *bitmap.add(w);
-                if word == 0 {
-                    continue;
-                }
-                let base_idx = w * 64;
-                for b in 0..64usize {
-                    if word & (1u64 << b) == 0 {
-                        continue;
-                    }
-                    let i = base_idx + b;
-                    if i >= cached_length {
-                        break;
-                    }
-                    visit(fixed_slot(cache.add(i) as *mut u64));
-                }
+            if cached_length != 0 {
+                visit(GcMutableSlotDescriptor::Range {
+                    range: HeapSlotRange::new(crate::json_tape::lazy_slot(lazy, 0), cached_length),
+                    layout_kind: None,
+                });
             }
         }
 
@@ -605,15 +580,15 @@ unsafe fn visit_gc_rewrite_slot_descriptors_with<
             if (*meta).owned_state != 0 {
                 visit(fixed_slot(&mut (*meta).owned_state as *mut u64));
             }
-            // Native payload and weak-collection `native_state` is its
-            // POINTER_TAG-boxed owned cell, reachable ONLY through this
-            // record, so it is a child edge exactly like `arguments`. A plain
-            // stream's state record (an array) is the same kind of edge. Other
-            // families pack POD into the same word (text bits, timer/tui ids,
-            // a Set's malloc'd index, a class's private-storage serial) and
-            // none of those words carries the pointer tag, so they are never
-            // visited; `native_payload_cell_survives_a_moving_collection`
-            // reddens if this visit is removed.
+            // A weak collection's `native_state` is its POINTER_TAG-boxed
+            // owned storage, reachable ONLY through this record, so it is a
+            // child edge exactly like `arguments`. A stream's state record
+            // (an array) and a native-this alias record are the same kind of
+            // edge. (A native payload cell is not meta state: it is the
+            // object's own payload slot, traced as a field.) Other families
+            // pack POD into the same word (text bits, timer/tui ids, a Set's
+            // malloc'd index, a class's private-storage serial) and none of
+            // those words carries the pointer tag, so they are never visited.
             if crate::native_payload::is_payload_state_word((*meta).native_state) {
                 #[cfg(test)]
                 if crate::node_stream::native_hooks::stream_sabotage("record_trace")
@@ -663,6 +638,11 @@ unsafe fn visit_gc_rewrite_slot_descriptors_with<
             }
         }
         GcRewriteDescriptorKind::Box => visit(fixed_slot(user_ptr as *mut u64)),
+        GcRewriteDescriptorKind::RecordArray => {
+            // The head's only traced edge: its element buffer, a pointer-free
+            // leaf, or null while the capacity is 0.
+            visit(pointer_slot(crate::record_array::elems_slot(user_ptr)));
+        }
         GcRewriteDescriptorKind::Scope => {
             let slots = user_ptr as *mut u64;
             for i in 0..crate::r#box::scope::scope_slot_count(header) {
@@ -705,6 +685,13 @@ pub(super) unsafe fn visit_gc_rewrite_slots<const DIAGNOSTICS: bool>(
     });
 }
 
+/// The slots the collector traces in `header`'s object, by address: the census
+/// reads a holder's words through the collector's own enumeration.
+#[cfg(perry_gc_instruments)]
+pub(crate) unsafe fn visit_traced_slots(header: *mut GcHeader, mut visit: impl FnMut(usize)) {
+    visit_gc_rewrite_slots::<false>(header, |slot| visit(slot.slot as usize));
+}
+
 /// [`visit_gc_rewrite_slots`] with the whole enumeration instantiated for
 /// `visit`: the copying drain. Indirect descriptor and slot visitor calls
 /// were a measured share of that path's per-object
@@ -723,6 +710,37 @@ pub(super) unsafe fn visit_gc_rewrite_slots_inline<const DIAGNOSTICS: bool>(
     visit_gc_rewrite_slot_descriptors_with::<DIAGNOSTICS, true>(header, |descriptor| unsafe {
         descriptor.visit_slots_inline(&mut visit);
     });
+}
+
+/// [`visit_gc_rewrite_slots`] through the ONE shared, out-of-line copy of the
+/// rewrite-descriptor and layout decoder. The walker's slot action is a
+/// separate function either way (it was never inlined into the decoder), so
+/// the shared copy trades a direct call per descriptor for an indirect one;
+/// what it removes is the per-walker instantiation of the whole decoder.
+/// Enumerates exactly the same slots, in the same order.
+pub(super) unsafe fn visit_gc_rewrite_slots_shared<const DIAGNOSTICS: bool>(
+    header: *mut GcHeader,
+    mut visit: impl FnMut(GcMutableSlot),
+) {
+    visit_gc_rewrite_slot_descriptors_shared::<DIAGNOSTICS>(header, &mut |descriptor| unsafe {
+        descriptor.visit_slots_inline(&mut visit);
+    });
+}
+
+/// The shared decoder body behind [`visit_gc_rewrite_slots_shared`]: one copy
+/// per `DIAGNOSTICS`, never inlined into a walker.
+#[inline(never)]
+pub(super) unsafe fn visit_gc_rewrite_slot_descriptors_shared<const DIAGNOSTICS: bool>(
+    header: *mut GcHeader,
+    visit: &mut dyn FnMut(GcMutableSlotDescriptor),
+) {
+    #[cfg(test)]
+    if (*header).obj_type == crate::gc::GC_TYPE_NATIVE_HANDLE
+        && crate::native_payload::callback_sabotage("rewrite")
+    {
+        return;
+    }
+    visit_gc_rewrite_slot_descriptors_with::<DIAGNOSTICS, true>(header, visit);
 }
 
 /// Test-only sabotage for the inline mask walk
@@ -784,7 +802,6 @@ unsafe fn visit_object_layout_slots<const DIAGNOSTICS: bool, F>(
         return;
     };
     let meta = crate::object::gc_object_meta_slot(obj as usize);
-    let arguments = crate::object::arguments_mapping_slot(obj);
     let selection = heap_payload_slot_selection_from(header, payload, shape);
     let full = full_trace_active();
     let prototype = crate::object::gc_shape_prototype_edge_slot(shape, full);
@@ -816,9 +833,6 @@ unsafe fn visit_object_layout_slots<const DIAGNOSTICS: bool, F>(
     }
     if let Some(slot) = meta {
         visit(pointer_slot(slot.cast()).with_layout(HeapChildSlotReadKind::Prefix));
-    }
-    if let Some(slot) = arguments {
-        visit(fixed_slot(slot).with_layout(HeapChildSlotReadKind::Prefix));
     }
     match selection {
         HeapPayloadSlotSelection::Empty => {}

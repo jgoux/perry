@@ -75,16 +75,16 @@ pub(crate) extern "C" fn js_typed_array_copy_within(
         |run| run(ta, target_value, start_value, end_value),
     )
 }
-static JS_TYPED_ARRAY_EVERY: Hook<
-    extern "C" fn(*const TypedArrayHeader, *const ClosureHeader) -> f64,
-> = Hook::empty();
-pub(crate) extern "C" fn js_typed_array_every(
+static JS_TYPED_ARRAY_EVERY: Hook<fn(*const TypedArrayHeader, *const ClosureHeader, f64) -> f64> =
+    Hook::empty();
+pub(crate) fn js_typed_array_every(
     ta: *const TypedArrayHeader,
     callback: *const ClosureHeader,
+    this_arg: f64,
 ) -> f64 {
     JS_TYPED_ARRAY_EVERY.get().map_or_else(
         || f64::from_bits(crate::value::TAG_UNDEFINED),
-        |run| run(ta, callback),
+        |run| run(ta, callback, this_arg),
     )
 }
 static JS_TYPED_ARRAY_FILL: Hook<
@@ -104,74 +104,79 @@ pub(crate) extern "C" fn js_typed_array_fill(
     )
 }
 static JS_TYPED_ARRAY_FILTER: Hook<
-    extern "C" fn(*const TypedArrayHeader, *const ClosureHeader) -> *mut TypedArrayHeader,
+    fn(*const TypedArrayHeader, *const ClosureHeader, f64) -> *mut TypedArrayHeader,
 > = Hook::empty();
-pub(crate) extern "C" fn js_typed_array_filter(
+pub(crate) fn js_typed_array_filter(
     ta: *const TypedArrayHeader,
     callback: *const ClosureHeader,
+    this_arg: f64,
 ) -> *mut TypedArrayHeader {
     JS_TYPED_ARRAY_FILTER
         .get()
-        .map_or_else(|| std::ptr::null_mut(), |run| run(ta, callback))
+        .map_or_else(|| std::ptr::null_mut(), |run| run(ta, callback, this_arg))
 }
-static JS_TYPED_ARRAY_FIND: Hook<
-    extern "C" fn(*const TypedArrayHeader, *const ClosureHeader) -> f64,
-> = Hook::empty();
-pub(crate) extern "C" fn js_typed_array_find(
+static JS_TYPED_ARRAY_FIND: Hook<fn(*const TypedArrayHeader, *const ClosureHeader, f64) -> f64> =
+    Hook::empty();
+pub(crate) fn js_typed_array_find(
     ta: *const TypedArrayHeader,
     callback: *const ClosureHeader,
+    this_arg: f64,
 ) -> f64 {
     JS_TYPED_ARRAY_FIND.get().map_or_else(
         || f64::from_bits(crate::value::TAG_UNDEFINED),
-        |run| run(ta, callback),
+        |run| run(ta, callback, this_arg),
     )
 }
 static JS_TYPED_ARRAY_FIND_INDEX: Hook<
-    extern "C" fn(*const TypedArrayHeader, *const ClosureHeader) -> f64,
+    fn(*const TypedArrayHeader, *const ClosureHeader, f64) -> f64,
 > = Hook::empty();
-pub(crate) extern "C" fn js_typed_array_find_index(
+pub(crate) fn js_typed_array_find_index(
     ta: *const TypedArrayHeader,
     callback: *const ClosureHeader,
+    this_arg: f64,
 ) -> f64 {
     JS_TYPED_ARRAY_FIND_INDEX.get().map_or_else(
         || f64::from_bits(crate::value::TAG_UNDEFINED),
-        |run| run(ta, callback),
+        |run| run(ta, callback, this_arg),
     )
 }
 static JS_TYPED_ARRAY_FIND_LAST: Hook<
-    extern "C" fn(*const TypedArrayHeader, *const ClosureHeader) -> f64,
+    fn(*const TypedArrayHeader, *const ClosureHeader, f64) -> f64,
 > = Hook::empty();
-pub(crate) extern "C" fn js_typed_array_find_last(
+pub(crate) fn js_typed_array_find_last(
     ta: *const TypedArrayHeader,
     callback: *const ClosureHeader,
+    this_arg: f64,
 ) -> f64 {
     JS_TYPED_ARRAY_FIND_LAST.get().map_or_else(
         || f64::from_bits(crate::value::TAG_UNDEFINED),
-        |run| run(ta, callback),
+        |run| run(ta, callback, this_arg),
     )
 }
 static JS_TYPED_ARRAY_FIND_LAST_INDEX: Hook<
-    extern "C" fn(*const TypedArrayHeader, *const ClosureHeader) -> f64,
+    fn(*const TypedArrayHeader, *const ClosureHeader, f64) -> f64,
 > = Hook::empty();
-pub(crate) extern "C" fn js_typed_array_find_last_index(
+pub(crate) fn js_typed_array_find_last_index(
     ta: *const TypedArrayHeader,
     callback: *const ClosureHeader,
+    this_arg: f64,
 ) -> f64 {
     JS_TYPED_ARRAY_FIND_LAST_INDEX.get().map_or_else(
         || f64::from_bits(crate::value::TAG_UNDEFINED),
-        |run| run(ta, callback),
+        |run| run(ta, callback, this_arg),
     )
 }
 static JS_TYPED_ARRAY_FOR_EACH: Hook<
-    extern "C" fn(*const TypedArrayHeader, *const ClosureHeader) -> f64,
+    fn(*const TypedArrayHeader, *const ClosureHeader, f64) -> f64,
 > = Hook::empty();
-pub(crate) extern "C" fn js_typed_array_for_each(
+pub(crate) fn js_typed_array_for_each(
     ta: *const TypedArrayHeader,
     callback: *const ClosureHeader,
+    this_arg: f64,
 ) -> f64 {
     JS_TYPED_ARRAY_FOR_EACH.get().map_or_else(
         || f64::from_bits(crate::value::TAG_UNDEFINED),
-        |run| run(ta, callback),
+        |run| run(ta, callback, this_arg),
     )
 }
 static JS_TYPED_ARRAY_GET: Hook<extern "C" fn(*const TypedArrayHeader, i32) -> f64> = Hook::empty();
@@ -234,28 +239,31 @@ pub extern "C" fn js_typed_array_length(ta: *const TypedArrayHeader) -> i32 {
     JS_TYPED_ARRAY_LENGTH.get().map_or_else(|| 0, |run| run(ta))
 }
 static JS_TYPED_ARRAY_MAP: Hook<
-    extern "C" fn(*const TypedArrayHeader, *const ClosureHeader) -> *mut TypedArrayHeader,
+    fn(*const TypedArrayHeader, *const ClosureHeader, f64) -> *mut TypedArrayHeader,
 > = Hook::empty();
-pub(crate) extern "C" fn js_typed_array_map(
+pub(crate) fn js_typed_array_map(
     ta: *const TypedArrayHeader,
     callback: *const ClosureHeader,
+    this_arg: f64,
 ) -> *mut TypedArrayHeader {
     JS_TYPED_ARRAY_MAP
         .get()
-        .map_or_else(|| std::ptr::null_mut(), |run| run(ta, callback))
+        .map_or_else(|| std::ptr::null_mut(), |run| run(ta, callback, this_arg))
 }
 static JS_TYPED_ARRAY_NEW: Hook<extern "C" fn(i32, f64) -> *mut TypedArrayHeader> = Hook::empty();
 pub(crate) extern "C" fn js_typed_array_new(kind: i32, val: f64) -> *mut TypedArrayHeader {
-    JS_TYPED_ARRAY_NEW
-        .get()
-        .map_or_else(|| std::ptr::null_mut(), |run| run(kind, val))
+    JS_TYPED_ARRAY_NEW.get().map_or_else(
+        || crate::family_never::byte_cells_not_installed(),
+        |run| run(kind, val),
+    )
 }
 static JS_TYPED_ARRAY_NEW_EMPTY: Hook<extern "C" fn(i32, i32) -> *mut TypedArrayHeader> =
     Hook::empty();
 pub extern "C" fn js_typed_array_new_empty(kind: i32, length: i32) -> *mut TypedArrayHeader {
-    JS_TYPED_ARRAY_NEW_EMPTY
-        .get()
-        .map_or_else(|| std::ptr::null_mut(), |run| run(kind, length))
+    JS_TYPED_ARRAY_NEW_EMPTY.get().map_or_else(
+        || crate::family_never::byte_cells_not_installed(),
+        |run| run(kind, length),
+    )
 }
 static JS_TYPED_ARRAY_NEW_FROM_ARRAY: Hook<
     extern "C" fn(i32, *const ArrayHeader) -> *mut TypedArrayHeader,
@@ -264,9 +272,10 @@ pub(crate) extern "C" fn js_typed_array_new_from_array(
     kind: i32,
     arr: *const ArrayHeader,
 ) -> *mut TypedArrayHeader {
-    JS_TYPED_ARRAY_NEW_FROM_ARRAY
-        .get()
-        .map_or_else(|| std::ptr::null_mut(), |run| run(kind, arr))
+    JS_TYPED_ARRAY_NEW_FROM_ARRAY.get().map_or_else(
+        || crate::family_never::byte_cells_not_installed(),
+        |run| run(kind, arr),
+    )
 }
 static JS_TYPED_ARRAY_REDUCE: Hook<
     extern "C" fn(*const TypedArrayHeader, *const ClosureHeader, i32, f64) -> f64,
@@ -340,16 +349,16 @@ pub(crate) extern "C" fn js_typed_array_slice(
         .get()
         .map_or_else(|| std::ptr::null_mut(), |run| run(ta, start, end))
 }
-static JS_TYPED_ARRAY_SOME: Hook<
-    extern "C" fn(*const TypedArrayHeader, *const ClosureHeader) -> f64,
-> = Hook::empty();
-pub(crate) extern "C" fn js_typed_array_some(
+static JS_TYPED_ARRAY_SOME: Hook<fn(*const TypedArrayHeader, *const ClosureHeader, f64) -> f64> =
+    Hook::empty();
+pub(crate) fn js_typed_array_some(
     ta: *const TypedArrayHeader,
     callback: *const ClosureHeader,
+    this_arg: f64,
 ) -> f64 {
     JS_TYPED_ARRAY_SOME.get().map_or_else(
         || f64::from_bits(crate::value::TAG_UNDEFINED),
-        |run| run(ta, callback),
+        |run| run(ta, callback, this_arg),
     )
 }
 static JS_TYPED_ARRAY_SORT_DEFAULT: Hook<
@@ -428,7 +437,7 @@ pub(crate) extern "C" fn js_typed_array_view(
     length_value: f64,
 ) -> *mut TypedArrayHeader {
     JS_TYPED_ARRAY_VIEW.get().map_or_else(
-        || std::ptr::null_mut(),
+        || crate::family_never::byte_cells_not_installed(),
         |run| run(kind, source, offset_value, length_value),
     )
 }
@@ -531,8 +540,41 @@ pub(crate) mod bigint {
     pub(crate) use super::{coerce_for_kind, to_bigint_for_store};
     pub(crate) use crate::byte_cell_support::{is_bigint_kind, throw_bigint_number_mix};
 }
+/// `Buffer.prototype`'s member table: a Buffer exists only in a program the
+/// typed-array install covers (the `Buffer` identifier, `node:buffer` and every
+/// module that births one name it), so an empty slot leaves only `constructor`.
+static BUFFER_PROTOTYPE_MEMBERS: Hook<fn(*mut crate::object::ObjectHeader)> = Hook::empty();
+pub(crate) fn buffer_prototype_members(proto: *mut crate::object::ObjectHeader) {
+    if let Some(install) = BUFFER_PROTOTYPE_MEMBERS.get() {
+        install(proto);
+    }
+}
+/// The `[[Get]]` of a `Buffer.prototype` member on a Buffer once the program
+/// wrote that prototype (`buffer_dispatch::buffer_written_member`): only a
+/// program that builds `Buffer.prototype` can write it, and that program
+/// installs this group.
+static BUFFER_WRITTEN_MEMBER: Hook<fn(usize, &str) -> Option<crate::value::JSValue>> =
+    Hook::empty();
+pub(crate) fn buffer_written_member(addr: usize, name: &str) -> Option<crate::value::JSValue> {
+    BUFFER_WRITTEN_MEMBER
+        .get()
+        .and_then(|lookup| lookup(addr, name))
+}
+/// The name dispatch on a Buffer once the program wrote `Buffer.prototype`
+/// (`buffer_dispatch::dispatch_buffer_method` behind the shadow bit), same
+/// group; an empty slot is the builtin dispatch.
+static BUFFER_WRITTEN_DISPATCH: Hook<crate::object::BufferDispatch> = Hook::empty();
+pub(crate) fn written_buffer_dispatch() -> crate::object::BufferDispatch {
+    BUFFER_WRITTEN_DISPATCH
+        .get()
+        .unwrap_or(crate::object::dispatch_builtin_buffer_method)
+}
 pub(crate) fn install() {
     crate::perry_install_once!({
+        BUFFER_WRITTEN_MEMBER.set(crate::object::buffer_written_member_lookup);
+        BUFFER_WRITTEN_DISPATCH.set(crate::object::dispatch_written_buffer_lookup);
+        BUFFER_PROTOTYPE_MEMBERS
+            .set(crate::object::native_module::callable_exports::install_buffer_prototype_members);
         COERCE_FOR_KIND.set(crate::typedarray::bigint::coerce_for_kind);
         FORMAT_TYPED_ARRAY.set(crate::typedarray::format_typed_array);
         #[cfg(test)]
@@ -541,14 +583,14 @@ pub(crate) fn install() {
         JS_NATIVE_MEMORY_FILL_U32.set(crate::typedarray::js_native_memory_fill_u32);
         JS_TYPED_ARRAY_AT.set(crate::typedarray::js_typed_array_at);
         JS_TYPED_ARRAY_COPY_WITHIN.set(crate::typedarray::js_typed_array_copy_within);
-        JS_TYPED_ARRAY_EVERY.set(crate::typedarray::js_typed_array_every);
+        JS_TYPED_ARRAY_EVERY.set(crate::typedarray::typed_array_every_this);
         JS_TYPED_ARRAY_FILL.set(crate::typedarray::js_typed_array_fill);
-        JS_TYPED_ARRAY_FILTER.set(crate::typedarray::js_typed_array_filter);
-        JS_TYPED_ARRAY_FIND.set(crate::typedarray::js_typed_array_find);
-        JS_TYPED_ARRAY_FIND_INDEX.set(crate::typedarray::js_typed_array_find_index);
-        JS_TYPED_ARRAY_FIND_LAST.set(crate::typedarray::js_typed_array_find_last);
-        JS_TYPED_ARRAY_FIND_LAST_INDEX.set(crate::typedarray::js_typed_array_find_last_index);
-        JS_TYPED_ARRAY_FOR_EACH.set(crate::typedarray::js_typed_array_for_each);
+        JS_TYPED_ARRAY_FILTER.set(crate::typedarray::typed_array_filter_this);
+        JS_TYPED_ARRAY_FIND.set(crate::typedarray::typed_array_find_this);
+        JS_TYPED_ARRAY_FIND_INDEX.set(crate::typedarray::typed_array_find_index_this);
+        JS_TYPED_ARRAY_FIND_LAST.set(crate::typedarray::typed_array_find_last_this);
+        JS_TYPED_ARRAY_FIND_LAST_INDEX.set(crate::typedarray::typed_array_find_last_index_this);
+        JS_TYPED_ARRAY_FOR_EACH.set(crate::typedarray::typed_array_for_each_this);
         JS_TYPED_ARRAY_GET.set(crate::typedarray::js_typed_array_get);
         JS_TYPED_ARRAY_INDEX_GET_DYNAMIC.set(crate::typedarray::js_typed_array_index_get_dynamic);
         JS_TYPED_ARRAY_INDEX_SET_DYNAMIC
@@ -556,7 +598,7 @@ pub(crate) fn install() {
         JS_TYPED_ARRAY_JOIN.set(crate::typedarray::js_typed_array_join);
         JS_TYPED_ARRAY_JOIN_VALUE.set(crate::typedarray::js_typed_array_join_value);
         JS_TYPED_ARRAY_LENGTH.set(crate::typedarray::js_typed_array_length);
-        JS_TYPED_ARRAY_MAP.set(crate::typedarray::js_typed_array_map);
+        JS_TYPED_ARRAY_MAP.set(crate::typedarray::typed_array_map_this);
         JS_TYPED_ARRAY_NEW.set(crate::typedarray::js_typed_array_new);
         JS_TYPED_ARRAY_NEW_EMPTY.set(crate::typedarray::js_typed_array_new_empty);
         JS_TYPED_ARRAY_NEW_FROM_ARRAY.set(crate::typedarray::js_typed_array_new_from_array);
@@ -566,7 +608,7 @@ pub(crate) fn install() {
         JS_TYPED_ARRAY_SET.set(crate::typedarray::js_typed_array_set);
         JS_TYPED_ARRAY_SET_FROM.set(crate::typedarray::js_typed_array_set_from);
         JS_TYPED_ARRAY_SLICE.set(crate::typedarray::js_typed_array_slice);
-        JS_TYPED_ARRAY_SOME.set(crate::typedarray::js_typed_array_some);
+        JS_TYPED_ARRAY_SOME.set(crate::typedarray::typed_array_some_this);
         JS_TYPED_ARRAY_SORT_DEFAULT.set(crate::typedarray::js_typed_array_sort_default);
         JS_TYPED_ARRAY_SORT_WITH_COMPARATOR
             .set(crate::typedarray::js_typed_array_sort_with_comparator);
@@ -590,5 +632,36 @@ pub(crate) fn install() {
         TYPED_ARRAY_FROM_SOURCE_RAW_VALUES
             .set(crate::typedarray::typed_array_from_source_raw_values);
         TYPED_ARRAY_TO_ARRAY.set(crate::typedarray::typed_array_to_array);
+        TYPED_ARRAY_METHOD_DISPATCH
+            .set(crate::object::native_call_method::typed_array_method_tower);
+        crate::family_never::installed(crate::family_never::BYTE_CELLS);
     });
+}
+/// The name dispatch of a `%TypedArray%.prototype` method on a typed array
+/// (`native_call_method::typed_array::typed_array_method_tower`). The tower
+/// and every operation it names are members of this group, so the
+/// always-linked callers reach it through this slot. They hold a typed array,
+/// and a typed array exists only in a program whose typed-array group is
+/// installed (`family_reach` decides the install, and a byte cell born
+/// without it aborts at its birth: `family_never`), so an empty slot is the
+/// never arm: it aborts, it does not answer.
+///
+/// Declared after `install` (and filled on the last line of its block) so
+/// that no line above moves: see `family_never`.
+static TYPED_ARRAY_METHOD_DISPATCH: Hook<
+    unsafe fn(*mut TypedArrayHeader, &str, *const f64, usize) -> Option<f64>,
+> = Hook::empty();
+/// # Safety
+/// `ta` is a live typed array; `args_ptr` names `args_len` values (or is null).
+#[inline(never)]
+pub(crate) unsafe fn dispatch_typed_array_method(
+    ta: *mut TypedArrayHeader,
+    method_name: &str,
+    args_ptr: *const f64,
+    args_len: usize,
+) -> Option<f64> {
+    match TYPED_ARRAY_METHOD_DISPATCH.get() {
+        Some(tower) => tower(ta, method_name, args_ptr, args_len),
+        None => crate::family_never::byte_cells_not_installed(),
+    }
 }

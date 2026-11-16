@@ -402,6 +402,9 @@ fn process_env_computed_key_strips_below_the_value() {
             value: Box::new(allocating("v")),
             receiver: Box::new(Expr::ProcessEnv),
             strict: true,
+            element_offset: 0,
+            byte_offset: 0,
+            byte_end: 0,
         })],
     );
     require_call_line(&ir, "js_to_property_key");
@@ -426,6 +429,9 @@ fn process_env_literal_key_loads_below_the_value() {
             value: Box::new(allocating("v")),
             receiver: Box::new(Expr::ProcessEnv),
             strict: true,
+            element_offset: 0,
+            byte_offset: 0,
+            byte_end: 0,
         })],
     );
     assert_operand_survives_the_window(

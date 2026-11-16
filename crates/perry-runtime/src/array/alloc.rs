@@ -7,8 +7,7 @@ use std::ptr;
 fn throw_invalid_array_length() -> ! {
     let bytes = b"Invalid array length";
     let msg = crate::string::js_string_from_bytes(bytes.as_ptr(), bytes.len() as u32);
-    let err = crate::error::js_rangeerror_new(msg);
-    crate::exception::js_throw(crate::value::js_nanbox_pointer(err as i64))
+    crate::exception::throw_core(crate::error::CoreError::range_error(msg))
 }
 
 /// Throw the `RangeError: Invalid array length` raised by `ArraySetLength`
@@ -29,7 +28,23 @@ pub(crate) fn array_length_from_number_or_throw(number: f64) -> u32 {
 
 pub(crate) fn array_length_from_property_value_or_throw(value: f64) -> u32 {
     let number = crate::builtins::js_number_coerce(value);
-    array_length_from_number_or_throw(number)
+    if (value.to_bits() & 0x7FFF_0000_0000_0000) < 0x7FF9_0000_0000_0000 {
+        return array_length_from_number_or_throw(number);
+    }
+    // 10.4.2.4 ArraySetLength steps 3-5: newLen = ToUint32( Desc.[[Value]] ) and
+    // numberLen = ToNumber( Desc.[[Value]] ) convert the value TWICE (an object's
+    // valueOf runs twice); a RangeError unless newLen == numberLen. The Number
+    // fast path above converts nothing and adds no call.
+    let again = crate::builtins::js_number_coerce(value);
+    let new_len = if number.is_finite() {
+        number.trunc().rem_euclid(4_294_967_296.0)
+    } else {
+        0.0
+    };
+    if new_len != again {
+        throw_invalid_array_length()
+    }
+    new_len as u32
 }
 
 /// RULE 3 (single-path object model, `object/shape_rule3.rs`): an
@@ -99,13 +114,13 @@ unsafe fn initialize_fresh_array_layout(arr: *mut ArrayHeader, raw_f64: bool, al
 
 /// Publish the birth layout word of a fresh array.
 #[inline(always)]
-unsafe fn install_birth_layout(arr: *mut ArrayHeader, layout: u16) {
+pub(super) unsafe fn install_birth_layout(arr: *mut ArrayHeader, layout: u16) {
     use crate::gc::{
         GC_ARRAY_ELEMENT_SHAPE, GC_ARRAY_RAW_F64_HOLES, GC_ARRAY_RAW_F64_LAYOUT,
         GC_LAYOUT_ALL_POINTERS, GC_LAYOUT_STATE_MASK,
     };
     let header = (arr as *mut u8).sub(crate::gc::GC_HEADER_SIZE) as *mut crate::gc::GcHeader;
-    debug_assert_eq!((*header).obj_type, crate::gc::GC_TYPE_ARRAY);
+    debug_assert!(crate::gc_type_is_array!((*header).obj_type));
     debug_assert_eq!(
         (*header)._reserved
             & (GC_LAYOUT_STATE_MASK
@@ -175,13 +190,13 @@ pub(crate) fn js_array_alloc_named_props_reserved(
         let (named, array) = array.across_mut::<ArrayHeader, _>(|| {
             crate::object::layout_desc::perry_alloc_layout(match set {
                 crate::array::NamedPropertyKeys::ExecResult => {
-                    std::ptr::addr_of!(crate::object::runtime_layouts::REGEX_EXEC_NAMED)
+                    crate::object::runtime_layouts::REGEX_EXEC_NAMED::desc()
                 }
                 crate::array::NamedPropertyKeys::ExecResultIndices => {
-                    std::ptr::addr_of!(crate::object::runtime_layouts::REGEX_EXEC_INDICES_NAMED)
+                    crate::object::runtime_layouts::REGEX_EXEC_INDICES_NAMED::desc()
                 }
                 crate::array::NamedPropertyKeys::IndicesGroups => {
-                    std::ptr::addr_of!(crate::object::runtime_layouts::REGEX_INDICES_GROUPS_NAMED)
+                    crate::object::runtime_layouts::REGEX_INDICES_GROUPS_NAMED::desc()
                 }
             })
         });
@@ -361,6 +376,8 @@ fn alloc_key_list(
         (*ptr).ek_kind = 0;
         let header = crate::gc::header_from_trusted_user_ptr(ptr.cast()).cast_mut();
         if canonical {
+            #[cfg(perry_gc_instruments)]
+            crate::arena::alloc_life::shape_shared(header);
             (*header).gc_flags |= crate::gc::GC_FLAG_SHAPE_SHARED;
         }
         if with_attrs {
@@ -472,11 +489,16 @@ pub extern "C" fn js_array_constructor_single(value: f64) -> *mut ArrayHeader {
         // dense, but represent a large fresh holey array exactly like a later
         // sparse length extension: a small backing store plus the full logical
         // length. Indexed reads already treat `index >= capacity` as a hole.
-        const MAX_FRESH_DENSE_ARRAY_LENGTH: u32 = 1_000_000;
-        let arr = if length > MAX_FRESH_DENSE_ARRAY_LENGTH {
+        // wpfacts admits a proven element read only up to the same bound.
+        let arr = if length > perry_abi::MAX_FRESH_DENSE_ARRAY_LENGTH {
             let arr = js_array_alloc(0);
             unsafe {
                 (*arr).length = length;
+                // The empty birth carries the dense raw-f64 claim (vacuously
+                // true at length 0). With a length over the 16-slot store it
+                // is false: its readers (the message serializer's bulk copy,
+                // the guarded numeric element read) take `length` raw slots.
+                clear_array_numeric_layout(arr);
             }
             arr
         } else {
@@ -613,6 +635,13 @@ unsafe fn js_array_from_arraylike_with_missing(
     }
     let length_key = crate::string::js_string_from_bytes(b"length".as_ptr(), 6);
     let length_val = crate::object::js_object_get_field_by_name_f64(obj, length_key);
+    // 7.1.20 ToLength( 7.1.4 ToNumber( length ) ): an object `length` runs its
+    // `@@toPrimitive` / `valueOf` / `toString` (the receiver stays rooted).
+    let (length_val, obj) = super::splice_slice::index_operand_across(
+        obj as *const ArrayHeader,
+        length_val,
+    );
+    let obj = obj as *const crate::object::ObjectHeader;
     let length_bits = length_val.to_bits();
     // ToLength coercion: NaN / undefined / non-finite / negative → 0.
     let len = if length_val.is_nan()

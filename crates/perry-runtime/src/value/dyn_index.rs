@@ -58,6 +58,34 @@ fn receiver_gc_tag(addr: usize) -> Option<(u8, u8)> {
     }
 }
 
+/// `m[k]` on a registered Map/Set: ToPropertyKey(k), then the by-name get,
+/// whose Map/Set arm reads own expandos and the prototype chain
+/// (`map_set_receiver::map_set_instance_property`). Cold: only collection
+/// receivers reach it.
+#[cold]
+#[inline(never)]
+fn collection_keyed_get(raw_ptr: usize, index: f64) -> f64 {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let recv = scope.root_raw_mut_ptr(raw_ptr as *mut crate::object::ObjectHeader);
+    // SAFETY: a NaN-boxed key; ToPropertyKey may run user code (rooted above).
+    let key = scope.root_nanbox_f64(unsafe { crate::object::js_to_property_key(index) });
+    let key = key.get_nanbox_f64();
+    if unsafe { crate::symbol::js_is_symbol(key) } != 0 {
+        let recv_bits = crate::value::js_nanbox_pointer(
+            recv.get_raw_const_ptr::<crate::object::ObjectHeader>() as i64,
+        );
+        return unsafe { crate::symbol::js_object_get_symbol_property(recv_bits, key) };
+    }
+    let key_ptr = js_get_string_pointer_unified(key) as *const crate::StringHeader;
+    if key_ptr.is_null() {
+        return f64::from_bits(TAG_UNDEFINED);
+    }
+    crate::object::js_object_get_field_by_name_f64(
+        recv.get_raw_const_ptr::<crate::object::ObjectHeader>(),
+        key_ptr,
+    )
+}
+
 #[inline(always)]
 fn is_registered_collection(addr: usize, obj_type: u8) -> bool {
     match obj_type {
@@ -67,21 +95,7 @@ fn is_registered_collection(addr: usize, obj_type: u8) -> bool {
     }
 }
 
-/// A legacy raw-I64 receiver has no NaN-box tag proving it came from a managed
-/// allocation. Validate membership without dereferencing it before asking for
-/// a `GcHeader`; the old magnitude-only `is_valid_obj_ptr` check admitted any
-/// aligned address in the platform heap range, including unmapped addresses.
-#[inline(always)]
-fn raw_i64_receiver_is_managed(addr: usize) -> bool {
-    unsafe { crate::value::addr_class::try_read_tracked_gc_header(addr) }.is_some()
-}
-
 fn finite_nonnegative_i32_index(index: f64) -> Option<i32> {
-    let bits = index.to_bits();
-    if (bits & TAG_MASK) == INT32_TAG {
-        let index = JSValue::from_bits(bits).as_int32();
-        return (index >= 0).then_some(index);
-    }
     if index.is_finite() && index >= 0.0 && index.fract() == 0.0 && index <= i32::MAX as f64 {
         Some(index as i32)
     } else {
@@ -90,11 +104,6 @@ fn finite_nonnegative_i32_index(index: f64) -> Option<i32> {
 }
 
 fn finite_nonnegative_u32_index(index: f64) -> Option<u32> {
-    let bits = index.to_bits();
-    if (bits & TAG_MASK) == INT32_TAG {
-        let index = JSValue::from_bits(bits).as_int32();
-        return (index >= 0).then_some(index as u32);
-    }
     if index.is_finite() && index >= 0.0 && index.fract() == 0.0 && index < u32::MAX as f64 {
         Some(index as u32)
     } else {
@@ -148,7 +157,7 @@ fn cached_u8_index_get(addr: usize, index: f64) -> Option<f64> {
 #[inline(never)]
 fn cached_u8_index_set(addr: usize, index: f64, value: f64) -> bool {
     let v = JSValue::from_bits(value.to_bits());
-    if !(v.is_number() || v.is_int32()) {
+    if !(v.is_number()) {
         return false;
     }
     let Some(idx) = finite_nonnegative_i32_index(index) else {
@@ -242,7 +251,7 @@ pub extern "C" fn js_dyn_index_get(value: f64, index: f64) -> f64 {
     // CLASS_DYNAMIC_PROPS tables; the computed form must do the same instead of
     // falling through to the not-a-pointer `undefined` path below. (test262
     // class/elements propertyHelper `isWritable(C, "m")` does `C[name] = v`.)
-    if crate::object::class_value::legacy_class_value_word(bits).is_some() {
+    if crate::object::class_value::class_ref_word(bits).is_some() {
         let idx_top16 = index.to_bits() >> 48;
         let key_ptr = if idx_top16 == 0x7FFF || idx_top16 == 0x7FF9 {
             js_get_string_pointer_unified(index) as *const crate::StringHeader
@@ -276,6 +285,19 @@ pub extern "C" fn js_dyn_index_get(value: f64, index: f64) -> f64 {
     let raw_ptr = if jsval.is_reference() {
         jsval.reference_payload()
     } else {
+        if jsval.is_number() {
+            // A Number receiver reads Number.prototype with ToPropertyKey of
+            // the index (`n["toFixed"]`), exactly as the named read `n.toFixed`.
+            let idx_top16 = index.to_bits() >> 48;
+            let key_ptr = if idx_top16 == 0x7FFF || idx_top16 == 0x7FF9 {
+                js_get_string_pointer_unified(index) as *const crate::StringHeader
+            } else {
+                crate::builtins::js_string_coerce(index) as *const crate::StringHeader
+            };
+            return f64::from_bits(
+                crate::object::field_get_set::primitive_number_get(value, key_ptr).bits(),
+            );
+        }
         return f64::from_bits(TAG_UNDEFINED);
     };
     if crate::value::addr_class::is_small_handle(raw_ptr) {
@@ -331,7 +353,7 @@ pub extern "C" fn js_dyn_index_get(value: f64, index: f64) -> f64 {
     {
         if let Some(key) = crate::buffer::canonical_index_key(index) {
             return crate::buffer::buffer_read_own_prop(raw_ptr, &key)
-                .unwrap_or_else(|| f64::from_bits(TAG_UNDEFINED));
+                .unwrap_or_else(|| crate::buffer::buffer_inherited_get(raw_ptr, &key));
         }
     }
     if crate::buffer::is_registered_buffer(raw_ptr) {
@@ -391,11 +413,13 @@ pub extern "C" fn js_dyn_index_get(value: f64, index: f64) -> f64 {
         let key = scope.root_nanbox_f64(unsafe { crate::object::js_to_property_key(index) });
         return crate::proxy_hooks::proxy_get(receiver.get_nanbox_f64(), key.get_nanbox_f64());
     }
+    // A Map/Set has no indexed own properties and its storage is no element
+    // vector: `m[k]` is the ordinary [[Get]] of ToPropertyKey(k), so own
+    // expandos, then the recorded [[Prototype]] chain (`m["get"]`, a subclass
+    // accessor). Reading the storage as an array answered `m[0]` with the
+    // first entry and every other key with undefined.
     if receiver_tag.is_some_and(|(obj_type, _)| is_registered_collection(raw_ptr, obj_type)) {
-        let Some(index) = finite_nonnegative_u32_index(index) else {
-            return f64::from_bits(TAG_UNDEFINED);
-        };
-        return crate::array::js_array_get_f64(raw_ptr as *const crate::array::ArrayHeader, index);
+        return collection_keyed_get(raw_ptr, index);
     }
     // Issue #63 / #321 (Effect.runSync→fork SIGBUS): the raw-I64 fallback
     // above accepts arbitrary in-range bits — including denormal f64
@@ -444,7 +468,7 @@ pub extern "C" fn js_dyn_index_get(value: f64, index: f64) -> f64 {
         // INT32-tagged keys are integer property names (and class-ref values
         // used as keys, rare); pure f64 numbers keep the element path. Every
         // other tag is a ToPropertyKey case.
-        if !idx_js.is_number() && !idx_js.is_int32() {
+        if !idx_js.is_number() {
             let scope = crate::gc::RuntimeHandleScope::new();
             let recv = scope.root_raw_mut_ptr(raw_ptr as *mut crate::object::ObjectHeader);
             // Prefer `js_to_property_key` so a Symbol-returning toString is
@@ -511,7 +535,7 @@ pub extern "C" fn js_dyn_index_get(value: f64, index: f64) -> f64 {
         // on `function f() { arguments[0] }; f()` printed `0` instead of
         // `undefined`. The narrow gate (GC_TYPE_ARRAY) keeps object
         // numeric-key fast path unchanged.
-        if obj_type == crate::gc::GC_TYPE_ARRAY {
+        if crate::gc_type_is_array!(obj_type) {
             if idx_i32 < 0 {
                 return f64::from_bits(TAG_UNDEFINED);
             }
@@ -526,12 +550,22 @@ pub extern "C" fn js_dyn_index_get(value: f64, index: f64) -> f64 {
             {
                 return crate::array::js_array_get_f64(arr, idx_i32 as u32);
             }
-            let length = unsafe { (*arr).length };
+            let (length, capacity) = unsafe { ((*arr).length, (*arr).capacity) };
+            // A long sparse Array keeps a short store under its length: only
+            // the complete accessor knows where such an element lives.
+            if length > capacity {
+                return crate::array::js_array_get_f64(arr, idx_i32 as u32);
+            }
             if (idx_i32 as u32) >= length {
                 return f64::from_bits(TAG_UNDEFINED);
             }
-        }
-        if crate::gc_type_is_object!(obj_type) || obj_type == crate::gc::GC_TYPE_CLOSURE {
+        } else {
+            // Every other GC-headed receiver (an ordinary object, a function,
+            // a Date, a Promise, an Error, a RegExp, a weak collection, a
+            // boxed primitive, ...) has no element vector behind its header:
+            // `o[i]` is the ordinary [[Get]] of ToString(i), own first, then
+            // the [[Prototype]] chain. Nothing but an Array reaches the
+            // element load at the end of this function.
             // An ordinary object's integral key (`record[id]`) is read by its
             // atom from the layouts first: no key string is allocated.
             let mut raw_ptr = raw_ptr;
@@ -577,7 +611,12 @@ pub extern "C" fn js_dyn_index_get(value: f64, index: f64) -> f64 {
             return v;
         }
     }
-    if idx_i32 < 0 {
+    // Only a live Array whose `idx_i32 < length <= capacity` was proven above
+    // has an element to load. A receiver without a GC header (the allocator
+    // does not vouch for the word) has no property to read: before, its
+    // "slot" `raw_ptr + 8 + 8 * index` was loaded with no bound at all.
+    if idx_i32 < 0 || !receiver_tag.is_some_and(|(obj_type, _)| crate::gc_type_is_array!(obj_type))
+    {
         return f64::from_bits(TAG_UNDEFINED);
     }
     // A plain array's logical element 0 is not always physical slot 0: a
@@ -585,15 +624,10 @@ pub extern "C" fn js_dyn_index_get(value: f64, index: f64) -> f64 {
     // (`array/named_props.rs`), keeps dead or reserved slack in front of it.
     // `array_elements_ptr` derives the base from `GcHeader.size` and
     // `capacity`, the same two words codegen's inline loads use.
-    let elem_addr =
-        if receiver_tag.is_some_and(|(obj_type, _)| obj_type == crate::gc::GC_TYPE_ARRAY) {
-            unsafe {
-                crate::array::array_elements_ptr(raw_ptr as *const crate::array::ArrayHeader)
-                    .add(idx_i32 as usize) as usize
-            }
-        } else {
-            raw_ptr.wrapping_add(8 + (idx_i32 as usize) * 8)
-        };
+    let elem_addr = unsafe {
+        crate::array::array_elements_ptr(raw_ptr as *const crate::array::ArrayHeader)
+            .add(idx_i32 as usize) as usize
+    };
     let v = unsafe { *(elem_addr as *const f64) };
     if v.to_bits() == crate::value::TAG_HOLE {
         return f64::from_bits(TAG_UNDEFINED);
@@ -650,7 +684,7 @@ pub extern "C" fn js_dyn_index_set_strict(obj: f64, index: f64, value: f64, stri
     // receiver writes here, so the runtime owns the symbol triage.
     if unsafe { crate::symbol::js_is_symbol(index) } != 0 {
         unsafe {
-            crate::symbol::js_object_set_symbol_property(obj, index, value);
+            crate::symbol::set_symbol_property_with_strictness(obj, index, value, strict);
         }
         return value;
     }
@@ -689,7 +723,7 @@ pub extern "C" fn js_dyn_index_set_strict(obj: f64, index: f64, value: f64, stri
     // form (`C.key = v`). Without this the write was silently dropped, so
     // propertyHelper's `isWritable(C, name)` (`C[name] = v`) reported a static
     // method as non-writable. (Mirrors the get arm above.)
-    if crate::object::class_value::legacy_class_value_word(bits).is_some() {
+    if crate::object::class_value::class_ref_word(bits).is_some() {
         let idx_top16 = index.to_bits() >> 48;
         if idx_top16 == 0x7FFF || idx_top16 == 0x7FF9 {
             let key_ptr = js_get_string_pointer_unified(index) as *const crate::StringHeader;
@@ -729,18 +763,10 @@ pub extern "C" fn js_dyn_index_set_strict(obj: f64, index: f64, value: f64, stri
     }
     let raw_ptr = if jsval.is_pointer() {
         (bits & POINTER_MASK) as usize
-    } else if !obj.is_nan()
-        && bits != 0
-        && bits < 0x0001_0000_0000_0000
-        && (bits & 0x3) == 0
-        && bits >= 0x10000
-        // A raw word is also what a subnormal number looks like. The buffer and
-        // typed-array probes below read the cell's header (#10694: the brand
-        // is the type byte), so the allocator must vouch for a raw word first.
-        && crate::buffer::header_is_owned(bits as usize)
-    {
-        bits as usize
     } else {
+        // A primitive receiver: the store has no effect. A word whose top
+        // 16 bits are clear is a Number (a denormal, or +0), never a raw
+        // object pointer, whether or not its bits equal a live address.
         return value;
     };
     if raw_ptr < crate::gc::GC_HEADER_SIZE + 0x1000 {
@@ -803,26 +829,35 @@ pub extern "C" fn js_dyn_index_set_strict(obj: f64, index: f64, value: f64, stri
         }
     }
     if crate::buffer::is_registered_buffer(raw_ptr) {
+        // The value converts before the bound is read and for an invalid
+        // numeric index too (`u[-1] = obj` runs `valueOf`); the helper roots
+        // the view across the conversion, which can run program code.
         if let Some(idx_i32) = finite_nonnegative_i32_index(index) {
-            let byte = crate::typedarray_hook_slots::jsvalue_to_uint8(value);
-            crate::buffer::js_buffer_set(
+            crate::buffer::js_buffer_set_value(
                 raw_ptr as *mut crate::buffer::BufferHeader,
                 idx_i32,
-                i32::from(byte),
+                value,
             );
+        } else if JSValue::from_bits(index.to_bits()).is_number() {
+            let _ = crate::typedarray_hook_slots::jsvalue_to_uint8(value);
         }
-        return value;
-    }
-    // A raw-I64 fallback is only a heuristic until arena/malloc membership
-    // proves it. Do this before `receiver_gc_tag`, which reads addr - 8.
-    if !jsval.is_pointer() && !raw_i64_receiver_is_managed(raw_ptr) {
         return value;
     }
     // #7865: reuse the header byte the array/object split below needs. Plain
     // receivers skip both registries; Map/Set tags still require confirmation.
     let receiver_tag = receiver_gc_tag(raw_ptr);
+    // A Map/Set has no indexed own properties and its storage is no element
+    // vector: `m[k] = v` is the ordinary [[Set]] of ToPropertyKey(k), so an
+    // inherited setter runs with the receiver, otherwise an own property is
+    // created (rejected on a frozen receiver). It is never a storage write,
+    // and never dropped. (The read twin is `collection_keyed_get`.)
     if receiver_tag.is_some_and(|(obj_type, _)| is_registered_collection(raw_ptr, obj_type)) {
-        return value;
+        let target = if jsval.is_pointer() {
+            obj
+        } else {
+            crate::value::js_nanbox_pointer(raw_ptr as i64)
+        };
+        return crate::proxy::js_put_value_set(target, index, value, target, strict);
     }
     if receiver_tag.is_some_and(|(obj_type, _)| obj_type == crate::gc::GC_TYPE_LAZY_ARRAY) {
         return unsafe {
@@ -886,7 +921,7 @@ pub extern "C" fn js_dyn_index_set_strict(obj: f64, index: f64, value: f64, stri
             return value;
         }
     }
-    let is_array = receiver_tag.is_some_and(|(obj_type, _)| obj_type == crate::gc::GC_TYPE_ARRAY);
+    let is_array = receiver_tag.is_some_and(|(obj_type, _)| crate::gc_type_is_array!(obj_type));
     if is_array {
         // #9394: this entry already carries the assignment's own `Throw`
         // flag (`js_dyn_index_set` passes 0 for the sloppy runtime callers);
@@ -976,3 +1011,7 @@ mod collection_tag_tests;
 #[cfg(test)]
 #[path = "dyn_index_uint8array_tests.rs"]
 mod uint8array_tests;
+
+#[cfg(test)]
+#[path = "dyn_index_non_array_receiver_tests.rs"]
+mod non_array_receiver_tests;

@@ -1,54 +1,311 @@
 //! Unit tests: small programs lowered from source, facts checked directly.
 
+mod any_key_builtin_read;
+mod absent_key;
+mod audit1;
+mod raw1;
+mod inspect1;
+mod audit2;
+mod accessor_after_data_store;
 mod accessor_keys;
+mod accessor_layout_exit;
+mod accessor_reach;
+mod accessor_receiver;
+mod activation_paths;
+mod annexb_accessors;
+mod annexb_known_accessor;
+mod annexb_method_value;
+mod annexb_own_accessor;
+mod args_beside_rest;
+mod arguments_object;
+mod arr_floor;
 mod array_ctor;
 mod array_elements;
+mod array_helper_nodes;
+mod array_holes;
+mod array_index_store;
+mod array_iteration;
 mod array_length;
 mod array_named_keys;
 mod array_numeric;
 mod array_record;
+mod array_reps;
+mod at_rest;
+mod computed_delete_absent;
+mod slice_call_array_like;
+mod fill_births;
+mod rest_elems;
+mod rest_fields;
+mod zero_sign;
+mod const_arrays;
+mod array_search;
+mod assign_to_object;
 mod binding_write_gap;
+mod birth_elements;
 mod birth_site;
 mod body_activation;
 mod body_identity;
-mod callable_contract;
+mod body_packets;
+mod booleans;
+mod bound_class;
+mod bound_in_summary;
+mod bound_call_memo;
+mod box_chain;
+mod boxed_primitive_methods;
+pub(crate) mod box_computed_read;
+mod for_in_key_read_enumerable;
+mod json_positions;
+mod string_prefix_keys;
+mod uuid_infix_keys;
+mod regex_capture_suffix;
+mod regex_track_build;
+mod track_key;
+mod builtin_fn_absent_member;
+mod sloppy_this_wrapper;
+mod computed_method_key;
+mod rest_instances;
+mod rest_positions;
+mod rest_shift;
+mod builtin_fn_identity;
+mod builtin_fn_keys;
 mod builtin_members;
+mod builtin_program_fields;
+mod builtin_proto_value;
+mod builtin_spread;
+mod forin_key_string;
+mod call_shadow;
+mod callable_contract;
 mod callback_origin;
 mod captured;
 mod cjs_require;
+mod class_capture_forwarding;
 mod class_statics;
+mod closed_marker_load;
 mod closed_world;
 mod closure_context;
+pub(crate) mod computed_key_members;
+mod computed_table_fn;
+mod const_key_read;
+mod const_key_set_store;
+mod const_numbers;
+mod key_strings;
+mod map_values;
+mod map_entry_pairs;
+mod promise_all_positions;
+mod promise_all_result_instance;
+mod value_run_context;
+mod realm_chain_members;
+mod prim_absent_member;
+mod option_name_merge;
+mod ctor_observed;
+mod ctor_return;
+mod dce_reach;
+mod dead_dynamic_import;
+mod declared_effects;
+mod declared_getter_results;
+mod default_params;
+mod data_define_named;
+mod r6defprop;
+mod define_through_unknown;
+mod realm_accessor_call;
+mod iter_realm_value;
+pub(crate) mod delivery_boundaries;
+pub(crate) mod described_holder_computed_read;
+mod descriptor_reads;
 mod diagnostics;
 mod dynamic_code;
 mod dynamic_import;
+mod elem_undef;
+mod element_reads;
+mod element_sites;
+mod enum_member_type;
+mod escaped_beside_top;
 mod escaped_constructor;
 mod escaped_contract_result;
 mod escaped_method_this;
+mod dead_fn;
 mod export_star;
+mod family_reach;
+mod field_array_push;
+mod first_store_order;
+mod fn_inst_default_proto;
+mod fn_intrinsic_proto;
+mod folded_call_own;
+mod for_in_enumerable_keys;
 mod for_in_keys;
+mod for_in_runs_per_key;
+mod called_param_runs;
+mod field_truthy_filter;
+mod bool_field_guard;
+mod field_test_narrowing;
+mod own_data_stops_chain;
+mod switch_param_runs;
+mod switch_mask_union;
+mod switch_const_runs;
+mod for_in_key_store;
+mod predicate_operands;
+mod for_of_next_argument;
+mod for_of_yield;
+mod fresh_static_blocks;
+mod function_call_value;
+mod function_ctor_without_interp;
 mod function_values;
+mod gen_members;
+mod getter_contract;
+mod global_gc;
+mod global_namespace_store;
+mod global_sentinel;
+mod gopd_key;
+mod held_lengths;
+mod host_objects;
 mod hub_tokens;
+mod identity_routes;
+mod idx_prim_call;
+mod in_bounds;
+mod in_bounds_read;
+mod indexed_callees;
 mod indexed_owner;
+mod indirect_eval_call;
 mod inherited_layout;
+mod instanceof_buffer_false;
+mod instanceof_class_has_instance;
+mod int_demand;
+mod int_ranges;
+mod interp_from_facts;
+mod iter_close;
+mod json_callbacks;
+mod key_signs;
 mod layout_key;
+mod ledger;
+mod list_caps;
+mod lit_accessor;
+mod literal_strings;
+mod locked_builtins;
+mod locked_delete;
+mod locked_store;
+mod locked_top_store;
+mod written_prim_method_receiver;
+mod escaped_active;
+mod escape_roots;
+mod arguments_instances;
+mod escaped_fn_own_return;
+mod locked_top_define;
+mod internal_slot_no_property;
+mod registry_prefix_runs;
+mod cache_key_runs;
+mod promise_adopts_thenable;
+mod logical_and;
+mod map_identity_ops;
+mod member_heritage;
+mod static_call_value;
+mod builtin_member_call;
+mod fetch_headers;
+mod json_protocol;
+mod response_body;
+mod error_to_string;
+mod regexp_chain_methods;
+mod json_object_proto_members;
+mod namespace_own_static;
+mod memo_context;
+mod method_sites;
+mod name_folds;
 mod named_accessors;
+mod named_lengths;
+mod named_method_on_class_value;
+mod native_accessor_get;
+mod native_array_proto;
+mod native_coercion;
+mod native_construct;
 mod native_fs;
+mod native_given_proto;
+mod native_given_runtime;
+mod native_member;
 mod native_proto;
+mod native_regexp_proto;
+mod native_target_accessor;
+mod native_user_code;
+mod num_key;
+mod objproto_protocol;
+mod own_guarded_read;
+mod own_helper_guard;
+mod own_key_shadow;
+mod own_length;
+mod own_store_read;
+mod own_values_proto;
 mod parent_value;
+mod plus_string;
 mod prim_result;
+mod private_accessor_reach;
+mod private_field;
+mod private_method_flow;
+mod private_method_read;
+mod process_argv;
 mod proof_receivers;
+mod proto_lock_keys;
 mod proto_value;
 mod protocol_calls;
 mod protocol_keys;
+mod protocol_touch_births;
+mod range_tightening;
+mod reach_accessor;
+mod reach_proto_members;
+mod reach_thenable;
 mod receiver_slots;
 mod receiver_this;
+mod records;
+mod recv_call_cycle;
+mod reflect_construct;
+mod reflect_new_target;
+mod regexp_exec;
+mod relinked_parent;
 mod rest_element;
+mod rest_elements;
 mod run_once_closed;
+mod runtime_errors;
 mod runtime_helpers;
+mod set_proto_result;
+mod specialized_prototype;
+mod spread_arguments;
+mod spread_compose_elems;
+mod spread_elements;
+mod spread_enumerable;
+mod spread_iterable_args;
+mod step_done;
 mod summary;
 mod super_heritage;
+mod super_home_proto;
+mod super_key;
+mod sync_require;
+mod tdz_seed;
+mod top_element_key;
+mod type_export;
+mod typed_array_exact;
+mod typed_array_element_store;
+mod typed_elem;
+mod typed_array_key_bigint;
+mod typed_array_length;
+mod typed_array_names;
+mod typed_array_symbol_absent;
+mod wrapper_realm_chain;
+mod realm_chain_computed_key;
+mod typed_array_numeric_key;
+mod typed_array_this_throws;
+mod class_call_throws;
+mod builtin_ctor_call;
+mod opaque_models;
+mod realm_present;
+mod null_proto_box_key;
+mod error_proto_data_keys;
+mod namespace_own_members;
+mod numeric_key_names;
+mod index_key_read;
+mod proto_key_read;
+mod spread_root;
+mod builtin_value_call;
+mod typed_array_key_read;
+mod unheld_key;
 mod unit_alias;
+mod root4162;
 mod unit_cjs;
 mod unit_ctor;
 mod unit_effects;
@@ -57,8 +314,19 @@ mod unit_mode;
 mod unit_namespace;
 mod unit_shared;
 mod unit_this;
+mod unknown_accessor_key;
+mod unrun_param_call;
+mod work_bound_widen;
 
-use crate::{compute, FactsConfig, ProgramFacts, Verdict};
+use crate::{compute, FactsConfig, ProgramFacts, SiteFacts, Verdict};
+
+/// The program `src` loaded beside an unseen module: `import "unseen-host"`
+/// names a file the program does not contain, so its code runs at load and
+/// may write any global (whole-program rule G). A control whose unknown value
+/// comes from an undeclared global takes it from there.
+pub(super) fn unseen(src: &str) -> String {
+    format!("import \"unseen-host\";\n{src}")
+}
 
 fn facts(src: &str) -> ProgramFacts {
     facts_with(src, FactsConfig::default())
@@ -210,7 +478,8 @@ fn closure_writer_is_post_construction() {
 #[test]
 fn unknown_callee_escapes_argument() {
     let pf = facts(
-        r#"
+        r#"import "unseen-host";
+
         class P { x = 1; }
         declare const ext: any;
         const p = new P(); ext(p); console.log(p.x);
@@ -394,7 +663,8 @@ fn interpreted_function_is_a_summary_node() {
 #[test]
 fn top_call_connects_only_top_values() {
     let pf = facts_with(
-        r#"
+        r#"import "unseen-host";
+
         class Kept { x: number; constructor(x: number) { this.x = x; } }
         const u: any = (globalThis as any).someUnknown;
         const r = u("a", 1);
@@ -623,7 +893,7 @@ fn dense_prototype_copies_preserve_all_values_within_work_bound() {
         assert!(
             !m.aborted,
             "{count}-value copies aborted at {} work",
-            m.work
+            m.work.get()
         );
         for n in reads {
             for &v in &values {
@@ -674,7 +944,7 @@ fn copying_a_base_into_a_superset_keeps_extra_values_and_primitives() {
     m.add_prim(src, prim::NUM);
     m.max_work = 100;
     m.solve();
-    assert!(!m.aborted, "base copy used {} work", m.work);
+    assert!(!m.aborted, "base copy used {} work", m.work.get());
     for t in values {
         assert!(m.nodes[dst as usize].pts.contains_tok(t));
     }
@@ -758,13 +1028,13 @@ fn observed_bases_avoid_recopying_pending_prefixes_and_keep_independent_members(
         let later = m.tok(TokKind::ModNs(40));
         m.add(src, &[later], prim::STR);
         // The bound measures the solve's deliveries, not setup.
-        m.work = 0;
+        m.work.set(0);
         m.max_work = 6000;
         m.solve();
         assert!(
             !m.aborted,
             "observed-base copies used {} work (own={own_members})",
-            m.work
+            m.work.get()
         );
         for (i, &dst) in destinations.iter().enumerate() {
             let n = &m.nodes[dst as usize];
@@ -799,10 +1069,10 @@ fn observed_relay_bases_share_new_batches_without_enumerating_each_transfer() {
     let next: Vec<_> = (40..80).map(|i| m.tok(TokKind::ModNs(i))).collect();
     m.add(src, &next, 0);
     // The bound measures the solve's deliveries, not setup.
-    m.work = 0;
+    m.work.set(0);
     m.max_work = 5000;
     m.solve();
-    assert!(!m.aborted, "batch sharing used {} work", m.work);
+    assert!(!m.aborted, "batch sharing used {} work", m.work.get());
     for dst in destinations {
         for &t in first.iter().chain(&next) {
             assert!(m.nodes[dst as usize].pts.contains_tok(t));
@@ -858,10 +1128,10 @@ fn small_observed_sets_preserve_superset_members_without_recopying_values() {
         extras.push(extra);
     }
     // The bound measures the solve's deliveries, not setup.
-    m.work = 0;
+    m.work.set(0);
     m.max_work = 1500;
     m.solve();
-    assert!(!m.aborted, "small supersets used {} work", m.work);
+    assert!(!m.aborted, "small supersets used {} work", m.work.get());
     for (i, dst) in destinations.into_iter().enumerate() {
         for t in [a, b, extras[i]] {
             assert!(m.nodes[dst as usize].pts.contains_tok(t));
@@ -898,10 +1168,10 @@ fn equal_snapshot_groups_keep_old_owners_covered_after_coalescing() {
     let added = m.tok(TokKind::ModNs(40));
     m.add_tok(src, added);
     // The bound measures the solve's deliveries, not setup.
-    m.work = 0;
+    m.work.set(0);
     m.max_work = 5000;
     m.solve();
-    assert!(!m.aborted, "coalesced snapshots used {} work", m.work);
+    assert!(!m.aborted, "coalesced snapshots used {} work", m.work.get());
     for dst in first {
         assert!(m.nodes[dst as usize].pts.contains_tok(added));
     }
@@ -939,10 +1209,10 @@ fn delivered_cardinality_proves_batch_adoption_with_independent_storage() {
     m.add_tok(destinations[999], own);
     let next: Vec<_> = (40..80).map(|i| m.tok(TokKind::ModNs(i))).collect();
     m.add(src, &next, 0);
-    m.work = 0;
+    m.work.set(0);
     m.max_work = 2000;
     m.solve();
-    assert!(!m.aborted, "cardinality batches used {} work", m.work);
+    assert!(!m.aborted, "cardinality batches used {} work", m.work.get());
     for (i, dst) in destinations.into_iter().enumerate() {
         let n = &m.nodes[dst as usize];
         for &t in first.iter().chain(&next) {
@@ -972,10 +1242,10 @@ fn new_subscribers_receive_current_values_once_and_then_later_deliveries() {
             }
         }
         // The bound measures the solve's deliveries, not setup.
-        m.work = 0;
+        m.work.set(0);
         m.max_work = group as u64 * 9;
         m.solve();
-        assert!(!m.aborted, "late subscribers used {} work", m.work);
+        assert!(!m.aborted, "late subscribers used {} work", m.work.get());
         for &dst in &destinations {
             for t in [a, b, c] {
                 assert!(m.nodes[dst as usize].pts.contains_tok(t));
@@ -983,7 +1253,7 @@ fn new_subscribers_receive_current_values_once_and_then_later_deliveries() {
         }
         let d = m.tok(TokKind::ModNs(4));
         m.add_tok(src, d);
-        m.work = 0;
+        m.work.set(0);
         m.max_work = group as u64 * 4;
         m.solve();
         assert!(!m.aborted);
@@ -1103,8 +1373,11 @@ fn cjs_cache_slot_holds_its_own_record() {
 /// store on what such a read returns (the loader's `child.parent = module`)
 /// is then a store on a record, not on a builtin (E20), and a call of it is
 /// no `Function(...)` call (E14). With `Object.prototype` as the prototype
-/// (`__perry_declared_keys_object`) the same read reaches the builtins.
-fn null_proto_read(births: &str) -> Option<String> {
+/// (`__perry_declared_keys_object`) the same read reaches the builtins: a
+/// store of `__proto__` relinks one and the value's members escape (E6); a
+/// store under a key the realm does not read back (`name`, `parent`) is
+/// their own field (rule R1, `realm_reads_store`).
+fn null_proto_read(births: &str, key: &str) -> Option<String> {
     let pf = facts(&format!(
         r#"
         class Parent {{ x = 1; }}
@@ -1114,7 +1387,7 @@ fn null_proto_read(births: &str) -> Option<String> {
         function read(path) {{ return cache[path]; }}
         const parent = new Parent();
         const got = read(String(Math.random()));
-        if (got !== undefined) got.parent = parent;
+        if (got !== undefined) got.{key} = parent;
         console.log(parent.x);
     "#
     ));
@@ -1123,11 +1396,21 @@ fn null_proto_read(births: &str) -> Option<String> {
 
 #[test]
 fn a_computed_read_of_a_null_prototype_record_stops_at_the_record() {
-    assert_eq!(null_proto_read("__perry_declared_keys"), None);
-    let escape = null_proto_read("__perry_declared_keys_object");
+    assert_eq!(null_proto_read("__perry_declared_keys", "parent"), None);
+    assert_eq!(null_proto_read("__perry_declared_keys", "name"), None);
+    assert_eq!(null_proto_read("__perry_declared_keys", "__proto__"), None);
+    assert_eq!(
+        null_proto_read("__perry_declared_keys_object", "name"),
+        None
+    );
+    let escape = null_proto_read("__perry_declared_keys_object", "__proto__");
     assert!(
-        escape.as_deref().is_some_and(|e| e.contains("E20")),
+        escape.as_deref().is_some_and(|e| e.contains("E6")),
         "{escape:?}"
+    );
+    assert_eq!(
+        null_proto_read("__perry_declared_keys_object", "parent"),
+        None
     );
 }
 
@@ -1321,8 +1604,11 @@ fn a_parameter_node_holds_its_argument_marker() {
     );
     let token = m.tok(TokKind::Func(0, NO_CTX));
     m.funcs.push(FuncInfo {
+        #[cfg(test)]
+        body_packet: Default::default(),
         module: 0,
         func_id: 0,
+        raise: u32::MAX,
         name: "f".into(),
         params: vec![p],
         rest: None,
@@ -1330,15 +1616,23 @@ fn a_parameter_node_holds_its_argument_marker() {
         ret,
         args_all: args,
         has_arguments: false,
+        arguments: None,
+        own_test: crate::model::OwnTestBody::Unknown,
         token,
         ctor_of: None,
         lexical_this: false,
         no_summary: true,
-        gen_step: false,
+        foreign_params: true,
+        gen_proto: None,
+        gen_fn_protos: None,
+        gen_async: false,
+        gen_reyields: false,
+        proto: None,
         captures: Vec::new(),
         forwards_super: false,
         parent: NO_FN,
         forwarded: false,
+        ret_param: None,
     });
     let (m1, m2) = (m.param_marker_tok(0, 0), m.param_marker_tok(0, 1));
     let a = m.tok(TokKind::ModNs(7));
@@ -1385,8 +1679,11 @@ fn a_store_into_a_marker_makes_no_field_of_it() {
     let (this, ret, args) = (m.node_l("this"), m.node_l("ret"), m.node_l("args"));
     let token = m.tok(TokKind::Func(0, NO_CTX));
     m.funcs.push(FuncInfo {
+        #[cfg(test)]
+        body_packet: Default::default(),
         module: 0,
         func_id: 0,
+        raise: u32::MAX,
         name: "f".into(),
         params: Vec::new(),
         rest: None,
@@ -1394,15 +1691,23 @@ fn a_store_into_a_marker_makes_no_field_of_it() {
         ret,
         args_all: args,
         has_arguments: false,
+        arguments: None,
+        own_test: crate::model::OwnTestBody::Unknown,
         token,
         ctor_of: None,
         lexical_this: false,
         no_summary: true,
-        gen_step: false,
+        foreign_params: true,
+        gen_proto: None,
+        gen_fn_protos: None,
+        gen_async: false,
+        gen_reyields: false,
+        proto: None,
         captures: Vec::new(),
         forwards_super: false,
         parent: NO_FN,
         forwarded: false,
+        ret_param: None,
     });
     let mk = m.param_marker_tok(0, 0);
     let v = m.node_l("v");
@@ -1438,8 +1743,11 @@ fn an_argument_marker_leaves_beside_when_a_valued_member_links() {
     let (this, ret, args) = (m.node_l("this"), m.node_l("ret"), m.node_l("args"));
     let token = m.tok(TokKind::Func(0, NO_CTX));
     m.funcs.push(FuncInfo {
+        #[cfg(test)]
+        body_packet: Default::default(),
         module: 0,
         func_id: 0,
+        raise: u32::MAX,
         name: "f".into(),
         params: Vec::new(),
         rest: None,
@@ -1447,15 +1755,23 @@ fn an_argument_marker_leaves_beside_when_a_valued_member_links() {
         ret,
         args_all: args,
         has_arguments: false,
+        arguments: None,
+        own_test: crate::model::OwnTestBody::Unknown,
         token,
         ctor_of: None,
         lexical_this: false,
         no_summary: true,
-        gen_step: false,
+        foreign_params: true,
+        gen_proto: None,
+        gen_fn_protos: None,
+        gen_async: false,
+        gen_reyields: false,
+        proto: None,
         captures: Vec::new(),
         forwards_super: false,
         parent: NO_FN,
         forwarded: false,
+        ret_param: None,
     });
     let mk = m.param_marker_tok(0, 0);
     // `r2` is a member of `r1` (an instance parameter passed on); `mk`
@@ -1465,7 +1781,7 @@ fn an_argument_marker_leaves_beside_when_a_valued_member_links() {
     let r1 = m.arg_marker(n1);
     let r2 = m.arg_marker(n2);
     m.link_marker(r2, r1);
-    m.cons(src, Cons::Arith { dst, add: false });
+    m.cons(src, Cons::Arith { dst, other: crate::model::NO_NODE });
     m.add_tok(src, r1);
     m.solve();
     assert_eq!(m.nodes[dst as usize].prim, 0, "beside: no kinds of its own");
@@ -1485,8 +1801,11 @@ fn marker_model() -> crate::model::Model {
     let (this, ret, args) = (m.node_l("this"), m.node_l("ret"), m.node_l("args"));
     let token = m.tok(TokKind::Func(0, NO_CTX));
     m.funcs.push(FuncInfo {
+        #[cfg(test)]
+        body_packet: Default::default(),
         module: 0,
         func_id: 0,
+        raise: u32::MAX,
         name: "f".into(),
         params: Vec::new(),
         rest: None,
@@ -1494,15 +1813,23 @@ fn marker_model() -> crate::model::Model {
         ret,
         args_all: args,
         has_arguments: false,
+        arguments: None,
+        own_test: crate::model::OwnTestBody::Unknown,
         token,
         ctor_of: None,
         lexical_this: false,
         no_summary: true,
-        gen_step: false,
+        foreign_params: true,
+        gen_proto: None,
+        gen_fn_protos: None,
+        gen_async: false,
+        gen_reyields: false,
+        proto: None,
         forwards_super: false,
         parent: NO_FN,
         captures: Vec::new(),
         forwarded: false,
+        ret_param: None,
     });
     m
 }
@@ -1527,19 +1854,19 @@ fn a_use_through_an_argument_marker_is_solve_work() {
     }
     let a = m.atom("k");
     let k = m.keyed_reach_of(r, a);
-    let w = m.work;
+    let w = m.work.get();
     m.mark_use(k, MARK_ESCAPE);
     assert!(
-        m.work - w >= n,
+        m.work.get() - w >= n,
         "a keyed use walked {n} members for {} work",
-        m.work - w
+        m.work.get() - w
     );
-    let w = m.work;
+    let w = m.work.get();
     m.mark_use(r, MARK_ESCAPE);
     assert!(
-        m.work - w >= n,
+        m.work.get() - w >= n,
         "a use walked {n} members for {} work",
-        m.work - w
+        m.work.get() - w
     );
 }
 
@@ -1626,14 +1953,14 @@ fn a_repeated_keyed_use_costs_one_step() {
     let k = m.keyed_reach_of(r, a);
     m.mark_use(k, MARK_READ);
     let reps = 100;
-    let w = m.work;
+    let w = m.work.get();
     for _ in 0..reps {
         m.mark_use(k, MARK_READ);
     }
     assert!(
-        m.work - w <= reps,
+        m.work.get() - w <= reps,
         "{reps} repeated uses cost {} work",
-        m.work - w
+        m.work.get() - w
     );
 }
 
@@ -1660,13 +1987,13 @@ fn a_keyed_use_in_a_recursion_walks_each_member_once_per_bit() {
         m.link_marker(mks[i], rs[i]);
         m.link_marker(rs[(i + 1) % n as usize], rs[i]);
     }
-    let w = m.work;
+    let w = m.work.get();
     let atoms: Vec<_> = (0..keys).map(|i| m.atom(&format!("k{i}"))).collect();
     for &a in &atoms {
         let k = m.keyed_reach_of(rs[0], a);
         m.mark_use(k, MARK_ESCAPE);
     }
-    let spent = m.work - w;
+    let spent = m.work.get() - w;
     assert!(
         spent <= 3 * keys + 2 * n as u64 + 4,
         "{keys} keys on a ring of {n} cost {spent} work"
@@ -1707,3 +2034,223 @@ fn a_protocol_touch_of_an_argument_marker_reads_nothing() {
     let tj = m.marker_load(r, Some(a));
     assert!(m.marker_use.get(&tj).is_some_and(|&u| u & MARK_ESCAPE != 0));
 }
+mod array_iter_lock;
+mod async_result;
+mod builtin_ctor_statics;
+mod collection_entries;
+mod concat_elements;
+mod console_output_arguments;
+mod console_protocol;
+mod keycall1;
+mod constructor_values;
+mod cycle_e20_own_field;
+mod cycle_locked_member;
+mod date_methods;
+mod declared_constructor;
+mod declared_global_write;
+mod delegate_step;
+mod field_read_calls;
+mod gen_proto_lock;
+mod gen_next;
+mod gen_proto_members;
+mod generator_results;
+mod generator_resume_arguments;
+mod global_unresolved;
+mod guard_presence;
+mod helper_protocols;
+mod host_helpers;
+mod iter_result_array;
+mod key_fn_shape;
+mod key_shape;
+mod method_this_escape;
+mod native_parent;
+mod native_proto_member;
+mod native_push;
+mod native_value_call;
+mod ns_receiver;
+mod param_key_shape;
+mod primitive_this;
+mod promise_capability_executor;
+mod proto_own_call;
+mod realm_read_static;
+mod receiver_param_call;
+mod regexp_results;
+mod signatures;
+mod static_native_parent;
+mod string_iter_lock;
+mod string_methods;
+mod string_results;
+mod string_this;
+mod top_store_handed_builtins;
+mod typed_array_methods;
+mod typed_locale_args;
+mod web_timer_methods;
+
+/// Export the exact facts fixtures for an independent runtime/Node oracle.
+/// Disabled in ordinary tests; the lane runner sets HLC_FIXTURE_DIR.
+fn dump_helper_fixture(src: &str) {
+    if let Ok(dir) = std::env::var("HLC_FIXTURE_DIR") {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        src.hash(&mut h);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            std::path::Path::new(&dir).join(format!("{:016x}.ts", h.finish())),
+            src,
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn borrowed_function_method_fact_fails_closed_on_alias_and_top_writes() {
+    assert!(facts("console.log((function() { return 1; }).call(null));")
+        .fnproto_borrow_written
+        .is_none());
+    assert!(
+        facts("const p = Function.prototype; p.call = function() {}; ")
+            .fnproto_borrow_written
+            .is_some()
+    );
+    assert!(
+        facts("const p = Function.prototype; p.apply = function() {}; ")
+            .fnproto_borrow_written
+            .is_some()
+    );
+    assert!(
+        facts("import \"unseen-host\"; const p = missing(); p.call = function() {}; ")
+            .fnproto_borrow_written
+            .is_some()
+    );
+    // A bind-specific write must not prevent a call/apply proof.
+    assert!(facts("Function.prototype.bind = function() {}; ")
+        .fnproto_borrow_written
+        .is_none());
+}
+
+mod builtin_fn_storage;
+mod numeric_property_store;
+mod shared_sets;
+
+mod builtin_missing_member;
+
+mod annexb_alias;
+mod primitive_operand_to_primitive;
+mod shaped_key_proto_methods;
+mod uri_coercion;
+
+mod accessor_lookup_values;
+mod buffer_iterator_absent;
+mod buffer_namespaces;
+mod error_namespaces;
+mod fresh_proto_chain;
+mod fs_path_operand;
+mod host_browser_effects;
+mod host_fs_effects;
+mod host_fs_read_effects;
+mod host_inspector_effects;
+mod host_performance_intl;
+mod host_stream_effects;
+mod native_fs_effects;
+mod native_fs_watch;
+mod native_module_ref;
+mod native_process;
+mod native_util_types_effects;
+mod number_bigint_ns;
+mod realm_object_proto_member;
+
+mod accessor_from_census;
+mod getter_result_decls;
+mod given_proto_census;
+mod navigator_decl;
+mod navigator_store;
+mod object_prototype_method_calls;
+mod spread_from_census;
+mod optimistic_json_key;
+mod peelk18;
+mod skinfa1;
+mod skinfa3;
+mod skinforin1;
+mod skinroot6;
+mod skinroot11;
+mod skinroot9;
+mod peelk19;
+mod peelk20;
+mod peelk21;
+mod skinroot10;
+mod skinroot14;
+mod skinroot17;
+mod skinroot19;
+mod skinroot24;
+mod peelk22;
+mod peelk23;
+mod fn_number_key;
+mod builtin_ctor_number_key;
+mod given_proto_members;
+mod sound1;
+mod scope_a;
+mod new_verdicts;
+mod lit_fact;
+mod arr_absent;
+mod prim_recv;
+mod not_unit;
+mod proto_recv;
+mod bns_recv;
+mod key_inherit;
+mod multi_run;
+mod held_realm_verdicts;
+mod held_realm_flow;
+mod forin1;
+mod key2;
+mod r9key1;
+mod r9key2;
+mod r9sites1;
+mod r9sites3;
+mod r9sites5;
+mod r9sites6;
+mod r9sites7;
+mod nocall1;
+mod skinfa8;
+mod local_versions;
+mod skinroot31;
+mod whyhold1;
+mod skinroot32;
+mod skinroot39;
+mod skinroot35;
+mod r6next;
+mod birthdef1;
+mod r9birth2;
+mod r9birth3;
+mod r9birth4;
+mod r9birth5;
+mod r9birth6;
+mod r9birth7;
+mod r9birth8;
+mod r9read1;
+mod r9store1;
+mod r9read2;
+mod r9store2;
+mod r9store3;
+mod r9read3;
+mod r9read4;
+mod r9store4;
+mod r9store5;
+mod r9store6;
+mod r9read5;
+mod r9read6;
+mod r9read7;
+mod r9read8;
+mod r9read9;
+mod r9read10;
+mod r9read11;
+mod onchange1;
+mod thisbind1;
+mod r9birth1;
+mod accsite1;
+mod accown1;
+mod d1;
+mod refold1;
+mod elems1;
+mod raybox2;
+mod raybox15;
+mod rb8;

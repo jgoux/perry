@@ -44,7 +44,7 @@ const BODY_STMT_STACK_SEGMENT: usize = 2 * 1024 * 1024;
 // graph (#9194). The call boundary is intentional, including in optimized
 // compiler builds.
 #[inline(never)]
-fn finish_for_with_property_array_hoist(
+pub(crate) fn finish_for_with_property_array_hoist(
     ctx: &mut LoweringContext,
     init: Option<Box<Stmt>>,
     condition: Option<Expr>,
@@ -187,6 +187,8 @@ fn lower_body_stmt_impl(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<V
                                                 object: Box::new(Expr::This),
                                                 property: field_name,
                                                 value: Box::new(Expr::LocalGet(temp_id)),
+                                                byte_offset: 0,
+                                                byte_end: 0,
                                             }));
 
                                             return Ok(result);
@@ -409,7 +411,11 @@ fn lower_body_stmt_impl(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<V
                         .any(|m| m.name.starts_with("__perry_static_init_"));
                 let has_private_elements = class.has_private_elements();
                 // Captures alone need a class object per evaluation only when
-                // the instances carry them: a guarded class environment
+                // the instances carry them. A class environment never makes
+                // them carry: a run-once definition has exactly one
+                // environment, whose slots are its only evaluation's (so the
+                // template IS the class, the one a member naming a later
+                // class through `ClassRef` reaches), and a guarded one
                 // (#11759 (c′)) gives the first evaluation the environment's
                 // slots and each later one its own capture array.
                 let per_evaluation_state = has_private_elements
@@ -417,7 +423,7 @@ fn lower_body_stmt_impl(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<V
                     || !computed_keys.is_empty()
                     || (!captured_exprs.is_empty()
                         && !has_static_state
-                        && !ctx.is_class_env_guarded(&class.name));
+                        && !ctx.is_class_env(&class.name));
                 // #11759 (c′): a declaration that may be evaluated more than
                 // once and has no other per-evaluation state keeps the shared
                 // class for its FIRST evaluation; later ones are fresh.
@@ -1165,6 +1171,7 @@ fn lower_body_stmt_impl(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<V
                 body,
                 catch,
                 finally,
+                forof_completion: None,
             });
         }
         ast::Stmt::Throw(throw_stmt) => {
@@ -1244,6 +1251,12 @@ fn lower_body_stmt_impl(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<V
             // `for_head::rewrite_collection_view_for_of`.
             let view_rewrite = crate::lower::rewrite_collection_view_for_of(ctx, for_of_stmt);
             let for_of_stmt = view_rewrite.as_ref().unwrap_or(for_of_stmt);
+            // A short array literal: a counted loop over its elements
+            // (`lower::for_of_guard`).
+            if let Some(stmts) = crate::lower::lower_body_literal_for_of(ctx, for_of_stmt)? {
+                result.extend(stmts);
+                return Ok(result);
+            }
 
             // --- Issue #237: `for await (const c of <ReadableStream>)` ---
             // Lower to a getReader/read loop so the body sees Uint8Array
@@ -1789,15 +1802,8 @@ fn lower_body_stmt_impl(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<V
             // Same materialization fix as the module-init lowering path —
             // wrap in `Expr::ArrayFrom` so iteration sees the byte values
             // not the byte buffer reinterpreted as f64s.
-            let is_iterable_typed_array = matches!(
-                &iterable_type,
-                Some(Type::Named(name)) if matches!(name.as_str(),
-                    "Uint8Array" | "Int8Array" | "Uint8ClampedArray"
-                    | "Uint16Array" | "Int16Array"
-                    | "Uint32Array" | "Int32Array"
-                    | "Float16Array" | "Float32Array" | "Float64Array"
-                )
-            );
+            let is_iterable_typed_array =
+                crate::lower::for_of_guard::is_numeric_typed_array(iterable_type.as_ref());
             // #321: when the receiver's static type can NOT be proven to
             // be a plain Array — an `any`-typed Map/Set (effect's
             // `for (const [tag, s] of that.unsafeMap)`, where `that` is an
@@ -1845,11 +1851,10 @@ fn lower_body_stmt_impl(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<V
                     Expr::SetValues(Box::new(arr_expr))
                 }
             } else if is_iterable_typed_array {
-                // Iterate the typed array LIVE (holder keeps the TA type so
-                // IndexGet/.length use the typed-array accessors) — body
-                // writes like `ta[1] = 64` must be observed mid-loop.
+                // A real typed array LIVE (body writes like `ta[1] = 64` are
+                // observed mid-loop), any other value drained by its iterator.
                 // Mirrors the module-init path in stmt_loops.rs.
-                arr_expr
+                crate::lower::for_of_guard::admitted_typed_array_holder(ctx, arr_expr, &mut result)
             } else if use_lazy_iter {
                 arr_expr
             } else if is_string_iter {
@@ -1925,9 +1930,7 @@ fn lower_body_stmt_impl(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<V
             } else if use_lazy_iter {
                 Type::Any // holds the iterator, not an array
             } else if is_iterable_typed_array {
-                // Keep the TA's own type so IndexGet/.length route through
-                // the typed-array accessors (live reads).
-                iterable_type.clone().unwrap_or(Type::Any)
+                Type::Any // a typed array or the Array its admission drained
             } else if let Some(ref elem) = inferred_elem_type {
                 Type::Array(Box::new(elem.clone()))
             } else {
@@ -1936,8 +1939,7 @@ fn lower_body_stmt_impl(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<V
             let item_hir_type = if is_string_iter {
                 Type::String
             } else if is_iterable_typed_array {
-                // Issue #578: typed-array element values are always Number.
-                Type::Number
+                Type::Any // Numbers only when the admission held
             } else if let Some(elem) = inferred_elem_type {
                 elem
             } else {
@@ -2106,12 +2108,10 @@ fn lower_body_stmt_impl(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<V
                         // module-init for-of arm. `use_lazy_iter` implies
                         // `!is_await`, so the await arm is always the index path.
                         let item_expr = if for_of_stmt.is_await {
-                            let raw_item_expr = Expr::IndexGet {
-                                byte_offset: 0,
-                                byte_end: 0,
-                                object: Box::new(Expr::LocalGet(arr_id)),
-                                index: Box::new(Expr::LocalGet(idx_id)),
-                            };
+                            let raw_item_expr = Expr::synthetic_index_get(
+                                Box::new(Expr::LocalGet(arr_id)),
+                                Box::new(Expr::LocalGet(idx_id)),
+                            );
                             Expr::Await(Box::new(raw_item_expr))
                         } else {
                             if let Some(id) = binding_value {
@@ -2383,12 +2383,10 @@ fn lower_body_stmt_impl(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<V
 
             // Lower the body and prepend the key binding/assignment
             let mut loop_body = lower_body_stmt(ctx, &for_in_stmt.body)?;
-            let key_source = Expr::IndexGet {
-                byte_offset: 0,
-                byte_end: 0,
-                object: Box::new(Expr::LocalGet(keys_id)),
-                index: Box::new(Expr::LocalGet(idx_id)),
-            };
+            let key_source = Expr::synthetic_index_get(
+                Box::new(Expr::LocalGet(keys_id)),
+                Box::new(Expr::LocalGet(idx_id)),
+            );
             let binding_stmts =
                 crate::lower::for_head_binding_stmts(ctx, &head_binding, key_source, Type::String)?;
             for (i, stmt) in binding_stmts.into_iter().enumerate() {

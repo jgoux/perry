@@ -41,6 +41,7 @@ use crate::closure_local_inline::{for_each_expr_in_stmt_mut, nested_stmt_lists};
 
 pub fn run(module: &mut Module) {
     fold_module_consts(module);
+    crate::immutable_numeric_arrays::run(module);
     // Phase 2 runs unconditionally — see `rewrite_literal_index_gets`.
     rewrite_literal_index_gets(module);
 }
@@ -298,6 +299,7 @@ fn walk_stmt_exprs(stmt: &Stmt, f: &mut dyn FnMut(&Expr)) {
             body,
             catch,
             finally,
+            ..
         } => {
             for s in body {
                 walk_stmt_exprs(s, f);
@@ -504,6 +506,7 @@ fn nested_stmt_lists_shared(stmt: &Stmt) -> Vec<&Vec<Stmt>> {
             body,
             catch,
             finally,
+            ..
         } => {
             let mut v = vec![body];
             if let Some(c) = catch {
@@ -845,6 +848,7 @@ mod tests {
         m.functions.push(func(
             1,
             vec![Stmt::Return(Some(Expr::IndexGet {
+                element_offset: 0,
                 byte_offset: 0,
                 byte_end: 0,
                 object: Box::new(Expr::LocalGet(8)),
@@ -880,6 +884,7 @@ mod tests {
             m.functions.push(func(
                 1,
                 vec![Stmt::Return(Some(Expr::IndexGet {
+                    element_offset: 0,
                     byte_offset: 0,
                     byte_end: 0,
                     object: Box::new(Expr::LocalGet(8)),
@@ -908,6 +913,7 @@ mod tests {
             m.functions.push(func(
                 1,
                 vec![Stmt::Return(Some(Expr::IndexGet {
+                    element_offset: 0,
                     byte_offset: 0,
                     byte_end: 0,
                     object: Box::new(Expr::LocalGet(8)),
@@ -933,6 +939,7 @@ mod tests {
     fn the_rewrite_runs_with_no_module_consts_at_all() {
         let mut m = Module::new("k.ts");
         m.init.push(Stmt::Expr(Expr::IndexGet {
+            element_offset: 0,
             byte_offset: 0,
             byte_end: 0,
             object: Box::new(Expr::LocalGet(8)),
@@ -959,6 +966,7 @@ mod tests {
 
     fn read_k(id: u32) -> Expr {
         Expr::IndexGet {
+            element_offset: 0,
             byte_offset: 0,
             byte_end: 0,
             object: Box::new(Expr::LocalGet(8)),
@@ -1115,9 +1123,11 @@ mod tests {
     fn a_nested_literal_index_rewrites_at_every_level() {
         let mut m = Module::new("k.ts");
         m.init.push(Stmt::Expr(Expr::IndexGet {
+            element_offset: 0,
             byte_offset: 0,
             byte_end: 0,
             object: Box::new(Expr::IndexGet {
+                element_offset: 0,
                 byte_offset: 0,
                 byte_end: 0,
                 object: Box::new(Expr::LocalGet(8)),

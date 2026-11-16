@@ -89,7 +89,7 @@ jobs:
         env:
           EXPECTED_SHA: ${{ inputs.checkout-sha }}
         run: |
-          python3 scripts/test_wasi_release.py
+          python3 tests/tooling/infrastructure/test_wasi_release.py
           python3 scripts/wasi_build_runtime.py
           python3 scripts/wasi_release.py package --revision "$EXPECTED_SHA" \
             --runtime target/wasm32-wasip2/release/libperry_runtime.a --output wasi-release
@@ -108,9 +108,10 @@ jobs:
         run: |
           set -euo pipefail
           archive="$(python3 scripts/wasi_build_runtime.py wasm32-wasip1 | sed -n 's/^WASI archive: //p' | tail -n 1)"
-          # The optional networking member ships in the archive; default
-          # linked modules still omit it unless PERRY_WASM_NET=1 is selected.
-          python3 scripts/wasi_imports_check.py "$archive" --allow-perry-net
+          # The optional networking and page-discard members ship in the
+          # archive; default linked modules still omit them unless
+          # PERRY_WASM_NET=1 / PERRY_WASM_DISCARD=1 is selected.
+          python3 scripts/wasi_imports_check.py "$archive" --allow-perry-net --allow-perry-host
           python3 scripts/wasi_release.py package --target wasm32-wasip1 --revision "$EXPECTED_SHA" \
             --runtime "$archive" --output wasip1-release
       - name: Upload the wasip1 runtime bundle

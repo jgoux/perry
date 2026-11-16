@@ -26,6 +26,7 @@ pub use boxed_primitives::{
     js_boxed_bigint_new, js_boxed_boolean_new, js_boxed_number_new, js_boxed_string_new,
     js_boxed_symbol_new,
 };
+mod array_layout;
 mod collections;
 mod identity_equality;
 mod prototype_equality;
@@ -34,7 +35,7 @@ mod typed_array_equality;
 mod util_format;
 pub(crate) use util_format::install_json_format;
 mod value_repr;
-pub(crate) use value_repr::{int32_or_class_repr, is_array_hole};
+pub(crate) use value_repr::is_array_hole;
 
 pub use strip_vt::js_util_strip_vt_control_characters;
 pub use util_format::{js_util_format, js_util_format_with_options, js_util_inspect};
@@ -111,22 +112,18 @@ fn inspect_finish_circular(ptr_addr: usize, body: String) -> String {
 }
 
 /// Format a finite, non-zero, non-integer-like f64 per ECMAScript
-/// NumberToString. Caller has already filtered NaN / ±Infinity / ±0 /
-/// integer-shaped values; this only decides decimal vs scientific
-/// notation per the |n| < 10^-6 / |n| >= 10^21 thresholds.
+/// Number::toString: the same formatter as `String(n)` (`js_format_f64`).
+/// Caller has already filtered NaN / ±Infinity / ±0 / integer-shaped values.
 ///
-/// Without the threshold split, Rust's Display impl produces 300-digit
-/// decimals for `Number.MAX_VALUE` (`1.7976931348623157e+308` → 309
-/// zeros) and 16-digit `0.000…0002…` decimals for `Number.EPSILON`,
-/// neither of which matches Node.
+/// Rust's `{}` / `{:e}` also emit a shortest round-tripping decimal, but when
+/// the two shortest candidates are equidistant they can pick the odd final
+/// digit (`2 ** -25` printed `2.9802322387695313e-8`); ECMA-262 requires the
+/// even one (`…312e-8`). `ryu-js` implements that tie-break together with the
+/// |n| < 10^-6 / |n| >= 10^21 notation thresholds.
 #[inline]
 pub(crate) fn format_finite_number_js(value: f64) -> String {
-    let abs = value.abs();
-    if !(1e-6..1e21).contains(&abs) {
-        crate::string::fix_exponent_format(&format!("{:e}", value))
-    } else {
-        format!("{}", value)
-    }
+    let mut buffer = ryu_js::Buffer::new();
+    buffer.format_finite(value).to_owned()
 }
 
 /// 2^53 — the largest magnitude below which every integer is exactly
@@ -723,7 +720,7 @@ pub(crate) fn format_jsvalue(value: f64, depth: usize) -> String {
                 if gc_type == crate::gc::GC_TYPE_ERROR {
                     let error_ptr = ptr as *const crate::error::ErrorHeader;
                     errors::format_error_value(error_ptr, depth)
-                } else if gc_type == crate::gc::GC_TYPE_ARRAY {
+                } else if crate::gc_type_is_array!(gc_type) {
                     // A grown array's old head is a forwarding stub; inspect the
                     // live header (and key the cycle check on it) instead.
                     let ptr = crate::array::clean_arr_ptr(ptr);
@@ -758,35 +755,34 @@ pub(crate) fn format_jsvalue(value: f64, depth: usize) -> String {
                         };
                         return inspect_finish_circular(ptr as usize, empty);
                     }
-                    let data_ptr = crate::array::array_elements_ptr(
-                        maybe_arr as *const crate::array::ArrayHeader,
-                    ) as *const f64;
                     // #9415: a hole slot is `TAG_HOLE`, whose bits read back as
                     // a NaN, so element-by-element recursion printed
                     // `new Array(3)` as `[ NaN, NaN, NaN ]`. Runs of holes are
                     // ONE entry (`<N empty items>`), which is also why the
-                    // layout below counts entries rather than slots.
-                    let mut parts =
-                        value_repr::array_entries_with_holes(data_ptr, length, |elem| {
-                            let elem_jsval = JSValue::from_bits(elem.to_bits());
-                            // Quote string elements like Node's util.inspect: 'hello'
-                            if elem_jsval.is_any_string() {
-                                let s = format_jsvalue(elem, depth + 1);
-                                return value_repr::ArrayEntry::new(format!("'{}'", s), false);
-                            }
-                            let rendered = format_jsvalue(elem, depth + 1);
-                            let numeric = value_repr::entry_is_numeric(elem, &rendered);
-                            value_repr::ArrayEntry::new(rendered, numeric)
-                        });
-                    let body_str = if inspect_show_hidden() {
+                    // layout below counts entries rather than slots. A sparse
+                    // Array's far elements are read from its named layout,
+                    // never as slots past the store.
+                    let mut parts = value_repr::array_entries(maybe_arr, |elem| {
+                        let elem_jsval = JSValue::from_bits(elem.to_bits());
+                        // Quote string elements like Node's util.inspect: 'hello'
+                        if elem_jsval.is_any_string() {
+                            let s = jsvalue_string_content(elem).unwrap_or_default();
+                            return value_repr::ArrayEntry::new(
+                                array_layout::inspect_string_value(&s, depth + 1),
+                                false,
+                            );
+                        }
+                        let rendered = format_jsvalue(elem, depth + 1);
+                        let numeric = value_repr::entry_is_numeric(elem);
+                        value_repr::ArrayEntry::new(rendered, numeric)
+                    });
+                    if inspect_show_hidden() {
                         // #9463: `%o` is `util.inspect(v, { showHidden: true,
                         // depth: 4 })`; the array's own `length` is part of that
                         // surface.
                         parts.push(value_repr::hidden_length_entry(length));
-                        value_repr::render_array_body_with_hidden(&parts)
-                    } else {
-                        value_repr::render_array_body(&parts, inspect_compact_enabled())
-                    };
+                    }
+                    let body_str = value_repr::array_body(parts, depth, inspect_compact_enabled());
                     inspect_finish_circular(ptr as usize, body_str)
                 } else if crate::gc_type_is_object!(gc_type) {
                     // Object — check for keys_array. Cycle check FIRST so the
@@ -833,10 +829,6 @@ pub(crate) fn format_jsvalue(value: f64, depth: usize) -> String {
                     "[object Object]".to_string()
                 }
             }
-        } else if jsval.is_int32() {
-            // Shares its tag with a class reference; `int32_or_class_repr` is
-            // the only place that decides which one these bits are (#9415).
-            value_repr::int32_or_class_repr(value)
         } else if value_repr::is_array_hole(value) {
             // A hole that escaped its array. `js_array_get_f64` normalizes one
             // to `undefined`, so that is what it must display as — not the
@@ -919,6 +911,11 @@ unsafe fn format_buffer_value(buf_ptr: *const crate::buffer::BufferHeader) -> St
             return out;
         }
 
+        // node prints an empty Buffer as `<Buffer >` (the payload slot is
+        // always preceded by a space).
+        if len == 0 {
+            return "<Buffer >".to_string();
+        }
         // Node caps at 50 bytes then shows "... N more bytes"
         let display_len = len.min(50);
         let mut out = String::with_capacity(9 + display_len * 3);
@@ -1144,12 +1141,8 @@ unsafe fn format_object_as_json(
     };
     // Node prefixes a null-prototype object with `[Object: null prototype]`
     // (e.g. `Object.create(null)`), since it has no constructor to name.
-    // The flag is set at allocation by `js_object_alloc_null_proto`.
-    let is_null_proto = {
-        let gc =
-            (obj_ptr as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
-        (*gc)._reserved & crate::gc::OBJ_FLAG_NULL_PROTO != 0
-    };
+    // The object's shape (or recorded prototype) says whether it has one.
+    let is_null_proto = crate::object::shapes::cell_prototype_is_null(obj_ptr as usize);
     // The display prefix before the `{ … }` body: a real class/constructor
     // name when present, otherwise `[Object: null prototype]` for a
     // null-proto plain object, otherwise nothing. (Distinct from
@@ -1300,7 +1293,7 @@ unsafe fn format_object_as_json(
     }
 
     if inspect_sorted_enabled() {
-        string_parts.sort_by(|(left, _), (right, _)| left.cmp(right));
+        crate::cold_sort::sort_by(&mut string_parts, |(left, _), (right, _)| left.cmp(right));
     }
 
     let mut parts: Vec<String> = string_parts
@@ -1422,10 +1415,11 @@ fn format_jsvalue_for_json(value: f64, depth: usize) -> String {
         } else if jsval.is_bool() {
             jsval.as_bool().to_string()
         } else if jsval.is_any_string() {
-            // Escape and quote strings for JSON-like output. SSO + heap
-            // strings handled identically via the central decoder.
+            // A string value is quoted and escaped the way node's
+            // `util.inspect` prints it. SSO + heap strings handled
+            // identically via the central decoder.
             let s = jsvalue_string_content(value).unwrap_or_default();
-            format!("'{}'", escape_string(&s))
+            array_layout::inspect_string_value(&s, depth)
         } else if jsval.is_bigint() {
             let ptr = jsval.as_bigint_ptr();
             if ptr.is_null() {
@@ -1515,7 +1509,7 @@ fn format_jsvalue_for_json(value: f64, depth: usize) -> String {
                     if gc_type == crate::gc::GC_TYPE_ERROR {
                         let error_ptr = ptr as *const crate::error::ErrorHeader;
                         errors::format_error_value(error_ptr, depth)
-                    } else if gc_type == crate::gc::GC_TYPE_ARRAY {
+                    } else if crate::gc_type_is_array!(gc_type) {
                         // A grown array's old head is a forwarding stub; inspect the
                         // live header (and key the cycle check on it) instead.
                         let ptr = crate::array::clean_arr_ptr(ptr);
@@ -1537,36 +1531,24 @@ fn format_jsvalue_for_json(value: f64, depth: usize) -> String {
                         if length > 1_000_000 {
                             return inspect_finish_circular(ptr as usize, "[Array]".to_string());
                         }
-                        let data_ptr = crate::array::array_elements_ptr(
-                            maybe_arr as *const crate::array::ArrayHeader,
-                        ) as *const f64;
                         // #9415: the same hole grouping the `format_jsvalue`
                         // array arm does. This is the twin that renders an
                         // array reached as an object FIELD, so without it
                         // `{ h: new Array(3) }` still said
                         // `{ h: [ NaN, NaN, NaN ] }`.
-                        let mut parts =
-                            value_repr::array_entries_with_holes(data_ptr, length, |elem| {
-                                value_repr::ArrayEntry::new(
-                                    format_jsvalue_for_json(elem, depth + 1),
-                                    false,
-                                )
-                            });
+                        let mut parts = value_repr::array_entries(maybe_arr, |elem| {
+                            let rendered = format_jsvalue_for_json(elem, depth + 1);
+                            let numeric = value_repr::entry_is_numeric(elem);
+                            value_repr::ArrayEntry::new(rendered, numeric)
+                        });
                         // #9463: the `showHidden` tail belongs on nested arrays
                         // too — node's `%o` on `{ a: [1, 2] }` is
                         // `{ a: [ 1, 2, [length]: 2 ] }`.
                         if inspect_show_hidden() {
                             parts.push(value_repr::hidden_length_entry(length));
                         }
-                        // Node formats empty arrays as `[]` and non-empty
-                        // arrays with a space inside the brackets:
-                        // `[ 1, 2, 3 ]`. Match byte-for-byte.
-                        let body_str = if parts.is_empty() {
-                            "[]".to_string()
-                        } else {
-                            let texts: Vec<&str> = parts.iter().map(|p| p.text.as_str()).collect();
-                            format!("[ {} ]", texts.join(", "))
-                        };
+                        let body_str =
+                            value_repr::array_body(parts, depth, inspect_compact_enabled());
                         inspect_finish_circular(ptr as usize, body_str)
                     } else if crate::gc_type_is_object!(gc_type) {
                         // Cycle check FIRST so back-edges win over the
@@ -1615,8 +1597,6 @@ fn format_jsvalue_for_json(value: f64, depth: usize) -> String {
                     }
                 }
             }
-        } else if jsval.is_int32() {
-            value_repr::int32_or_class_repr(value)
         } else if value_repr::is_array_hole(value) {
             "undefined".to_string()
         } else {
@@ -1702,19 +1682,6 @@ mod inspect_property_key_tests;
 #[cfg(test)]
 mod internal_key_hiding_tests;
 
-#[inline]
-fn looks_like_raw_heap_pointer(value: f64) -> bool {
-    let bits = value.to_bits();
-    if (bits >> 48) >= 0x7FF8 {
-        return false;
-    }
-    let addr = bits as usize;
-    // Compare in u64 so the 2^47 upper bound stays in range on 32-bit targets
-    // (arm64_32 watchOS, wasm32), where it's a no-op — no addresses that high.
-    (0x1000..0x8000_0000_0000u64).contains(&(addr as u64))
-        && addr >= crate::gc::GC_HEADER_SIZE + 0x1000
-}
-
 mod deep_equal;
 pub use deep_equal::*;
 
@@ -1727,15 +1694,21 @@ pub extern "C" fn js_array_print(arr_ptr: *const crate::array::ArrayHeader) {
     }
 
     unsafe {
-        let length = (*arr_ptr).length as usize;
-        let data_ptr = crate::array::array_elements_ptr(arr_ptr as *const crate::array::ArrayHeader)
-            as *const f64;
-
-        let mut parts: Vec<String> = Vec::with_capacity(length);
-        for i in 0..length {
-            let value = *data_ptr.add(i);
-            parts.push(format_jsvalue_for_json(value, 0));
+        let arr = crate::array::clean_arr_ptr(arr_ptr);
+        if arr.is_null() {
+            println!("[]");
+            return;
         }
+        // Holes and a sparse Array's absent indices print as `undefined`; no
+        // slot past the store is read.
+        let length = (*arr).length as usize;
+        let mut parts: Vec<String> = Vec::new();
+        crate::array::array_for_each_own_element(arr, |index, value| {
+            parts.resize(index as usize, "undefined".to_string());
+            parts.push(format_jsvalue_for_json(value, 0));
+            true
+        });
+        parts.resize(length, "undefined".to_string());
         println!("[{}]", parts.join(", "));
     }
 }

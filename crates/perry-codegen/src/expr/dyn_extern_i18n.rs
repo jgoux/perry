@@ -4,7 +4,7 @@
 //! Pure mechanical move — match arm bodies are verbatim copies, called from
 //! `lower_expr`'s outer dispatch.
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::Result;
 use perry_hir::types::Type as HirType;
 use perry_hir::Expr;
 
@@ -63,6 +63,12 @@ pub(crate) fn namespace_value_for_prefix(ctx: &mut FnCtx<'_>, prefix: &str) -> S
         blk.call_void(&format!("{}__init", prefix), &[]);
         blk.load(DOUBLE, &format!("@__perry_ns_{}", prefix))
     }
+}
+
+/// A module-owned cached identity, without evaluating its synchronous body.
+pub(crate) fn deferred_namespace_value_for_prefix(ctx: &mut FnCtx<'_>, prefix: &str) -> String {
+    ctx.block()
+        .call(DOUBLE, &format!("{prefix}__deferred_namespace"), &[])
 }
 
 /// What `require` returns for a compiled target: its `module.exports` when the
@@ -514,7 +520,11 @@ fn materialize_compiled_namespace(ctx: &mut FnCtx<'_>, name: &str) -> Result<Opt
         // The module graph owns one namespace and its init guard. Reading a
         // static namespace must load that same object as dynamic import(),
         // rather than rebuilding a projection of its members in the consumer.
-        return Ok(Some(namespace_value_for_prefix(ctx, &prefix)));
+        return Ok(Some(if ctx.deferred_namespace_imports.contains(name) {
+            deferred_namespace_value_for_prefix(ctx, &prefix)
+        } else {
+            namespace_value_for_prefix(ctx, &prefix)
+        }));
     }
 
     let mut members: Vec<String> = ctx
@@ -622,92 +632,16 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             paths,
             filename,
             options,
-            is_eval: _,
-            partial,
-        } => {
-            if !paths.is_empty() && (*partial || paths.len() > 1) {
-                return worker_new::lower_candidates(ctx, paths, filename, options.as_deref());
-            }
-            // An empty `paths` list means collect_modules could not resolve
-            // the filename statically (it warned at compile time). The
-            // runtime looks it up in the worker entry table and throws
-            // ERR_WORKER_NOT_COMPILED only if no entry matches. Many real
-            // packages construct such Workers only on cold paths (e.g.
-            // Next.js build-time worker pools), so this must not fail the
-            // compile.
-            if paths.is_empty() {
-                return worker_new::lower_by_spec(ctx, filename, options.as_deref());
-            }
-            let _ = lower_expr(ctx, filename)?;
-            if ctx.block().is_terminated() {
-                return Ok(double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED)));
-            }
-            let options_val = if let Some(options) = options {
-                let value = lower_expr(ctx, options)?;
-                if ctx.block().is_terminated() {
-                    return Ok(double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED)));
-                }
-                value
-            } else {
-                double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED))
-            };
-            if paths.len() != 1 {
-                bail!(
-                    "worker_threads Worker requires exactly one compile-time-resolved filename, got {}",
-                    paths.len()
-                );
-            }
-            let path = &paths[0];
-            let target_prefix = ctx
-                .dynamic_import_path_to_prefix
-                .get(path)
-                .cloned()
-                .ok_or_else(|| anyhow!("worker_threads Worker target was not compiled: {path}"))?;
-            if target_prefix.starts_with("__node_submod__")
-                || target_prefix.starts_with("__native_mod__")
-            {
-                bail!("worker_threads Worker target must be a compiled source file: {path}");
-            }
-            // #10399: which entry symbol the worker thread starts on.
-            //
-            // `<prefix>__init` is the guarded wrapper: it initializes the
-            // module's DEPENDENCIES and then runs the body. `__init_body` is
-            // the body alone.
-            //
-            // When the program has a Worker the `__perry_init_done_*` guard is
-            // thread-local, so the wrapper is correct and necessary: it runs
-            // once per thread, and it is the only thing that initializes the
-            // worker entry's own imports. Calling the bare body instead left
-            // every module the entry imports uninitialized on that thread —
-            // a module reachable only from the worker never ran at all and its
-            // bindings stayed `undefined`.
-            //
-            // The bare body remains the fallback for the (unreachable in
-            // practice) case where the guard is still process-wide: there the
-            // wrapper's flag would be set by the first worker or by
-            // main-thread import init and every later worker's entry would be
-            // a no-op, leaving the spawned thread idle and the parent waiting
-            // forever.
-            let init_name = if ctx.program_has_worker {
-                format!("{}__init", target_prefix)
-            } else {
-                format!("{}__init_body", target_prefix)
-            };
-            ctx.pending_declares
-                .push((init_name.clone(), crate::types::VOID, vec![]));
-            let entry_ptr = ctx.block().ptrtoint(&format!("@{}", init_name), I64);
-            Ok(ctx.block().call(
-                DOUBLE,
-                "js_worker_threads_worker_new",
-                &[(I64, &entry_ptr), (DOUBLE, &options_val)],
-            ))
-        }
+            is_eval,
+            ..
+        } => worker_new::lower(ctx, paths, filename, options.as_deref(), *is_eval),
         Expr::DynamicImport {
             paths,
             arg,
             options,
             deferred_error,
             synchronous,
+            deferred,
             ..
         } => {
             // #5389 Tier 2: a synchronous CommonJS `require(expr)` returns the
@@ -885,6 +819,17 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                             "js_create_native_module_namespace",
                             &[(PTR, &mod_label), (I64, &mod_len.to_string())],
                         )
+                    } else if *deferred {
+                        deferred_namespace_value_for_prefix(ctx, target_prefix)
+                    } else if ctx.program_has_tla {
+                        let blk = ctx.block();
+                        let record =
+                            blk.call(I64, &format!("{}__async_record", target_prefix), &[]);
+                        let promise = blk.call(DOUBLE, "js_async_module_import", &[(I64, &record)]);
+                        blk.store(DOUBLE, &promise, &result_slot);
+                        blk.br(&join_label);
+                        ctx.current_block = next_label;
+                        continue;
                     } else {
                         let blk = ctx.block();
                         blk.call_void(&format!("{}__init", target_prefix), &[]);
@@ -954,12 +899,9 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             // Imported class references (refs #420 / drizzle): when `name`
             // resolves to a class registered in `ctx.class_ids` (populated
             // from `opts.imported_classes` for imported classes too), emit
-            // the same INT32-tagged class-id NaN-box that local `Expr::ClassRef`
-            // produces. This is what `js_object_has_own`'s Symbol-key branch
-            // looks for to consult `CLASS_STATIC_SYMBOLS`. Without this,
-            // `Object.prototype.hasOwnProperty.call(ImportedClass, sym)`
-            // always returned false because the receiver was a closure-pointer
-            // NaN-box (POINTER_TAG) rather than a class-ref (INT32_TAG).
+            // the same constructor function object that local `Expr::ClassRef`
+            // produces. This preserves the class's identity and own static
+            // symbol properties for imported-class property operations.
             // Class metadata also includes classes that are not lexical
             // imports (for cross-module return-type dispatch). An unrelated
             // class with the same name must not shadow an imported variable.

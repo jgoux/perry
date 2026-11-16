@@ -310,7 +310,6 @@ pub(super) fn lower_arrow(ctx: &mut LoweringContext, arrow: &ast::ArrowExpr) -> 
             }
             let native_info = match type_name.as_str() {
                 "PluginApi" => Some(("perry/plugin", "PluginApi")),
-                "WebSocket" | "WebSocketServer" => Some(("ws", type_name.as_str())),
                 // Web Fetch API: Request / Response / Headers passed as
                 // function parameters need the same native-instance
                 // registration the `new Request()`/`new Response()`/
@@ -682,13 +681,11 @@ fn lower_fn_expr_anon(ctx: &mut LoweringContext, fn_expr: &ast::FnExpr) -> Resul
             destructuring_params.push((param_id, inner_pat.clone()));
         }
     }
-    for (param, pat) in params.iter_mut().zip(default_param_pats.iter()) {
-        param.default = get_param_default(ctx, pat)?;
-    }
-
     // #677: synthesize `arguments` for non-arrow function expressions when the
-    // body references it. Function expressions get their own `arguments`
-    // binding per spec — they don't inherit from the enclosing scope.
+    // body or a parameter default references it. Function expressions get
+    // their own `arguments` binding per spec — they don't inherit from the
+    // enclosing scope. Bound before the defaults are lowered (a default that
+    // refers to `arguments` sees this function's object), as in fn_decl.
     let user_has_arguments_param = fn_expr
         .function
         .params
@@ -703,7 +700,9 @@ fn lower_fn_expr_anon(ctx: &mut LoweringContext, fn_expr: &ast::FnExpr) -> Resul
             .body
             .as_ref()
             .map(|b| crate::lower_decl::body_uses_arguments(&b.stmts))
-            .unwrap_or(false);
+            .unwrap_or(false)
+        || !user_has_arguments_param
+            && crate::lower_decl::params_use_arguments(&fn_expr.function.params);
     if needs_arguments_synth {
         let mapped = !strict && simple_parameters;
         let mapped_parameter_ids = if mapped {
@@ -719,6 +718,9 @@ fn lower_fn_expr_anon(ctx: &mut LoweringContext, fn_expr: &ast::FnExpr) -> Resul
             !mapped,
             mapped_parameter_ids,
         );
+    }
+    for (param, pat) in params.iter_mut().zip(default_param_pats.iter()) {
+        param.default = get_param_default(ctx, pat)?;
     }
 
     let outer_strict = ctx.current_strict;
@@ -1491,6 +1493,7 @@ fn insert_class_capture_refresh_into_stmt(stmt: &mut Stmt, re_regs: &[Stmt]) {
             body,
             catch,
             finally,
+            ..
         } => {
             insert_class_capture_refresh_before_returns(body, re_regs);
             if let Some(c) = catch {
@@ -1731,6 +1734,7 @@ fn insert_class_capture_refresh_inside_expressions(
                 body,
                 catch,
                 finally,
+                ..
             } => {
                 insert_class_capture_refresh_inside_expressions(body, regs);
                 if let Some(catch) = catch {
@@ -1807,6 +1811,7 @@ pub(crate) fn insert_class_capture_refresh_after_assignments(
                 body,
                 catch,
                 finally,
+                ..
             } => {
                 insert_class_capture_refresh_after_assignments(body, regs);
                 if let Some(c) = catch {

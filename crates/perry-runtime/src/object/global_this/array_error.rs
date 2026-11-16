@@ -291,7 +291,7 @@ pub(crate) extern "C" fn object_prototype_has_own_property_thunk(
     key: f64,
 ) -> f64 {
     let this_value = f64::from_bits(this.bits());
-    super::super::object_ops::js_object_has_own(this_value, key)
+    super::super::object_ops::has_own::object_prototype_has_own_property(this_value, key)
 }
 
 pub(crate) extern "C" fn object_prototype_property_is_enumerable_thunk(
@@ -435,8 +435,7 @@ const MAX_GENERIC_ARRAY_LIKE_LENGTH: i64 = 1_000_000;
 
 fn throw_apply_range_error(message: &[u8]) -> ! {
     let msg = crate::string::js_string_from_bytes(message.as_ptr(), message.len() as u32);
-    let err = crate::error::js_rangeerror_new(msg);
-    crate::exception::js_throw(crate::value::js_nanbox_pointer(err as i64))
+    crate::exception::throw_core(crate::error::CoreError::range_error(msg))
 }
 
 unsafe fn function_apply_args(args_array: f64) -> Vec<f64> {
@@ -499,8 +498,7 @@ unsafe fn function_apply_args(args_array: f64) -> Vec<f64> {
 
 fn throw_type_error_message(message: &[u8]) -> ! {
     let msg = crate::string::js_string_from_bytes(message.as_ptr(), message.len() as u32);
-    let err = crate::error::js_typeerror_new(msg);
-    crate::exception::js_throw(crate::value::js_nanbox_pointer(err as i64))
+    crate::exception::throw_core(crate::error::CoreError::type_error(msg))
 }
 
 /// Generic `CreateListFromArrayLike` (spec 7.3.24) for an `argArray` that is
@@ -666,15 +664,13 @@ pub(crate) extern "C" fn function_prototype_to_string_thunk(
             let str_ptr = crate::string::js_string_from_bytes(s.as_ptr(), s.len() as u32);
             return f64::from_bits(JSValue::string_ptr(str_ptr).bits());
         }
-        // A class reference (INT32-tagged registered class id) is a function
+        // A class constructor (a class function object) is a function
         // value; #9413 retains its source text at compile time, so answer with
         // that and keep the NativeFunction form only for classes with none.
-        if super::super::class_prototype_ref_id(this_val).is_none() {
-            if let Some(cid) = super::super::native_module::class_ref_id(this_val) {
-                let s = super::super::class_registry::class_ref_to_string(cid);
-                let str_ptr = crate::string::js_string_from_bytes(s.as_ptr(), s.len() as u32);
-                return f64::from_bits(JSValue::string_ptr(str_ptr).bits());
-            }
+        if let Some(cid) = super::super::native_module::class_ref_id(this_val) {
+            let s = super::super::class_registry::class_ref_to_string(cid);
+            let str_ptr = crate::string::js_string_from_bytes(s.as_ptr(), s.len() as u32);
+            return f64::from_bits(JSValue::string_ptr(str_ptr).bits());
         }
         // A per-evaluation class object (`ClassExprFresh`) is a function too.
         if let Some(source) = super::super::field_get_set::class_object_source_text(this_val) {
@@ -707,6 +703,11 @@ pub(crate) extern "C" fn function_prototype_to_string_thunk(
 /// read off the singleton's empty proto object as `undefined` and the
 /// chained `.call` access threw
 /// `Cannot read properties of undefined (reading 'call')` at module init.
+fn is_byte_family_receiver(addr: usize) -> bool {
+    unsafe { crate::value::addr_class::try_read_tracked_gc_header(addr) }
+        .is_some_and(|header| crate::gc::is_byte_family_type(unsafe { header.as_ref() }.obj_type))
+}
+
 pub(crate) extern "C" fn array_prototype_slice_thunk(
     _closure: *const crate::closure::ClosureHeader,
     this: crate::closure::JsThis,
@@ -719,20 +720,10 @@ pub(crate) extern "C" fn array_prototype_slice_thunk(
     let arr_ptr = if this_jsv.is_pointer() {
         this_jsv.as_pointer::<crate::array::ArrayHeader>()
     } else {
-        // Tolerate raw-i64-encoded array receivers (some module-init
-        // call sites pass array pointers as `this` without
-        // NaN-boxing). The clean_arr_ptr check inside js_array_slice
-        // re-validates.
-        let raw = this_bits as *const crate::array::ArrayHeader;
-        if (raw as usize) > 0x10000 {
-            raw
-        } else {
-            std::ptr::null()
-        }
+        // A primitive or nullish `this`: ToObject, then the generic body
+        // reads `length` and the indexed elements off the wrapper.
+        return crate::array::js_arraylike_slice(this.as_f64(), start_val, 1, end_val, 1);
     };
-    if arr_ptr.is_null() {
-        return f64::from_bits(crate::value::TAG_UNDEFINED);
-    }
     // A borrowed builtin (`obj.slice = Array.prototype.slice; obj.slice()`)
     // reaches this thunk rather than the HIR ArrayLikeMethod path. Keep the
     // original object intact so LengthOfArrayLike and the result-length guard
@@ -742,6 +733,18 @@ pub(crate) extern "C" fn array_prototype_slice_thunk(
     // below.
     if let Some(recv) = crate::array::non_array_object_receiver(arr_ptr) {
         return crate::array::js_arraylike_slice(recv, start_val, 1, end_val, 1);
+    }
+    // A typed array / Buffer / DataView receiver is not an Array: its
+    // ArraySpeciesCreate is ArrayCreate, so `Array.prototype.slice.call(u8)`
+    // yields a plain Array of the element values (not a typed-array copy).
+    if is_byte_family_receiver(arr_ptr as usize) {
+        return crate::array::js_arraylike_slice(
+            f64::from_bits(this_bits),
+            start_val,
+            1,
+            end_val,
+            1,
+        );
     }
     let result = unsafe {
         if let Some(arr) =
@@ -789,7 +792,7 @@ pub(crate) extern "C" fn array_prototype_values_thunk(
     this: crate::closure::JsThis,
     _a: f64,
 ) -> f64 {
-    let this = this.as_f64();
+    let this = crate::array::array_receiver(this.as_f64());
     crate::array::array_values_iter(this)
 }
 
@@ -798,7 +801,7 @@ pub(crate) extern "C" fn array_prototype_flat_thunk(
     this: crate::closure::JsThis,
     depth: f64,
 ) -> f64 {
-    crate::array::js_arraylike_flat(this.as_f64(), depth)
+    crate::array::js_arraylike_flat(crate::array::array_receiver(this.as_f64()), depth)
 }
 
 /// Real thunks for `Array.prototype.{flatMap,toReversed,toSorted,with,keys,
@@ -811,7 +814,8 @@ pub(crate) extern "C" fn array_prototype_flat_thunk(
 fn array_proto_generic_read(this: crate::closure::JsThis, method: &str, args: &[f64]) -> f64 {
     // Nothing allocates before the generic body roots its receiver and
     // arguments, so the thunk's own values are passed straight through.
-    crate::array::dispatch_arraylike_read_method(this.as_f64(), method, args.as_ptr(), args.len())
+    let this = crate::array::array_receiver(this.as_f64());
+    crate::array::dispatch_arraylike_read_method(this, method, args.as_ptr(), args.len())
         .unwrap_or_else(|| f64::from_bits(crate::value::TAG_UNDEFINED))
 }
 
@@ -838,6 +842,18 @@ pub(crate) extern "C" fn array_prototype_with_thunk(
     value: f64,
 ) -> f64 {
     array_proto_generic_read(this, "with", &[index, value])
+}
+
+/// `Array.prototype.toSpliced(start, skipCount, ...items)` as a value and on
+/// every receiver the call site does not lower to `js_array_to_spliced`.
+pub(crate) extern "C" fn array_prototype_to_spliced_thunk(
+    _c: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
+    args: *const f64,
+    argc: usize,
+) -> f64 {
+    let args = unsafe { native_args(args, argc) };
+    array_proto_generic_read(this, "toSpliced", args)
 }
 
 pub(crate) extern "C" fn array_prototype_keys_thunk(
@@ -869,7 +885,7 @@ pub(crate) extern "C" fn array_prototype_pop_thunk(
     if bits & !crate::value::POINTER_MASK == crate::value::POINTER_TAG {
         let addr = (bits & crate::value::POINTER_MASK) as usize;
         if let Some(header) = unsafe { crate::value::addr_class::try_read_gc_header(addr) } {
-            if header.obj_type == crate::gc::GC_TYPE_ARRAY
+            if crate::gc_type_is_array!(header.obj_type)
                 && header.gc_flags & crate::gc::GC_FLAG_FORWARDED == 0
             {
                 let array = addr as *mut crate::array::ArrayHeader;
@@ -949,7 +965,7 @@ pub(crate) extern "C" fn array_prototype_push_thunk(
     if bits & !crate::value::POINTER_MASK == crate::value::POINTER_TAG {
         let addr = (bits & crate::value::POINTER_MASK) as usize;
         if let Some(header) = unsafe { crate::value::addr_class::try_read_gc_header(addr) } {
-            if header.obj_type == crate::gc::GC_TYPE_ARRAY {
+            if crate::gc_type_is_array!(header.obj_type) {
                 let array = addr as *mut crate::array::ArrayHeader;
                 // The ordinary dispatcher renders the rejected NEW index
                 // before its spec helper's non-writable length check.
@@ -1213,3 +1229,43 @@ mod native_args_tests;
 
 #[cfg(test)]
 mod variadic_args_tests;
+
+#[cfg(test)]
+mod slice_typed_receiver_tests {
+    /// `Array.prototype.slice.call(new Uint8Array([115, 116, 200]))` is an
+    /// Array of the values (ECMA-262 ArraySpeciesCreate: a non-Array receiver
+    /// gets ArrayCreate), so `[].concat(it)` spreads it.
+    #[test]
+    fn array_prototype_slice_of_a_typed_array_is_an_array() {
+        let mut arr = crate::array::js_array_alloc(3);
+        for v in [115.0, 116.0, 200.0] {
+            arr = crate::array::js_array_push_f64(arr, v);
+        }
+        let typed = crate::typedarray::js_typed_array_new_from_array(1, arr);
+        let this = crate::closure::JsThis::from_f64(f64::from_bits(
+            crate::value::JSValue::pointer(typed as *const u8).bits(),
+        ));
+        let undef = f64::from_bits(crate::value::TAG_UNDEFINED);
+        let sliced = super::array_prototype_slice_thunk(std::ptr::null(), this, undef, undef);
+        let ptr = crate::value::js_nanbox_get_pointer(sliced) as usize;
+        let obj_type = unsafe {
+            (*((ptr - crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader)).obj_type
+        };
+        assert_eq!(
+            obj_type,
+            crate::gc::GC_TYPE_ARRAY,
+            "slice of a typed array is an Array"
+        );
+        let out = ptr as *const crate::array::ArrayHeader;
+        assert_eq!(unsafe { (*out).length }, 3);
+        assert_eq!(crate::array::js_array_get_f64(out, 2), 200.0);
+        let empty = crate::array::js_array_alloc(0);
+        let args = [sliced];
+        let spread = crate::array::js_array_concat_variadic(empty, args.as_ptr(), 1);
+        assert_eq!(
+            unsafe { (*spread).length },
+            3,
+            "concat spreads the sliced Array"
+        );
+    }
+}

@@ -3,6 +3,7 @@
 //! Observable Gets retain the ordinary runtime reads.
 use super::field_get_set::runtime_read_site::{self as read, object_receiver, Answer, Key};
 use super::regex_proto_thunks as thunks;
+use crate::symbol::OwnSymbolSlot;
 
 const NAMES: [&[u8]; 16] = [
     b"exec",
@@ -60,23 +61,37 @@ pub(crate) fn builtin_exec_data(value: f64) -> Option<*const crate::regex::RegEx
         // SAFETY: admitted just now; nothing collected since.
         Some(unsafe { crate::regex::instance::builtin_data(re) })
     } else {
-        crate::regex::regexp_data_of(value).filter(|_| {
-            let object = (value.to_bits() & crate::value::POINTER_MASK) as *mut super::ObjectHeader;
-            matches!(unsafe { read::probe(object, Key::Name(b"exec")) },
-                Some(Answer::Data(bits))
-                if thunks::is_builtin_regexp_exec(f64::from_bits(bits)))
-        })
+        observable_exec_data(value)
     };
+    count_exec_proof(data.is_some());
+    data
+}
+
+/// The half of [`builtin_exec_data`] for a receiver `instance::builtin`
+/// declined: a branded receiver whose `exec` is still the builtin. Callers
+/// that took the builtin fact themselves ask only this.
+#[inline(always)]
+pub(crate) fn observable_exec_data(value: f64) -> Option<*const crate::regex::RegExpData> {
+    crate::regex::regexp_data_of(value).filter(|_| {
+        let object = (value.to_bits() & crate::value::POINTER_MASK) as *mut super::ObjectHeader;
+        matches!(unsafe { read::probe(object, Key::Name(b"exec")) },
+            Some(Answer::Data(bits))
+            if thunks::is_builtin_regexp_exec(f64::from_bits(bits)))
+    })
+}
+
+/// The exec proof's diagnostic counters (off unless the regex diag is on).
+#[inline(always)]
+pub(crate) fn count_exec_proof(hit: bool) {
     if crate::hot_diag::regex_on() {
         crate::hot_diag::regex_counters(|d| {
-            if data.is_some() {
+            if hit {
                 d.proof_exec_hit += 1;
             } else {
                 d.proof_exec_miss += 1;
             }
         });
     }
-    data
 }
 
 pub(crate) fn test(value: f64) -> bool {
@@ -177,15 +192,31 @@ const SYMBOLS: [&str; 7] = [
 ];
 
 fn symbol_probe(value: f64, index: usize) -> Option<Answer> {
-    let obj = object_receiver(value).or_else(|| unsafe {
-        // Functions' symbol properties are already ordinary shaped bags.
-        super::shaped_symbols::owner(crate::value::js_nanbox_get_pointer(value) as usize)
-    })?;
     let symbol = crate::symbol::well_known_symbol_if_cached(SYMBOLS[index]);
     if symbol.is_null() {
         return None;
     }
-    unsafe { read::probe(obj, Key::Symbol(symbol as usize)) }
+    if let Some(obj) = object_receiver(value) {
+        // An ordinary receiver's layouts carry its [[Prototype]] chain, so
+        // `undefined` here is a proven absence.
+        return unsafe { read::probe(obj, Key::Symbol(symbol as usize)) };
+    }
+    // A function's (or a native owner's) symbol properties are an ordinary
+    // bag that stands in for its OWN properties only: the owner's
+    // [[Prototype]] chain is not the bag's (a subclass constructor inherits
+    // RegExp's @@species getter). Only a key the bag holds answers for the
+    // owner; a key it lacks leaves the observable Get to walk the chain, and
+    // a proxy's Get is its trap.
+    if crate::proxy_hooks::proxy_address(value).is_some() {
+        return None;
+    }
+    let key = f64::from_bits(crate::value::POINTER_TAG | symbol as u64);
+    match unsafe { crate::symbol::own_symbol_slot(value, key) }? {
+        OwnSymbolSlot::Data(bits) => Some(Answer::Data(bits)),
+        OwnSymbolSlot::Accessor { get, .. } if get != 0 => Some(Answer::Getter(get)),
+        // A getter-less pair reads as `undefined`; the observable read says so.
+        OwnSymbolSlot::Accessor { .. } => None,
+    }
 }
 
 pub(crate) fn split(value: f64) -> bool {

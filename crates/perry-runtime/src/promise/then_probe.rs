@@ -51,7 +51,7 @@
 //! * no own `then` key (a direct dense scan of the keys array — this is the
 //!   common REAL thenable, `{ then(res, rej) {…} }`, and it must always be
 //!   found);
-//! * `OBJ_FLAG_NULL_PROTO` ⇒ the own keys ARE the whole chain, answer proven;
+//! * a null [[Prototype]] (the shape's identity) ⇒ the own keys ARE the whole chain, answer proven;
 //! * otherwise no per-instance `setPrototypeOf` / `__proto__` override
 //!   (`object_static_prototype`) ⇒ the chain is exactly
 //!   `obj → Object.prototype → null`.
@@ -194,7 +194,7 @@ unsafe fn proto_signature(proto_addr: usize) -> Option<(usize, u32, u16, u32)> {
             return None;
         }
         let kh = crate::value::addr_class::try_read_gc_header(keys_addr)?;
-        if kh.obj_type != crate::gc::GC_TYPE_ARRAY
+        if crate::gc_type_is_not_array!(kh.obj_type)
             || kh.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
         {
             return None;
@@ -297,7 +297,7 @@ fn compute_object_prototype_then(proto_addr: usize) -> Option<bool> {
     }
     // Likewise if `Object.prototype` itself was given a prototype: the chain
     // above it is not modelled here, and an accessor could live on it.
-    if crate::object::prototype_chain::object_static_prototype(proto_addr).is_some() {
+    if crate::object::prototype_chain::object_static_prototype_is_linked(proto_addr) {
         return Some(false);
     }
     let proto_value = crate::value::js_nanbox_pointer(proto_addr as i64);
@@ -346,7 +346,7 @@ unsafe fn own_then_scan(obj: *const ObjectHeader) -> OwnScan {
     let Some(header) = crate::value::addr_class::try_read_gc_header(keys_addr) else {
         return OwnScan::Unknown;
     };
-    if header.obj_type != crate::gc::GC_TYPE_ARRAY
+    if crate::gc_type_is_not_array!(header.obj_type)
         || header.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
         || crate::array::array_has_named_layout(keys as *const crate::array::ArrayHeader)
     {
@@ -487,7 +487,8 @@ unsafe fn prove_no_then(value: f64) -> Outcome {
     let Some(gc) = crate::value::addr_class::try_read_gc_header(addr) else {
         return Outcome::NotArena;
     };
-    if crate::gc_type_is_not_object!(gc.obj_type) || gc.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0 {
+    if crate::gc_type_is_not_object!(gc.obj_type) || gc.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
+    {
         return Outcome::NotPlainObject;
     }
     let flags = gc._reserved;
@@ -529,7 +530,7 @@ unsafe fn prove_no_then(value: f64) -> Outcome {
         OwnScan::NoThen => {}
     }
     // A null-prototype object's own keys are its whole `[[Get]]` chain.
-    if flags & crate::gc::OBJ_FLAG_NULL_PROTO != 0 {
+    if crate::object::shapes::object_prototype_is_null(obj) {
         return Outcome::Proved;
     }
     // A per-instance `setPrototypeOf` / `__proto__` override puts an arbitrary
@@ -696,7 +697,7 @@ mod tests {
         assert!(!definitely_no_then(f64::from_bits(crate::value::TAG_NULL)));
         assert!(!definitely_no_then(f64::from_bits(crate::value::TAG_TRUE)));
         assert!(!definitely_no_then(f64::from_bits(
-            crate::value::INT32_TAG | 7
+            crate::value::INTERNAL_WORD_TAG | 7
         )));
         // A STRING_TAG value is a pointer, but not a POINTER_TAG one.
         assert!(!definitely_no_then(f64::from_bits(

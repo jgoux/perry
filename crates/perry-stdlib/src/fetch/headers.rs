@@ -191,7 +191,10 @@ fn read_headers_record_entries(
         return unsafe { read_proxy_record_entries(value, scope) };
     }
     let raw = perry_runtime::js_nanbox_get_pointer(value);
-    if !matches!(gc_type_for_raw_ptr(raw), Some(perry_runtime::gc_object_type_pat!())) {
+    if !matches!(
+        gc_type_for_raw_ptr(raw),
+        Some(perry_runtime::gc_object_type_pat!())
+    ) {
         return None;
     }
 
@@ -327,7 +330,7 @@ unsafe fn materialize_header_pair(
     let raw = perry_runtime::js_nanbox_get_pointer(pair_value);
     let pair_array_value = if matches!(
         gc_type_for_raw_ptr(raw),
-        Some(perry_runtime::gc::GC_TYPE_ARRAY | perry_runtime::gc::GC_TYPE_LAZY_ARRAY)
+        Some(perry_runtime::gc_array_type_pat!() | perry_runtime::gc::GC_TYPE_LAZY_ARRAY)
     ) {
         pair_value
     } else {
